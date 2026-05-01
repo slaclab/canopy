@@ -1,0 +1,34 @@
+[project]
+name = "eed-swapps-py-template"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[dependency-groups]
+dev = [
+    "pre-commit",
+    "pytest",
+]
+docs = [
+    "mkdocs",
+    "mkdocs-material",
+    "mkdocstrings",
+    "mkdocstrings-python",
+    "mkdocs-git-revision-date-localized-plugin",
+    "mkdocs-git-committers-plugin-2",
+]
+
+[tool.ruff]
+extend-exclude = ["__init__.py"]
+line-length = 120
+
+[tool.isort]
+profile = "black"
+color_output = true
+extend_skip = ["__init__.py"]
+length_sort = true
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
