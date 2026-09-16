@@ -93,9 +93,7 @@ class EnvKeyRegistry:
 
     def __init__(self, raw: str = "") -> None:
         self._keys: dict[str, APIKey] = {}
-        for position, entry in enumerate((e.strip() for e in raw.split(",")), start=1):
-            if not entry:
-                continue
+        for position, entry in enumerate((e.strip() for e in raw.split(",") if e.strip()), start=1):
             try:
                 token, rest = entry.split(":", 1)
             except ValueError:
