@@ -23,49 +23,6 @@ can.
 Independently, every key also carries a **module scope** — see
 [Module scoping](#module-scoping) below.
 
-Clients send the token in the `X-API-Key` header. WebSocket endpoints also
-accept `?api_key=<token>` for browsers that cannot set headers on a WebSocket
-handshake — that parameter exists purely as a compatibility workaround and is
-not a convention to extend to other endpoints.
-
-### Two credential layers
-
-Keys resolve from two places, checked in order:
-
-1. **Env (`CANOPY_API_KEYS`)** — a small, long-lived, statically-stable set.
-   Parsed once at startup, so it keeps working even if Postgres is completely
-   unreachable, including on a cold start when there is nothing cached yet.
-   Checked first, so the highest-volume credential in the system — the read
-   key baked into every display — never makes a database round trip.
-2. **Database** — every other key: per-tool, per-user, and CI keys, and any
-   `write` key. Minted and revoked without a deploy, cached briefly for
-   latency, with revocation therefore not quite instant (see
-   [Revocation](#revocation)).
-
-A deployment's env layer typically holds exactly two keys — one `read` key for
-displays, one `admin` key for ops — and manages everything else in the
-database. The env key is not an emergency-only credential: because the display
-key ends up inlined into a public JS bundle at build time (via react-trace's
-`.env`), it was never going to be a fast-revocation secret regardless of where
-it lived, so it's simplest to keep it as a permanent, statically-stable floor
-rather than a special break-glass case.
-
-!!! warning "Unset means locked, not open"
-    If both layers are empty, no keys exist and every gated endpoint returns
-    `401`. Startup logs the loaded env count — see [Verifying](#verifying-a-deployment).
-
-!!! note "Running without a database"
-    An env key works with no Postgres at all. An **unknown** token, however,
-    falls through to the database registry, so with no database reachable it
-    returns `503` `key_store_unavailable` rather than `401` — the store
-    genuinely cannot say whether the token is valid.
-
-## Provisioning a key
-
-### Local development / Docker Compose
-
-`.env` / `docker/.env` carry `CANOPY_API_KEYS`; `docker-compose.yml` defaults it
-to `dev:read+write@*` when unset. Fine for a laptop, never for a shared host.
 Everything else — the working set of keys for local testing — is easiest to
 manage through the CLI once `CANOPY_DATABASE_URL` points somewhere real:
 
@@ -177,53 +134,6 @@ A key that resolves but isn't scoped to the module a route belongs to gets
 scope check, so an out-of-scope, no-access key is still reported as
 out-of-scope, not out-of-read.
 
-### Why `admin`, not `write`
-
-Gating key management on `write` would let any write-capable client — every
-tool that can set a live setpoint — mint credentials that outlive rotation of
-its own key. `write` is the largest, least-controlled population of keys in
-Canopy, and the wrong one to trust with provisioning. `admin` is a separate,
-narrowly-held scope for exactly this and other operational actions — for the
-same reason, `POST /vole/v1/_debug/evict/{pv}` (dropping a ring buffer) is
-gated on `admin` too, not `write`: it's an operational action, not a data
-write.
-
-## Rotation
-
-Overlapping keys make rotation zero-downtime:
-
-1. **Mint** the new key (`scripts/create_key.py` or `POST /v1/api-keys`). Both
-   old and new tokens are now valid.
-2. **Roll clients over** to the new token.
-3. **Deactivate** the old key (`scripts/deactivate_key.py` or
-   `DELETE /v1/api-keys/{id}`).
-
-`last_used_at` (visible via `GET /v1/api-keys`) is what turns "is it safe to
-deactivate the old key yet?" from a guess into a query — check it before step 3
-rather than picking an arbitrary overlap window.
-
-Rotating an **env** key is still the old process: add the new token to
-`CANOPY_API_KEYS`, deploy, roll clients, remove the old token, deploy again.
-Keep the env layer's population small (the two long-lived keys) specifically
-so this stays rare.
-
-### Revocation
-
-Deactivating a database-backed key (CLI or HTTP) takes effect once its cached
-entry expires — the cache TTL **is** the revocation latency (`CANOPY_API_KEY_CACHE_TTL_S`,
-default 60s). If Postgres itself is unreachable when you deactivate a key, the
-cached entry may still be served stale for up to `CANOPY_API_KEY_MAX_STALE_S`
-(default 1h) — bounded so an outage cannot keep a revoked key alive forever,
-but worth knowing if a leak coincides with a database outage.
-
-Revoking an **env** key is a deploy, same as rotation: the practical exposure
-window is the length of your deploy pipeline.
-
-## Production hygiene
-
-Before declaring an instance provisioned:
-
-- [ ] `CANOPY_API_KEYS` does **not** contain the `dev:read+write@*` default.
 - [ ] Tokens are freshly generated per instance — not shared between DEV and a
       facility, and not shared with another SLAC app.
 - [ ] Only one `admin` key exists in the env layer (for ops), and it is not
