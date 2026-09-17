@@ -23,6 +23,49 @@ can.
 Independently, every key also carries a **module scope** — see
 [Module scoping](#module-scoping) below.
 
+Clients send the token in the `X-API-Key` header. WebSocket endpoints also
+accept `?api_key=<token>` for browsers that cannot set headers on a WebSocket
+handshake — that parameter exists purely as a compatibility workaround and is
+not a convention to extend to other endpoints.
+
+### Two credential layers
+
+Keys resolve from two places, checked in order:
+
+1. **Env (`CANOPY_API_KEYS`)** — a small, long-lived, statically-stable set.
+   Parsed once at startup, so it keeps working even if Postgres is completely
+   unreachable, including on a cold start when there is nothing cached yet.
+   Checked first, so the highest-volume credential in the system — the read
+   key baked into every display — never makes a database round trip.
+2. **Database** — every other key: per-tool, per-user, and CI keys, and any
+   `write` key. Minted and revoked without a deploy, cached briefly for
+   latency, with revocation therefore not quite instant (see
+   [Revocation](#revocation)).
+
+A deployment's env layer typically holds exactly two keys — one `read` key for
+displays, one `admin` key for ops — and manages everything else in the
+database. The env key is not an emergency-only credential: because the display
+key ends up inlined into a public JS bundle at build time (via react-trace's
+`.env`), it was never going to be a fast-revocation secret regardless of where
+it lived, so it's simplest to keep it as a permanent, statically-stable floor
+rather than a special break-glass case.
+
+!!! warning "Unset means locked, not open"
+    If both layers are empty, no keys exist and every gated endpoint returns
+    `401`. Startup logs the loaded env count — see [Verifying](#verifying-a-deployment).
+
+!!! note "Running without a database"
+    An env key works with no Postgres at all. An **unknown** token, however,
+    falls through to the database registry, so with no database reachable it
+    returns `503` `key_store_unavailable` rather than `401` — the store
+    genuinely cannot say whether the token is valid.
+
+## Provisioning a key
+
+### Local development / Docker Compose
+
+`.env` / `docker/.env` carry `CANOPY_API_KEYS`; `docker-compose.yml` defaults it
+to `dev:read+write@*` when unset. Fine for a laptop, never for a shared host.
 Everything else — the working set of keys for local testing — is easiest to
 manage through the CLI once `CANOPY_DATABASE_URL` points somewhere real:
 
@@ -134,6 +177,54 @@ A key that resolves but isn't scoped to the module a route belongs to gets
 scope check, so an out-of-scope, no-access key is still reported as
 out-of-scope, not out-of-read.
 
+### Why `admin`, not `write`
+
+A key can be restricted to one or more mounted sub-apps — `mole`, `hare`,
+`raccoon`, `vole`, `fox`, `beaver`, `squirrel`, `magpie`, `jobs`, `converter`
+— or `core`, for the parent app's own routes (`/health`, `/v1/api-keys`).
+Minting a key via the CLI or `POST /v1/api-keys` without naming any modules
+grants every module, an explicit default of `["*"]` at that layer. There is no
+such default for the env layer — see below.
+
+This constrains which **surface** a key can call, not which **data** it can
+see through that surface — a `squirrel`-scoped key can reach every route
+`squirrel` exposes, the same as an unscoped key would. Facility-level data
+scoping is a separate, Squirrel-side mechanism and is not expressible here.
+
+Set it with `-m`/`--module` (repeatable) on `scripts/create_key.py`, or the
+`modules` field on `POST /v1/api-keys`:
+
+```bash
+uv run python scripts/create_key.py trace -r -m fox -m vole
+```
+
+```bash
+curl -X POST -H "X-API-Key: <admin-token>" -H "Content-Type: application/json" \
+  -d '{"appName": "trace", "read": true, "modules": ["fox", "vole"]}' \
+  http://localhost:<API_PORT>/v1/api-keys
+```
+
+For an env-layer key, the `@<module>[+<module>]` suffix is **required** — an
+entry with no `@` at all is skipped as malformed, the same as an empty token.
+Use `@*` for every module:
+
+```bash
+CANOPY_API_KEYS="trace:read@fox+vole,ops:admin@*"
+```
+
+A key that resolves but isn't scoped to the module a route belongs to gets
+`403` `insufficient_module_access` — checked before the `read`/`write`/`admin`
+scope check, so an out-of-scope, no-access key is still reported as
+out-of-scope, not out-of-read.
+
+Revoking an **env** key is a deploy, same as rotation: the practical exposure
+window is the length of your deploy pipeline.
+
+## Production hygiene
+
+Before declaring an instance provisioned:
+
+- [ ] `CANOPY_API_KEYS` does **not** contain the `dev:read+write@*` default.
 - [ ] Tokens are freshly generated per instance — not shared between DEV and a
       facility, and not shared with another SLAC app.
 - [ ] Only one `admin` key exists in the env layer (for ops), and it is not
