@@ -20,8 +20,9 @@ cannot itself read a PV is a better credential for a provisioning tool than one
 that can do everything. A `write` key cannot mint or revoke keys; only `admin`
 can.
 
-Independently, every key also carries a **module scope** — see
-[Module scoping](#module-scoping) below.
+Independently, every key also carries a **module scope** and a **facility
+scope** — see [Module scoping](#module-scoping) and
+[Facility scoping](#facility-scoping) below.
 
 Clients send the token in the `X-API-Key` header. WebSocket endpoints also
 accept `?api_key=<token>` for browsers that cannot set headers on a WebSocket
@@ -119,7 +120,7 @@ The same operations are available at `/v1/api-keys` on the parent app, gated on
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `POST` | `/v1/api-keys` | Mint a key. Body: `appName`, and any of `read`/`write`/`admin`. Returns the plaintext `token` once. |
+| `POST` | `/v1/api-keys` | Mint a key. Body: `appName`, any of `read`/`write`/`admin`, and optionally `modules`/`facilities`. Returns the plaintext `token` once. |
 | `GET` | `/v1/api-keys` | List keys (`?activeOnly=true`, `?appName=<name>` to filter). Never returns a token. |
 | `GET` | `/v1/api-keys/count` | Count keys (`?activeOnly=true` to filter). |
 | `DELETE` | `/v1/api-keys/{id}` | Deactivate a key. |
@@ -148,8 +149,9 @@ such default for the env layer — see below.
 
 This constrains which **surface** a key can call, not which **data** it can
 see through that surface — a `squirrel`-scoped key can reach every route
-`squirrel` exposes, the same as an unscoped key would. Facility-level data
-scoping is a separate, Squirrel-side mechanism and is not expressible here.
+`squirrel` exposes, the same as an unscoped key would. Restricting *which*
+facility's data a key can see is a separate mechanism — see
+[Facility scoping](#facility-scoping) below.
 
 Set it with `-m`/`--module` (repeatable) on `scripts/create_key.py`, or the
 `modules` field on `POST /v1/api-keys`:
