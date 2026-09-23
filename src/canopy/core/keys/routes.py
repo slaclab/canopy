@@ -30,6 +30,7 @@ async def create_key(
         admin=data.admin,
         modules=data.modules,
         acting_key_modules=list(key.modules),
+        facilities=data.facilities,
     )
 
 
