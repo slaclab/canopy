@@ -16,8 +16,9 @@ from collections.abc import Callable
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from canopy.core.errors import BadRequest
+from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
 from canopy.core.time_parse import to_utc
+from canopy.core.facilities import gateway as facilities_gateway
 from canopy.squirrel.errors import SnapshotNotFound
 from canopy.contracts.pagination import PagedResult
 from canopy.squirrel.data.models import Snapshot
@@ -248,6 +249,7 @@ class SnapshotService:
         session: AsyncSession,
         epics_io: EpicsIO | None = None,
         restore_hooks: list[RestoreHook] | None = None,
+        facility_scope: set[str] | None = None,
     ):
         """Wire the repositories, EPICS adapter and restore hooks.
 
@@ -262,8 +264,13 @@ class SnapshotService:
             Hooks to run during a restore. ``None`` falls back to the configured
             singletons; an empty list disables hooks outright, which is how tests
             isolate themselves from the environment.
+        facility_scope : set[str] | None
+            The calling key's granted facility ids, hierarchy-expanded, resolved per
+            request by ``squirrel.dependencies``; ``None`` means unrestricted, which
+            is what the worker gets.
         """
         self.session = session
+        self.facility_scope = facility_scope
         self.snapshot_repo = SnapshotRepository(session)
         self.value_repo = SnapshotValueRepository(session)
         self.pv_repo = PvRepository(session)
@@ -285,6 +292,16 @@ class SnapshotService:
                 )
         return meta_pv_values
 
+    def _require_facility_write(self, facility_id: str | None, what: str) -> None:
+        """Gate a write on the calling key's facility grant. Unrestricted keys and
+        unassigned rows (``facility_id IS NULL``) pass; otherwise the row's facility must
+        be in the grant. Mirrors ``PvService._require_facility_write`` — a snapshot has at
+        most one facility, so "any overlap" degenerates to membership."""
+        if self.facility_scope is None or facility_id is None:
+            return
+        if facility_id not in self.facility_scope:
+            raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility")
+
     async def list_snapshots(
         self,
         title: str | None = None,
@@ -293,6 +310,7 @@ class SnapshotService:
         end: datetime | None = None,
         page_size: int = 100,
         continuation_token: str | None = None,
+        facility: str | None = None,
     ) -> PagedResult[SnapshotSummaryDTO]:
         """List snapshots one keyset page at a time, newest first, optionally filtered.
 
@@ -315,6 +333,9 @@ class SnapshotService:
             Maximum number of summaries on the page.
         continuation_token : str | None
             Token from the previous page's result; ``None`` for the first page.
+        facility : str | None
+            A facility slug to additionally narrow the search to, resolved against the
+            calling key's own facility scope by ``facilities_gateway.resolve_effective_scope``.
 
         Returns
         -------
@@ -333,6 +354,7 @@ class SnapshotService:
         end = _utc_bound("end", end)
         if start is not None and end is not None and start > end:
             raise BadRequest(f"start ({start.isoformat()}) must not be after end ({end.isoformat()})")
+        facility_ids = await facilities_gateway.resolve_effective_scope(facility, self.facility_scope)
         snapshots, next_cursor, total_count = await self.snapshot_repo.search(
             title=title,
             tag_ids=tag_ids,
@@ -340,6 +362,7 @@ class SnapshotService:
             end=end,
             limit=page_size,
             after=_decode_cursor(continuation_token),
+            facility_ids=facility_ids,
         )
 
         # One grouped query for all value counts (avoids N+1).
@@ -357,6 +380,7 @@ class SnapshotService:
                     created_date=snap.created_at,
                     created_by=snap.created_by,
                     pv_count=counts.get(snap.id, 0),
+                    facility_id=snap.facility_id,
                     meta_pvs=await self._get_meta_pv_values_for_snapshot(snap.id, meta_pvs),
                 )
             )
@@ -419,6 +443,7 @@ class SnapshotService:
             created_date=snapshot.created_at,
             created_by=snapshot.created_by,
             pv_count=total_count,
+            facility_id=snapshot.facility_id,
             pv_values=pv_values,
             meta_pvs=await self._get_meta_pv_values_for_snapshot(snapshot.id, meta_pvs),
         )
@@ -430,6 +455,12 @@ class SnapshotService:
         description: str | None = None,
     ) -> SnapshotSummaryDTO | None:
         """Update a snapshot's title and/or description."""
+        # Read before writing: the facility gate needs the row's `facility_id`, and a
+        # refused write must not have already landed.
+        existing = await self.snapshot_repo.get_by_id(snapshot_id)
+        if not existing:
+            return None
+        self._require_facility_write(existing.facility_id, "this snapshot")
         snapshot = await self.snapshot_repo.update_metadata(snapshot_id, title=title, description=description)
         if not snapshot:
             return None
@@ -443,13 +474,23 @@ class SnapshotService:
             created_date=snapshot.created_at,
             created_by=snapshot.created_by,
             pv_count=pv_count,
+            facility_id=snapshot.facility_id,
             meta_pvs=await self._get_meta_pv_values_for_snapshot(snapshot.id, meta_pvs),
         )
 
     async def create_snapshot(
-        self, data: NewSnapshotDTO, created_by: str | None = None, progress_callback: Callable | None = None
+        self,
+        data: NewSnapshotDTO,
+        created_by: str | None = None,
+        progress_callback: Callable | None = None,
+        facility_id: str | None = None,
     ) -> SnapshotSummaryDTO:
-        """Create a snapshot by reading every registered PV from EPICS (the hot read path)."""
+        """Create a snapshot by reading every registered PV from EPICS (the hot read path).
+
+        ``facility_id`` lets a caller that already resolved ``data.facility`` pass the id
+        straight through. The route does that — it has to resolve the slug anyway to gate
+        the write, and passing the id over the job queue avoids re-resolving it.
+        """
         logger.info("Creating snapshot: %s", data.title)
         start_time = datetime.now(UTC)
 
@@ -489,9 +530,20 @@ class SnapshotService:
         if progress_callback:
             await progress_callback(total_pv_count, total_pv_count, "Processing results...")
 
+        # A snapshot's facility is the specific node captured, not a descendant-expanded
+        # scope, so this goes through `get_by_slug`. An unknown slug here is a real input
+        # error, not the "matches nothing" a read filter wants.
+        if facility_id is None and data.facility is not None:
+            facility = await facilities_gateway.get_by_slug(data.facility)
+            if facility is None:
+                raise FacilityNotFound(f"Facility '{data.facility}' not found")
+            facility_id = facility.id
+
         # Create the snapshot row. The flush puts it in the open transaction so the
         # COPY below (same connection) sees it for the FK — no commit needed here.
-        snapshot = Snapshot(title=data.title, description=data.description, created_by=created_by)
+        snapshot = Snapshot(
+            title=data.title, description=data.description, created_by=created_by, facility_id=facility_id
+        )
         snapshot = await self.snapshot_repo.create(snapshot)
 
         # Group the readings by PV, keeping only connected reads.
@@ -562,8 +614,42 @@ class SnapshotService:
             created_date=snapshot.created_at,
             created_by=snapshot.created_by,
             pv_count=count,
+            facility_id=snapshot.facility_id,
             meta_pvs=await self._get_meta_pv_values_for_snapshot(snapshot.id, meta_pvs),
         )
+
+    async def plan_restore(
+        self, snapshot_id: str, pv_ids: list[str] | None = None
+    ) -> tuple[list[str] | None, list[str]]:
+        """Narrow a restore's write set to what the calling key may actually write.
+
+        Returns ``(pv_ids_to_restore, skipped_pv_ids)``, where a ``None`` first element
+        keeps the "restore everything in the snapshot" meaning ``pv_ids=None`` already has.
+
+        This runs in the *route*, not the worker: no caller identity crosses the Arq
+        boundary, so the write set has to be narrowed before the job is queued.
+
+        The gate is per-PV, not on the snapshot's own facility: a restore writes live
+        EPICS setpoints, not the snapshot row. A snapshot captures every registered PV,
+        so one filed under a parent facility normally spans several children, and a key
+        granted one child should restore its own PVs without touching its siblings'.
+        """
+        if self.facility_scope is None:
+            return pv_ids, []
+
+        values = (
+            await self.value_repo.get_by_snapshot_and_pvs(snapshot_id, pv_ids)
+            if pv_ids
+            else await self.value_repo.get_by_snapshot(snapshot_id)
+        )
+        by_pv = await self.pv_repo.facility_ids_for_many([v.pv_id for v in values])
+        allowed, skipped = [], []
+        for value in values:
+            assigned = by_pv.get(value.pv_id, set())
+            # Same rule as `_require_facility_write`: unassigned PVs are writable by any
+            # write-scoped key, and one shared facility is enough for the rest.
+            (allowed if not assigned or assigned & self.facility_scope else skipped).append(value.pv_id)
+        return allowed, skipped
 
     async def restore_snapshot(
         self,
@@ -883,4 +969,8 @@ class SnapshotService:
 
     async def delete_snapshot(self, snapshot_id: str) -> bool:
         """Delete a snapshot and all its values (DB cascade)."""
+        snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
+        if not snapshot:
+            return False
+        self._require_facility_write(snapshot.facility_id, "this snapshot")
         return await self.snapshot_repo.delete_with_values(snapshot_id)

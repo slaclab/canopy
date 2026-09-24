@@ -5,7 +5,8 @@ from __future__ import annotations
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from canopy.core.errors import BadRequest
+from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
+from canopy.core.facilities import gateway as facilities_gateway
 from canopy.squirrel.errors import PvNotFound, MetaPvNotFound, PvAlreadyExists
 from canopy.squirrel.schemas.pv import (
     PVElementDTO,
@@ -66,13 +67,17 @@ def _identity(
 class PvService:
     """PV registry + meta-PV management. Owns no transaction — the caller commits."""
 
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: AsyncSession, facility_scope: set[str] | None = None):
+        """``facility_scope`` is the calling key's granted facility ids, hierarchy-
+        expanded, resolved per request by ``squirrel.dependencies``; ``None`` means
+        unrestricted, which is what the worker gets."""
         self.session = session
+        self.facility_scope = facility_scope
         self.pv_repo = PvRepository(session)
         self.meta_pv_repo = MetaPvRepository(session)
         self.tag_repo = TagRepository(session)
 
-    def _to_dto(self, pv: Pv) -> PVElementDTO:
+    def _to_dto(self, pv: Pv, facility_ids: set[str] | None = None) -> PVElementDTO:
         return PVElementDTO(
             id=pv.id,
             setpoint_address=pv.setpoint_address,
@@ -83,9 +88,43 @@ class PvService:
             abs_tolerance=pv.abs_tolerance,
             rel_tolerance=pv.rel_tolerance,
             tags=[TagDTO(id=t.id, name=t.name, description=t.description) for t in pv.tags],
+            facility_ids=sorted(facility_ids or ()),
             created_date=pv.created_at,
             last_modified_date=pv.updated_at,
         )
+
+    async def _to_dtos(self, pvs: list[Pv]) -> list[PVElementDTO]:
+        """``_to_dto`` over a result set, with one batched ``pv_facility`` read instead
+        of one per row."""
+        by_pv = await self.pv_repo.facility_ids_for_many([pv.id for pv in pvs])
+        return [self._to_dto(pv, by_pv.get(pv.id, set())) for pv in pvs]
+
+    def _require_facility_write(self, row_facility_ids: set[str], what: str) -> None:
+        """Gate a write on the calling key's facility grant.
+
+        Allowed when the key is unrestricted, when the row is unassigned, or when the
+        row's facilities overlap the grant *at all* — holding one of a PV's facilities
+        is enough. Unassigned rows are writable by any write-scoped key, mirroring the
+        read side, where an unfiltered query returns them.
+        """
+        if self.facility_scope is None or not row_facility_ids:
+            return
+        if not (row_facility_ids & self.facility_scope):
+            raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility")
+
+    async def _resolve_slugs(self, slugs: list[str] | set[str]) -> dict[str, str]:
+        """Facility slugs -> ``{slug: id}``.
+
+        An unknown slug is a hard ``FacilityNotFound``: degrading to "matches nothing"
+        is right for a *filter*, wrong when the facility is the field being written.
+        """
+        resolved: dict[str, str] = {}
+        for slug in sorted(slugs):
+            facility = await facilities_gateway.get_by_slug(slug)
+            if facility is None:
+                raise FacilityNotFound(f"Facility '{slug}' not found")
+            resolved[slug] = facility.id
+        return resolved
 
     @staticmethod
     def _normalize_address(address: str | None) -> str | None:
@@ -101,15 +140,18 @@ class PvService:
         page_size: int = 100,
         continuation_token: str | None = None,
         tag_filters: dict[str, list[str]] | None = None,
+        facility: str | None = None,
     ) -> PagedResult[PVElementDTO]:
+        facility_ids = await facilities_gateway.resolve_effective_scope(facility, self.facility_scope)
         pvs, next_token, total_count = await self.pv_repo.search_by_name(
             search=search,
             limit=page_size,
             continuation_token=continuation_token,
             tag_filters=tag_filters,
+            facility_ids=facility_ids,
         )
         return PagedResult(
-            results=[self._to_dto(pv) for pv in pvs],
+            results=await self._to_dtos(pvs),
             continuation_token=next_token,
             total_count=total_count,
         )
@@ -118,7 +160,9 @@ class PvService:
         # Route through get_by_ids so tags (and their group) are eager-loaded: _to_dto reads
         # pv.tags, and a bare session.get() would trigger an async lazy-load (MissingGreenlet).
         pvs = await self.pv_repo.get_by_ids([pv_id])
-        return self._to_dto(pvs[0]) if pvs else None
+        if not pvs:
+            return None
+        return self._to_dto(pvs[0], await self.pv_repo.facility_ids_for(pv_id))
 
     async def _find_by_identity(self, kind: str, address: str) -> Pv | None:
         """Look up the PV already holding an identity.
@@ -175,6 +219,9 @@ class PvService:
             if len(tags) != len(data.tags):
                 raise BadRequest("One or more tag IDs are invalid")
 
+        facility_ids = set((await self._resolve_slugs(data.facilities)).values())
+        self._require_facility_write(facility_ids, "the requested")
+
         pv = Pv(
             setpoint_address=setpoint_address,
             readback_address=readback_address,
@@ -189,7 +236,9 @@ class PvService:
             pv = await self.pv_repo.create(pv)
         except IntegrityError as e:
             raise PvAlreadyExists(f"PV addresses violate uniqueness constraints: {e}") from e
-        return self._to_dto(pv)
+        if facility_ids:
+            await self.pv_repo.set_facilities(pv.id, facility_ids)
+        return self._to_dto(pv, facility_ids)
 
     async def create_many(self, data_list: list[NewPVElementDTO]) -> list[PVElementDTO]:
         """Register many PVs in one import.
@@ -248,6 +297,13 @@ class PvService:
             tags = await self.tag_repo.get_by_ids(list(all_tag_ids))
             tags_by_id = {t.id: t for t in tags}
 
+        # Resolve the whole import's distinct slugs up front — one gateway round trip
+        # each instead of one per (row, slug) pair — then gate the union once.
+        ids_by_slug = await self._resolve_slugs(
+            {slug for _, _, _, data in normalized_records for slug in data.facilities}
+        )
+        self._require_facility_write(set(ids_by_slug.values()), "the requested")
+
         pvs = []
         for setpoint_address, readback_address, config_address, data in normalized_records:
             pv_tags = [tags_by_id[tid] for tid in data.tags if tid in tags_by_id]
@@ -268,12 +324,31 @@ class PvService:
             pvs = await self.pv_repo.bulk_create(pvs)
         except IntegrityError as e:
             raise PvAlreadyExists(f"PV addresses violate uniqueness constraints: {e}") from e
-        return [self._to_dto(pv) for pv in pvs]
+
+        # `bulk_create` returns in input order, so zipping back against the normalized
+        # records is what maps each new id to the slugs its payload asked for.
+        assignments = [
+            (pv.id, {ids_by_slug[slug] for slug in data.facilities})
+            for pv, (_, _, _, data) in zip(pvs, normalized_records)
+            if data.facilities
+        ]
+        await self.pv_repo.add_facilities_many(assignments)
+        ids_by_pv = dict(assignments)
+        return [self._to_dto(pv, ids_by_pv.get(pv.id, set())) for pv in pvs]
 
     async def update(self, pv_id: str, data: UpdatePVElementDTO) -> PVElementDTO | None:
         pv = await self.pv_repo.get_by_id(pv_id)
         if not pv:
             return None
+        facility_ids = await self.pv_repo.facility_ids_for(pv_id)
+        self._require_facility_write(facility_ids, "this PV")
+        if data.facilities is not None:
+            new_ids = set((await self._resolve_slugs(data.facilities)).values())
+            # Both the old and the new assignment are gated: a restricted key may
+            # neither take a PV out of a facility it can't reach nor put one into one.
+            self._require_facility_write(new_ids, "the requested")
+            await self.pv_repo.set_facilities(pv_id, new_ids)
+            facility_ids = new_ids
         if data.device is not None:
             pv.device = data.device
         if data.description is not None:
@@ -288,12 +363,13 @@ class PvService:
                 raise BadRequest("One or more tag IDs are invalid")
             pv.tags = tags
         pv = await self.pv_repo.update(pv)
-        return self._to_dto(pv)
+        return self._to_dto(pv, facility_ids)
 
     async def delete(self, pv_id: str) -> bool:
         pv = await self.pv_repo.get_by_id(pv_id)
         if not pv:
             return False
+        self._require_facility_write(await self.pv_repo.facility_ids_for(pv_id), "this PV")
         try:
             await self.pv_repo.delete(pv)
         except IntegrityError as e:
@@ -316,12 +392,19 @@ class PvService:
         tag_ids: list[str] | None = None,
         limit: int = 100,
         offset: int = 0,
+        facility: str | None = None,
     ) -> PVSearchResponse:
         """Offset-paginated, server-side filtered search (the source's live-value join is dropped)."""
+        facility_ids = await facilities_gateway.resolve_effective_scope(facility, self.facility_scope)
         pvs, total = await self.pv_repo.search_filtered(
-            search_term=q, devices=devices or None, tag_ids=tag_ids or None, limit=limit, offset=offset
+            search_term=q,
+            devices=devices or None,
+            tag_ids=tag_ids or None,
+            limit=limit,
+            offset=offset,
+            facility_ids=facility_ids,
         )
-        return PVSearchResponse(results=[self._to_dto(pv) for pv in pvs], total_count=total, limit=limit, offset=offset)
+        return PVSearchResponse(results=await self._to_dtos(pvs), total_count=total, limit=limit, offset=offset)
 
     async def get_all_devices(self) -> list[str]:
         """All distinct device names, for the frontend's device filter."""
