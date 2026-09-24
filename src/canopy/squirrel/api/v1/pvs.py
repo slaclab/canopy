@@ -34,9 +34,10 @@ router = APIRouter(prefix="/pvs", tags=["PVs"])
 async def search_pvs(
     service: PvServiceDep,
     pvName: str | None = Query(None),
+    facility: str | None = Query(None, description="Facility slug — includes descendants"),
 ) -> list[PVElementDTO]:
     """Search PVs by name (non-paginated, capped — kept for backward compatibility)."""
-    result = await service.search_paged(search=pvName, page_size=1000)
+    result = await service.search_paged(search=pvName, page_size=1000, facility=facility)
     return result.results
 
 
@@ -47,6 +48,7 @@ async def search_pvs_paged(
     pageSize: int = Query(100, ge=1, le=1000),
     continuationToken: str | None = Query(None),
     tagFilters: str | None = Query(None, description='JSON object: {"groupId": ["tagId", ...], ...}'),
+    facility: str | None = Query(None, description="Facility slug — includes descendants"),
 ) -> PagedResult[PVElementDTO]:
     """Keyset-paginated search with optional tag filtering.
 
@@ -65,6 +67,7 @@ async def search_pvs_paged(
         page_size=pageSize,
         continuation_token=continuationToken,
         tag_filters=tag_filters,
+        facility=facility,
     )
 
 
@@ -76,9 +79,12 @@ async def search_pvs_filtered(
     tags: list[str] = Query(default=[], description="Filter by tag IDs"),
     limit: int = Query(100, ge=1, le=1000, description="Max results"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
+    facility: str | None = Query(None, description="Facility slug — includes descendants"),
 ) -> PVSearchResponse:
     """Offset-paginated, server-side filtered search (more efficient than client-side filtering)."""
-    return await service.search_filtered(q=q, devices=devices or None, tag_ids=tags or None, limit=limit, offset=offset)
+    return await service.search_filtered(
+        q=q, devices=devices or None, tag_ids=tags or None, limit=limit, offset=offset, facility=facility
+    )
 
 
 @router.get("/devices", dependencies=[Security(require_read_access)])

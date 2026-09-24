@@ -356,7 +356,7 @@ async def test_create_enqueues_job(client: AsyncClient, enqueued: list):
     assert r.status_code == 200
     assert r.json() == {"jobId": "test-job-id", "statusUrl": "/jobs/v1/test-job-id"}
     assert enqueued[0][0] == "create_snapshot_task"
-    assert enqueued[0][2] == {"title": "T", "description": "D"}
+    assert enqueued[0][2] == {"title": "T", "description": "D", "facility_id": None}
 
 
 async def test_restore_existing_enqueues_with_pv_ids(client: AsyncClient, db_session: AsyncSession, enqueued: list):
@@ -364,7 +364,7 @@ async def test_restore_existing_enqueues_with_pv_ids(client: AsyncClient, db_ses
     r = await client.post(f"/v1/snapshots/{sid}/restore", headers=WRITE_HEADERS, json={"pvIds": ["p1", "p2"]})
     assert r.status_code == 200 and r.json()["jobId"] == "test-job-id"
     assert enqueued[-1][0] == "restore_snapshot_task"
-    assert enqueued[-1][2] == {"snapshot_id": sid, "pv_ids": ["p1", "p2"]}
+    assert enqueued[-1][2] == {"snapshot_id": sid, "pv_ids": ["p1", "p2"], "skipped_pv_ids": []}
 
 
 async def test_restore_missing_is_404_and_does_not_enqueue(client: AsyncClient, enqueued: list):
