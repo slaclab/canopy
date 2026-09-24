@@ -58,9 +58,18 @@ def _maybe_retry(exc: Exception) -> None:
 
 
 async def create_snapshot_task(
-    ctx: dict, title: str, description: str | None = None, created_by: str | None = None
+    ctx: dict,
+    title: str,
+    description: str | None = None,
+    created_by: str | None = None,
+    facility_id: str | None = None,
 ) -> dict:
-    """Read every registered PV from EPICS and persist a snapshot. Returns ``{"type":"snapshot","id":...}``."""
+    """Read every registered PV from EPICS and persist a snapshot. Returns ``{"type":"snapshot","id":...}``.
+
+    The facility arrives as a resolved **id**, not a slug: the route had to resolve it to
+    check the caller's facility grant before enqueueing, and re-resolving here would
+    re-read a slug that may have changed in the interim.
+    """
     logger.info("create_snapshot_task: job_id=%s title=%r", ctx.get("job_id"), title)
     try:
         epics_io = _build_epics_io(ctx)
@@ -70,6 +79,7 @@ async def create_snapshot_task(
                 NewSnapshotDTO(title=title, description=description),
                 created_by=created_by,
                 progress_callback=_progress_sink(ctx),
+                facility_id=facility_id,
             )
             await session.commit()
         return {"type": "snapshot", "id": summary.id}
@@ -79,8 +89,15 @@ async def create_snapshot_task(
         raise
 
 
-async def restore_snapshot_task(ctx: dict, snapshot_id: str, pv_ids: list[str] | None = None) -> dict:
-    """Restore a snapshot's setpoints to EPICS. Returns the restore summary (opaque to Jobs)."""
+async def restore_snapshot_task(
+    ctx: dict, snapshot_id: str, pv_ids: list[str] | None = None, skipped_pv_ids: list[str] | None = None
+) -> dict:
+    """Restore a snapshot's setpoints to EPICS. Returns the restore summary (opaque to Jobs).
+
+    ``skipped_pv_ids`` are PVs the route already dropped from ``pv_ids`` because the
+    caller's key isn't granted their facility; they're carried through only so the result
+    can report them.
+    """
     logger.info("restore_snapshot_task: job_id=%s snapshot_id=%s", ctx.get("job_id"), snapshot_id)
     try:
         epics_io = _build_epics_io(ctx)
@@ -95,6 +112,7 @@ async def restore_snapshot_task(ctx: dict, snapshot_id: str, pv_ids: list[str] |
             "successCount": result.success_count,
             "failureCount": result.failure_count,
             "failures": result.failures[:50],
+            "skippedPvIds": skipped_pv_ids or [],
         }
     except Exception as exc:
         logger.exception("restore_snapshot_task failed: job_id=%s", ctx.get("job_id"))

@@ -219,17 +219,41 @@ curl -X POST -H "X-API-Key: <admin-token>" -H "Content-Type: application/json" \
   http://localhost:<API_PORT>/v1/api-keys
 ```
 
-Every slug named in a grant must already exist — an unrecognized or mistyped
-one is a `400` naming it, not a shrug. A typo'd grant resolves to "matches
-nothing" at request time, so the key would authenticate normally and then see
-and write nothing, with no error anywhere to point at the mistake. Define the
-facility first (see [Defining facilities](docker.md#defining-facilities)). `*`
-names no slug, so it needs nothing defined.
+Every slug named in a grant must already exist — a mistyped one is a `400` naming
+it. A typo'd grant resolves to "matches nothing" at request time, so the key would
+authenticate normally and then see and write nothing, with no error to point at the
+mistake. Define the facility first (see
+[Defining facilities](docker.md#defining-facilities)). `*` names no slug, so it
+needs nothing defined.
 
 For the same reason, a facility that any *active* key grants cannot be deleted:
-`DELETE /v1/facilities/{slug}` is refused with `facility_in_use` until the
-grants are gone, since slugs are immutable and deleting one would silently turn
-those keys deny-all. Deactivating a key releases its grants.
+`DELETE /v1/facilities/{slug}` is refused with `facility_in_use` until the grants
+are gone. Deactivating a key releases its grants.
+
+**Reads** are filtered, not refused: the key's grant is intersected with the
+request's own `?facility=` filter, and out-of-scope rows are simply absent. A key
+with an empty grant gets zero rows. Asking for a facility the key isn't granted
+returns nothing rather than everything.
+
+**Writes** are refused, with a `403 insufficient_facility_access` — a filtered
+write would silently do nothing, which is worse than an error. The rules:
+
+- Mutating a row assigned to facilities requires the key to hold **any one** of
+  them. Holding one of a PV's facilities is enough.
+- A row with no facility assignment is writable by any write-scoped key, mirroring
+  the read side, where an unfiltered query returns it.
+- Creating a *new* snapshot is the exception: a facility-restricted key must name
+  a facility it holds. Minting new unscoped data would create rows the key could
+  not otherwise have reached.
+- Restoring a snapshot is gated per PV, not on the snapshot's facility — a restore
+  drives live setpoints on the PVs, so the write set is narrowed to the ones in
+  scope and the rest are reported in the job result's `skippedPvIds`. A restore
+  with nothing in scope is a `403`.
+
+Note the deliberate asymmetry: an unassigned PV is *invisible* to a restricted
+key's facility-filtered reads (it has no assignment to match) but *writable* by
+it. Read filtering is set membership; write enforcement is a permission check on
+a claim nobody has made.
 
 This check and a concurrent mint aren't serialized against each other — each
 runs in its own transaction with no lock between them — so a delete and a mint

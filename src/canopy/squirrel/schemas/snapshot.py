@@ -66,6 +66,8 @@ class SnapshotBase(CanopyModel):
 class NewSnapshotDTO(SnapshotBase):
     """Create a snapshot. All registered PVs are captured automatically."""
 
+    facility: str | None = None
+
 
 class SnapshotSummaryDTO(SnapshotBase):
     """Summary DTO for listing snapshots."""
@@ -74,6 +76,7 @@ class SnapshotSummaryDTO(SnapshotBase):
     created_date: datetime
     created_by: str | None = None
     pv_count: int = 0
+    facility_id: str | None = None
     meta_pvs: list[MetaPVValueDTO] = Field(default_factory=list)
 
 
