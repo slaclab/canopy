@@ -228,43 +228,42 @@ those keys deny-all. Deactivating a key releases its grants.
 
 ### Why `admin`, not `write`
 
-A key can be restricted to one or more mounted sub-apps — `mole`, `hare`,
-`raccoon`, `vole`, `fox`, `beaver`, `squirrel`, `magpie`, `jobs`, `converter`
-— or `core`, for the parent app's own routes (`/health`, `/v1/api-keys`).
-Minting a key via the CLI or `POST /v1/api-keys` without naming any modules
-grants every module, an explicit default of `["*"]` at that layer. There is no
-such default for the env layer — see below.
+Gating key management on `write` would let any write-capable client — every
+tool that can set a live setpoint — mint credentials that outlive rotation of
+its own key. `write` is the largest, least-controlled population of keys in
+Canopy, and the wrong one to trust with provisioning. `admin` is a separate,
+narrowly-held scope for exactly this and other operational actions — for the
+same reason, `POST /vole/v1/_debug/evict/{pv}` (dropping a ring buffer) is
+gated on `admin` too, not `write`: it's an operational action, not a data
+write.
 
-This constrains which **surface** a key can call, not which **data** it can
-see through that surface — a `squirrel`-scoped key can reach every route
-`squirrel` exposes, the same as an unscoped key would. Facility-level data
-scoping is a separate, Squirrel-side mechanism and is not expressible here.
+## Rotation
 
-Set it with `-m`/`--module` (repeatable) on `scripts/create_key.py`, or the
-`modules` field on `POST /v1/api-keys`:
+Overlapping keys make rotation zero-downtime:
 
-```bash
-uv run python scripts/create_key.py trace -r -m fox -m vole
-```
+1. **Mint** the new key (`scripts/create_key.py` or `POST /v1/api-keys`). Both
+   old and new tokens are now valid.
+2. **Roll clients over** to the new token.
+3. **Deactivate** the old key (`scripts/deactivate_key.py` or
+   `DELETE /v1/api-keys/{id}`).
 
-```bash
-curl -X POST -H "X-API-Key: <admin-token>" -H "Content-Type: application/json" \
-  -d '{"appName": "trace", "read": true, "modules": ["fox", "vole"]}' \
-  http://localhost:<API_PORT>/v1/api-keys
-```
+`last_used_at` (visible via `GET /v1/api-keys`) is what turns "is it safe to
+deactivate the old key yet?" from a guess into a query — check it before step 3
+rather than picking an arbitrary overlap window.
 
-For an env-layer key, the `@<module>[+<module>]` suffix is **required** — an
-entry with no `@` at all is skipped as malformed, the same as an empty token.
-Use `@*` for every module:
+Rotating an **env** key is still the old process: add the new token to
+`CANOPY_API_KEYS`, deploy, roll clients, remove the old token, deploy again.
+Keep the env layer's population small (the two long-lived keys) specifically
+so this stays rare.
 
-```bash
-CANOPY_API_KEYS="trace:read@fox+vole,ops:admin@*"
-```
+### Revocation
 
-A key that resolves but isn't scoped to the module a route belongs to gets
-`403` `insufficient_module_access` — checked before the `read`/`write`/`admin`
-scope check, so an out-of-scope, no-access key is still reported as
-out-of-scope, not out-of-read.
+Deactivating a database-backed key (CLI or HTTP) takes effect once its cached
+entry expires — the cache TTL **is** the revocation latency (`CANOPY_API_KEY_CACHE_TTL_S`,
+default 60s). If Postgres itself is unreachable when you deactivate a key, the
+cached entry may still be served stale for up to `CANOPY_API_KEY_MAX_STALE_S`
+(default 1h) — bounded so an outage cannot keep a revoked key alive forever,
+but worth knowing if a leak coincides with a database outage.
 
 Revoking an **env** key is a deploy, same as rotation: the practical exposure
 window is the length of your deploy pipeline.
