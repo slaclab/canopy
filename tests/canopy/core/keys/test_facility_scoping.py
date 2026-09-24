@@ -26,7 +26,7 @@ async def test_empty_facility_list_is_accepted_not_rejected(session, session_mak
     assert resp.json()["facilities"] == []
 
 
-async def test_facilities_round_trip_through_create_and_list(session, session_maker, keys_client):
+async def test_facilities_round_trip_through_create_and_list(session, session_maker, keys_client, seeded_facilities):
     with db_backed_registry(env="admin-env-key:admin@*"):
         create = keys_client.post(
             "/v1/api-keys",
@@ -42,11 +42,39 @@ async def test_facilities_round_trip_through_create_and_list(session, session_ma
     assert entry["facilities"] == ["lcls", "lcls-sc"]
 
 
-async def test_wildcard_facility_collapses_the_list(session, session_maker, keys_client):
+async def test_wildcard_facility_collapses_the_list(session, session_maker, keys_client, seeded_facilities):
     with db_backed_registry(env="admin-env-key:admin@*"):
         resp = keys_client.post(
             "/v1/api-keys",
             json={"appName": "trace", "read": True, "facilities": ["lcls", WILDCARD]},
+            headers=ADMIN_HEADERS,
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["facilities"] == [WILDCARD]
+
+
+async def test_unknown_facility_slug_is_rejected_naming_it(session, session_maker, keys_client, seeded_facilities):
+    """A typo'd grant is a 400, not a key that authenticates and then sees nothing."""
+    with db_backed_registry(env="admin-env-key:admin@*"):
+        resp = keys_client.post(
+            "/v1/api-keys",
+            json={"appName": "trace", "read": True, "facilities": ["lcls", "lcsl"]},
+            headers=ADMIN_HEADERS,
+        )
+
+    assert resp.status_code == 400, resp.text
+    assert "lcsl" in resp.json()["detail"]
+    # The valid slug alongside it isn't blamed.
+    assert "'lcls'" not in resp.json()["detail"]
+
+
+async def test_wildcard_only_grant_needs_no_defined_facilities(session, session_maker, keys_client):
+    """``*`` names no slug, so it mints fine against an empty facility table."""
+    with db_backed_registry(env="admin-env-key:admin@*"):
+        resp = keys_client.post(
+            "/v1/api-keys",
+            json={"appName": "trace", "read": True, "facilities": [WILDCARD]},
             headers=ADMIN_HEADERS,
         )
 

@@ -179,6 +179,53 @@ A key that resolves but isn't scoped to the module a route belongs to gets
 scope check, so an out-of-scope, no-access key is still reported as
 out-of-scope, not out-of-read.
 
+### Facility scoping
+
+A key can also be restricted to one or more `core.facility` slugs — a global
+attribute of the key, independent of module scope, that a data-serving module
+(today, only Squirrel) consults on both reads and writes. Naming a facility
+grants that facility and everything beneath it in the hierarchy, the same
+"itself plus descendants" rule `?facility=` filtering itself uses.
+
+Unlike module scope, an **empty** facility list is valid and meaningful — it's
+the default for a newly minted key, and means "provisioned but not yet
+assigned to a facility" (or "data access suspended without revoking the
+credential entirely"). Minting without any `-f`/`facilities` value leaves this
+empty; there is no implicit "every facility" default the way module scope
+defaults to `["*"]`. Pass the wildcard explicitly (`-f '*'` or
+`"facilities": ["*"]`) for a key that should see every facility's data.
+
+Keys configured via `CANOPY_API_KEYS` are always granted every facility. There
+is no env syntax for facility scope and deliberately won't be: env keys are the
+statically stable floor that has to keep working through a database outage, and
+resolving a facility grant requires reading the hierarchy from the database.
+Restrict by facility with a database-backed key.
+
+Set it with `-f`/`--facility` (repeatable) on `scripts/create_key.py`, or the
+`facilities` field on `POST /v1/api-keys`:
+
+```bash
+uv run python scripts/create_key.py trace -r -f lcls -f lcls-sc
+```
+
+```bash
+curl -X POST -H "X-API-Key: <admin-token>" -H "Content-Type: application/json" \
+  -d '{"appName": "trace", "read": true, "facilities": ["lcls", "lcls-sc"]}' \
+  http://localhost:<API_PORT>/v1/api-keys
+```
+
+Every slug named in a grant must already exist — an unrecognized or mistyped
+one is a `400` naming it, not a shrug. A typo'd grant resolves to "matches
+nothing" at request time, so the key would authenticate normally and then see
+and write nothing, with no error anywhere to point at the mistake. Define the
+facility first (see [Defining facilities](docker.md#defining-facilities)). `*`
+names no slug, so it needs nothing defined.
+
+For the same reason, a facility that any *active* key grants cannot be deleted:
+`DELETE /v1/facilities/{slug}` is refused with `facility_in_use` until the
+grants are gone, since slugs are immutable and deleting one would silently turn
+those keys deny-all. Deactivating a key releases its grants.
+
 ### Why `admin`, not `write`
 
 A key can be restricted to one or more mounted sub-apps — `mole`, `hare`,

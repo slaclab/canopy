@@ -54,7 +54,19 @@ async def get_by_slug(slug: str) -> FacilityDTO | None:
         return await FacilityService(session).get_by_slug(slug)
 
 
-def register_in_use_checker(checker: Callable[[str], Awaitable[bool]]) -> None:
-    """Register a module's "is this facility still referenced by my data?" check,
-    consulted by ``FacilityService.delete`` before allowing a facility to be removed."""
-    _register_in_use_checker(checker)
+async def known_slugs(slugs: list[str]) -> set[str]:
+    """The subset of ``slugs`` that exist. Used to reject unknown facilities at the
+    point a reference to one is *written* (e.g. minting an API key's grant)."""
+    async with session_scope() as session:
+        return await FacilityService(session).known_slugs(slugs)
+
+
+def register_in_use_checker(checker: Callable[[str, str], Awaitable[bool]], what: str) -> None:
+    """Register an "is this facility still referenced by my data?" check, consulted by
+    ``FacilityService.delete``.
+
+    The checker receives ``(facility_id, slug)`` — module data references a facility by
+    id, a key grant by slug. ``what`` names what to go unassign, e.g. ``"PVs or
+    snapshots"``.
+    """
+    _register_in_use_checker(checker, what)

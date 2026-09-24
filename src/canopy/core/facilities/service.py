@@ -22,17 +22,18 @@ from canopy.core.facilities.models import Facility
 from canopy.core.facilities.schemas import FacilityDTO, FacilityCreate, FacilityUpdate
 from canopy.core.facilities.repositories import FacilityRepository
 
-# Async callables `(facility_id) -> bool`, each answering "is this facility still
-# referenced by module X's data?" Modules that reference a facility by opaque id
-# (today, only Squirrel's `pv_facility`/`Snapshot.facility_id`) register one at
-# startup via `register_in_use_checker`, so `delete()` can enforce the same
-# "can't delete a facility still in use" guard it did when Facility lived in
-# Squirrel, without core taking on a dependency on Squirrel's models.
-_in_use_checkers: list[Callable[[str], Awaitable[bool]]] = []
+# Async `(facility_id, slug) -> bool` callables, each answering "is this facility still
+# referenced by my data?", paired with a label naming what the operator has to go
+# unassign. Registered at startup so `delete()` can enforce its guard without core
+# importing any referencing module's models. Both the id and the slug are passed because
+# references come in both forms: module data stores ids, key grants store slugs.
+_in_use_checkers: list[tuple[Callable[[str, str], Awaitable[bool]], str]] = []
 
 
-def register_in_use_checker(checker: Callable[[str], Awaitable[bool]]) -> None:
-    _in_use_checkers.append(checker)
+def register_in_use_checker(checker: Callable[[str, str], Awaitable[bool]], what: str) -> None:
+    """``what`` completes "Cannot delete a facility that still has ``<what>`` assigned
+    to it" — e.g. ``"PVs or snapshots"``."""
+    _in_use_checkers.append((checker, what))
 
 
 class FacilityService:
@@ -65,12 +66,23 @@ class FacilityService:
         facility = await self.facility_repo.get_by_slug(slug)
         return self._to_dto(facility) if facility else None
 
+    async def _resolve_parent_id(self, parent_slug: str) -> str:
+        """Parent *slug* -> its id. Unknown slug is a hard ``FacilityNotFound``."""
+        parent = await self.facility_repo.get_by_slug(parent_slug)
+        if not parent:
+            raise FacilityNotFound(f"Parent facility '{parent_slug}' not found")
+        return parent.id
+
+    async def known_slugs(self, slugs: list[str]) -> set[str]:
+        """The subset of ``slugs`` that exist. One query, not one per slug — callers
+        reach this through the gateway, which opens a session per call."""
+        return await self.facility_repo.existing_slugs(slugs)
+
     async def create(self, data: FacilityCreate) -> FacilityDTO:
         if await self.facility_repo.get_by_slug(data.slug):
             raise FacilitySlugConflict(f"Facility with slug '{data.slug}' already exists")
-        if data.parent_id is not None and not await self.facility_repo.get_by_id(data.parent_id):
-            raise FacilityNotFound(f"Parent facility {data.parent_id} not found")
-        facility = Facility(slug=data.slug, name=data.name, description=data.description, parent_id=data.parent_id)
+        parent_id = await self._resolve_parent_id(data.parent) if data.parent is not None else None
+        facility = Facility(slug=data.slug, name=data.name, description=data.description, parent_id=parent_id)
         try:
             facility = await self.facility_repo.create(facility)
         except IntegrityError as e:
@@ -81,12 +93,11 @@ class FacilityService:
         facility = await self.facility_repo.get_by_id(facility_id)
         if not facility:
             return None
-        if data.parent_id is not None:
-            if data.parent_id == facility_id:
+        if data.parent is not None:
+            parent_id = await self._resolve_parent_id(data.parent)
+            if parent_id == facility_id:
                 raise FacilityHasChildren("A facility cannot be its own parent")
-            if not await self.facility_repo.get_by_id(data.parent_id):
-                raise FacilityNotFound(f"Parent facility {data.parent_id} not found")
-            facility.parent_id = data.parent_id
+            facility.parent_id = parent_id
         if data.name is not None:
             facility.name = data.name
         if data.description is not None:
@@ -100,9 +111,9 @@ class FacilityService:
             return False
         if await self.facility_repo.get_children(facility_id):
             raise FacilityHasChildren("Cannot delete a facility that has children; reparent or remove them first")
-        for checker in _in_use_checkers:
-            if await checker(facility_id):
-                raise FacilityInUse("Cannot delete a facility that still has PVs or snapshots assigned to it")
+        for checker, what in _in_use_checkers:
+            if await checker(facility_id, facility.slug):
+                raise FacilityInUse(f"Cannot delete a facility that still has {what} assigned to it")
         await self.facility_repo.delete(facility)
         return True
 

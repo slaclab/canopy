@@ -65,7 +65,7 @@ class TestMintAndResolve:
         assert resolved is not None
         assert resolved.modules == frozenset({"*"})
 
-    async def test_scoped_key_resolves_with_its_facilities(self, session, session_maker):
+    async def test_scoped_key_resolves_with_its_facilities(self, session, session_maker, seeded_facilities):
         created = await mint(session, "trace", read=True, facilities=["lcls", "lcls-sc"])
 
         resolved = await DbKeyRegistry().get(created.token)
