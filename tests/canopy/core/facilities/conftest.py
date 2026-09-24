@@ -18,9 +18,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import canopy.core.facilities.models  # noqa: F401 — register core tables on Base.metadata
-from canopy.core import db
+from canopy.core import db, security
 from canopy.core.db import Base, get_session
 from canopy.core.errors import register_canopy_error_handler
+from canopy.core.security import APIKey
 from canopy.core.facilities import service as facilities_service
 from canopy.core.facilities.routes import router as facilities_router
 
@@ -86,6 +87,32 @@ async def session(session_maker) -> AsyncSession:
     async with session_maker() as s:
         yield s
         await s.rollback()
+
+
+@pytest.fixture
+def fake_keys():
+    """Bind a registry serving one read key and one admin key, then restore.
+
+    The bound registry is process-global, so restoring keeps a facilities-flavored
+    registry from leaking into everything that runs after. Two keys because writes
+    are admin-gated while ``GET`` stays read-gated — the pair is what lets a test
+    show a read key is refused a write and still allowed the read.
+    """
+    keys = {
+        "test-read": APIKey(token="test-read", read=True, write=False, name="read"),
+        "test-admin": APIKey(token="test-admin", read=True, write=True, admin=True, name="admin"),
+    }
+
+    class FakeRegistry:
+        async def get(self, token: str) -> APIKey | None:
+            return keys.get(token)
+
+    previous = security._registry
+    security.bind_key_registry(FakeRegistry())
+    try:
+        yield
+    finally:
+        security._registry = previous
 
 
 @pytest.fixture

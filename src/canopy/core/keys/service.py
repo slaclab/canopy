@@ -18,6 +18,7 @@ from canopy.core.errors import (
 )
 from canopy.core.modules import MODULES, WILDCARD, split_modules
 from canopy.core.security import invalidate_key_id
+from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.keys.models import ApiKey
 from canopy.core.keys.tokens import hash_token, mint_token
 from canopy.core.keys.schemas import ApiKeyDTO, ApiKeyCreateResultDTO
@@ -80,10 +81,10 @@ def _normalize_facilities(facilities: list[str]) -> list[str]:
 
     Unlike ``_normalize_modules``, an empty list is valid and meaningful —
     "provisioned but not yet assigned to a facility" / "data-suspended without
-    revoking the credential" — so it is returned as-is rather than rejected. No
-    validation against known facility slugs: an unrecognized facility already
-    resolves to "matches nothing" everywhere else (``resolve_facility_scope``),
-    so mint time stays consistent with that rather than a hard error.
+    revoking the credential" — so it is returned as-is rather than rejected.
+
+    Whether the named slugs *exist* is checked separately, in ``create_key``,
+    where there's a session in hand; this stays a pure string transform.
     """
     cleaned = {f.strip() for f in facilities if f.strip()}
     if WILDCARD in cleaned:
@@ -135,6 +136,17 @@ class ApiKeyService:
         module_list = _normalize_modules(modules)
         _require_module_containment(module_list, acting_key_modules)
         facility_list = _normalize_facilities(facilities or [])
+        # A grant naming a nonexistent facility is a hard reject: it resolves to
+        # "matches nothing" at request time, so the key would authenticate and then
+        # see and write nothing, with no error to point at the typo. `[WILDCARD]`
+        # names no slug, so there's nothing to check.
+        if facility_list and facility_list != [WILDCARD]:
+            unknown = set(facility_list) - await facilities_gateway.known_slugs(facility_list)
+            if unknown:
+                raise BadRequest(
+                    f"Unknown facility slug(s) {sorted(unknown)}; create them first "
+                    f"(scripts/create_facility.py or POST /v1/facilities)"
+                )
 
         token = mint_token()
         created = await self.repo.create(

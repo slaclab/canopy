@@ -87,9 +87,7 @@ async def test_create_facility_rejects_duplicate_slug(session, session_maker):
 async def test_create_facility_rejects_unknown_parent(session, session_maker):
     service = FacilityService(session)
     try:
-        await service.create(
-            FacilityCreate(slug="orphan", name="Orphan", parent_id="11111111-1111-1111-1111-111111111111")
-        )
+        await service.create(FacilityCreate(slug="orphan", name="Orphan", parent="no-such-parent"))
         assert False, "expected FacilityNotFound"
     except FacilityNotFound:
         pass
@@ -112,21 +110,17 @@ async def test_delete_blocked_by_in_use_checker(session, session_maker):
     facility = await _seed_facility(session, "in-use")
     await session.commit()
 
-    async def always_in_use(facility_id: str) -> bool:
+    async def always_in_use(facility_id: str, slug: str) -> bool:
         return facility_id == facility.id
 
-    register_in_use_checker(always_in_use)
+    # The conftest's autouse `_reset_in_use_checkers` restores the registry after.
+    register_in_use_checker(always_in_use, "widgets")
+    service = FacilityService(session)
     try:
-        service = FacilityService(session)
-        try:
-            await service.delete(facility.id)
-            assert False, "expected FacilityInUse"
-        except FacilityInUse:
-            pass
-    finally:
-        from canopy.core.facilities import service as service_module
-
-        service_module._in_use_checkers.remove(always_in_use)
+        await service.delete(facility.id)
+        assert False, "expected FacilityInUse"
+    except FacilityInUse as exc:
+        assert "widgets" in exc.detail
 
 
 async def test_delete_succeeds_when_unused(session, session_maker):

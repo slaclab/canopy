@@ -28,6 +28,13 @@ class FacilityRepository(BaseRepository[Facility]):
         result = await self.session.execute(select(Facility).where(Facility.parent_id == facility_id))
         return list(result.scalars().all())
 
+    async def existing_slugs(self, slugs: list[str]) -> set[str]:
+        """The subset of ``slugs`` that exist, in one query."""
+        if not slugs:
+            return set()
+        result = await self.session.execute(select(Facility.slug).where(Facility.slug.in_(slugs)))
+        return {row[0] for row in result.all()}
+
     async def resolve_facility_scope(self, slug: str) -> set[str] | None:
         """Slug -> {facility_id, all descendant facility_ids}. ``None`` if the slug
         is unknown — distinct from ``set()``, which means "known slug, no facilities
