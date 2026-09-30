@@ -16,6 +16,7 @@ from canopy.core import security
 from canopy.main import _facility_granted_to_key
 from canopy.core.db import get_session
 from canopy.core.errors import register_canopy_error_handler
+from canopy.core.modules import WILDCARD, tag_module
 from canopy.core.security import APIKey
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.facilities import service as facilities_service
@@ -41,6 +42,7 @@ def facility_checkers():
 def admin_client(session_maker) -> TestClient:
     app = FastAPI()
     register_canopy_error_handler(app)
+    tag_module(app, "core")
     app.include_router(facilities_router)
 
     async def override_get_session():
@@ -57,7 +59,9 @@ def admin_client(session_maker) -> TestClient:
     class FakeRegistry:
         async def get(self, token: str) -> APIKey | None:
             if token == "test-admin":
-                return APIKey(token=token, read=True, write=True, admin=True, name="admin")
+                return APIKey(
+                    token=token, read=True, write=True, admin=True, modules=frozenset({WILDCARD}), name="admin"
+                )
             return None
 
     previous = security._registry
