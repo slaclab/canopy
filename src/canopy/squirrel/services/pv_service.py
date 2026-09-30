@@ -126,17 +126,16 @@ class PvService:
             raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility(s) {sorted(outside)}")
 
     async def _resolve_slugs(self, slugs: list[str] | set[str]) -> dict[str, str]:
-        """Facility slugs -> ``{slug: id}``.
+        """Facility slugs -> ``{slug: id}``, in one round trip regardless of how many
+        slugs are named (a CSV import can name dozens).
 
         An unknown slug is a hard ``FacilityNotFound``: degrading to "matches nothing"
         is right for a *filter*, wrong when the facility is the field being written.
+        Every unknown slug is named at once, not just the first alphabetically.
         """
-        resolved: dict[str, str] = {}
-        for slug in sorted(slugs):
-            facility = await facilities_gateway.get_by_slug(slug)
-            if facility is None:
-                raise FacilityNotFound(f"Facility '{slug}' not found")
-            resolved[slug] = facility.id
+        resolved = await facilities_gateway.ids_by_slug(slugs)
+        if unknown := set(slugs) - resolved.keys():
+            raise FacilityNotFound(f"Facility(s) {sorted(unknown)} not found")
         return resolved
 
     @staticmethod

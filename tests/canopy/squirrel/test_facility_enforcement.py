@@ -209,6 +209,17 @@ async def test_unknown_facility_slug_on_a_write_is_404_not_a_silent_no_op(
     assert r.json()["code"] == "facility_not_found"
 
 
+async def test_multiple_unknown_facility_slugs_are_all_named_at_once(client: AsyncClient, db_session: AsyncSession):
+    await _seed_hierarchy(db_session)
+    r = await client.post(
+        "/v1/pvs", headers=WILD_HEADERS, json={"setpointAddress": "X:PV:SP", "facilities": ["nope", "also-nope"]}
+    )
+    assert r.status_code == 404
+    assert r.json()["code"] == "facility_not_found"
+    assert "nope" in r.json()["detail"]
+    assert "also-nope" in r.json()["detail"]
+
+
 # --- reads ------------------------------------------------------------------- #
 
 

@@ -61,6 +61,14 @@ async def known_slugs(slugs: list[str]) -> set[str]:
         return await FacilityService(session).known_slugs(slugs)
 
 
+async def ids_by_slug(slugs: list[str] | set[str]) -> dict[str, str]:
+    """``{slug: id}`` for the subset of ``slugs`` that exist, in one round trip. For a
+    caller resolving many slugs at once (a bulk PV import naming several facilities)
+    instead of one ``get_by_slug`` call per slug."""
+    async with session_scope() as session:
+        return await FacilityService(session).ids_by_slug(slugs)
+
+
 def register_in_use_checker(checker: Callable[[str, str], Awaitable[bool]], what: str) -> None:
     """Register an "is this facility still referenced by my data?" check, consulted by
     ``FacilityService.delete``.
