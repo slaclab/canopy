@@ -283,6 +283,13 @@ class SnapshotValueRepository(BaseRepository[SnapshotValue]):
         result = await self.session.execute(select(SnapshotValue).where(SnapshotValue.snapshot_id == snapshot_id))
         return list(result.scalars().all())
 
+    async def get_pv_ids_by_snapshot(self, snapshot_id: str) -> list[str]:
+        """Just the ``pv_id`` column, for callers that need the write set (or its size)
+        rather than the payload — skips loading every ``setpoint_value``/``readback_value``
+        JSONB blob, which can be a sizeable synchronous read for a large snapshot."""
+        result = await self.session.execute(select(SnapshotValue.pv_id).where(SnapshotValue.snapshot_id == snapshot_id))
+        return list(result.scalars().all())
+
     async def count_by_snapshot(self, snapshot_id: str) -> int:
         result = await self.session.execute(
             select(func.count()).select_from(SnapshotValue).where(SnapshotValue.snapshot_id == snapshot_id)
