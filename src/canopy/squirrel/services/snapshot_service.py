@@ -411,11 +411,11 @@ class SnapshotService:
             return False
         if self.facility_scope is None:
             return True
-        values = await self.value_repo.get_by_snapshot(snapshot_id)
-        if not values:
+        pv_ids = await self.value_repo.get_pv_ids_by_snapshot(snapshot_id)
+        if not pv_ids:
             return True
-        by_pv = await self.pv_repo.facility_ids_for_many([v.pv_id for v in values])
-        return any(not by_pv.get(v.pv_id) or by_pv[v.pv_id] & self.facility_scope for v in values)
+        by_pv = await self.pv_repo.facility_ids_for_many(pv_ids)
+        return any(not by_pv.get(pv_id) or by_pv[pv_id] & self.facility_scope for pv_id in pv_ids)
 
     async def get_by_id(self, snapshot_id: str, limit: int | None = None, offset: int = 0) -> SnapshotDTO | None:
         """Get a snapshot with its values (values optionally paginated)."""
@@ -662,18 +662,21 @@ class SnapshotService:
         if self.facility_scope is None:
             return pv_ids, []
 
-        values = (
-            await self.value_repo.get_by_snapshot_and_pvs(snapshot_id, pv_ids)
+        candidate_ids = (
+            [v.pv_id for v in await self.value_repo.get_by_snapshot_and_pvs(snapshot_id, pv_ids)]
             if pv_ids
-            else await self.value_repo.get_by_snapshot(snapshot_id)
+            # Only the id column: the full row (including the setpoint_value/
+            # readback_value JSONB) is never used here, and a snapshot can hold tens
+            # of thousands of values.
+            else await self.value_repo.get_pv_ids_by_snapshot(snapshot_id)
         )
-        by_pv = await self.pv_repo.facility_ids_for_many([v.pv_id for v in values])
+        by_pv = await self.pv_repo.facility_ids_for_many(candidate_ids)
         allowed, skipped = [], []
-        for value in values:
-            assigned = by_pv.get(value.pv_id, set())
+        for pv_id in candidate_ids:
+            assigned = by_pv.get(pv_id, set())
             # Same rule as `_require_facility_write`: unassigned PVs are writable by any
             # write-scoped key, and one shared facility is enough for the rest.
-            (allowed if not assigned or assigned & self.facility_scope else skipped).append(value.pv_id)
+            (allowed if not assigned or assigned & self.facility_scope else skipped).append(pv_id)
         return allowed, skipped
 
     async def restore_snapshot(
