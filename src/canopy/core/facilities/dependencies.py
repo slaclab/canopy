@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from canopy.core.db import get_session
 from canopy.core.facilities.service import FacilityService
 
-SessionDep = Annotated[AsyncSession, Depends(get_session)]
+SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
 
 
 def get_facility_service(session: SessionDep) -> FacilityService:
