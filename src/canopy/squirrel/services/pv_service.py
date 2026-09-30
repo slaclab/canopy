@@ -298,11 +298,15 @@ class PvService:
             tags_by_id = {t.id: t for t in tags}
 
         # Resolve the whole import's distinct slugs up front — one gateway round trip
-        # each instead of one per (row, slug) pair — then gate the union once.
+        # each instead of one per (row, slug) pair — but gate per row: collapsing the
+        # import into one set and requiring only that it overlap the grant would let a
+        # row assigned solely to an out-of-scope facility ride in alongside one the key
+        # can reach.
         ids_by_slug = await self._resolve_slugs(
             {slug for _, _, _, data in normalized_records for slug in data.facilities}
         )
-        self._require_facility_write(set(ids_by_slug.values()), "the requested")
+        for _, _, _, data in normalized_records:
+            self._require_facility_write({ids_by_slug[slug] for slug in data.facilities}, "the requested")
 
         pvs = []
         for setpoint_address, readback_address, config_address, data in normalized_records:
