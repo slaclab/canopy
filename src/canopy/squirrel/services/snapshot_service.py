@@ -302,6 +302,13 @@ class SnapshotService:
         if facility_id not in self.facility_scope:
             raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility")
 
+    def _in_facility_scope(self, facility_id: str | None) -> bool:
+        """Same membership rule as ``_require_facility_write``, as a predicate rather
+        than a raise. Read paths use this to report an out-of-scope snapshot as
+        not-found rather than forbidden — existence itself must not leak to a key that
+        cannot reach the snapshot's facility."""
+        return self.facility_scope is None or facility_id is None or facility_id in self.facility_scope
+
     async def list_snapshots(
         self,
         title: str | None = None,
@@ -391,8 +398,24 @@ class SnapshotService:
         )
 
     async def snapshot_exists(self, snapshot_id: str) -> bool:
-        """Lightweight existence check (no value load) — used before enqueueing a restore."""
-        return await self.snapshot_repo.get_by_id(snapshot_id) is not None
+        """Existence check used before enqueueing a restore.
+
+        Facility-scoped like the restore write-gate itself — per-PV, not the snapshot's
+        own facility (see ``plan_restore``): a snapshot with zero PVs reachable by the
+        key reports as not existing, so the precondition can't be used to confirm a
+        snapshot is there when nothing in it could ever be restored. A snapshot with no
+        values at all (nothing to gate) exists unconditionally.
+        """
+        snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
+        if snapshot is None:
+            return False
+        if self.facility_scope is None:
+            return True
+        values = await self.value_repo.get_by_snapshot(snapshot_id)
+        if not values:
+            return True
+        by_pv = await self.pv_repo.facility_ids_for_many([v.pv_id for v in values])
+        return any(not by_pv.get(v.pv_id) or by_pv[v.pv_id] & self.facility_scope for v in values)
 
     async def get_by_id(self, snapshot_id: str, limit: int | None = None, offset: int = 0) -> SnapshotDTO | None:
         """Get a snapshot with its values (values optionally paginated)."""
@@ -400,6 +423,8 @@ class SnapshotService:
         if not result:
             return None
         snapshot, values = result
+        if not self._in_facility_scope(snapshot.facility_id):
+            return None
 
         total_count = await self.value_repo.count_by_snapshot(snapshot_id)
 
@@ -871,8 +896,12 @@ class SnapshotService:
         result2 = await self.snapshot_repo.get_with_values(snapshot2_id)
         if not result1 or not result2:
             raise SnapshotNotFound("One or both snapshots not found")
-        _snap1, values1_list = result1
-        _snap2, values2_list = result2
+        snap1, values1_list = result1
+        snap2, values2_list = result2
+        if not self._in_facility_scope(snap1.facility_id) or not self._in_facility_scope(snap2.facility_id):
+            # Same message/shape as a genuine not-found — an out-of-scope snapshot must
+            # not be distinguishable from one that doesn't exist.
+            raise SnapshotNotFound("One or both snapshots not found")
 
         values1 = {v.pv_id: v for v in values1_list}
         values2 = {v.pv_id: v for v in values2_list}

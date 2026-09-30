@@ -254,9 +254,12 @@ async def test_restore_writes_only_in_scope_pvs_and_reports_the_rest(
     assert kwargs["skipped_pv_ids"] == [nc_pv]
 
 
-async def test_restore_with_nothing_in_scope_is_refused_and_does_not_enqueue(
+async def test_restore_with_nothing_in_scope_is_404_not_403(
     client: AsyncClient, db_session: AsyncSession, enqueued: list
 ):
+    """A snapshot with zero PVs the key can reach must not be distinguishable from one
+    that doesn't exist — the restore precondition (`snapshot_exists`) is per-PV, same
+    as the write gate itself, not the snapshot's own (possibly-parent) facility tag."""
     facilities = await _seed_hierarchy(db_session)
     nc_pv = await _create_pv(client, WILD_HEADERS, "NC:PV:SP", ["lcls-nc"])
     snapshot = Snapshot(title="nc-only", facility_id=facilities["lcls"].id)
@@ -269,7 +272,8 @@ async def test_restore_with_nothing_in_scope_is_refused_and_does_not_enqueue(
     enqueued.clear()
 
     r = await client.post(f"/v1/snapshots/{snapshot.id}/restore", headers=SC_HEADERS, json={})
-    assert r.status_code == 403
+    assert r.status_code == 404, r.text
+    assert r.json()["code"] == "snapshot_not_found"
     assert enqueued == []
 
 
@@ -290,3 +294,37 @@ async def test_snapshot_metadata_and_delete_are_facility_gated(client: AsyncClie
 
     r = await client.put(f"/v1/snapshots/{snapshot.id}", headers=SC_HEADERS, json={"title": "renamed"})
     assert r.status_code == 200, r.text
+
+
+# --- out-of-scope snapshots must not leak via get/compare/restore ------------ #
+
+
+async def test_get_snapshot_outside_the_grant_is_404_not_403(client: AsyncClient, db_session: AsyncSession):
+    """Existence itself must not leak: an out-of-scope snapshot reports the same as a
+    snapshot that doesn't exist, not a 403 that confirms something is there."""
+    facilities = await _seed_hierarchy(db_session)
+    snapshot = Snapshot(title="nc-snap", facility_id=facilities["lcls-nc"].id)
+    db_session.add(snapshot)
+    await db_session.commit()
+
+    r = await client.get(f"/v1/snapshots/{snapshot.id}", headers=SC_HEADERS)
+    assert r.status_code == 404, r.text
+    assert r.json()["code"] == "snapshot_not_found"
+
+    r = await client.get(f"/v1/snapshots/{snapshot.id}", headers=WILD_HEADERS)
+    assert r.status_code == 200, r.text
+
+
+async def test_compare_snapshots_outside_the_grant_is_404(client: AsyncClient, db_session: AsyncSession):
+    facilities = await _seed_hierarchy(db_session)
+    in_scope = Snapshot(title="sc-snap", facility_id=facilities["lcls-sc"].id)
+    out_of_scope = Snapshot(title="nc-snap", facility_id=facilities["lcls-nc"].id)
+    db_session.add_all([in_scope, out_of_scope])
+    await db_session.commit()
+
+    r = await client.get(f"/v1/snapshots/{in_scope.id}/compare/{out_of_scope.id}", headers=SC_HEADERS)
+    assert r.status_code == 404, r.text
+    assert r.json()["code"] == "snapshot_not_found"
+
+    r = await client.get(f"/v1/snapshots/{out_of_scope.id}/compare/{in_scope.id}", headers=SC_HEADERS)
+    assert r.status_code == 404, r.text
