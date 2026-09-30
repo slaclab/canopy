@@ -1,0 +1,48 @@
+"""Facility repository: hierarchy CRUD + descendant-set resolution.
+
+Owns no notion of "is this facility in use" — references live in other modules'
+schemas, which this repository can't reach without a cross-schema query. See
+``service.py``'s ``_in_use_checkers`` hook for how that check is composed back in.
+"""
+
+from __future__ import annotations
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from canopy.core.db import BaseRepository
+from canopy.core.facilities.models import Facility
+
+
+class FacilityRepository(BaseRepository[Facility]):
+    """Repository for Facility operations, including hierarchy resolution."""
+
+    def __init__(self, session: AsyncSession):
+        super().__init__(Facility, session)
+
+    async def get_by_slug(self, slug: str) -> Facility | None:
+        result = await self.session.execute(select(Facility).where(Facility.slug == slug))
+        return result.scalar_one_or_none()
+
+    async def get_children(self, facility_id: str) -> list[Facility]:
+        result = await self.session.execute(select(Facility).where(Facility.parent_id == facility_id))
+        return list(result.scalars().all())
+
+    async def resolve_facility_scope(self, slug: str) -> set[str] | None:
+        """Slug -> {facility_id, all descendant facility_ids}. ``None`` if the slug
+        is unknown — distinct from ``set()``, which means "known slug, no facilities
+        currently match" (not reachable for a single root, but kept for symmetry with
+        callers that intersect multiple scopes).
+
+        A recursive CTE over ``parent_id`` starting at the named facility.
+        """
+        root = await self.get_by_slug(slug)
+        if root is None:
+            return None
+
+        hierarchy = select(Facility.id).where(Facility.id == root.id).cte("facility_scope", recursive=True)
+        children = select(Facility.id).join(hierarchy, Facility.parent_id == hierarchy.c.id)
+        hierarchy = hierarchy.union_all(children)
+
+        result = await self.session.execute(select(hierarchy.c.id))
+        return {row[0] for row in result.all()}

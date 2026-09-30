@@ -38,6 +38,7 @@ from canopy.converter.app import converter_lifespan
 from canopy.core.security import bind_key_registry
 from canopy.core.keys.routes import router as api_keys_router
 from canopy.core.keys.registry import build_key_registry
+from canopy.core.facilities.routes import router as facilities_router
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -108,6 +109,7 @@ register_canopy_error_handler(app)
 tag_module(app, "core")
 
 app.include_router(api_keys_router)
+app.include_router(facilities_router)
 
 app.mount("/mole", mole_app)
 app.mount("/hare", hare_app)
