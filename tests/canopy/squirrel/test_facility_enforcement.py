@@ -38,11 +38,35 @@ def scoped_keys():
     security.bind_key_registry(
         MultiKeyRegistry(
             [
-                APIKey(token="sc-key", read=True, write=True, facilities=frozenset({"lcls-sc"})),
-                APIKey(token="nc-key", read=True, write=True, facilities=frozenset({"lcls-nc"})),
-                APIKey(token="lcls-key", read=True, write=True, facilities=frozenset({"lcls"})),
-                APIKey(token="none-key", read=True, write=True, facilities=frozenset()),
-                APIKey(token="wild-key", read=True, write=True, facilities=frozenset({WILDCARD})),
+                APIKey(
+                    token="sc-key",
+                    read=True,
+                    write=True,
+                    modules=frozenset({WILDCARD}),
+                    facilities=frozenset({"lcls-sc"}),
+                ),
+                APIKey(
+                    token="nc-key",
+                    read=True,
+                    write=True,
+                    modules=frozenset({WILDCARD}),
+                    facilities=frozenset({"lcls-nc"}),
+                ),
+                APIKey(
+                    token="lcls-key",
+                    read=True,
+                    write=True,
+                    modules=frozenset({WILDCARD}),
+                    facilities=frozenset({"lcls"}),
+                ),
+                APIKey(token="none-key", read=True, write=True, modules=frozenset({WILDCARD}), facilities=frozenset()),
+                APIKey(
+                    token="wild-key",
+                    read=True,
+                    write=True,
+                    modules=frozenset({WILDCARD}),
+                    facilities=frozenset({WILDCARD}),
+                ),
             ]
         )
     )
