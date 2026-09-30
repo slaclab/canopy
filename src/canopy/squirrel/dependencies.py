@@ -4,10 +4,10 @@ Each service is built per request from the shared ``canopy.core.db.SessionDep``.
 ``SnapshotService`` is constructed without an ``EpicsIO``: the read endpoints never touch
 EPICS (snapshot create/restore run in the worker, which injects the connector).
 
-The PV and snapshot factories also resolve the calling key's facility grant to an id set
-here, once per request — the single chokepoint, so no route can forget it. ``None`` means
-unrestricted, which is what a service built anywhere else (the Arq worker) gets by
-default: the worker acts on a request the route already authorized.
+The PV and snapshot factories also take the calling key's facility grant, resolved to an
+id set by ``get_facility_scope`` below — the single chokepoint, so no route can forget it.
+``None`` means unrestricted, which is what a service built anywhere else (the Arq worker)
+gets by default: the worker acts on a request the route already authorized.
 """
 
 from typing import Annotated
@@ -22,13 +22,20 @@ from canopy.squirrel.services.tag_service import TagService
 from canopy.squirrel.services.snapshot_service import SnapshotService
 
 
-async def get_snapshot_service(session: SessionDep, key: APIKeyDep) -> SnapshotService:
-    scope = await facilities_gateway.resolve_key_facility_scope(key.facilities)
+async def get_facility_scope(key: APIKeyDep) -> set[str] | None:
+    return await facilities_gateway.resolve_key_facility_scope(key.facilities)
+
+
+# FastAPI caches a dependency's result per request by default, so a route pulling in
+# both PvServiceDep and SnapshotServiceDep still resolves the grant once, not twice.
+FacilityScopeDep = Annotated[set[str] | None, Depends(get_facility_scope)]
+
+
+async def get_snapshot_service(session: SessionDep, scope: FacilityScopeDep) -> SnapshotService:
     return SnapshotService(session, facility_scope=scope)
 
 
-async def get_pv_service(session: SessionDep, key: APIKeyDep) -> PvService:
-    scope = await facilities_gateway.resolve_key_facility_scope(key.facilities)
+async def get_pv_service(session: SessionDep, scope: FacilityScopeDep) -> PvService:
     return PvService(session, facility_scope=scope)
 
 
