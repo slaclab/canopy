@@ -21,6 +21,7 @@ import canopy.core.facilities.models  # noqa: F401 — register core tables on B
 from canopy.core import db, security
 from canopy.core.db import Base, get_session
 from canopy.core.errors import register_canopy_error_handler
+from canopy.core.modules import WILDCARD, tag_module
 from canopy.core.security import APIKey
 from canopy.core.facilities import service as facilities_service
 from canopy.core.facilities.routes import router as facilities_router
@@ -99,8 +100,10 @@ def fake_keys():
     show a read key is refused a write and still allowed the read.
     """
     keys = {
-        "test-read": APIKey(token="test-read", read=True, write=False, name="read"),
-        "test-admin": APIKey(token="test-admin", read=True, write=True, admin=True, name="admin"),
+        "test-read": APIKey(token="test-read", read=True, write=False, modules=frozenset({WILDCARD}), name="read"),
+        "test-admin": APIKey(
+            token="test-admin", read=True, write=True, admin=True, modules=frozenset({WILDCARD}), name="admin"
+        ),
     }
 
     class FakeRegistry:
@@ -124,6 +127,7 @@ def facilities_client(session_maker) -> TestClient:
     """
     app = FastAPI()
     register_canopy_error_handler(app)
+    tag_module(app, "core")
     app.include_router(facilities_router)
 
     async def override_get_session():
