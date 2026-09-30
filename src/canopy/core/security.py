@@ -60,18 +60,6 @@ class APIKey:
         """
         return WILDCARD in self.facilities
 
-    @property
-    def unrestricted_facilities(self) -> bool:
-        """Whether this key may reach every facility's data.
-
-        There is no ``allows_facility(id)`` counterpart to ``allows_module``:
-        ``facilities`` holds slugs, rows carry ids, and a grant on a parent covers its
-        descendants, so the check needs hierarchy expansion against the database.
-        That resolution lives in ``core.facilities.gateway``; the per-row check lives
-        in the module owning the row.
-        """
-        return WILDCARD in self.facilities
-
 
 class KeyRegistry(Protocol):
     """Strategy for resolving an API key token to an `APIKey` record (or None).
