@@ -151,6 +151,29 @@ async def test_assigning_a_pv_outside_the_grant_is_refused(client: AsyncClient, 
     assert r.status_code == 403
 
 
+async def test_multi_create_gates_each_row_not_the_import_s_union(client: AsyncClient, db_session: AsyncSession):
+    """A row assigned solely to an out-of-scope facility must not ride in on the back
+    of a sibling row the key can reach — gating the import's union of facilities
+    instead of each row would let it through, making ``/pvs/multi`` a way around the
+    single-create gate."""
+    await _seed_hierarchy(db_session)
+
+    r = await client.post(
+        "/v1/pvs/multi",
+        headers=SC_HEADERS,
+        json=[
+            {"setpointAddress": "SC:PV:SP", "facilities": ["lcls-sc"]},
+            {"setpointAddress": "NC:PV:SP", "facilities": ["lcls-nc"]},
+        ],
+    )
+    assert r.status_code == 403
+    assert r.json()["code"] == "insufficient_facility_access"
+
+    # And the refused batch did not partially land.
+    r = await client.get("/v1/pvs/paged", headers=WILD_HEADERS)
+    assert r.json()["results"] == []
+
+
 async def test_unknown_facility_slug_on_a_write_is_404_not_a_silent_no_op(
     client: AsyncClient, db_session: AsyncSession
 ):
