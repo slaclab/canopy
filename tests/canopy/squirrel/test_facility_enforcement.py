@@ -127,6 +127,32 @@ async def test_holding_one_of_a_pvs_facilities_is_enough(client: AsyncClient, db
     assert set(r.json()["facilityIds"]) == {facilities["lcls-sc"].id, facilities["facet"].id}
 
 
+async def test_an_update_cannot_silently_drop_a_facility_the_key_cant_reach(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """Overlap with the *new* set isn't enough: every facility being added or removed
+    must be in the grant, or an SC-only key could rewrite a shared PV's facilities to
+    quietly strip a facility (`facet`) it was never scoped to touch."""
+    facilities = await _seed_hierarchy(db_session)
+    pv_id = await _create_pv(client, WILD_HEADERS, "SHARED:PV:SP", ["lcls-sc", "facet"])
+
+    # Rewriting to just the facility the key holds would silently drop `facet`.
+    r = await client.put(f"/v1/pvs/{pv_id}", headers=SC_HEADERS, json={"facilities": ["lcls-sc"]})
+    assert r.status_code == 403
+    assert r.json()["code"] == "insufficient_facility_access"
+
+    # The refused write did not land.
+    r = await client.get("/v1/pvs/paged", headers=WILD_HEADERS)
+    pv = next(p for p in r.json()["results"] if p["id"] == pv_id)
+    assert set(pv["facilityIds"]) == {facilities["lcls-sc"].id, facilities["facet"].id}
+
+    # Symmetric case: adding a facility the key doesn't hold is refused the same way,
+    # even though the PV's sole existing facility overlaps the grant.
+    other_pv = await _create_pv(client, SC_HEADERS, "SC:PV:SP", ["lcls-sc"])
+    r = await client.put(f"/v1/pvs/{other_pv}", headers=SC_HEADERS, json={"facilities": ["lcls-sc", "facet"]})
+    assert r.status_code == 403
+
+
 async def test_unassigned_pv_is_writable_by_any_write_scoped_key(client: AsyncClient, db_session: AsyncSession):
     await _seed_hierarchy(db_session)
     pv_id = await _create_pv(client, WILD_HEADERS, "ORPHAN:PV:SP", [])
