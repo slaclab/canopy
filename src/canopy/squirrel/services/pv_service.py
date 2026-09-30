@@ -112,6 +112,19 @@ class PvService:
         if not (row_facility_ids & self.facility_scope):
             raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility")
 
+    def _require_facility_containment(self, facility_ids: set[str], what: str) -> None:
+        """Gate a specific set of facilities against the grant, requiring every one of
+        them to be held — stricter than ``_require_facility_write``'s "any overlap"
+        test. Used where ``facility_ids`` describes a delta (facilities being added or
+        removed) rather than "does this row belong to me at all": a key holding only
+        one of several facilities must not be able to add or remove the others just
+        because it can touch the row through one it does hold.
+        """
+        if self.facility_scope is None or not facility_ids:
+            return
+        if outside := facility_ids - self.facility_scope:
+            raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility(s) {sorted(outside)}")
+
     async def _resolve_slugs(self, slugs: list[str] | set[str]) -> dict[str, str]:
         """Facility slugs -> ``{slug: id}``.
 
@@ -348,9 +361,10 @@ class PvService:
         self._require_facility_write(facility_ids, "this PV")
         if data.facilities is not None:
             new_ids = set((await self._resolve_slugs(data.facilities)).values())
-            # Both the old and the new assignment are gated: a restricted key may
-            # neither take a PV out of a facility it can't reach nor put one into one.
-            self._require_facility_write(new_ids, "the requested")
+            # Every facility being added or removed must be in the grant: "any overlap
+            # with the new set" would let a key holding just one of a PV's several
+            # facilities silently drop the others on an otherwise-permitted update.
+            self._require_facility_containment(facility_ids ^ new_ids, "the requested")
             await self.pv_repo.set_facilities(pv_id, new_ids)
             facility_ids = new_ids
         if data.device is not None:
