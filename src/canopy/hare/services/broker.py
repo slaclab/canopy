@@ -275,9 +275,11 @@ class PVBroker:
         sem = asyncio.Semaphore(self._config.seed_concurrency)
 
         async def _seed(pv: str) -> None:
-            async with sem, self._seed_locks.setdefault(pv, asyncio.Lock()):
-                if self._needs_seed(pv):
-                    await self._seed_pv(pv)
+            async with sem:
+                lock = self._seed_locks.setdefault(pv, asyncio.Lock())
+                async with lock:
+                    if self._seed_locks.get(pv) is lock and self._needs_seed(pv):
+                        await self._seed_pv(pv, lock)
 
         await asyncio.gather(*(_seed(pv) for pv in pvs if self._needs_seed(pv)))
         initial = {pv: self._latest[pv] for pv in pvs if pv in self._latest}
@@ -313,7 +315,7 @@ class PVBroker:
         now = time.monotonic()
         return now >= self._seed_retry_after.get(pv, now)
 
-    async def _seed_pv(self, pv: str) -> None:
+    async def _seed_pv(self, pv: str, lock: asyncio.Lock) -> None:
         """Fetch whichever of the seed value and static metadata a PV is missing.
 
         Each half is fetched only when absent from the cache, so a half that
@@ -327,21 +329,41 @@ class PVBroker:
         value through the monitor is kept until `_stop_monitors` releases the
         PV, so the deadlines are bounded by the PVs that have subscribers.
 
+        `_stop_monitors` discards the PV's seed lock on release and a later
+        subscribe creates a new one, so the attempt writes only while ``lock``
+        is still the PV's. An attempt that outlives its PV's release leaves no
+        cached value, metadata or deadline behind and never overwrites what a
+        newer attempt fetched.
+
         Parameters
         ----------
         pv : str
             Validated name of a subscribed PV.
+        lock : asyncio.Lock
+            The PV's seed lock, held by the caller.
         """
+
+        def current() -> bool:
+            return self._seed_locks.get(pv) is lock
+
         if pv not in self._latest:
             try:
-                self._latest[pv] = await self._connector.get(pv)
+                value = await self._connector.get(pv)
             except Exception as exc:
                 logger.debug("initial get failed for %s: %s", pv, exc)
-        if pv not in self._meta:
+            else:
+                if current():
+                    self._latest[pv] = value
+        if current() and pv not in self._meta:
             try:
-                self._meta[pv] = await self._connector.describe(pv)
+                meta = await self._connector.describe(pv)
             except Exception as exc:
                 logger.debug("describe failed for %s: %s", pv, exc)
+            else:
+                if current():
+                    self._meta[pv] = meta
+        if not current():
+            return
         if pv in self._latest and pv in self._meta:
             self._seed_retry_after.pop(pv, None)
         else:

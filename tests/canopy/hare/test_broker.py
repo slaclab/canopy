@@ -11,6 +11,7 @@ import pytest
 
 from canopy.epics.base import PVWriteFailed
 from canopy.hare.config import HareConfig
+from canopy.contracts.pv import PVValue
 from canopy.contracts.sample import AlarmSeverity
 from canopy.epics.pv_protocol import InvalidPVName
 from tests.canopy.hare.conftest import FakeWebSocket
@@ -510,3 +511,74 @@ async def test_concurrent_subscribes_share_one_seed_attempt(fake_connector, get_
         (initial,) = _initial_frames(ws)
         assert ("PV:SEED" in initial["data"]) is not get_fails
         assert "PV:SEED" in initial["meta"]
+
+
+async def test_seed_finishing_after_release_leaves_no_cached_state(fake_connector):
+    """A seed still in flight when its PV is released caches nothing once it finishes.
+
+    The next subscriber therefore seeds the PV afresh instead of being served
+    the orphaned attempt's value.
+    """
+    broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=3600))
+    original_get = fake_connector.get
+    release = asyncio.Event()
+    gets: list[str] = []
+
+    async def stalled_get(pv, **kwargs):
+        gets.append(pv)
+        await release.wait()
+        return await original_get(pv, **kwargs)
+
+    fake_connector.get = stalled_get
+
+    broker.add_client("c1", FakeWebSocket())
+    orphaned = asyncio.create_task(broker.subscribe("c1", ["PV:SEED"]))
+    await asyncio.sleep(0.02)
+    await broker.unsubscribe("c1", ["PV:SEED"])
+    release.set()
+    await asyncio.wait_for(orphaned, 1.0)
+
+    assert "PV:SEED" not in broker._latest
+    assert "PV:SEED" not in broker._meta
+    assert "PV:SEED" not in broker._seed_retry_after
+
+    later = FakeWebSocket()
+    broker.add_client("c2", later)
+    await broker.subscribe("c2", ["PV:SEED"])
+    assert gets == ["PV:SEED", "PV:SEED"]
+    assert "PV:SEED" in _initial_frames(later)[0]["data"]
+
+
+async def test_orphaned_seed_finishing_last_keeps_the_newer_seed(fake_connector):
+    """A released PV's seed that finishes after a re-subscribe's seed does not overwrite it.
+
+    The first ``get`` is released only after the second one has completed, so
+    the orphaned attempt finishes last; the cache keeps the second value.
+    """
+    broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=3600))
+    gates = [asyncio.Event(), asyncio.Event()]
+    calls = 0
+
+    async def gated_get(pv, **kwargs):
+        nonlocal calls
+        index = calls
+        calls += 1
+        await gates[index].wait()
+        return PVValue(pv=pv, value=float(index + 1), severity=AlarmSeverity.NO_ALARM, ts_ns=index + 1, connected=True)
+
+    fake_connector.get = gated_get
+
+    broker.add_client("c1", FakeWebSocket())
+    orphaned = asyncio.create_task(broker.subscribe("c1", ["PV:SEED"]))
+    await asyncio.sleep(0.02)
+    await broker.unsubscribe("c1", ["PV:SEED"])
+    broker.add_client("c2", FakeWebSocket())
+    fresh = asyncio.create_task(broker.subscribe("c2", ["PV:SEED"]))
+    await asyncio.sleep(0.02)
+
+    gates[1].set()
+    await asyncio.wait_for(fresh, 1.0)
+    gates[0].set()
+    await asyncio.wait_for(orphaned, 1.0)
+
+    assert broker._latest["PV:SEED"].value == 2.0
