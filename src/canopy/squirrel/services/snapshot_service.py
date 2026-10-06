@@ -17,8 +17,8 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
-from canopy.core.time_parse import to_utc
 from canopy.core.facilities import gateway as facilities_gateway
+from canopy.core.time_parse import to_utc
 from canopy.squirrel.errors import SnapshotNotFound
 from canopy.contracts.pagination import PagedResult
 from canopy.squirrel.data.models import Snapshot

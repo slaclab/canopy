@@ -14,8 +14,8 @@ from canopy.jobs import gateway as jobs_gateway
 from canopy.core.errors import FacilityNotFound, InsufficientFacilityAccess
 from canopy.core.security import WriteKeyDep, require_read_access, require_write_access
 from canopy.contracts.jobs import JobCreatedDTO
-from canopy.core.time_parse import DateTimeBound
 from canopy.core.facilities import gateway as facilities_gateway
+from canopy.core.time_parse import DateTimeBound
 from canopy.squirrel.errors import SnapshotNotFound
 from canopy.contracts.pagination import PagedResult
 from canopy.squirrel.dependencies import SnapshotServiceDep
