@@ -5,14 +5,13 @@ The facility-scope test uses a real Postgres *test database* (shared fixtures wi
 unreachable.
 """
 
-from canopy.core import db
-from canopy.squirrel import dependencies
-
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from canopy.core import db
 from canopy.core.db import get_session
+from canopy.squirrel import dependencies
 from canopy.core.modules import tag_module
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.squirrel.dependencies import PvServiceDep, SnapshotServiceDep
