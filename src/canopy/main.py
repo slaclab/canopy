@@ -5,7 +5,7 @@ import logging
 from html import escape
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -27,6 +27,7 @@ from canopy.core.errors import register_canopy_error_handler
 from canopy.raccoon.app import app as raccoon_app
 from canopy.raccoon.app import raccoon_lifespan
 from canopy.core.logging import configure_logging
+from canopy.core.metrics import HTTPMetricsMiddleware, render_latest
 from canopy.core.modules import tag_module
 from canopy.squirrel.app import app as squirrel_app
 from canopy.squirrel.app import squirrel_lifespan
@@ -91,6 +92,10 @@ app = FastAPI(
     redoc_url=None,
 )
 
+# Registered first so it sits INSIDE CORSMiddleware (Starlette wraps in reverse
+# registration order): preflight OPTIONS requests that CORS answers itself never
+# reach the router, and counting them would only inflate the "unmatched" series.
+app.add_middleware(HTTPMetricsMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -130,6 +135,14 @@ tag_module(analytics_app, "analytics")
 @app.get("/health", tags=["meta"])
 async def health() -> dict[str, str]:
     return {"status": "healthy"}
+
+
+@app.get("/metrics", tags=["meta"])
+async def metrics() -> Response:
+    """Prometheus exposition. Unauthenticated by design, like /health —
+    scrapers don't carry API keys. See docs/observability/metrics.md."""
+    payload, content_type = render_latest()
+    return Response(content=payload, media_type=content_type)
 
 
 @app.get("/docs", include_in_schema=False, response_class=HTMLResponse)

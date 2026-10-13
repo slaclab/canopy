@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from canopy.hare import gateway
+from canopy.hare import gateway, metrics
 from canopy.core.errors import register_canopy_error_handler
 from canopy.hare.config import get_hare_config
 from canopy.epics.config import get_epics_config
@@ -28,12 +28,14 @@ async def hare_lifespan():
     broker = PVBroker(connector, hare_config)
     await broker.start()
     gateway.bind(broker)
+    metrics.bind(broker)
     mark_started()
     logger.info("Hare started: EPICS backend=%r", epics_config.backend)
     try:
         yield
     finally:
         await broker.stop()
+        metrics.bind(None)
         gateway.bind(None)
         logger.info("Hare shutdown complete")
 
