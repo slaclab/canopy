@@ -6,7 +6,7 @@ from html import escape
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from canopy import __version__
@@ -137,10 +137,9 @@ async def health() -> dict[str, str]:
     return {"status": "healthy"}
 
 
-@app.get("/metrics", tags=["meta"])
+@app.get("/metrics", tags=["meta"], response_class=PlainTextResponse)
 async def metrics() -> Response:
-    """Prometheus exposition. Unauthenticated by design, like /health —
-    scrapers don't carry API keys. See docs/observability/metrics.md."""
+    """Prometheus exposition for this process."""
     payload, content_type = render_latest()
     return Response(content=payload, media_type=content_type)
 

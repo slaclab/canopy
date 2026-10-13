@@ -12,9 +12,24 @@ so every module's instrumentation looks the same. The implementation lives in
 `GET /metrics` is served by the **parent app** (`canopy.main`), not by the
 module sub-apps. Prometheus expects one exposition endpoint per *process*, and
 all modules share one process — per-module endpoints would each re-expose the
-whole registry anyway. The endpoint is **unauthenticated by design**, like
-`/health`: scrapers don't carry API keys, and the payload is operational
-aggregates (counts, latencies, sizes), never control-system data.
+whole registry anyway.
+
+The API is one of two process types. The Arq worker (`canopy-worker`, which
+runs snapshot restores and batch conversions) exposes nothing yet. Worker-side
+metrics need a second scrape target, served from the worker's startup hook
+with `prometheus_client.start_http_server` on its own port, under the same
+naming and label rules. That is a follow-up; nothing here changes for it.
+
+The endpoint is unauthenticated, like `/health`, `/docs` and every
+module's `/openapi.json`. This follows Prometheus's own security model, which
+assumes exposition endpoints are reachable only from trusted networks and
+leaves access control to the network rather than the application. The
+[facility deployments](../deployment/facilities.md) bind the API directly on
+hosts inside the lab's networks, and nothing documented exposes it beyond
+them, so that assumption holds today. What the payload adds to the already
+public route map is operational telemetry — request counts, latencies, status
+codes, connected-client counts, process memory and the Python version — never
+PV names, values or key names.
 
 ### Single default registry
 
@@ -37,7 +52,11 @@ them at exposition adds machinery with no benefit at our scale.
 
 ### Label discipline
 
-Labels must be **low-cardinality**. The HTTP metrics carry two:
+Labels must be low-cardinality. The HTTP metrics carry four. `status`
+is a three-digit code, and `method` collapses to `other` outside the standard
+HTTP methods, because Starlette still routes an unknown method token (as a
+405) and a scanner could otherwise mint a series per spelling. The two that
+need care:
 
 - `module` — the tag each app carries via `canopy.core.modules.tag_module`,
   the same vocabulary API-key scopes use (`hare`, `vole`, …, and `core` for
@@ -94,7 +113,8 @@ speculatively.
 Candidates deliberately **not** built yet, each its own follow-up: Hare event
 queue depth and dropped updates, Mole archiver round-trip latency, Vole
 ring-buffer bytes and evictions, Fox evaluation latency, Squirrel restore
-durations.
+durations (a worker-side metric, so it also waits on the worker exposition
+above).
 
 ## Adding a module metric
 

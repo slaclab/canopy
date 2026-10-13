@@ -48,7 +48,6 @@ services:
     image: prom/prometheus:v2.53.0
     container_name: canopy-prometheus
     logging: *default-logging
-    command: --config.file=/etc/prometheus/prometheus.yml
     ports:
       - "${PROMETHEUS_HOST_PORT:-9090}:9090"
     volumes:

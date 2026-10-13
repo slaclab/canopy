@@ -9,7 +9,9 @@ carries (``canopy.core.modules.tag_module``) and the matched route *template*
 (``/v1/pvs/{pv}``), never raw request paths — unbounded label values blow up
 the time-series index. A request that matches no route keeps its module label
 (the tag comes from the app instance, not the URL, so it is bounded by
-construction) and collapses the route into ``unmatched``.
+construction) and collapses the route into ``unmatched``. The ``method`` label
+is bounded the same way: anything outside the standard HTTP methods is
+reported as ``other``.
 """
 
 import time
@@ -25,6 +27,13 @@ DEFAULT_API_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 
 
 UNMATCHED = "unmatched"
 """``route`` label for requests no FastAPI route claimed (404s, Starlette-served pages)."""
+
+OTHER_METHOD = "other"
+"""``method`` label for anything outside ``KNOWN_METHODS``. Starlette still routes
+an unknown method token (a matched path answers 405), so without this a scanner
+could mint one series per spelling."""
+
+KNOWN_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"})
 
 HTTP_REQUESTS = Counter(
     "canopy_http_requests_total",
@@ -65,7 +74,7 @@ class HTTPMetricsMiddleware:
             await self.app(scope, receive, send)
             return
 
-        method = scope["method"]
+        method = _method_label(scope)
         status = "500"
         start = time.perf_counter()
 
@@ -99,6 +108,11 @@ def _module_label(scope: Scope) -> str:
         return module_for_app(scope["app"])
     except (KeyError, AttributeError):
         return "untagged"
+
+
+def _method_label(scope: Scope) -> str:
+    method = scope["method"]
+    return method if method in KNOWN_METHODS else OTHER_METHOD
 
 
 def _route_label(scope: Scope) -> str:

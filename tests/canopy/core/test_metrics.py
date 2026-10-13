@@ -64,6 +64,21 @@ def test_unmatched_path_outside_every_mount_is_labelled_core():
     assert "wp-admin" not in exposition
 
 
+def test_unknown_http_methods_collapse_into_other():
+    """Starlette still routes an unknown method token (405 on a matched path),
+    so the method label must be bounded too or a scanner could mint a series
+    per spelling."""
+    labels = dict(method="other", module="core", route="/health", status="405")
+    before = _requests_total(**labels)
+    with TestClient(app) as client:
+        assert client.request("FOOBAR", "/health").status_code == 405
+        assert client.request("BREW", "/health").status_code == 405
+        exposition = client.get("/metrics").text
+    assert _requests_total(**labels) == before + 2
+    assert "FOOBAR" not in exposition
+    assert "BREW" not in exposition
+
+
 def test_cors_preflight_not_counted():
     """CORS answers preflights before routing; the metrics middleware sits
     inside CORS, so they never reach it."""
