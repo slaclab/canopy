@@ -33,5 +33,5 @@ See the [modules overview](modules/index.md) for shared conventions
 
 - [Getting started](getting_started.md) — local development, simulation and
   real EPICS backends.
-- [Deployment](deployment/index.md) — Docker Compose and the SLAC facility
-  deployment pipeline.
+- [Deployment](deployment/index.md) — Docker Compose and deploying Canopy at
+  your facility.

@@ -27,8 +27,6 @@ on:
 permissions:
   contents: read
   packages: write
-  deployments: write
-  actions: read
 
 jobs:
   build:
@@ -88,37 +86,6 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  # Keep the existing Software Factory DEV deployment. The Kubernetes DEV
-  # deployment is an additional target, not a replacement.
-  validate-dev-secrets:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    env:
-      APP_SECRETS_DEV: ${{ secrets.APP_SECRETS_DEV }}
-    steps:
-      - name: Checkout validation script
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          sparse-checkout: .github/scripts
-          persist-credentials: false
-
-      - name: Validate APP_SECRETS_DEV
-        run: SECRET_NAME=APP_SECRETS_DEV SECRET_VALUE="$APP_SECRETS_DEV" FACILITY=FACILITY_DEV bash .github/scripts/validate_app_secrets.sh
-
-  deploy-dev:
-    needs: [build, validate-dev-secrets]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    uses: slaclab/software-factory/.github/workflows/container-deploy.yml@main
-    with:
-      component_name: canopy
-      repository_name: canopy
-      tag: ${{ needs.build.outputs.image_tag }}
-      facilities: '["FACILITY_DEV"]'
-      health_check_path: /health
-      migration_command: 'alembic upgrade head'
-    secrets:
-      APP_SECRETS: ${{ secrets.APP_SECRETS_DEV }}
 
   dispatch-swapps-dev:
     name: Deploy Kubernetes dev

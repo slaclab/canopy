@@ -61,6 +61,13 @@ CANOPY_API_KEYS="dev:read+write@*" CANOPY_EPICS__BACKEND=epics \
 
 Examples are provided under the `frontend-demos` directory for connecting to PVs.
 
+## Deployment
+
+Canopy ships as the `ghcr.io/slaclab/canopy` image. To run it at your
+facility, see [Deploy at your facility](https://slaclab.github.io/canopy/deployment/production/)
+([source](docs/deployment/production.md)) and the reference
+[`docker/docker-compose.prod.yml`](docker/docker-compose.prod.yml).
+
 ## Building Docs
 
 ```bash
