@@ -664,7 +664,7 @@ class SnapshotService:
 
         candidate_ids = (
             [v.pv_id for v in await self.value_repo.get_by_snapshot_and_pvs(snapshot_id, pv_ids)]
-            if pv_ids
+            if pv_ids is not None
             # Only the id column: the full row (including the setpoint_value/
             # readback_value JSONB) is never used here, and a snapshot can hold tens
             # of thousands of values.
@@ -719,7 +719,7 @@ class SnapshotService:
         logger.info("Restoring snapshot: %s", snapshot_id)
         start_time = datetime.now(UTC)
 
-        if request and request.pv_ids:
+        if request is not None and request.pv_ids is not None:
             values = await self.value_repo.get_by_snapshot_and_pvs(snapshot_id, request.pv_ids)
         else:
             values = await self.value_repo.get_by_snapshot(snapshot_id)
