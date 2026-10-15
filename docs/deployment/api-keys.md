@@ -262,6 +262,12 @@ each see the other's not-yet-committed state. In practice this needs two admin
 actions targeting the same facility at nearly the same instant, which is far
 outside normal operation; it isn't a guarantee against that specific race.
 
+**Meta-PVs are exempt.** Which PVs are meta-PVs (shown as summary columns on every
+snapshot), their display names, and whether they're active are global settings, not
+facility data. Any write-scoped key can add, rename, enable, disable, or remove one,
+and `GET /v1/pvs/meta` lists all of them regardless of the key's facility scope. The
+meta-PV *values* shown on a snapshot follow that snapshot's own facility gate.
+
 ### Why `admin`, not `write`
 
 Gating key management on `write` would let any write-capable client — every
