@@ -582,3 +582,41 @@ async def test_orphaned_seed_finishing_last_keeps_the_newer_seed(fake_connector)
     await asyncio.wait_for(orphaned, 1.0)
 
     assert broker._latest["PV:SEED"].value == 2.0
+
+
+async def test_seed_queued_for_a_slot_skips_a_pv_released_meanwhile(fake_connector):
+    """A seed still waiting for a ``seed_concurrency`` slot when its PV is released caches nothing.
+
+    With one slot, PV:B's seed queues behind PV:A's stalled read and PV:B is
+    released before the slot frees, so the next subscriber of PV:B seeds it afresh.
+    """
+    broker = PVBroker(fake_connector, HareConfig(seed_concurrency=1, seed_retry_backoff_s=3600))
+    original_get = fake_connector.get
+    release = asyncio.Event()
+    gets: list[str] = []
+
+    async def stalled_get(pv, **kwargs):
+        gets.append(pv)
+        if pv == "PV:A":
+            await release.wait()
+        return await original_get(pv, **kwargs)
+
+    fake_connector.get = stalled_get
+
+    broker.add_client("c1", FakeWebSocket())
+    first = asyncio.create_task(broker.subscribe("c1", ["PV:A", "PV:B"]))
+    await asyncio.sleep(0.02)
+    await broker.unsubscribe("c1", ["PV:B"])
+    release.set()
+    await asyncio.wait_for(first, 1.0)
+
+    assert gets == ["PV:A"]
+    assert "PV:B" not in broker._latest
+    assert "PV:B" not in broker._meta
+    assert "PV:B" not in broker._seed_locks
+
+    later = FakeWebSocket()
+    broker.add_client("c2", later)
+    await broker.subscribe("c2", ["PV:B"])
+    assert gets == ["PV:A", "PV:B"]
+    assert "PV:B" in _initial_frames(later)[0]["data"]

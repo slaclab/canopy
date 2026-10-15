@@ -236,6 +236,8 @@ class PVBroker:
         and one slow PV does not stall the rest. Concurrent subscribes of the
         same PV share one seed attempt: a later subscribe waits for the attempt
         in flight, then re-checks the cache and retry deadline it left behind.
+        Each PV's seed lock is taken as soon as the PV is registered, so a PV
+        released while its seed is still queued for a slot is not seeded.
 
         Parameters
         ----------
@@ -268,20 +270,19 @@ class PVBroker:
             return []
         previously_subscribed = self._registry.client_pvs(client_id)
         newly = self._registry.subscribe(client_id, pvs)
+        locks = {pv: self._seed_locks.setdefault(pv, asyncio.Lock()) for pv in pvs}
         await self._start_monitors(newly)
         new_for_client = [pv for pv in pvs if pv not in previously_subscribed]
         if new_for_client:
             await self._fire_activation_hooks(new_for_client, client_id)
         sem = asyncio.Semaphore(self._config.seed_concurrency)
 
-        async def _seed(pv: str) -> None:
-            async with sem:
-                lock = self._seed_locks.setdefault(pv, asyncio.Lock())
-                async with lock:
-                    if self._seed_locks.get(pv) is lock and self._needs_seed(pv):
-                        await self._seed_pv(pv, lock)
+        async def _seed(pv: str, lock: asyncio.Lock) -> None:
+            async with sem, lock:
+                if self._seed_locks.get(pv) is lock and self._needs_seed(pv):
+                    await self._seed_pv(pv, lock)
 
-        await asyncio.gather(*(_seed(pv) for pv in pvs if self._needs_seed(pv)))
+        await asyncio.gather(*(_seed(pv, locks[pv]) for pv in pvs if self._needs_seed(pv)))
         initial = {pv: self._latest[pv] for pv in pvs if pv in self._latest}
         meta = {pv: self._meta[pv] for pv in pvs if pv in self._meta}
         if initial or meta:
