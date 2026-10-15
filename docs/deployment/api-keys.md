@@ -250,6 +250,12 @@ key's facility-filtered reads (it has no assignment to match) but *writable* by
 it. Read filtering is set membership; write enforcement is a permission check on
 a claim nobody has made.
 
+**Meta-PVs are exempt.** Which PVs are meta-PVs (shown as summary columns on every
+snapshot), their display names, and whether they're active are global settings, not
+facility data. Any write-scoped key can add, rename, enable, disable, or remove one,
+and `GET /v1/pvs/meta` lists all of them regardless of the key's facility scope. The
+meta-PV *values* shown on a snapshot follow that snapshot's own facility gate.
+
 ### Why `admin`, not `write`
 
 Gating key management on `write` would let any write-capable client — every

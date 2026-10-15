@@ -428,6 +428,9 @@ class PvService:
         return await self.pv_repo.get_all_devices()
 
     # --- meta PVs ------------------------------------------------------------ #
+    #
+    # Deliberately not facility-gated: which PVs are meta-PVs is a global display setting
+    # shared by every snapshot, not facility data. See docs/deployment/api-keys.md.
 
     async def enable_meta_pv(self, id: str) -> MetaPVDTO:
         meta_pv = await self.meta_pv_repo.enable(id)
