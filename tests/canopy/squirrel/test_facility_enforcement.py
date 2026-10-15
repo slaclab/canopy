@@ -337,6 +337,56 @@ async def test_restore_with_nothing_in_scope_is_404_not_403(
     assert enqueued == []
 
 
+async def test_restore_naming_pvs_outside_the_snapshot_is_refused_not_widened(
+    client: AsyncClient, db_session: AsyncSession, enqueued: list
+):
+    """Regression: `pvIds` that match nothing in the snapshot narrowed to `[]`, which the
+    route enqueued and the worker read as "restore everything" — every facility's PVs."""
+    facilities = await _seed_hierarchy(db_session)
+    sc_pv = await _create_pv(client, WILD_HEADERS, "SC:PV:SP", ["lcls-sc"])
+    nc_pv = await _create_pv(client, WILD_HEADERS, "NC:PV:SP", ["lcls-nc"])
+    snapshot = Snapshot(title="all", facility_id=facilities["lcls"].id)
+    db_session.add(snapshot)
+    await db_session.commit()
+    db_session.add_all(
+        [
+            SnapshotValue(snapshot_id=snapshot.id, pv_id=pv_id, pv_name=name, setpoint_value={"value": 1.0})
+            for pv_id, name in [(sc_pv, "SC:PV:SP"), (nc_pv, "NC:PV:SP")]
+        ]
+    )
+    await db_session.commit()
+    enqueued.clear()
+
+    r = await client.post(
+        f"/v1/snapshots/{snapshot.id}/restore",
+        headers=SC_HEADERS,
+        json={"pvIds": ["00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002"]},
+    )
+    assert r.status_code == 400, r.text
+    assert r.json()["code"] == "bad_request"
+    assert enqueued == []
+
+
+async def test_restore_with_an_empty_pv_list_restores_nothing(
+    client: AsyncClient, db_session: AsyncSession, enqueued: list
+):
+    facilities = await _seed_hierarchy(db_session)
+    sc_pv = await _create_pv(client, WILD_HEADERS, "SC:PV:SP", ["lcls-sc"])
+    snapshot = Snapshot(title="sc", facility_id=facilities["lcls-sc"].id)
+    db_session.add(snapshot)
+    await db_session.commit()
+    db_session.add(
+        SnapshotValue(snapshot_id=snapshot.id, pv_id=sc_pv, pv_name="SC:PV:SP", setpoint_value={"value": 1.0})
+    )
+    await db_session.commit()
+    enqueued.clear()
+
+    for headers in (SC_HEADERS, WILD_HEADERS):
+        r = await client.post(f"/v1/snapshots/{snapshot.id}/restore", headers=headers, json={"pvIds": []})
+        assert r.status_code == 400, r.text
+    assert enqueued == []
+
+
 async def test_snapshot_metadata_and_delete_are_facility_gated(client: AsyncClient, db_session: AsyncSession):
     facilities = await _seed_hierarchy(db_session)
     snapshot = Snapshot(title="sc-snap", facility_id=facilities["lcls-sc"].id)
