@@ -11,7 +11,7 @@ from typing import Annotated
 from fastapi import Query, Security, APIRouter
 
 from canopy.jobs import gateway as jobs_gateway
-from canopy.core.errors import FacilityNotFound, InsufficientFacilityAccess
+from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
 from canopy.core.security import WriteKeyDep, require_read_access, require_write_access
 from canopy.contracts.jobs import JobCreatedDTO
 from canopy.core.facilities import gateway as facilities_gateway
@@ -191,8 +191,11 @@ async def restore_snapshot(
     # Narrow the write set to the key's facilities here, pre-enqueue — the worker has no
     # caller identity to check against.
     pv_ids, skipped = await service.plan_restore(snapshot_id, request.pv_ids if request else None)
-    if skipped and not pv_ids:
-        raise InsufficientFacilityAccess("API key is not scoped to any facility in this snapshot")
+    # `None` restores everything; `[]` restores nothing and is refused, never enqueued.
+    if pv_ids is not None and not pv_ids:
+        if skipped:
+            raise InsufficientFacilityAccess("API key is not scoped to any facility in this snapshot")
+        raise BadRequest("Nothing to restore: none of the requested PVs are in this snapshot")
     job_id = await jobs_gateway.enqueue(
         "restore_snapshot_task", snapshot_id=snapshot_id, pv_ids=pv_ids, skipped_pv_ids=skipped
     )

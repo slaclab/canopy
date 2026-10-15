@@ -101,7 +101,7 @@ async def restore_snapshot_task(
     logger.info("restore_snapshot_task: job_id=%s snapshot_id=%s", ctx.get("job_id"), snapshot_id)
     try:
         epics_io = _build_epics_io(ctx)
-        request = RestoreRequestDTO(pv_ids=pv_ids) if pv_ids else None
+        request = RestoreRequestDTO(pv_ids=pv_ids) if pv_ids is not None else None
         async with session_scope() as session:  # read-only (restore writes to EPICS, not the DB)
             service = SnapshotService(session, epics_io)
             result = await service.restore_snapshot(snapshot_id, request, progress_callback=_progress_sink(ctx))

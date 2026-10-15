@@ -448,6 +448,21 @@ async def test_restore_subset_by_pv_ids(db_session: AsyncSession):
     assert io.writes == {"A:SP": 1.0}  # only the requested PV
 
 
+async def test_restore_with_an_empty_pv_list_writes_nothing(db_session: AsyncSession):
+    """`pv_ids=[]` is "restore nothing", not "restore all" — the worker must never widen a
+    write set the route narrowed."""
+    await _seed_pv(db_session, "A:SP")
+    await _seed_pv(db_session, "B:SP")
+    io = FakeEpicsIO({"A:SP": _ev(1.0), "B:SP": _ev(2.0)})
+    svc = SnapshotService(db_session, io, restore_hooks=[_NoHook()])
+    summary = await svc.create_snapshot(NewSnapshotDTO(title="s"))
+
+    io.writes.clear()
+    result = await svc.restore_snapshot(summary.id, RestoreRequestDTO(pv_ids=[]))
+    assert result.total_pvs == 0
+    assert io.writes == {}
+
+
 async def test_compare_detects_value_difference(db_session: AsyncSession):
     await _seed_pv(db_session, "A:SP", abs_tol=0.0, rel_tol=0.0)
     svc1 = SnapshotService(db_session, FakeEpicsIO({"A:SP": _ev(1.0)}), restore_hooks=[_NoHook()])
