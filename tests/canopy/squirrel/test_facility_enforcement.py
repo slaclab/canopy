@@ -285,56 +285,59 @@ async def test_unrestricted_key_may_create_an_unassigned_snapshot(
     assert enqueued[-1][2]["facility_id"] is None
 
 
-async def test_restore_writes_only_in_scope_pvs_and_reports_the_rest(
+async def test_restore_is_gated_on_the_snapshot_s_own_facility(
     client: AsyncClient, db_session: AsyncSession, enqueued: list
 ):
+    """A key that can't view a snapshot can't restore it either — even when the snapshot
+    holds PVs in the key's own facility. `lcls-sc` is below `lcls`, never above it."""
     facilities = await _seed_hierarchy(db_session)
     sc_pv = await _create_pv(client, WILD_HEADERS, "SC:PV:SP", ["lcls-sc"])
-    nc_pv = await _create_pv(client, WILD_HEADERS, "NC:PV:SP", ["lcls-nc"])
-    orphan_pv = await _create_pv(client, WILD_HEADERS, "ORPHAN:PV:SP", [])
+    snapshot = Snapshot(title="lcls", facility_id=facilities["lcls"].id)
+    db_session.add(snapshot)
+    await db_session.commit()
+    db_session.add(
+        SnapshotValue(snapshot_id=snapshot.id, pv_id=sc_pv, pv_name="SC:PV:SP", setpoint_value={"value": 1.0})
+    )
+    await db_session.commit()
+    enqueued.clear()
 
-    # A snapshot in `lcls` captures every registered PV, across both children.
-    snapshot = Snapshot(title="all", facility_id=facilities["lcls"].id)
+    assert (await client.get(f"/v1/snapshots/{snapshot.id}", headers=SC_HEADERS)).status_code == 404
+    r = await client.post(f"/v1/snapshots/{snapshot.id}/restore", headers=SC_HEADERS, json={})
+    assert r.status_code == 404, r.text
+    assert r.json()["code"] == "snapshot_not_found"
+    assert enqueued == []
+
+    r = await client.post(f"/v1/snapshots/{snapshot.id}/restore", headers=LCLS_HEADERS, json={})
+    assert r.status_code == 200, r.text
+    assert enqueued[-1][2]["pv_ids"] == [sc_pv]
+
+
+async def test_restore_skips_a_pv_reassigned_out_of_scope_after_capture(
+    client: AsyncClient, db_session: AsyncSession, enqueued: list
+):
+    """Capture only takes the snapshot's facility's PVs, but a PV's assignment can change
+    afterwards; restore must not drive a setpoint the key can no longer reach."""
+    facilities = await _seed_hierarchy(db_session)
+    kept_pv = await _create_pv(client, WILD_HEADERS, "SC:KEPT:SP", ["lcls-sc"])
+    moved_pv = await _create_pv(client, WILD_HEADERS, "SC:MOVED:SP", ["lcls-sc"])
+    snapshot = Snapshot(title="sc", facility_id=facilities["lcls-sc"].id)
     db_session.add(snapshot)
     await db_session.commit()
     db_session.add_all(
         [
             SnapshotValue(snapshot_id=snapshot.id, pv_id=pv_id, pv_name=name, setpoint_value={"value": 1.0})
-            for pv_id, name in [(sc_pv, "SC:PV:SP"), (nc_pv, "NC:PV:SP"), (orphan_pv, "ORPHAN:PV:SP")]
+            for pv_id, name in [(kept_pv, "SC:KEPT:SP"), (moved_pv, "SC:MOVED:SP")]
         ]
     )
     await db_session.commit()
+    r = await client.put(f"/v1/pvs/{moved_pv}", headers=WILD_HEADERS, json={"facilities": ["lcls-nc"]})
+    assert r.status_code == 200, r.text
 
     r = await client.post(f"/v1/snapshots/{snapshot.id}/restore", headers=SC_HEADERS, json={})
     assert r.status_code == 200, r.text
     kwargs = enqueued[-1][2]
-    # The snapshot's own facility (`lcls`) is in scope, but the write set is still
-    # narrowed: the NC setpoint must not be driven by an SC-only key.
-    assert set(kwargs["pv_ids"]) == {sc_pv, orphan_pv}
-    assert kwargs["skipped_pv_ids"] == [nc_pv]
-
-
-async def test_restore_with_nothing_in_scope_is_404_not_403(
-    client: AsyncClient, db_session: AsyncSession, enqueued: list
-):
-    """A snapshot with zero PVs the key can reach must not be distinguishable from one
-    that doesn't exist — the restore precondition (`snapshot_exists`) is per-PV, same
-    as the write gate itself, not the snapshot's own (possibly-parent) facility tag."""
-    facilities = await _seed_hierarchy(db_session)
-    nc_pv = await _create_pv(client, WILD_HEADERS, "NC:PV:SP", ["lcls-nc"])
-    snapshot = Snapshot(title="nc-only", facility_id=facilities["lcls"].id)
-    db_session.add(snapshot)
-    await db_session.commit()
-    db_session.add(
-        SnapshotValue(snapshot_id=snapshot.id, pv_id=nc_pv, pv_name="NC:PV:SP", setpoint_value={"value": 1.0})
-    )
-    await db_session.commit()
-    enqueued.clear()
-
-    r = await client.post(f"/v1/snapshots/{snapshot.id}/restore", headers=SC_HEADERS, json={})
-    assert r.status_code == 404, r.text
-    assert r.json()["code"] == "snapshot_not_found"
-    assert enqueued == []
+    assert kwargs["pv_ids"] == [kept_pv]
+    assert kwargs["skipped_pv_ids"] == [moved_pv]
 
 
 async def test_restore_naming_pvs_outside_the_snapshot_is_refused_not_widened(
@@ -359,7 +362,7 @@ async def test_restore_naming_pvs_outside_the_snapshot_is_refused_not_widened(
 
     r = await client.post(
         f"/v1/snapshots/{snapshot.id}/restore",
-        headers=SC_HEADERS,
+        headers=LCLS_HEADERS,
         json={"pvIds": ["00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002"]},
     )
     assert r.status_code == 400, r.text

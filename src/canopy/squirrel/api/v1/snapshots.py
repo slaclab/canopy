@@ -112,7 +112,8 @@ async def list_snapshots(
 
 @router.post("")
 async def create_snapshot(data: NewSnapshotDTO, key: WriteKeyDep) -> JobCreatedDTO:
-    """Enqueue a snapshot of every registered PV. The worker reads EPICS and persists it."""
+    """Enqueue a snapshot of the facility's PVs (every PV if no facility is given). The
+    worker reads EPICS and persists it."""
     # The facility gate has to run *here*, not in the service: nothing of the caller's
     # identity crosses the Arq boundary, and a refused write must not become a queued job.
     facility_id = None
