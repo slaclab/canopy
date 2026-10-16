@@ -654,14 +654,9 @@ class SnapshotService:
         if self.facility_scope is None:
             return pv_ids, []
 
-        candidate_ids = (
-            [v.pv_id for v in await self.value_repo.get_by_snapshot_and_pvs(snapshot_id, pv_ids)]
-            if pv_ids is not None
-            # Only the id column: the full row (including the setpoint_value/
-            # readback_value JSONB) is never used here, and a snapshot can hold tens
-            # of thousands of values.
-            else await self.value_repo.get_pv_ids_by_snapshot(snapshot_id)
-        )
+        # Only the id column: the full row (including the setpoint_value/readback_value
+        # JSONB) is never used here, and a snapshot can hold tens of thousands of values.
+        candidate_ids = await self.value_repo.get_pv_ids_by_snapshot(snapshot_id, pv_ids)
         by_pv = await self.pv_repo.facility_ids_for_many(candidate_ids)
         allowed, skipped = [], []
         for pv_id in candidate_ids:

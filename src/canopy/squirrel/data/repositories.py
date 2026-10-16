@@ -14,6 +14,7 @@ from datetime import datetime
 from collections.abc import Callable, Awaitable
 
 from sqlalchemy import (
+    ARRAY,
     Select,
     or_,
     any_,
@@ -27,6 +28,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import noload, selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import UUID
 
 from canopy.core.db import BaseRepository
 from canopy.squirrel.data.models import (
@@ -47,6 +49,12 @@ BULK_INSERT_CHUNK_SIZE = 5000
 # Postgres caps a statement at 32767 bind parameters; stay well under it when
 # expanding an ``IN (...)`` / address list.
 PARAM_BATCH_SIZE = 30000
+
+
+def _uuid_array(ids: list[str]):
+    """``ids`` as one ``uuid[]`` bind parameter, for ``col == any_(...)`` — avoids a huge
+    ``IN (...)`` expansion."""
+    return literal(ids, ARRAY(UUID(as_uuid=False)))
 
 
 class SnapshotRepository(BaseRepository[Snapshot]):
@@ -283,11 +291,17 @@ class SnapshotValueRepository(BaseRepository[SnapshotValue]):
         result = await self.session.execute(select(SnapshotValue).where(SnapshotValue.snapshot_id == snapshot_id))
         return list(result.scalars().all())
 
-    async def get_pv_ids_by_snapshot(self, snapshot_id: str) -> list[str]:
+    async def get_pv_ids_by_snapshot(self, snapshot_id: str, pv_ids: list[str] | None = None) -> list[str]:
         """Just the ``pv_id`` column, for callers that need the write set (or its size)
         rather than the payload — skips loading every ``setpoint_value``/``readback_value``
-        JSONB blob, which can be a sizeable synchronous read for a large snapshot."""
-        result = await self.session.execute(select(SnapshotValue.pv_id).where(SnapshotValue.snapshot_id == snapshot_id))
+        JSONB blob, which can be a sizeable synchronous read for a large snapshot.
+
+        ``pv_ids`` limits it to those of the given PVs that are in the snapshot.
+        """
+        query = select(SnapshotValue.pv_id).where(SnapshotValue.snapshot_id == snapshot_id)
+        if pv_ids is not None:
+            query = query.where(SnapshotValue.pv_id == any_(_uuid_array(pv_ids)))
+        result = await self.session.execute(query)
         return list(result.scalars().all())
 
     async def count_by_snapshot(self, snapshot_id: str) -> int:
@@ -299,7 +313,9 @@ class SnapshotValueRepository(BaseRepository[SnapshotValue]):
     async def get_by_snapshot_and_pvs(self, snapshot_id: str, pv_ids: list[str]) -> list[SnapshotValue]:
         """Get specific PV values from a snapshot (``= ANY(array)`` avoids huge IN expansion)."""
         result = await self.session.execute(
-            select(SnapshotValue).where(SnapshotValue.snapshot_id == snapshot_id, SnapshotValue.pv_id == any_(pv_ids))
+            select(SnapshotValue).where(
+                SnapshotValue.snapshot_id == snapshot_id, SnapshotValue.pv_id == any_(_uuid_array(pv_ids))
+            )
         )
         return list(result.scalars().all())
 
