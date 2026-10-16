@@ -23,6 +23,13 @@ async def resolve_facility_scope(slug: str | None) -> set[str] | None:
         return await FacilityService(session).resolve_facility_scope(slug)
 
 
+async def descendant_ids(facility_id: str) -> set[str]:
+    """``{facility_id, all descendant facility_ids}`` — ``resolve_facility_scope`` for a
+    caller already holding an id (the snapshot worker, which is handed one)."""
+    async with session_scope() as session:
+        return await FacilityService(session).descendant_ids(facility_id)
+
+
 async def resolve_key_facility_scope(slugs: frozenset[str]) -> set[str] | None:
     """A credential's granted slugs -> union of their descendant id sets, or ``None``
     if unrestricted. See ``FacilityService.resolve_key_facility_scope``.
