@@ -201,6 +201,12 @@ statically stable floor that has to keep working through a database outage, and
 resolving a facility grant requires reading the hierarchy from the database.
 Restrict by facility with a database-backed key.
 
+The rest of this section calls a key **unrestricted** if it is granted `*` or
+comes from `CANOPY_API_KEYS`, and **restricted** otherwise — including a key
+with an empty grant. Facility scope is independent of `read`/`write`/`admin`:
+those are flags on the key as a whole, and a key's one facility list applies to
+all of them. There is no "write here, read-only there."
+
 Set it with `-f`/`--facility` (repeatable) on `scripts/create_key.py`, or the
 `facilities` field on `POST /v1/api-keys`:
 
@@ -225,10 +231,22 @@ For the same reason, a facility that any *active* key grants cannot be deleted:
 `DELETE /v1/facilities/{slug}` is refused with `facility_in_use` until the grants
 are gone. Deactivating a key releases its grants.
 
-**Reads** are filtered, not refused: the key's grant is intersected with the
-request's own `?facility=` filter, and out-of-scope rows are simply absent. A key
-with an empty grant gets zero rows. Asking for a facility the key isn't granted
-returns nothing rather than everything.
+**Reads** are filtered, not refused. Every PV and snapshot read a restricted key
+makes is filtered; there is no unfiltered read for it to fall back on:
+
+- **PV lists** (`GET /v1/pvs`, `/paged`, `/search`) return only PVs assigned to a
+  facility the key holds.
+- **The snapshot list** (`GET /v1/snapshots`) returns only snapshots filed under
+  a facility the key holds.
+- **A single snapshot or a comparison** (`GET /v1/snapshots/{id}`,
+  `/{id1}/compare/{id2}`) is a `404` if a snapshot is filed under a facility the
+  key doesn't hold, so it can't be read by id either.
+
+A request's own `?facility=` filter is intersected with the key's grant, so it
+can narrow results but never widen them. A key with an empty grant gets zero
+rows, and asking for a facility the key isn't granted returns nothing rather
+than everything. Tags, the device list, and meta-PVs (see below) are global and
+not filtered.
 
 **Writes** are refused, with a `403 insufficient_facility_access` — a filtered
 write would silently do nothing, which is worse than an error. The rules:
@@ -246,8 +264,11 @@ write would silently do nothing, which is worse than an error. The rules:
   skipped and reported in the job result's `skippedPvIds`; if every PV is
   skipped, the restore is a `403`.
 
-**Snapshots capture their facility.** A snapshot created with a `facility`
-captures only the PVs assigned to that facility or one of its descendants, the
+**Where facilities come from.** Both are set by the user. A PV's facilities (it
+can have several) are assigned when it's created or edited, through `facilities`
+on `POST`/`PUT /v1/pvs`. A snapshot has at most one facility, chosen when it's
+taken through `facility` on `POST /v1/snapshots`, and that choice decides what it
+captures: only the PVs assigned to that facility or one of its descendants, the
 same set `GET /v1/pvs?facility=<slug>` returns. An `lcls` snapshot holds the
 `lcls`, `lcls-sc`, and `lcls-nc` PVs, never `facet`'s. PVs with no facility are
 left out. A snapshot with no `facility` captures every registered PV, and only
