@@ -507,10 +507,20 @@ class PvRepository(BaseRepository[Pv]):
 
         return pvs, next_token, total_count
 
-    async def get_all_addresses(self) -> list[tuple[str, str | None, str | None, str | None]]:
-        """All ``(id, setpoint, readback, config)`` tuples — the snapshot-capture input."""
-        result = await self.session.execute(select(Pv.id, Pv.setpoint_address, Pv.readback_address, Pv.config_address))
-        return list(result.all())
+    async def get_all_addresses(
+        self, facility_ids: set[str] | None = None
+    ) -> list[tuple[str, str | None, str | None, str | None]]:
+        """All ``(id, setpoint, readback, config)`` tuples — the snapshot-capture input.
+
+        ``facility_ids`` limits it to PVs assigned to any of them; unassigned PVs are
+        excluded. ``None`` returns every PV.
+        """
+        query = select(Pv.id, Pv.setpoint_address, Pv.readback_address, Pv.config_address)
+        if facility_ids is not None:
+            pvs_in_facility = select(pv_facility.c.pv_id).where(pv_facility.c.facility_id.in_(facility_ids)).distinct()
+            query = query.where(Pv.id.in_(pvs_in_facility))
+        result = await self.session.execute(query)
+        return list(result.tuples().all())
 
     async def bulk_create(self, pvs: list[Pv]) -> list[Pv]:
         self.session.add_all(pvs)

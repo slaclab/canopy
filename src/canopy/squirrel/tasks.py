@@ -64,7 +64,8 @@ async def create_snapshot_task(
     created_by: str | None = None,
     facility_id: str | None = None,
 ) -> dict:
-    """Read every registered PV from EPICS and persist a snapshot. Returns ``{"type":"snapshot","id":...}``.
+    """Read the facility's PVs (or every PV) from EPICS and persist a snapshot. Returns
+    ``{"type":"snapshot","id":...}``.
 
     The facility arrives as a resolved **id**, not a slug: the route had to resolve it to
     check the caller's facility grant before enqueueing, and re-resolving here would

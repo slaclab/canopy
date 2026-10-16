@@ -58,8 +58,11 @@ class FacilityRepository(BaseRepository[Facility]):
         root = await self.get_by_slug(slug)
         if root is None:
             return None
+        return await self.descendant_ids(root.id)
 
-        hierarchy = select(Facility.id).where(Facility.id == root.id).cte("facility_scope", recursive=True)
+    async def descendant_ids(self, facility_id: str) -> set[str]:
+        """``{facility_id, all descendant facility_ids}``, by id rather than slug."""
+        hierarchy = select(Facility.id).where(Facility.id == facility_id).cte("facility_scope", recursive=True)
         children = select(Facility.id).join(hierarchy, Facility.parent_id == hierarchy.c.id)
         hierarchy = hierarchy.union(children)
 

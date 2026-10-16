@@ -398,24 +398,11 @@ class SnapshotService:
         )
 
     async def snapshot_exists(self, snapshot_id: str) -> bool:
-        """Existence check used before enqueueing a restore.
-
-        Facility-scoped like the restore write-gate itself — per-PV, not the snapshot's
-        own facility (see ``plan_restore``): a snapshot with zero PVs reachable by the
-        key reports as not existing, so the precondition can't be used to confirm a
-        snapshot is there when nothing in it could ever be restored. A snapshot with no
-        values at all (nothing to gate) exists unconditionally.
-        """
+        """Existence check used before enqueueing a restore. Gated on the snapshot's own
+        facility, the same rule as ``get_by_id``: a snapshot the key can't view doesn't
+        exist for it, so it can't be restored either."""
         snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
-        if snapshot is None:
-            return False
-        if self.facility_scope is None:
-            return True
-        pv_ids = await self.value_repo.get_pv_ids_by_snapshot(snapshot_id)
-        if not pv_ids:
-            return True
-        by_pv = await self.pv_repo.facility_ids_for_many(pv_ids)
-        return any(not by_pv.get(pv_id) or by_pv[pv_id] & self.facility_scope for pv_id in pv_ids)
+        return snapshot is not None and self._in_facility_scope(snapshot.facility_id)
 
     async def get_by_id(self, snapshot_id: str, limit: int | None = None, offset: int = 0) -> SnapshotDTO | None:
         """Get a snapshot with its values (values optionally paginated)."""
@@ -510,7 +497,11 @@ class SnapshotService:
         progress_callback: Callable | None = None,
         facility_id: str | None = None,
     ) -> SnapshotSummaryDTO:
-        """Create a snapshot by reading every registered PV from EPICS (the hot read path).
+        """Create a snapshot by reading PVs from EPICS (the hot read path).
+
+        A facility snapshot captures only the PVs assigned to that facility or one of its
+        descendants; unassigned PVs are left out. A snapshot with no facility captures
+        every registered PV.
 
         ``facility_id`` lets a caller that already resolved ``data.facility`` pass the id
         straight through. The route does that — it has to resolve the slug anyway to gate
@@ -519,7 +510,17 @@ class SnapshotService:
         logger.info("Creating snapshot: %s", data.title)
         start_time = datetime.now(UTC)
 
-        pv_addresses = await self.pv_repo.get_all_addresses()
+        # The snapshot's own facility is a specific node, so this goes through
+        # `get_by_slug`. An unknown slug here is a real input error, not the "matches
+        # nothing" a read filter wants.
+        if facility_id is None and data.facility is not None:
+            facility = await facilities_gateway.get_by_slug(data.facility)
+            if facility is None:
+                raise FacilityNotFound(f"Facility '{data.facility}' not found")
+            facility_id = facility.id
+        capture_scope = await facilities_gateway.descendant_ids(facility_id) if facility_id is not None else None
+
+        pv_addresses = await self.pv_repo.get_all_addresses(capture_scope)
         total_pv_count = len(pv_addresses)
 
         # Collect the unique addresses to read (config addresses are not snapshotted).
@@ -554,15 +555,6 @@ class SnapshotService:
 
         if progress_callback:
             await progress_callback(total_pv_count, total_pv_count, "Processing results...")
-
-        # A snapshot's facility is the specific node captured, not a descendant-expanded
-        # scope, so this goes through `get_by_slug`. An unknown slug here is a real input
-        # error, not the "matches nothing" a read filter wants.
-        if facility_id is None and data.facility is not None:
-            facility = await facilities_gateway.get_by_slug(data.facility)
-            if facility is None:
-                raise FacilityNotFound(f"Facility '{data.facility}' not found")
-            facility_id = facility.id
 
         # Create the snapshot row. The flush puts it in the open transaction so the
         # COPY below (same connection) sees it for the FK — no commit needed here.
@@ -654,10 +646,10 @@ class SnapshotService:
         This runs in the *route*, not the worker: no caller identity crosses the Arq
         boundary, so the write set has to be narrowed before the job is queued.
 
-        The gate is per-PV, not on the snapshot's own facility: a restore writes live
-        EPICS setpoints, not the snapshot row. A snapshot captures every registered PV,
-        so one filed under a parent facility normally spans several children, and a key
-        granted one child should restore its own PVs without touching its siblings'.
+        The route has already gated on the snapshot's own facility, and capture only takes
+        that facility's PVs, so this normally keeps everything. It catches PVs whose
+        facility assignment changed after capture, and snapshots taken before capture was
+        facility-scoped.
         """
         if self.facility_scope is None:
             return pv_ids, []

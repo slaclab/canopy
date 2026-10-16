@@ -64,7 +64,8 @@ class SnapshotBase(CanopyModel):
 
 
 class NewSnapshotDTO(SnapshotBase):
-    """Create a snapshot. All registered PVs are captured automatically."""
+    """Create a snapshot. With ``facility``, captures the PVs assigned to that facility
+    or its descendants; without, every registered PV."""
 
     facility: str | None = None
 

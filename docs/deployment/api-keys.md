@@ -245,10 +245,18 @@ write would silently do nothing, which is worse than an error. The rules:
 - Creating a *new* snapshot is the exception: a facility-restricted key must name
   a facility it holds. Minting new unscoped data would create rows the key could
   not otherwise have reached.
-- Restoring a snapshot is gated per PV, not on the snapshot's facility — a restore
-  drives live setpoints on the PVs, so the write set is narrowed to the ones in
-  scope and the rest are reported in the job result's `skippedPvIds`. A restore
-  with nothing in scope is a `403`.
+- Restoring a snapshot is gated on the snapshot's facility, the same as viewing
+  it: a snapshot the key can't see is a `404`. Within a visible snapshot, any PV
+  whose facility was changed after capture to one the key doesn't hold is
+  skipped and reported in the job result's `skippedPvIds`; if every PV is
+  skipped, the restore is a `403`.
+
+**Snapshots capture their facility.** A snapshot created with a `facility`
+captures only the PVs assigned to that facility or one of its descendants, the
+same set `GET /v1/pvs?facility=<slug>` returns. An `lcls` snapshot holds the
+`lcls`, `lcls-sc`, and `lcls-nc` PVs, never `facet`'s. PVs with no facility are
+left out. A snapshot with no `facility` captures every registered PV, and only
+an unrestricted key can create one.
 
 Note the deliberate asymmetry: an unassigned PV is *invisible* to a restricted
 key's facility-filtered reads (it has no assignment to match) but *writable* by

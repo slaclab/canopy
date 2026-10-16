@@ -128,6 +128,10 @@ class FacilityService:
         await self.facility_repo.delete(facility)
         return True
 
+    async def descendant_ids(self, facility_id: str) -> set[str]:
+        """``{facility_id, all descendant facility_ids}``. Empty for an unknown id."""
+        return await self.facility_repo.descendant_ids(facility_id)
+
     async def resolve_facility_scope(self, slug: str | None) -> set[str] | None:
         """Slug -> {facility_id, all descendant facility_ids}.
 

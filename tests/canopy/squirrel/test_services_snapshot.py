@@ -12,7 +12,8 @@ from collections import Counter
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from canopy.squirrel.data.models import Pv
+from canopy.squirrel.data.models import Pv, pv_facility
+from canopy.core.facilities.models import Facility
 from canopy.squirrel.schemas.snapshot import NewSnapshotDTO, RestoreRequestDTO
 from canopy.squirrel.adapters.epics_io import EpicsValue
 from canopy.squirrel.restore_hooks.base import RestoreHook, RestoreHookError
@@ -126,6 +127,32 @@ async def test_create_skips_disconnected_reads(db_session: AsyncSession):
     by_name = {v.pv_name: v for v in full.pv_values}
     assert by_name["OK:SP"].setpoint_value.value == 1.0
     assert by_name["DEAD:SP"].setpoint_value is None  # disconnected read stored no blob
+
+
+async def test_facility_snapshot_captures_only_that_facility_and_its_descendants(db_session: AsyncSession):
+    lcls = Facility(slug="lcls", name="LCLS")
+    facet = Facility(slug="facet", name="FACET")
+    db_session.add_all([lcls, facet])
+    await db_session.commit()
+    sc = Facility(slug="lcls-sc", name="SC", parent_id=lcls.id)
+    db_session.add(sc)
+    await db_session.commit()  # the gateway resolves facilities in its own session
+
+    for address, facility in [("LCLS:SP", lcls), ("SC:SP", sc), ("FACET:SP", facet), ("NONE:SP", None)]:
+        pv = await _seed_pv(db_session, address)
+        if facility is not None:
+            await db_session.execute(pv_facility.insert().values(pv_id=pv.id, facility_id=facility.id))
+    reads = {a: _ev(1.0) for a in ("LCLS:SP", "SC:SP", "FACET:SP", "NONE:SP")}
+    svc = SnapshotService(db_session, FakeEpicsIO(reads), restore_hooks=[_NoHook()])
+
+    lcls_snap = await svc.create_snapshot(NewSnapshotDTO(title="lcls", facility="lcls"))
+    assert {v.pv_name for v in (await svc.get_by_id(lcls_snap.id)).pv_values} == {"LCLS:SP", "SC:SP"}
+
+    sc_snap = await svc.create_snapshot(NewSnapshotDTO(title="sc", facility="lcls-sc"))
+    assert {v.pv_name for v in (await svc.get_by_id(sc_snap.id)).pv_values} == {"SC:SP"}
+
+    machine = await svc.create_snapshot(NewSnapshotDTO(title="all"))
+    assert machine.pv_count == 4
 
 
 async def test_paginated_get_does_not_delete_values(db_session: AsyncSession):
