@@ -73,17 +73,17 @@ async def test_snapshot_list_filtered_by_facility(client: AsyncClient, db_sessio
     await db_session.commit()
 
     r = await client.get("/v1/snapshots?facility=lcls2", headers=READ_HEADERS)
-    assert {s["title"] for s in r.json()} == {"sc-snap"}
+    assert {s["title"] for s in r.json()["results"]} == {"sc-snap"}
 
     r = await client.get("/v1/snapshots?facility=lcls2-sc", headers=READ_HEADERS)
-    assert {s["title"] for s in r.json()} == {"sc-snap"}
+    assert {s["title"] for s in r.json()["results"]} == {"sc-snap"}
 
     r = await client.get("/v1/snapshots", headers=READ_HEADERS)
-    titles = {s["title"] for s in r.json()}
+    titles = {s["title"] for s in r.json()["results"]}
     assert {"sc-snap", "facet-snap", "no-facility-snap"} <= titles
 
     r = await client.get("/v1/snapshots?facility=unknown-slug", headers=READ_HEADERS)
-    assert r.json() == []
+    assert r.json()["results"] == []
 
 
 async def test_create_snapshot_enqueues_with_facility(client: AsyncClient, enqueued: list, db_session: AsyncSession):
