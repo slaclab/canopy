@@ -54,12 +54,16 @@ class PVBroker:
         self._latest: dict[str, PVValue] = {}
         self._meta: dict[str, PVMeta] = {}
         self._seed_retry_after: dict[str, float] = {}
+        # One lock per subscribed PV, replaced on each release and re-subscribe.
+        # Besides serializing seeds it marks the subscription: seeds and monitor
+        # updates carry the lock they started under and are cached only while
+        # it is still the PV's, so replacing a live PV's lock drops its updates.
         self._seed_locks: dict[str, asyncio.Lock] = {}
         self._buffer: dict[str, PVValue] = {}
         self._buffer_lock = asyncio.Lock()
         # Bounded so a fast producer can't grow the queue without limit; the
         # QueueFull path in _on_event then applies backpressure by dropping.
-        self._queue: asyncio.Queue[PVValue] = asyncio.Queue(maxsize=config.event_queue_maxsize)
+        self._queue: asyncio.Queue[tuple[PVValue, asyncio.Lock]] = asyncio.Queue(maxsize=config.event_queue_maxsize)
         self._running = False
         self._tasks: list[asyncio.Task] = []
         self._activation_hooks: list[tuple[LifecycleHook, set[str]]] = []
@@ -236,6 +240,8 @@ class PVBroker:
         and one slow PV does not stall the rest. Concurrent subscribes of the
         same PV share one seed attempt: a later subscribe waits for the attempt
         in flight, then re-checks the cache and retry deadline it left behind.
+        Each PV's seed lock is created as soon as the PV is registered, so a PV
+        released while its seed is still queued for a slot is not seeded.
 
         Parameters
         ----------
@@ -268,18 +274,19 @@ class PVBroker:
             return []
         previously_subscribed = self._registry.client_pvs(client_id)
         newly = self._registry.subscribe(client_id, pvs)
+        locks = {pv: self._seed_locks.setdefault(pv, asyncio.Lock()) for pv in pvs}
         await self._start_monitors(newly)
         new_for_client = [pv for pv in pvs if pv not in previously_subscribed]
         if new_for_client:
             await self._fire_activation_hooks(new_for_client, client_id)
         sem = asyncio.Semaphore(self._config.seed_concurrency)
 
-        async def _seed(pv: str) -> None:
-            async with sem, self._seed_locks.setdefault(pv, asyncio.Lock()):
-                if self._needs_seed(pv):
-                    await self._seed_pv(pv)
+        async def _seed(pv: str, lock: asyncio.Lock) -> None:
+            async with sem, lock:
+                if self._seed_locks.get(pv) is lock and self._needs_seed(pv):
+                    await self._seed_pv(pv, lock)
 
-        await asyncio.gather(*(_seed(pv) for pv in pvs if self._needs_seed(pv)))
+        await asyncio.gather(*(_seed(pv, locks[pv]) for pv in pvs if self._needs_seed(pv)))
         initial = {pv: self._latest[pv] for pv in pvs if pv in self._latest}
         meta = {pv: self._meta[pv] for pv in pvs if pv in self._meta}
         if initial or meta:
@@ -313,7 +320,7 @@ class PVBroker:
         now = time.monotonic()
         return now >= self._seed_retry_after.get(pv, now)
 
-    async def _seed_pv(self, pv: str) -> None:
+    async def _seed_pv(self, pv: str, lock: asyncio.Lock) -> None:
         """Fetch whichever of the seed value and static metadata a PV is missing.
 
         Each half is fetched only when absent from the cache, so a half that
@@ -327,21 +334,41 @@ class PVBroker:
         value through the monitor is kept until `_stop_monitors` releases the
         PV, so the deadlines are bounded by the PVs that have subscribers.
 
+        `_stop_monitors` discards the PV's seed lock on release and a later
+        subscribe creates a new one, so the attempt writes only while ``lock``
+        is still the PV's. An attempt that outlives its PV's release leaves no
+        cached value, metadata or deadline behind and never overwrites what a
+        newer attempt fetched.
+
         Parameters
         ----------
         pv : str
             Validated name of a subscribed PV.
+        lock : asyncio.Lock
+            The PV's seed lock, held by the caller.
         """
+
+        def current() -> bool:
+            return self._seed_locks.get(pv) is lock
+
         if pv not in self._latest:
             try:
-                self._latest[pv] = await self._connector.get(pv)
+                value = await self._connector.get(pv)
             except Exception as exc:
                 logger.debug("initial get failed for %s: %s", pv, exc)
-        if pv not in self._meta:
+            else:
+                if current():
+                    self._latest[pv] = value
+        if current() and pv not in self._meta:
             try:
-                self._meta[pv] = await self._connector.describe(pv)
+                meta = await self._connector.describe(pv)
             except Exception as exc:
                 logger.debug("describe failed for %s: %s", pv, exc)
+            else:
+                if current():
+                    self._meta[pv] = meta
+        if not current():
+            return
         if pv in self._latest and pv in self._meta:
             self._seed_retry_after.pop(pv, None)
         else:
@@ -363,11 +390,27 @@ class PVBroker:
     # --- monitor lifecycle ----------------------------------------------- #
 
     async def _start_monitors(self, pvs: Iterable[str]) -> None:
+        """Start a monitor for each given PV that does not already have one.
+
+        Each monitor's callback is bound to the PV's seed lock at the time it
+        starts, so `_ingest` can tell its updates from those of a monitor
+        released earlier. A PV released while an earlier PV's monitor was
+        starting has no lock left and gets no monitor. A monitor that fails to
+        start is logged and does not stop the rest of the batch.
+
+        Parameters
+        ----------
+        pvs : Iterable[str]
+            PVs that just gained their first subscriber.
+        """
         for pv in pvs:
-            if pv in self._monitors:
+            lock = self._seed_locks.get(pv)
+            if pv in self._monitors or lock is None:
                 continue
             try:
-                self._monitors[pv] = await self._connector.subscribe(pv, self._on_event)
+                self._monitors[pv] = await self._connector.subscribe(
+                    pv, lambda value, lock=lock: self._on_event(value, lock)
+                )
             except Exception as exc:
                 logger.error("failed to start monitor for %s: %s", pv, exc)
 
@@ -398,18 +441,18 @@ class PVBroker:
 
     # --- event ingestion ------------------------------------------------- #
 
-    def _on_event(self, value: PVValue) -> None:
-        """Connector callback. Non-blocking; must run on the event loop thread."""
+    def _on_event(self, value: PVValue, lock: asyncio.Lock) -> None:
+        """Connector callback, with the seed lock its monitor started under. Non-blocking; must run on the event loop thread."""
         try:
-            self._queue.put_nowait(value)
+            self._queue.put_nowait((value, lock))
         except asyncio.QueueFull:
             logger.warning("broker queue full; dropping update for %s", value.pv)
 
     async def _consume_loop(self) -> None:
         while self._running:
             try:
-                value = await self._queue.get()
-                await self._ingest(value)
+                value, lock = await self._queue.get()
+                await self._ingest(value, lock)
                 await self._drain_nowait()
             except asyncio.CancelledError:
                 raise
@@ -420,12 +463,29 @@ class PVBroker:
         """Process all currently-queued events without blocking. Drives `_consume_loop`; also called directly by tests."""
         while True:
             try:
-                value = self._queue.get_nowait()
+                value, lock = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            await self._ingest(value)
+            await self._ingest(value, lock)
 
-    async def _ingest(self, value: PVValue) -> None:
+    async def _ingest(self, value: PVValue, lock: asyncio.Lock) -> None:
+        """Cache a monitor update and buffer it for the next diff flush.
+
+        `_stop_monitors` discards a PV's seed lock on release and a later
+        subscribe creates a new one, so the update is kept only while ``lock``
+        is still the PV's. An update from a released monitor, whether still
+        queued at release or delivered after a re-subscribe, is neither cached
+        nor buffered.
+
+        Parameters
+        ----------
+        value : PVValue
+            Update delivered by the PV's monitor.
+        lock : asyncio.Lock
+            The PV's seed lock when that monitor started.
+        """
+        if self._seed_locks.get(value.pv) is not lock:
+            return
         self._latest[value.pv] = value
         async with self._buffer_lock:
             self._buffer[value.pv] = value
