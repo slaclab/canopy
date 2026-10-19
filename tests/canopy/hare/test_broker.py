@@ -637,3 +637,28 @@ async def test_monitor_update_queued_before_release_is_not_cached(broker, fake_c
     assert "PV:A" not in broker._latest
     assert "PV:A" not in broker._buffer
     assert (await broker.get_value("PV:A")).value == 0.0
+
+
+async def test_released_monitor_update_delivered_after_resubscribe_is_not_cached(broker, fake_connector):
+    """An update from a released monitor that arrives after a re-subscribe does not replace the fresh seed.
+
+    The EPICS backend hands updates to the loop with ``call_soon_threadsafe``, so
+    the old monitor's callback can still run once a new subscribe has seeded the
+    PV and started a new monitor. Only the new monitor's updates are cached.
+    """
+    broker.add_client("c1", FakeWebSocket())
+    await broker.subscribe("c1", ["PV:A"])
+    released_callback = fake_connector.callbacks["PV:A"]
+    await broker.unsubscribe("c1", ["PV:A"])
+    broker.add_client("c2", FakeWebSocket())
+    await broker.subscribe("c2", ["PV:A"])
+
+    released_callback(PVValue(pv="PV:A", value=7.0, severity=AlarmSeverity.NO_ALARM, ts_ns=2, connected=True))
+    await broker._drain_nowait()
+    assert broker._latest["PV:A"].value == 0.0
+    assert "PV:A" not in broker._buffer
+
+    fake_connector.emit("PV:A", 3.0)
+    await broker._drain_nowait()
+    assert broker._latest["PV:A"].value == 3.0
+    assert broker._buffer["PV:A"].value == 3.0
