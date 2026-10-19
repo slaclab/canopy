@@ -236,7 +236,7 @@ class PVBroker:
         and one slow PV does not stall the rest. Concurrent subscribes of the
         same PV share one seed attempt: a later subscribe waits for the attempt
         in flight, then re-checks the cache and retry deadline it left behind.
-        Each PV's seed lock is taken as soon as the PV is registered, so a PV
+        Each PV's seed lock is created as soon as the PV is registered, so a PV
         released while its seed is still queued for a slot is not seeded.
 
         Parameters
@@ -449,6 +449,19 @@ class PVBroker:
             await self._ingest(value)
 
     async def _ingest(self, value: PVValue) -> None:
+        """Cache a monitor update and buffer it for the next diff flush.
+
+        An update still queued when `_stop_monitors` released its PV is
+        dropped: a PV has a seed lock exactly while it has subscribers, so a
+        released PV is neither re-cached nor buffered.
+
+        Parameters
+        ----------
+        value : PVValue
+            Update delivered by the PV's monitor.
+        """
+        if value.pv not in self._seed_locks:
+            return
         self._latest[value.pv] = value
         async with self._buffer_lock:
             self._buffer[value.pv] = value

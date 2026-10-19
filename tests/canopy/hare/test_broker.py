@@ -620,3 +620,20 @@ async def test_seed_queued_for_a_slot_skips_a_pv_released_meanwhile(fake_connect
     await broker.subscribe("c2", ["PV:B"])
     assert gets == ["PV:A", "PV:B"]
     assert "PV:B" in _initial_frames(later)[0]["data"]
+
+
+async def test_monitor_update_queued_before_release_is_not_cached(broker, fake_connector):
+    """A monitor update still queued when its PV is released is discarded when drained.
+
+    Nothing is cached or buffered for the released PV, so a later read goes to
+    the connector instead of serving the update from before the release.
+    """
+    broker.add_client("c1", FakeWebSocket())
+    await broker.subscribe("c1", ["PV:A"])
+    fake_connector.emit("PV:A", 7.0)
+    await broker.unsubscribe("c1", ["PV:A"])
+    await broker._drain_nowait()
+
+    assert "PV:A" not in broker._latest
+    assert "PV:A" not in broker._buffer
+    assert (await broker.get_value("PV:A")).value == 0.0
