@@ -1,5 +1,6 @@
 # Production compose: app containers only. This is the reference for running
-# Canopy at a facility; copy it next to a .env file and adapt it as needed.
+# Canopy at a facility: copy it to the host as compose.yml, next to a .env
+# file, and adapt it as needed.
 #
 # Postgres 16 and Redis 7 are NOT here. Run them however your site runs
 # databases and point the app at them with CANOPY_DATABASE_URL and
@@ -11,8 +12,10 @@
 #
 # All config comes from a sibling .env file: IMAGE=ghcr.io/slaclab/canopy:<tag>
 # for the compose file itself, plus the app's CANOPY_* / EPICS_* settings.
-# Start it with `docker compose up -d` from this directory; run
-# `docker compose run --rm api alembic upgrade head` before starting a new image.
+# From that host directory, run `docker compose run --rm api alembic upgrade head`
+# before starting a new image, then `docker compose up -d`. Without -f, Compose
+# doesn't find this file under its repo name, and in this repo's docker/
+# directory the bare commands select the development stack.
 #
 # Every service logs to stdout continuously and the docker daemon keeps those
 # json-file logs without limit, so cap what is retained per container.

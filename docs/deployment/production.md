@@ -73,10 +73,13 @@ EPICS_PVA_AUTO_ADDR_LIST=NO
 
 ## Run with the reference compose file
 
-Copy `docker/docker-compose.prod.yml`, from the same release as the image, into
-a directory on the host next to the `.env` above. It runs one `api` and two
-`worker` replicas with `network_mode: host`, because EPICS CA/PVA discovery
-needs UDP broadcast. See [Production compose](docker.md#production-compose).
+Copy `docker/docker-compose.prod.yml`, from the same release as the image, to
+a directory on the host as `compose.yml`, next to the `.env` above. Compose
+finds `compose.yml` without `-f`, so the commands on this page work from that
+directory. Under its repo name, every command would need
+`-f docker-compose.prod.yml`. It runs one `api` and two `worker` replicas with
+`network_mode: host`, because EPICS CA/PVA discovery needs UDP broadcast. See
+[Production compose](docker.md#production-compose).
 
 ```bash
 docker compose pull

@@ -91,3 +91,9 @@ push to `main` and every `v*` release tag — see
 [image tags](production.md#image-tags). The image also carries the Alembic
 tree, so migrations run as
 `docker compose run --rm api alembic upgrade head`.
+
+On the host, save the file as `compose.yml` next to its `.env`, so the bare
+`docker compose` commands in these docs find it. Compose doesn't pick up
+`docker-compose.prod.yml` by itself, and in the repo's `docker/` directory the
+same commands select the development stack. See
+[Deploy at your facility](production.md#run-with-the-reference-compose-file).
