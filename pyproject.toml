@@ -77,6 +77,8 @@ filterwarnings = [
 [tool.coverage.run]
 relative_files = true
 source = ["src/canopy"]
+# Async SQLAlchemy runs queries in greenlets; without this, lines after a DB await go untraced.
+concurrency = ["thread", "greenlet"]
 omit = ["*/tests/*", "*/test_*", "*/__pycache__/*"]
 
 [tool.coverage.report]
