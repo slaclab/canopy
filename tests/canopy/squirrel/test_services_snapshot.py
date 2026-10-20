@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from canopy.squirrel.data.models import Pv, pv_facility
 from canopy.core.facilities.models import Facility
 from canopy.squirrel.schemas.snapshot import NewSnapshotDTO, RestoreRequestDTO
-from canopy.squirrel.adapters.epics_io import EpicsValue
+from canopy.squirrel.adapters.epics_io import EpicsIO, EpicsValue, ProgressCallback
 from canopy.squirrel.restore_hooks.base import RestoreHook, RestoreHookError
 from canopy.squirrel.restore_hooks.magnet_trim import MagnetTrimHook
 from canopy.squirrel.services.snapshot_service import SnapshotService
@@ -29,24 +29,32 @@ class _NoHook(RestoreHook):
         return []
 
 
-class FakeEpicsIO:
-    """In-memory stand-in for the EpicsIO adapter (records writes, serves canned reads)."""
+class FakeEpicsIO(EpicsIO):
+    """In-memory stand-in for the EpicsIO adapter (records writes, serves canned reads).
+
+    Subclasses ``EpicsIO`` only so it type-checks where one is expected; ``__init__``
+    deliberately skips ``super()``, since there is no connector behind it.
+    """
 
     def __init__(self, reads: dict[str, EpicsValue] | None = None):
         self.reads = reads or {}
         self.writes: dict[str, Any] = {}
         self.fail_writes: set[str] = set()
 
-    async def get_many(self, addrs: list[str]) -> dict[str, EpicsValue]:
-        return {a: self.reads.get(a, EpicsValue(value=None, connected=False, error="no value")) for a in addrs}
+    async def get_many(self, pv_names: list[str]) -> dict[str, EpicsValue]:
+        return {a: self.reads.get(a, EpicsValue(value=None, connected=False, error="no value")) for a in pv_names}
 
-    async def get_many_with_progress(self, addrs, cb=None) -> dict[str, EpicsValue]:
-        return await self.get_many(addrs)
+    async def get_many_with_progress(
+        self, pv_names: list[str], progress_callback: ProgressCallback | None = None
+    ) -> dict[str, EpicsValue]:
+        return await self.get_many(pv_names)
 
     async def put_many(self, values: dict[str, Any]) -> dict[str, tuple[bool, str | None]]:
         return await self.put_many_with_progress(values, None)
 
-    async def put_many_with_progress(self, values, cb=None) -> dict[str, tuple[bool, str | None]]:
+    async def put_many_with_progress(
+        self, values: dict[str, Any], progress_callback: ProgressCallback | None = None
+    ) -> dict[str, tuple[bool, str | None]]:
         out: dict[str, tuple[bool, str | None]] = {}
         for addr, val in values.items():
             if addr in self.fail_writes:
@@ -54,8 +62,8 @@ class FakeEpicsIO:
             else:
                 self.writes[addr] = val
                 out[addr] = (True, None)
-        if cb and values:
-            await cb(len(values), len(values), f"Wrote {len(values)}/{len(values)} PVs...")
+        if progress_callback and values:
+            await progress_callback(len(values), len(values), f"Wrote {len(values)}/{len(values)} PVs...")
         return out
 
 

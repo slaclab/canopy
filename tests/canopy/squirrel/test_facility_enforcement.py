@@ -7,20 +7,28 @@ request flow. The registry is restored in teardown; it leaks across the suite ot
 """
 
 import pytest
-from httpx import AsyncClient
+from httpx import AsyncClient, ASGITransport
+from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.core import security
-from canopy.core.modules import WILDCARD
+from canopy.core.db import get_session
+from canopy.core.errors import register_canopy_error_handler
+from canopy.core.modules import WILDCARD, tag_module
+from canopy.squirrel.app import _facility_in_use
 from canopy.core.security import APIKey
+from canopy.core.facilities import gateway as facilities_gateway
+from canopy.core.facilities import service as facilities_service
 from canopy.squirrel.data.models import Snapshot, SnapshotValue
 from canopy.core.facilities.models import Facility
+from canopy.core.facilities.routes import router as facilities_router
 
 SC_HEADERS = {"X-API-Key": "sc-key"}
 NC_HEADERS = {"X-API-Key": "nc-key"}
 LCLS_HEADERS = {"X-API-Key": "lcls-key"}
 NONE_HEADERS = {"X-API-Key": "none-key"}
 WILD_HEADERS = {"X-API-Key": "wild-key"}
+ADMIN_HEADERS = {"X-API-Key": "admin-key"}
 
 
 class MultiKeyRegistry:
@@ -33,7 +41,8 @@ class MultiKeyRegistry:
 
 @pytest.fixture(autouse=True)
 def scoped_keys():
-    """Five write-capable keys differing only in facility grant."""
+    """Five write-capable keys differing only in facility grant, plus an admin key for
+    the facility definition routes."""
     previous = security._registry
     security.bind_key_registry(
         MultiKeyRegistry(
@@ -64,6 +73,14 @@ def scoped_keys():
                     token="wild-key",
                     read=True,
                     write=True,
+                    modules=frozenset({WILDCARD}),
+                    facilities=frozenset({WILDCARD}),
+                ),
+                APIKey(
+                    token="admin-key",
+                    read=True,
+                    write=True,
+                    admin=True,
                     modules=frozenset({WILDCARD}),
                     facilities=frozenset({WILDCARD}),
                 ),
@@ -340,6 +357,26 @@ async def test_restore_skips_a_pv_reassigned_out_of_scope_after_capture(
     assert kwargs["skipped_pv_ids"] == [moved_pv]
 
 
+async def test_restore_with_every_pv_out_of_scope_is_403(client: AsyncClient, db_session: AsyncSession, enqueued: list):
+    """A visible snapshot whose PVs have all been reassigned out of the key's reach: the
+    key may see the snapshot but write none of it, which is a refusal, not a no-op job."""
+    facilities = await _seed_hierarchy(db_session)
+    pv = await _create_pv(client, WILD_HEADERS, "SC:PV:SP", ["lcls-sc"])
+    snapshot = Snapshot(title="sc", facility_id=facilities["lcls-sc"].id)
+    db_session.add(snapshot)
+    await db_session.commit()
+    db_session.add(SnapshotValue(snapshot_id=snapshot.id, pv_id=pv, pv_name="SC:PV:SP", setpoint_value={"value": 1.0}))
+    await db_session.commit()
+    r = await client.put(f"/v1/pvs/{pv}", headers=WILD_HEADERS, json={"facilities": ["lcls-nc"]})
+    assert r.status_code == 200, r.text
+    enqueued.clear()
+
+    r = await client.post(f"/v1/snapshots/{snapshot.id}/restore", headers=SC_HEADERS, json={})
+    assert r.status_code == 403, r.text
+    assert r.json()["code"] == "insufficient_facility_access"
+    assert enqueued == []
+
+
 async def test_restore_naming_pvs_outside_the_snapshot_is_refused_not_widened(
     client: AsyncClient, db_session: AsyncSession, enqueued: list
 ):
@@ -441,3 +478,54 @@ async def test_compare_snapshots_outside_the_grant_is_404(client: AsyncClient, d
 
     r = await client.get(f"/v1/snapshots/{out_of_scope.id}/compare/{in_scope.id}", headers=SC_HEADERS)
     assert r.status_code == 404, r.text
+
+
+# --- facility deletion ------------------------------------------------------- #
+
+
+@pytest.fixture
+async def facilities_client(test_engine, db_session):
+    """The parent app's ``/v1/facilities`` routes, with Squirrel's in-use checker
+    registered exactly as ``squirrel_lifespan`` does."""
+    previous = list(facilities_service._in_use_checkers)
+    facilities_service._in_use_checkers.clear()
+    facilities_gateway.register_in_use_checker(_facility_in_use, "PVs or snapshots")
+
+    app = FastAPI()
+    register_canopy_error_handler(app)
+    tag_module(app, "core")
+    app.include_router(facilities_router)
+
+    async def override_get_session():
+        async with AsyncSession(test_engine, expire_on_commit=False) as s:
+            try:
+                yield s
+                await s.commit()
+            except Exception:
+                await s.rollback()
+                raise
+
+    app.dependency_overrides[get_session] = override_get_session
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            yield c
+    finally:
+        facilities_service._in_use_checkers[:] = previous
+
+
+async def test_a_facility_with_squirrel_pvs_or_snapshots_cannot_be_deleted(
+    client: AsyncClient, facilities_client: AsyncClient, db_session: AsyncSession
+):
+    facilities = await _seed_hierarchy(db_session)
+    await _create_pv(client, WILD_HEADERS, "SC:PV:SP", ["lcls-sc"])
+    db_session.add(Snapshot(title="nc", facility_id=facilities["lcls-nc"].id))
+    await db_session.commit()
+
+    for slug in ("lcls-sc", "lcls-nc"):
+        r = await facilities_client.delete(f"/v1/facilities/{slug}", headers=ADMIN_HEADERS)
+        assert r.status_code == 400, r.text
+        assert r.json()["code"] == "facility_in_use"
+        assert "PVs or snapshots" in r.json()["detail"]
+
+    r = await facilities_client.delete("/v1/facilities/facet", headers=ADMIN_HEADERS)
+    assert r.status_code == 200, r.text
