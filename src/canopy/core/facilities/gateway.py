@@ -76,6 +76,13 @@ async def ids_by_slug(slugs: list[str] | set[str]) -> dict[str, str]:
         return await FacilityService(session).ids_by_slug(slugs)
 
 
+async def slugs_by_id(ids: list[str] | set[str]) -> dict[str, str]:
+    """``{id: slug}`` for the subset of ``ids`` that exist, in one round trip. For a
+    module that stores facility ids but reports facilities by slug."""
+    async with session_scope() as session:
+        return await FacilityService(session).slugs_by_id(ids)
+
+
 def register_in_use_checker(checker: Callable[[str, str], Awaitable[bool]], what: str) -> None:
     """Register an "is this facility still referenced by my data?" check, consulted by
     ``FacilityService.delete``.

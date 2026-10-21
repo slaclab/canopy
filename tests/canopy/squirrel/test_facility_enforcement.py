@@ -135,13 +135,13 @@ async def test_parent_grant_covers_a_child_facility(client: AsyncClient, db_sess
 
 
 async def test_holding_one_of_a_pvs_facilities_is_enough(client: AsyncClient, db_session: AsyncSession):
-    facilities = await _seed_hierarchy(db_session)
+    await _seed_hierarchy(db_session)
     pv_id = await _create_pv(client, WILD_HEADERS, "SHARED:PV:SP", ["lcls-sc", "facet"])
 
     r = await client.put(f"/v1/pvs/{pv_id}", headers=SC_HEADERS, json={"device": "d"})
     assert r.status_code == 200, r.text
     # The write didn't quietly drop the facility the key can't reach.
-    assert set(r.json()["facilityIds"]) == {facilities["lcls-sc"].id, facilities["facet"].id}
+    assert r.json()["facilities"] == ["facet", "lcls-sc"]
 
 
 async def test_an_update_cannot_silently_drop_a_facility_the_key_cant_reach(
@@ -150,7 +150,7 @@ async def test_an_update_cannot_silently_drop_a_facility_the_key_cant_reach(
     """Overlap with the *new* set isn't enough: every facility being added or removed
     must be in the grant, or an SC-only key could rewrite a shared PV's facilities to
     quietly strip a facility (`facet`) it was never scoped to touch."""
-    facilities = await _seed_hierarchy(db_session)
+    await _seed_hierarchy(db_session)
     pv_id = await _create_pv(client, WILD_HEADERS, "SHARED:PV:SP", ["lcls-sc", "facet"])
 
     # Rewriting to just the facility the key holds would silently drop `facet`.
@@ -161,7 +161,7 @@ async def test_an_update_cannot_silently_drop_a_facility_the_key_cant_reach(
     # The refused write did not land.
     r = await client.get("/v1/pvs/paged", headers=WILD_HEADERS)
     pv = next(p for p in r.json()["results"] if p["id"] == pv_id)
-    assert set(pv["facilityIds"]) == {facilities["lcls-sc"].id, facilities["facet"].id}
+    assert pv["facilities"] == ["facet", "lcls-sc"]
 
     # Symmetric case: adding a facility the key doesn't hold is refused the same way,
     # even though the PV's sole existing facility overlaps the grant.

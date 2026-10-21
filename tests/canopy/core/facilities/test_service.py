@@ -125,7 +125,7 @@ async def test_update_rejects_reparenting_under_a_descendant(session, session_ma
     sibling = await _seed_facility(session, "lcls-nc", parent_id=root.id)
     await session.commit()
     updated = await service.update(grandchild.id, FacilityUpdate(parent="lcls-nc"))
-    assert updated.parent_id == sibling.id
+    assert updated.parent == sibling.slug
 
 
 async def test_delete_blocked_by_children(session, session_maker):
