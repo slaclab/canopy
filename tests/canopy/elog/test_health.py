@@ -42,6 +42,7 @@ def test_all_apps_healthy_is_ok(summary):
 
     assert body["status"] == "ok"
     assert body["provider"] == "fake"
+    assert body["reason"] is None
     assert body["apps"] == [
         {"app": "squirrel", "healthy": True, "identity": "squirrel@app.elog", "latencyMs": 1.0, "lastError": None},
         {"app": "trace", "healthy": True, "identity": "trace@app.elog", "latencyMs": 1.0, "lastError": None},
@@ -68,12 +69,27 @@ def test_every_app_down_is_down(summary):
     squirrel = FakeElogAdapter("squirrel")
     squirrel.health_result = DOWN
 
-    assert summary({"squirrel": squirrel})["status"] == "down"
+    body = summary({"squirrel": squirrel})
+
+    assert body["status"] == "down"
+    # Per-app failures explain themselves in lastError.
+    assert body["reason"] is None
 
 
-def test_no_provider_is_disabled(summary):
-    assert summary({}, enabled=False) == {"status": "disabled", "provider": None, "apps": []}
+def test_no_provider_is_disabled_with_its_reason(summary):
+    assert summary({}, enabled=False) == {
+        "status": "disabled",
+        "provider": None,
+        "reason": "No e-log provider is configured (CANOPY_ELOG__PROVIDER is empty)",
+        "apps": [],
+    }
 
 
-def test_provider_without_any_app_token_is_disabled(summary):
-    assert summary({}) == {"status": "disabled", "provider": "fake", "apps": []}
+def test_provider_without_any_app_token_is_down_not_disabled(summary):
+    # A pod deployed before its tokens exist: misconfigured, not switched off.
+    assert summary({}) == {
+        "status": "down",
+        "provider": "fake",
+        "reason": "No app has an e-log token configured (CANOPY_ELOG__APPS__<APP>__TOKEN)",
+        "apps": [],
+    }

@@ -88,7 +88,7 @@ All routes live under `/elog/v1`. API keys need the module scope `elog`
 | `POST /apps/{app}/attachments` | write | `{id}`; multipart with one part named `file` |
 | `POST /apps/{app}/entries` | write | `{id, url}` |
 | `GET /health/watchdog` | none | liveness heartbeat |
-| `GET /health/summary` | read | `{status, provider, apps: [{app, healthy, identity, latencyMs, lastError}]}` |
+| `GET /health/summary` | read | `{status, provider, reason, apps: [{app, healthy, identity, latencyMs, lastError}]}` |
 
 `{app}` must match `^[a-z0-9_-]{1,64}$` (the same rule as Magpie's app names).
 
@@ -144,10 +144,16 @@ malformed request.
 
 ### Health summary
 
-`status` is `disabled` when no app can post (no provider, or no app has a
-token), otherwise `ok` when every app's token probe succeeds, `down` when none
-does, and `degraded` in between. Each app is probed concurrently with
-`GET /v1/users/me` on elog-plus, two seconds per probe.
+| `status` | When | `reason` |
+|----------|------|----------|
+| `disabled` | no usable provider (`PROVIDER` empty, unknown, or missing its base URL) | why, as in the `config` route |
+| `down` | a provider is set but no app has a token | `No app has an e-log token configured ...` |
+| `down` | every app's token probe fails | `null`; see each app's `lastError` |
+| `degraded` | some apps' probes fail | `null` |
+| `ok` | every app's probe succeeds | `null` |
+
+Each app is probed concurrently with `GET /v1/users/me` on elog-plus, two
+seconds per probe.
 
 ## Calling it in-process
 

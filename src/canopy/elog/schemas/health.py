@@ -17,11 +17,14 @@ class ElogAppHealthDTO(CanopyModel):
 class ElogHealthSummaryDTO(CanopyModel):
     """Rollup across configured apps.
 
-    ``disabled`` when no app can post (no provider, or no app has a token);
-    otherwise ``ok`` when every app's probe succeeds, ``down`` when none does,
-    and ``degraded`` in between.
+    ``disabled`` when no usable provider is configured; ``down`` when a
+    provider is set but no app has a token, or no app's probe succeeds; ``ok``
+    when every app's probe succeeds, and ``degraded`` in between. ``reason``
+    explains ``disabled`` and the no-token ``down``; it is ``None`` otherwise
+    (per-app failures are in ``apps[].last_error``).
     """
 
     status: Literal["ok", "degraded", "down", "disabled"]
     provider: str | None = None
+    reason: str | None = None
     apps: list[ElogAppHealthDTO]

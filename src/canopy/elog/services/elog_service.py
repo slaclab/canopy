@@ -29,6 +29,8 @@ from canopy.elog.adapters.registry import ElogRegistry
 
 logger = logging.getLogger(__name__)
 
+NO_APP_TOKENS_REASON = "No app has an e-log token configured (CANOPY_ELOG__APPS__<APP>__TOKEN)"
+
 
 def _check_app_name(app: str) -> None:
     if not is_app(app):
@@ -123,15 +125,21 @@ class ElogService:
             )
             for app, h in health_map.items()
         ]
-        if not apps:
+        reason: str | None = None
+        if not self._registry.enabled:
             status: Literal["ok", "degraded", "down", "disabled"] = "disabled"
+            reason = self._registry.disabled_reason
+        elif not apps:
+            # A provider is set but nothing can post: misconfigured, not switched off.
+            status = "down"
+            reason = NO_APP_TOKENS_REASON
         elif all(a.healthy for a in apps):
             status = "ok"
         elif not any(a.healthy for a in apps):
             status = "down"
         else:
             status = "degraded"
-        return ElogHealthSummaryDTO(status=status, provider=self._registry.provider, apps=apps)
+        return ElogHealthSummaryDTO(status=status, provider=self._registry.provider, reason=reason, apps=apps)
 
     async def close(self) -> None:
         await self._registry.close_all()
