@@ -359,6 +359,12 @@ async def test_create_enqueues_job(client: AsyncClient, enqueued: list):
     assert enqueued[0][2] == {"title": "T", "description": "D"}
 
 
+async def test_create_with_use_cache_asks_the_worker_for_a_cached_snapshot(client: AsyncClient, enqueued: list):
+    r = await client.post("/v1/snapshots?useCache=true", headers=WRITE_HEADERS, json={"title": "T", "description": "D"})
+    assert r.status_code == 200
+    assert enqueued[0][2] == {"title": "T", "description": "D", "use_cache": True}
+
+
 async def test_restore_existing_enqueues_with_pv_ids(client: AsyncClient, db_session: AsyncSession, enqueued: list):
     sid = await _seed_snapshot(db_session, "restore-me")
     r = await client.post(f"/v1/snapshots/{sid}/restore", headers=WRITE_HEADERS, json={"pvIds": ["p1", "p2"]})

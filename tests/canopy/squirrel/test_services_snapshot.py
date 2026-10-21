@@ -13,6 +13,7 @@ from collections import Counter
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.squirrel.data.models import Pv
+from canopy.squirrel.pv_cache.reader import CacheLookup
 from canopy.squirrel.schemas.snapshot import NewSnapshotDTO, RestoreRequestDTO
 from canopy.squirrel.adapters.epics_io import EpicsValue
 from canopy.squirrel.restore_hooks.base import RestoreHook, RestoreHookError
@@ -126,6 +127,66 @@ async def test_create_skips_disconnected_reads(db_session: AsyncSession):
     by_name = {v.pv_name: v for v in full.pv_values}
     assert by_name["OK:SP"].setpoint_value.value == 1.0
     assert by_name["DEAD:SP"].setpoint_value is None  # disconnected read stored no blob
+
+
+class _FakePVCache:
+    """Serves canned hits; everything else is a miss for the live path."""
+
+    def __init__(self, hits: dict[str, EpicsValue]):
+        self.hits = hits
+
+    async def lookup(self, addresses: list[str]) -> CacheLookup:
+        return CacheLookup(
+            hits={a: v for a, v in self.hits.items() if a in addresses},
+            misses=[a for a in addresses if a not in self.hits],
+        )
+
+
+class _RecordingEpicsIO(FakeEpicsIO):
+    def __init__(self, reads: dict[str, EpicsValue] | None = None):
+        super().__init__(reads)
+        self.requested: list[str] = []
+
+    async def get_many(self, addrs: list[str]) -> dict[str, EpicsValue]:
+        self.requested.extend(addrs)
+        return await super().get_many(addrs)
+
+    async def get_many_with_progress(self, addrs, cb=None) -> dict[str, EpicsValue]:
+        values = await self.get_many(addrs)
+        if cb:
+            await cb(len(addrs), len(addrs), f"Read {len(addrs)}/{len(addrs)} PVs...")
+        return values
+
+
+async def test_create_takes_cache_hits_and_reads_only_the_misses_live(db_session: AsyncSession):
+    await _seed_pv(db_session, "C:SP", "L:RB")
+    io = _RecordingEpicsIO({"L:RB": _ev(0.5)})
+    svc = SnapshotService(db_session, io, restore_hooks=[_NoHook()])
+    progress: list[str] = []
+
+    async def on_progress(current, total, message, phases=None):
+        progress.append(message)
+
+    summary = await svc.create_snapshot(
+        NewSnapshotDTO(title="cached"), progress_callback=on_progress, pv_cache=_FakePVCache({"C:SP": _ev(4.0)})
+    )
+
+    assert io.requested == ["L:RB"]
+    full = await svc.get_by_id(summary.id)
+    (value,) = full.pv_values
+    assert (value.setpoint_value.value, value.readback_value.value) == (4.0, 0.5)
+    assert any(message.startswith("1 from cache; Read") for message in progress)
+
+
+async def test_create_with_a_full_cache_hit_reads_nothing_live(db_session: AsyncSession):
+    await _seed_pv(db_session, "C:SP")
+    io = _RecordingEpicsIO()
+    svc = SnapshotService(db_session, io, restore_hooks=[_NoHook()])
+
+    summary = await svc.create_snapshot(NewSnapshotDTO(title="cached"), pv_cache=_FakePVCache({"C:SP": _ev(4.0)}))
+
+    assert io.requested == []
+    assert (await svc.get_by_id(summary.id)).pv_values[0].setpoint_value.value == 4.0
 
 
 async def test_paginated_get_does_not_delete_values(db_session: AsyncSession):

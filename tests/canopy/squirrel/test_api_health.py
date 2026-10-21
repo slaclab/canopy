@@ -5,6 +5,8 @@ only, so these run against the sub-app directly with an in-memory Redis instead 
 the DB-gated ``client`` fixture.
 """
 
+import json
+import time
 import asyncio
 from datetime import datetime
 
@@ -17,7 +19,8 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 from canopy.jobs import gateway as jobs_gateway
 from canopy.squirrel.app import app as squirrel_app
 from canopy.squirrel.api.v1 import health
-from canopy.squirrel.config import SquirrelConfig
+from canopy.squirrel.config import PVCacheConfig, SquirrelConfig
+from canopy.squirrel.pv_cache import STATUS_KEY, VALUES_KEY
 from canopy.squirrel.restore_hooks import registry, publish_worker_status
 
 READ_HEADERS = {"X-API-Key": "test-read"}
@@ -160,3 +163,91 @@ async def test_watchdog_reports_the_module(http_client: AsyncClient):
     r = await http_client.get("/v1/health/watchdog")
     assert r.status_code == 200
     assert r.json()["module"] == "squirrel"
+
+
+# --- PV cache status -------------------------------------------------------- #
+
+
+def _cache_config(monkeypatch, enabled: bool) -> None:
+    monkeypatch.setattr(health, "get_squirrel_config", lambda: SquirrelConfig(pv_cache=PVCacheConfig(enabled=enabled)))
+
+
+async def _cache_status(http_client: AsyncClient) -> dict:
+    r = await http_client.get("/v1/health/pv-cache", headers=READ_HEADERS)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+async def _report(redis, **overrides) -> None:
+    now = time.time()
+    report = {
+        "instance": "abc",
+        "host": "worker-1",
+        "leaderSince": now - 60,
+        "heartbeatAt": now,
+        "configured": 3,
+        "monitored": 3,
+        "connected": 3,
+        "seen": 3,
+        "warm": True,
+        **overrides,
+    }
+    await redis.set(STATUS_KEY, json.dumps(report))
+
+
+async def test_pv_cache_status_requires_a_key(http_client: AsyncClient):
+    assert (await http_client.get("/v1/health/pv-cache")).status_code == 401
+
+
+async def test_pv_cache_is_disabled_when_nothing_ran_it(http_client: AsyncClient, monkeypatch):
+    _cache_config(monkeypatch, enabled=False)
+    status = await _cache_status(http_client)
+    assert (status["status"], status["enabled"]) == ("disabled", False)
+
+
+async def test_pv_cache_is_down_when_enabled_but_no_worker_reported(http_client: AsyncClient, monkeypatch):
+    _cache_config(monkeypatch, enabled=True)
+    status = await _cache_status(http_client)
+    assert status["status"] == "down"
+    assert "CANOPY_SQUIRREL__PV_CACHE__ENABLED" in status["error"]
+
+
+async def test_pv_cache_is_ok_with_a_fresh_warm_report(http_client: AsyncClient, redis, monkeypatch):
+    _cache_config(monkeypatch, enabled=True)
+    await _report(redis)
+    await redis.hset(VALUES_KEY, mapping={"A": "{}", "B": "{}"})
+
+    status = await _cache_status(http_client)
+    assert status["status"] == "ok"
+    assert (status["host"], status["monitored"], status["connected"], status["cached"]) == ("worker-1", 3, 3, 2)
+    assert status["heartbeatAgeS"] < 5
+    assert datetime.fromisoformat(status["leaderSince"]).tzinfo is not None
+
+
+@pytest.mark.parametrize("overrides", [{"warm": False, "seen": 1}, {"connected": 2}])
+async def test_pv_cache_is_degraded_while_warming_or_with_disconnected_pvs(
+    http_client: AsyncClient, redis, monkeypatch, overrides
+):
+    _cache_config(monkeypatch, enabled=True)
+    await _report(redis, **overrides)
+    assert (await _cache_status(http_client))["status"] == "degraded"
+
+
+async def test_pv_cache_is_down_when_the_heartbeat_is_stale(http_client: AsyncClient, redis, monkeypatch):
+    _cache_config(monkeypatch, enabled=True)
+    await _report(redis, heartbeatAt=0)
+    status = await _cache_status(http_client)
+    assert status["status"] == "down"
+    assert "heartbeat" in status["error"]
+
+
+async def test_pv_cache_is_down_when_redis_is_unreachable(http_client: AsyncClient, monkeypatch):
+    _cache_config(monkeypatch, enabled=True)
+
+    async def broken_pool():
+        raise RedisConnectionError("connection refused")
+
+    monkeypatch.setattr(jobs_gateway, "get_pool", broken_pool)
+    status = await _cache_status(http_client)
+    assert status["status"] == "down"
+    assert "connection refused" in status["error"]

@@ -21,6 +21,8 @@ from canopy.epics.config import get_epics_config
 from canopy.epics.gateway import build_connector
 from canopy.squirrel.tasks import create_snapshot_task, restore_snapshot_task
 from canopy.converter.tasks import convert_batch
+from canopy.squirrel.config import get_squirrel_config
+from canopy.squirrel.pv_cache import PVCacheMonitor
 from canopy.squirrel.restore_hooks import get_restore_hooks, publish_worker_status
 
 configure_logging()
@@ -54,10 +56,22 @@ async def on_startup(ctx: dict) -> None:
     ctx["epics"] = connector
     get_restore_hooks()
     await publish_worker_status(ctx["redis"])
-    logger.info("canopy-worker startup complete: EPICS connector ready")
+    cache_cfg = get_squirrel_config().pv_cache
+    if cache_cfg.enabled:
+        # Every worker competes for the cache's leader lease; one monitors, the rest stand by.
+        monitor = PVCacheMonitor(connector, ctx["redis"], cache_cfg)
+        monitor.start()
+        ctx["pv_cache_monitor"] = monitor
+    logger.info(
+        "canopy-worker startup complete: EPICS connector ready, PV cache %s",
+        "enabled" if cache_cfg.enabled else "disabled",
+    )
 
 
 async def on_shutdown(ctx: dict) -> None:
+    monitor = ctx.get("pv_cache_monitor")
+    if monitor is not None:
+        await monitor.stop()
     connector = ctx.get("epics")
     if connector is not None:
         await connector.close()
