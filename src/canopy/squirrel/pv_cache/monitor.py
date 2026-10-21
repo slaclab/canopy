@@ -88,6 +88,9 @@ class PVCacheMonitor:
 
         # Leader-only state, cleared on every step-down.
         self._leader_since: float | None = None
+        # Set by the renew loop the moment the lease is gone, so an in-flight flush
+        # doesn't overwrite the new leader's report on its way out.
+        self._lease_lost = False
         self._wanted: set[str] = set()
         self._subs: dict[str, Subscription] = {}
         self._pending: dict[str, PVValue] = {}
@@ -142,6 +145,7 @@ class PVCacheMonitor:
 
     async def _lead(self) -> None:
         self._leader_since = self._clock()
+        self._lease_lost = False
         logger.info("PV cache monitor %s is the leader", self._instance)
         loops = [
             asyncio.create_task(self._renew_loop()),
@@ -184,10 +188,12 @@ class PVCacheMonitor:
                 failures += 1
                 logger.warning("PV cache lease renewal failed (%d/%d): %s", failures, _MAX_RENEW_FAILURES, exc)
                 if failures >= _MAX_RENEW_FAILURES:
+                    self._lease_lost = True
                     return
                 continue
             if not renewed:
                 logger.warning("PV cache monitor %s lost the leader lease", self._instance)
+                self._lease_lost = True
                 return
             failures = 0
 
@@ -314,6 +320,8 @@ class PVCacheMonitor:
                 if address in self._wanted:
                     self._pending.setdefault(address, value)
             raise
+        if self._lease_lost:
+            return
         await self._redis.set(STATUS_KEY, json.dumps(self.status_report(now)))
 
     def status_report(self, now: float) -> dict[str, Any]:
