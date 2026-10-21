@@ -33,8 +33,8 @@ PV names, values or key names.
 
 ### Single default registry
 
-Modules create metrics with the plain `prometheus_client` constructors, which
-register into the default `REGISTRY`. No per-module sub-registries: merging
+Modules create metrics with the plain `prometheus_client` constructors, or
+register a collector, into the default `REGISTRY`. No per-module sub-registries: merging
 them at exposition adds machinery with no benefit at our scale.
 
 !!! warning "Multi-process caveat"
@@ -81,10 +81,21 @@ app's `/openapi.json`, a sub-app's `/docs`) are counted under
 
 Each module already computes its operational numbers for
 `/<module>/v1/health/summary`. Module gauges expose **the same numbers from
-the same code**, read when Prometheus scrapes (`Gauge.set_function` over the
-service's existing status call) rather than updated on every state change.
-The hot paths — broker fan-out, buffer appends, formula evaluation — never
-touch a metric, and the dashboard and the health endpoint cannot disagree.
+the same code**, read when Prometheus scrapes rather than updated on every
+state change: one custom collector per module fetches the service through the
+module's gateway, calls its existing status method once, and yields a gauge
+per field. The hot paths — broker fan-out, buffer appends, formula
+evaluation — never touch a metric, and the dashboard and the health endpoint
+cannot disagree.
+
+Three properties of that collector are deliberate. Going through the gateway
+means it rides the lifespan's existing bind and unbind, so a scrape before
+startup or after shutdown reads zeros and nothing is bound twice. Calling the
+status method once per scrape keeps a module with an expensive status from
+paying for it once per gauge. And it catches exceptions from that call, logs,
+and yields nothing, so one module's fault drops its own series from that
+scrape and never the whole exposition. A collector that raises fails the
+entire `/metrics` response, HTTP and process metrics included.
 
 Counters and histograms (things that *happen*, not things that *are*) are
 the exception: those have to be incremented where the event occurs. Keep them
@@ -104,9 +115,14 @@ speculatively.
   `canopy_http_request_duration_seconds{method,module,route}`. Modules get
   this for free — no per-module code. WebSocket sessions are not HTTP
   requests and are not covered here; Hare's gauges are the view into them.
+  Two requests arrive on their own and form a steady baseline under
+  `module="core"`: the container healthcheck on `/health` and Prometheus's
+  own scrape of `/metrics`. Each has its own `route` label, so a panel that
+  wants user traffic excludes them with one selector.
 - **Hare** (the exemplar for module gauges): `canopy_hare_clients`,
-  `canopy_hare_active_monitors`, `canopy_hare_subscriptions` — the broker's
-  status, which is also what `/hare/v1/health/summary` reports. The client
+  `canopy_hare_active_monitors`, `canopy_hare_subscriptions` — one collector
+  over the broker's status, which is also what `/hare/v1/health/summary`
+  reports. The client
   count includes in-process consumers (Vole holds a permanent broker client),
   exactly as the health summary does.
 
@@ -123,15 +139,18 @@ Use `canopy.hare.metrics` as the template:
 1. Declare the metrics at module scope in `canopy/<module>/metrics.py` with a
    `canopy_<module>_` name. Import `DEFAULT_API_BUCKETS` from
    `canopy.core.metrics` for histograms.
-2. For gauges, expose a `bind(service)` that points each gauge at the
-   service's existing status method with `set_function`. The module's
-   lifespan calls `bind(service)` right after it binds the gateway and
-   `bind(None)` on shutdown. Nothing else in the module should know the
-   gauges exist.
+2. For gauges, write a collector like `canopy.hare.metrics.HareCollector`:
+   fetch the service through the module's gateway (treat "not bound" as
+   zeros), call its status method once, yield a `GaugeMetricFamily` per
+   field, and catch exceptions from that call so one module's fault cannot
+   fail the scrape. Expose a `register()` that adds it to the default
+   registry and call it once from the module's `app.py` at import. Nothing
+   else in the module should know the collector exists.
 3. Check the label-discipline rules above before adding any label.
 4. Add the metric names to the exposition test in
-   `tests/canopy/core/test_metrics.py`, plus a module test that each gauge
-   agrees with the health summary.
+   `tests/canopy/core/test_metrics.py`, plus module tests that each gauge
+   agrees with the health summary and that a failing status call drops the
+   module's series but not the scrape.
 
 ## Scraping
 

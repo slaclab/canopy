@@ -28,15 +28,17 @@ async def hare_lifespan():
     broker = PVBroker(connector, hare_config)
     await broker.start()
     gateway.bind(broker)
-    metrics.bind(broker)
     mark_started()
     logger.info("Hare started: EPICS backend=%r", epics_config.backend)
     try:
         yield
     finally:
-        await broker.stop()
-        metrics.bind(None)
-        gateway.bind(None)
+        try:
+            await broker.stop()
+        finally:
+            # Unbind even if stop() raised, so neither the gateway nor the metrics
+            # collector keeps reading a half-torn-down broker.
+            gateway.bind(None)
         logger.info("Hare shutdown complete")
 
 
@@ -47,3 +49,4 @@ app = FastAPI(
 
 register_canopy_error_handler(app)
 app.include_router(v1_router)
+metrics.register()

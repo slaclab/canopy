@@ -15,6 +15,7 @@ reported as ``other``.
 """
 
 import time
+import asyncio
 
 from starlette.types import Send, Scope, ASGIApp, Message, Receive
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
@@ -64,6 +65,12 @@ class HTTPMetricsMiddleware:
     FastAPI routes (``APIRoute``) populate ``scope["route"]``; Starlette's own
     routes — every app's ``/openapi.json``, a sub-app's ``/docs`` — are counted
     under ``route="unmatched"`` with their real status code.
+
+    An exception that reaches this middleware before any response started is
+    counted as a 500, which is what ``ServerErrorMiddleware`` (outside it) then
+    sends. A cancellation that arrives before any response started — uvicorn's
+    graceful-shutdown timeout cancelling in-flight handlers — is not a response
+    at all and is not counted.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -75,7 +82,8 @@ class HTTPMetricsMiddleware:
             return
 
         method = _method_label(scope)
-        status = "500"
+        status: str | None = None  # set by the response start, if one is ever sent
+        cancelled = False
         start = time.perf_counter()
 
         async def send_wrapper(message: Message) -> None:
@@ -86,12 +94,16 @@ class HTTPMetricsMiddleware:
 
         try:
             await self.app(scope, receive, send_wrapper)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
-            duration = time.perf_counter() - start
-            module = _module_label(scope)
-            route = _route_label(scope)
-            HTTP_REQUESTS.labels(method=method, module=module, route=route, status=status).inc()
-            HTTP_REQUEST_DURATION.labels(method=method, module=module, route=route).observe(duration)
+            if status is not None or not cancelled:
+                duration = time.perf_counter() - start
+                module = _module_label(scope)
+                route = _route_label(scope)
+                HTTP_REQUESTS.labels(method=method, module=module, route=route, status=status or "500").inc()
+                HTTP_REQUEST_DURATION.labels(method=method, module=module, route=route).observe(duration)
 
 
 def _module_label(scope: Scope) -> str:

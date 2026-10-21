@@ -1,11 +1,15 @@
 """canopy.core.metrics — HTTP middleware labels + /metrics exposition."""
 
+import asyncio
+
+import pytest
 from prometheus_client import REGISTRY
 from fastapi.testclient import TestClient
 from prometheus_client.parser import text_string_to_metric_families
 
 from canopy.main import app
 from tests.conftest import READ_HEADERS
+from canopy.core.metrics import HTTPMetricsMiddleware
 
 
 def _requests_total(**labels) -> float:
@@ -95,6 +99,44 @@ def test_cors_preflight_not_counted():
         )
     assert resp.status_code == 200
     assert "access-control-allow-origin" in resp.headers
+    assert _requests_total(**labels) == before
+
+
+async def _never_called(*_):
+    raise AssertionError("the fake apps below neither read a body nor send a response")
+
+
+def _bare_scope() -> dict:
+    """Straight into the middleware: the tagged parent app, no matched route."""
+    return {"type": "http", "method": "GET", "app": app}
+
+
+async def test_unhandled_exception_is_counted_as_500():
+    """ServerErrorMiddleware, outside this one, turns the exception into a 500
+    response, so that is what the request was."""
+
+    async def failing_app(scope, receive, send):
+        raise RuntimeError("boom")
+
+    labels = dict(method="GET", module="core", route="unmatched", status="500")
+    before = _requests_total(**labels)
+    with pytest.raises(RuntimeError):
+        await HTTPMetricsMiddleware(failing_app)(_bare_scope(), _never_called, _never_called)
+    assert _requests_total(**labels) == before + 1
+
+
+async def test_cancelled_before_any_response_is_not_counted():
+    """A handler cancelled before it sent anything (uvicorn's graceful-shutdown
+    timeout) produced no response, so there is no status to count, and the
+    cancellation propagates untouched."""
+
+    async def cancelled_app(scope, receive, send):
+        raise asyncio.CancelledError()
+
+    labels = dict(method="GET", module="core", route="unmatched", status="500")
+    before = _requests_total(**labels)
+    with pytest.raises(asyncio.CancelledError):
+        await HTTPMetricsMiddleware(cancelled_app)(_bare_scope(), _never_called, _never_called)
     assert _requests_total(**labels) == before
 
 
