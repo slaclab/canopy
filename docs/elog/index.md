@@ -26,7 +26,7 @@ routes (env names are case-insensitive, so `APPS__SQUIRREL__` serves
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CANOPY_ELOG__PROVIDER` | `""` (disabled) | `elog_plus`, or a `module:Class` dotted path to an out-of-tree adapter. |
-| `CANOPY_ELOG__ELOG_PLUS__BASE_URL` | — | elog-plus' **application-token ingress**. SLAC production: `https://elog.example.org/api/elog-apptoken`. Not `/api/elog`: that path is behind Vouch, which strips the token header. |
+| `CANOPY_ELOG__ELOG_PLUS__BASE_URL` | — | elog-plus' **application-token ingress**. For example: `https://elog.example.org/api/elog-apptoken`. Not `/api/elog`: that path is behind Vouch, which strips the token header. |
 | `CANOPY_ELOG__ELOG_PLUS__AUTH_HEADER` | `x-vouch-idp-accesstoken` | Header the token travels in; matches `ELOG_PLUS_AUTH_HEADER` on the elog-plus service. |
 | `CANOPY_ELOG__APPS__<APP>__TOKEN` | — | The app's elog-plus application token. An app without one reports `enabled: false`. |
 | `CANOPY_ELOG__APPS__<APP>__DEFAULT_LOGBOOK_IDS` | `[]` | JSON list of logbook ids the client preselects, e.g. `["<id>"]`. |
