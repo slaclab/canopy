@@ -49,9 +49,11 @@ class PVCacheReader:
     async def lookup(self, addresses: list[str]) -> CacheLookup:
         """Split ``addresses`` into cache hits and the misses to read live.
 
-        An entry is a hit only when it is connected and was written by the current
-        leader (``cachedAt >= leaderSince``): an entry left by an earlier leader may
-        describe a channel nobody was watching since. The whole cache is skipped when
+        An entry is a hit only when it is connected and carries the generation the
+        status report names, i.e. was written under the current leader's lease: an
+        entry left by an earlier leader may describe a channel nobody was watching
+        since. Generations are compared rather than timestamps, so clock skew between
+        workers can't make an old entry look current. The whole cache is skipped when
         no monitor has reported or its heartbeat is older than ``heartbeat_max_age_s``.
         """
         try:
@@ -63,7 +65,9 @@ class PVCacheReader:
         age = self._clock() - float(status.get("heartbeatAt") or 0)
         if age > self._heartbeat_max_age_s:
             return CacheLookup(misses=list(addresses), skipped=f"the PV cache heartbeat is {age:.0f}s old")
-        leader_since = float(status.get("leaderSince") or 0)
+        generation = status.get("generation")
+        if not generation:
+            return CacheLookup(misses=list(addresses), skipped="the PV cache report names no leader generation")
 
         result = CacheLookup()
         try:
@@ -71,7 +75,7 @@ class PVCacheReader:
                 chunk = addresses[start : start + BATCH_SIZE]
                 raws = await self._redis.hmget(VALUES_KEY, chunk)
                 for address, raw in zip(chunk, raws, strict=True):
-                    value = self._trusted(raw, leader_since)
+                    value = self._trusted(raw, generation)
                     if value is None:
                         result.misses.append(address)
                     else:
@@ -81,14 +85,14 @@ class PVCacheReader:
         return result
 
     @staticmethod
-    def _trusted(raw: bytes | str | None, leader_since: float) -> EpicsValue | None:
+    def _trusted(raw: bytes | str | None, generation: str) -> EpicsValue | None:
         if raw is None:
             return None
         try:
-            cached_at, pv = decode_entry(raw)
+            entry_generation, pv = decode_entry(raw)
         except (ValueError, KeyError, TypeError):
             logger.warning("Ignoring an unreadable PV cache entry")
             return None
-        if cached_at < leader_since or not pv.connected:
+        if entry_generation != generation or not pv.connected:
             return None
         return _to_epics_value(pv)

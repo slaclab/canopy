@@ -1,8 +1,9 @@
 """Redis keys and the entry format shared by the PV cache's writer and readers.
 
 The elected ``canopy-worker`` writes; snapshot create and the health endpoint read.
-Each cached value is stored as ``{"cachedAt": <unix seconds>, "pv": <PVValue>}`` so a
-reader gets back exactly the ``PVValue`` a live ``connector.get()`` would return.
+Each cached value is stored as ``{"gen": <lease generation>, "cachedAt": <unix seconds>,
+"pv": <PVValue>}`` so a reader gets back exactly the ``PVValue`` a live
+``connector.get()`` would return, and can tell which leader's lease wrote it.
 """
 
 from __future__ import annotations
@@ -23,13 +24,14 @@ STATUS_KEY = "canopy:squirrel:pv_cache:status"
 BATCH_SIZE = 2000
 
 
-def encode_entry(value: PVValue, cached_at: float) -> str:
-    return json.dumps({"cachedAt": cached_at, "pv": value.model_dump(mode="json")})
+def encode_entry(value: PVValue, cached_at: float, generation: str | None) -> str:
+    return json.dumps({"gen": generation, "cachedAt": cached_at, "pv": value.model_dump(mode="json")})
 
 
-def decode_entry(raw: bytes | str) -> tuple[float, PVValue]:
+def decode_entry(raw: bytes | str) -> tuple[str | None, PVValue]:
+    """The generation that wrote the entry, and its value."""
     entry = json.loads(raw)
-    return float(entry["cachedAt"]), PVValue.model_validate(entry["pv"])
+    return entry.get("gen"), PVValue.model_validate(entry["pv"])
 
 
 async def read_status(redis: Any) -> dict[str, Any] | None:

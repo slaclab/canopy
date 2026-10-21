@@ -52,11 +52,15 @@ class _Sub:
 class FakeConnector:
     """Monitors that fire only on `emit`, so tests control exactly what the cache hears."""
 
-    def __init__(self) -> None:
+    def __init__(self, fail_once: set[str] | None = None) -> None:
         self.callbacks: dict = {}
         self.closed: list[str] = []
+        self.fail_once = set(fail_once or ())
 
     async def subscribe(self, pv, on_event):
+        if pv in self.fail_once:
+            self.fail_once.discard(pv)
+            raise RuntimeError(f"cannot monitor {pv}")
         self.callbacks[pv] = on_event
         return _Sub(self, pv)
 
@@ -144,6 +148,8 @@ async def test_flush_writes_values_disconnects_and_a_heartbeat():
         assert status["seen"] == 2
         assert status["warm"] is True
         assert status["heartbeatAt"] >= status["leaderSince"]
+        # Entries and report carry the generation the lease was taken with.
+        assert a["gen"] == status["generation"] == (await redis.get(LEADER_KEY)).decode()
     finally:
         await monitor.stop()
 
@@ -191,11 +197,41 @@ async def test_reconcile_follows_the_registered_pvs():
         await monitor.stop()
 
 
+async def test_a_former_leader_cannot_write_after_losing_its_lease():
+    """A leader that resumes after a pause must not overwrite the new leader's cache."""
+    redis = fakeredis.aioredis.FakeRedis()
+    monitor, connector = await _leader(redis, {"A"})
+    try:
+        await monitor.flush()
+        report_before = await redis.get(STATUS_KEY)
+        await redis.hdel(VALUES_KEY, "A")
+
+        await redis.set(LEADER_KEY, "new-leader-generation")  # taken over during a pause
+        connector.emit(_pv("A", 99.0))
+        await monitor.flush()  # runs before the renew loop notices
+
+        assert not await redis.hexists(VALUES_KEY, "A")
+        assert await redis.get(STATUS_KEY) == report_before
+    finally:
+        await monitor.stop()
+
+
+async def test_a_failed_subscription_is_retried_on_the_next_reconcile():
+    redis = fakeredis.aioredis.FakeRedis()
+    connector = FakeConnector(fail_once={"B"})
+    monitor = PVCacheMonitor(connector, redis, FAST, _loader({"A", "B"}))
+    monitor.start()
+    try:
+        assert await wait_for(lambda: set(connector.callbacks) == {"A", "B"})
+    finally:
+        await monitor.stop()
+
+
 # --- what the reader trusts -------------------------------------------------- #
 
 
-async def _write_status(redis, *, heartbeat_at: float, leader_since: float) -> None:
-    await redis.set(STATUS_KEY, json.dumps({"heartbeatAt": heartbeat_at, "leaderSince": leader_since}))
+async def _write_status(redis, *, heartbeat_at: float, generation: str = "gen-2") -> None:
+    await redis.set(STATUS_KEY, json.dumps({"heartbeatAt": heartbeat_at, "generation": generation}))
 
 
 async def test_reader_skips_the_cache_when_no_monitor_has_reported():
@@ -208,24 +244,25 @@ async def test_reader_skips_the_cache_when_no_monitor_has_reported():
 async def test_reader_skips_the_cache_when_the_heartbeat_is_stale():
     redis = fakeredis.aioredis.FakeRedis()
     now = time.time()
-    await _write_status(redis, heartbeat_at=now - 120, leader_since=now - 600)
-    await redis.hset(VALUES_KEY, "A", encode_entry(_pv("A"), now - 130))
+    await _write_status(redis, heartbeat_at=now - 120)
+    await redis.hset(VALUES_KEY, "A", encode_entry(_pv("A"), now - 130, "gen-2"))
 
     lookup = await PVCacheReader(redis, heartbeat_max_age_s=30).lookup(["A"])
     assert lookup.misses == ["A"]
     assert "heartbeat" in lookup.skipped
 
 
-async def test_reader_serves_only_connected_entries_written_by_the_current_leader():
+async def test_reader_serves_only_connected_entries_from_the_current_generation():
     redis = fakeredis.aioredis.FakeRedis()
     now = time.time()
-    await _write_status(redis, heartbeat_at=now, leader_since=now - 10)
+    await _write_status(redis, heartbeat_at=now)
     await redis.hset(
         VALUES_KEY,
         mapping={
-            "fresh": encode_entry(_pv("fresh", 7.0), now - 1),
-            "previous-leader": encode_entry(_pv("previous-leader"), now - 60),
-            "disconnected": encode_entry(_pv("disconnected", connected=False), now - 1),
+            "fresh": encode_entry(_pv("fresh", 7.0), now - 1, "gen-2"),
+            # A previous leader on a host whose clock runs ahead: newer timestamp, wrong generation.
+            "previous-leader": encode_entry(_pv("previous-leader"), now + 600, "gen-1"),
+            "disconnected": encode_entry(_pv("disconnected", connected=False), now - 1, "gen-2"),
             "garbage": "not json",
         },
     )
@@ -247,7 +284,7 @@ async def test_a_new_leaders_entries_become_hits_as_its_monitors_report():
     """After a takeover, the previous leader's entries are misses until the new one rewrites them."""
     redis = fakeredis.aioredis.FakeRedis()
     old = time.time() - 60
-    await redis.hset(VALUES_KEY, mapping={a: encode_entry(_pv(a), old) for a in ("A", "B")})
+    await redis.hset(VALUES_KEY, mapping={a: encode_entry(_pv(a), old, "previous-generation") for a in ("A", "B")})
 
     monitor, connector = await _leader(redis, {"A", "B"})
     try:
