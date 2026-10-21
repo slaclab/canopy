@@ -22,6 +22,7 @@ dependencies = [
     "redis>=5.0",
     "PyDMConverter>=1.0.7",
     "python-multipart>=0.0.32",
+    "markdown>=3.5",
 ]
 
 [dependency-groups]
