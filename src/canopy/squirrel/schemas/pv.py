@@ -51,7 +51,7 @@ class PVElementDTO(PVBase):
 
     id: str
     tags: list[TagDTO] = []
-    facility_ids: list[str] = []
+    facilities: list[str] = []  # slugs
     created_date: datetime
     last_modified_date: datetime
     created_by: str | None = None

@@ -30,7 +30,7 @@ router = APIRouter(prefix="/v1/facilities", tags=["Facilities"])
 
 @router.get("", dependencies=[Security(require_read_or_admin_access)])
 async def list_facilities(service: FacilityServiceDep) -> list[FacilityDTO]:
-    """Full facility hierarchy, flat with ``parent_id`` — the client assembles the tree."""
+    """Full facility hierarchy, flat with ``parent`` — the client assembles the tree."""
     return await service.get_all()
 
 

@@ -89,6 +89,21 @@ async def test_snapshot_list_filtered_by_facility(client: AsyncClient, db_sessio
     assert {"sc-snap", "facet-snap", "no-facility-snap"} <= titles
 
 
+async def test_snapshots_report_their_facility_by_slug(client: AsyncClient, db_session: AsyncSession):
+    sc = await _seed_facility(db_session, "lcls-sc")
+    snapshot = Snapshot(title="sc-snap", facility_id=sc.id)
+    db_session.add_all([snapshot, Snapshot(title="no-facility-snap")])
+    await db_session.commit()
+
+    r = await client.get("/v1/snapshots", headers=READ_HEADERS)
+    by_title = {s["title"]: s for s in r.json()["results"]}
+    assert by_title["sc-snap"]["facility"] == "lcls-sc"
+    assert by_title["no-facility-snap"]["facility"] is None
+
+    r = await client.get(f"/v1/snapshots/{snapshot.id}", headers=READ_HEADERS)
+    assert r.json()["facility"] == "lcls-sc"
+
+
 async def test_create_snapshot_enqueues_with_facility(client: AsyncClient, enqueued: list, db_session: AsyncSession):
     facility = await _seed_facility(db_session, "createfac")
     r = await client.post("/v1/snapshots", headers=WRITE_HEADERS, json={"title": "T", "facility": "createfac"})

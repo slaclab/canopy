@@ -31,12 +31,11 @@ async def main() -> int:
         print("No facilities. Create one with scripts/create_facility.py.")
         return 0
 
-    slug_by_id = {f.id: f.slug for f in facilities}
     rows = [
         (
             f.slug,
             f.name,
-            slug_by_id.get(f.parent_id, "") if f.parent_id else "",
+            f.parent or "",
             f.description or "",
             f.id,
         )
