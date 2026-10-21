@@ -23,10 +23,9 @@ naming and label rules. That is a follow-up; nothing here changes for it.
 The endpoint is unauthenticated, like `/health`, `/docs` and every
 module's `/openapi.json`. This follows Prometheus's own security model, which
 assumes exposition endpoints are reachable only from trusted networks and
-leaves access control to the network rather than the application. The
-[facility deployments](../deployment/production.md) bind the API directly on
-hosts inside the lab's networks, and nothing documented exposes it beyond
-them, so that assumption holds today. What the payload adds to the already
+leaves access control to the network rather than the application.
+[Production deployments](../deployment/production.md) must restrict access
+to the API's metrics endpoint to trusted networks. What the payload adds to the already
 public route map is operational telemetry — request counts, latencies, status
 codes, connected-client counts, process memory and the Python version — never
 PV names, values or key names.
@@ -158,7 +157,6 @@ The `docker/observability/` overlay runs Prometheus (`:9090`) scraping
 `api:8000/metrics` every 15 s, with a provisioned Grafana datasource
 (`canopy-prometheus`). See the [setup guide](setup_guide.md).
 
-That overlay is the only scraper today: the [facility deployments](../deployment/production.md)
-run no Prometheus yet. The endpoint costs nothing to serve, and once a
-facility Prometheus exists it only needs a scrape target of
+The [production deployment guide](../deployment/production.md) does not
+include Prometheus. To use a facility's Prometheus, configure a scrape target of
 `<api-host>:<API_PORT>/metrics`.
