@@ -23,6 +23,7 @@ dependencies = [
     "PyDMConverter>=1.0.7",
     "python-multipart>=0.0.32",
     "markdown>=3.5",
+    "prometheus-client>=0.20",
 ]
 
 [dependency-groups]

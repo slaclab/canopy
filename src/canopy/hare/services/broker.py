@@ -585,9 +585,12 @@ class PVBroker:
         return {
             "running": self._running,
             "backend": getattr(self._connector, "backend_name", None),
-            "clients": len(self._channels),
             "active_monitors": len(self._monitors),
             **self._registry.stats(),
+            # After the spread so it wins over the registry's own ``clients``
+            # bookkeeping key; the two are kept in step, but this is the count
+            # of connected channels the health summary describes.
+            "clients": len(self._channels),
         }
 
     # --- lifecycle hooks ------------------------------------------------- #
