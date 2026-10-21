@@ -16,7 +16,6 @@ import asyncio
 import logging
 import importlib
 
-from canopy.core.errors import CanopyError
 from canopy.elog.config import ElogConfig
 from canopy.elog.validation import is_app
 from canopy.elog.adapters.base import (
@@ -100,6 +99,8 @@ def _resolve_provider_class(provider: str) -> type[ElogAdapter]:
         cls = getattr(module, class_name, None)
         if cls is None:
             raise ValueError(f"E-log adapter class '{class_name}' not found in '{module_path}'")
+        if not isinstance(cls, type) or not callable(getattr(cls, "from_config", None)):
+            raise ValueError(f"'{provider}' is not an e-log adapter class (it has no from_config classmethod)")
         return cls
 
     cls = get_registered_provider(provider)
@@ -135,7 +136,7 @@ def build_registry(config: ElogConfig) -> ElogRegistry:
             continue
         try:
             adapters[app] = cls.from_config(app, app_config, config)
-        except (CanopyError, ValueError) as exc:
+        except Exception as exc:  # an out-of-tree adapter may raise anything; none of it may abort startup
             # Provider-level config (base URL, ...) is shared by every app, so
             # one app failing here means they all would: disable the module.
             # Adapters built so far have sent nothing, so dropping them is enough.

@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 _MARKDOWN_EXTENSIONS = ["extra", "sane_lists", "nl2br"]
 _HEALTH_TIMEOUT_S = 2.0
 _ERROR_EXCERPT_CHARS = 500
+_NO_EMAIL = "elog-plus /v1/users/me returned no email for this app's token"
 
 
 def render_markdown(md: str) -> str:
@@ -191,7 +192,7 @@ class ElogPlusAdapter:
             email = _email_of(await self._call("GET", "/v1/users/me"))
             if not email:
                 # Without it the author filter would drop out and list everyone's entries.
-                raise ElogUpstreamError("elog-plus /v1/users/me returned no email for this app's token")
+                raise ElogUpstreamError(_NO_EMAIL)
             self._email = email
         return self._email
 
@@ -287,11 +288,13 @@ class ElogPlusAdapter:
         start = time.monotonic()
         try:
             email = _email_of(await self._call("GET", "/v1/users/me", timeout=_HEALTH_TIMEOUT_S))
+            if not email:
+                # Recent entries would fail on the same payload, so don't report ok.
+                raise ElogUpstreamError(_NO_EMAIL)
         except Exception as exc:
             return AdapterHealth(healthy=False, latency_ms=(time.monotonic() - start) * 1000, last_error=str(exc))
-        if email:
-            self._email = email
-        return AdapterHealth(healthy=True, identity=email or None, latency_ms=(time.monotonic() - start) * 1000)
+        self._email = email
+        return AdapterHealth(healthy=True, identity=email, latency_ms=(time.monotonic() - start) * 1000)
 
     async def close(self) -> None:
         if not self._client.is_closed:

@@ -11,7 +11,7 @@ from fastapi import File, Query, Security, APIRouter, UploadFile
 
 from canopy.elog.errors import ElogAttachmentTooLarge
 from canopy.core.security import APIKey, require_read_access, require_write_access
-from canopy.elog.dependencies import ElogConfigDep, ElogServiceDep
+from canopy.elog.dependencies import ElogServiceDep
 from canopy.elog.schemas.elog import (
     ElogTagDTO,
     ElogUserDTO,
@@ -84,11 +84,10 @@ async def list_recent_entries(
 async def upload_attachment(
     app: str,
     service: ElogServiceDep,
-    config: ElogConfigDep,
     file: Annotated[UploadFile, File(description="The file to attach")],
 ) -> ElogAttachmentDTO:
     """Upload one file; pass the returned ``id`` in ``attachmentIds`` when posting the entry."""
-    data = await _read_upload(file, config.max_attachment_bytes)
+    data = await _read_upload(file, service.max_attachment_bytes)
     return await service.upload_attachment(
         app, filename=file.filename or "attachment", content_type=file.content_type, data=data
     )

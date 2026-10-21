@@ -288,8 +288,8 @@ class TestAttachments:
         assert r.json() == {"id": "att-1"}
         assert squirrel_adapter.calls == [("upload_attachment", "plot.png", "image/png", b"\x89PNG")]
 
-    def test_over_the_limit_is_413(self, elog_client, squirrel_adapter, monkeypatch):
-        monkeypatch.setenv("CANOPY_ELOG__MAX_ATTACHMENT_BYTES", "8")
+    def test_over_the_limit_is_413(self, elog_client, squirrel_adapter, use_service):
+        use_service(build_service({"squirrel": squirrel_adapter}, max_attachment_bytes=8))
 
         r = elog_client.post(
             "/elog/v1/apps/squirrel/attachments", files={"file": ("big.bin", b"123456789")}, headers=WRITE_HEADERS
@@ -299,8 +299,8 @@ class TestAttachments:
         assert r.json()["code"] == "elog_attachment_too_large"
         assert squirrel_adapter.calls == []
 
-    def test_at_the_limit_is_accepted(self, elog_client, monkeypatch):
-        monkeypatch.setenv("CANOPY_ELOG__MAX_ATTACHMENT_BYTES", "8")
+    def test_at_the_limit_is_accepted(self, elog_client, squirrel_adapter, use_service):
+        use_service(build_service({"squirrel": squirrel_adapter}, max_attachment_bytes=8))
 
         r = elog_client.post(
             "/elog/v1/apps/squirrel/attachments", files={"file": ("ok.bin", b"12345678")}, headers=WRITE_HEADERS

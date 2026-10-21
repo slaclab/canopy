@@ -2,13 +2,15 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from pydantic import ValidationError
+from pydantic_settings import SettingsError
 
 from canopy.elog import gateway
 from canopy.core.errors import register_canopy_error_handler
-from canopy.elog.config import get_elog_config
+from canopy.elog.config import ElogConfig, get_elog_config, describe_settings_error
 from canopy.elog.runtime import mark_started
 from canopy.elog.api.v1.router import router as v1_router
-from canopy.elog.adapters.registry import build_registry
+from canopy.elog.adapters.registry import ElogRegistry, build_registry
 from canopy.elog.services.elog_service import ElogService
 
 logger = logging.getLogger(__name__)
@@ -21,9 +23,17 @@ async def elog_lifespan():
     Mounted sub-apps don't run their own lifespan behind ``app.mount()``.
     Startup builds one adapter per configured app (each with its own token)
     and binds the ElogService to the gateway; shutdown closes the adapters.
+    Settings that don't parse disable e-log rather than stopping Canopy: the
+    service then runs on defaults and reports why in every app's config.
     """
-    config = get_elog_config()
-    registry = build_registry(config)
+    try:
+        config = get_elog_config()
+    except (ValidationError, SettingsError) as exc:
+        reason = describe_settings_error(exc)
+        logger.error("E-log disabled: %s", reason)
+        config, registry = ElogConfig.model_construct(), ElogRegistry(None, disabled_reason=reason)
+    else:
+        registry = build_registry(config)
     service = ElogService(config, registry)
     gateway.bind(service)
     mark_started()

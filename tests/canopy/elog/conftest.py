@@ -21,10 +21,13 @@ from canopy.elog.services.elog_service import ElogService
 DEFAULT_LOGBOOK_IDS = ["lb-ops"]
 
 
-def build_service(adapters: dict[str, FakeElogAdapter], *, enabled: bool = True) -> ElogService:
+def build_service(
+    adapters: dict[str, FakeElogAdapter], *, enabled: bool = True, max_attachment_bytes: int = 20 * 1024 * 1024
+) -> ElogService:
     config = ElogConfig(
         provider="fake" if enabled else "",
         apps={app: ElogAppConfig(token="t", default_logbook_ids=DEFAULT_LOGBOOK_IDS) for app in adapters},
+        max_attachment_bytes=max_attachment_bytes,
     )
     if enabled:
         registry = ElogRegistry("fake", adapters)

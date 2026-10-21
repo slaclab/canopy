@@ -2,6 +2,8 @@
 
 import logging
 
+import pytest
+
 from canopy.elog.config import ElogConfig, ElogAppConfig, ElogPlusConfig
 from tests.canopy.elog._fakes import FakeElogAdapter
 from canopy.elog.adapters.registry import ElogRegistry, build_registry
@@ -74,6 +76,23 @@ def test_dotted_path_provider_loads_an_out_of_tree_adapter():
     registry = build_registry(_config(provider=FAKE_PATH, apps={"squirrel": ElogAppConfig(token="t")}))
 
     assert isinstance(registry.get("squirrel"), FakeElogAdapter)
+
+
+@pytest.mark.parametrize("provider", ["json:JSONDecoder", "json:loads", "json:__name__"])
+def test_dotted_path_to_something_that_is_not_an_adapter_disables_the_module(provider):
+    registry = build_registry(_config(provider=provider, apps={"squirrel": ElogAppConfig(token="t")}))
+
+    assert registry.enabled is False
+    assert "is not an e-log adapter class" in registry.disabled_reason
+
+
+def test_adapter_factory_failure_of_any_kind_disables_the_module():
+    registry = build_registry(
+        _config(provider="tests.canopy.elog._fakes:ExplodingElogAdapter", apps={"squirrel": ElogAppConfig(token="t")})
+    )
+
+    assert registry.enabled is False
+    assert registry.disabled_reason == "adapter factory blew up"
 
 
 def test_dotted_path_to_a_missing_module_disables_the_module():

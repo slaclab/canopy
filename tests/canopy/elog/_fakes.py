@@ -89,3 +89,11 @@ class FakeElogAdapter:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class ExplodingElogAdapter(FakeElogAdapter):
+    """An out-of-tree adapter whose factory fails with something other than a config error."""
+
+    @classmethod
+    def from_config(cls, app: str, app_config: ElogAppConfig, config: ElogConfig) -> "ExplodingElogAdapter":
+        raise RuntimeError("adapter factory blew up")

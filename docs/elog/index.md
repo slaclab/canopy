@@ -42,9 +42,12 @@ CANOPY_ELOG__APPS__SQUIRREL__DEFAULT_LOGBOOK_IDS=["<logbook id>"]
 CANOPY_ELOG__APPS__TRACE__TOKEN=<trace's elog-plus token>
 ```
 
-A misconfigured provider (unknown name, missing base URL) leaves the module
-disabled rather than failing Canopy's startup. The startup log says why, and
-so does every app's `config` route (`reason`).
+Misconfiguration leaves the module disabled rather than failing Canopy's
+startup: an unknown provider, a dotted path that isn't an adapter class, a
+missing base URL, or a `CANOPY_ELOG__*` value that doesn't parse (a
+non-numeric `TIMEOUT_S`, a `DEFAULT_LOGBOOK_IDS` that isn't a JSON list). The
+startup log says why, and so does every app's `config` route (`reason`). The
+reason names the offending variables, never their values.
 
 ## Minting an elog-plus application token
 
@@ -146,7 +149,7 @@ malformed request.
 
 | `status` | When | `reason` |
 |----------|------|----------|
-| `disabled` | no usable provider (`PROVIDER` empty, unknown, or missing its base URL) | why, as in the `config` route |
+| `disabled` | no usable provider (`PROVIDER` empty or unknown, base URL missing, or settings that don't parse) | why, as in the `config` route |
 | `down` | a provider is set but no app has a token | `No app has an e-log token configured ...` |
 | `down` | every app's token probe fails | `null`; see each app's `lastError` |
 | `degraded` | some apps' probes fail | `null` |

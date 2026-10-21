@@ -50,6 +50,10 @@ class ElogService:
     def registry(self) -> ElogRegistry:
         return self._registry
 
+    @property
+    def max_attachment_bytes(self) -> int:
+        return self._config.max_attachment_bytes
+
     def _adapter_for(self, app: str) -> ElogAdapter:
         _check_app_name(app)
         if not self._registry.enabled:

@@ -276,6 +276,16 @@ class TestHealth:
         assert health.last_error is None
         assert health.latency_ms is not None
 
+    @pytest.mark.parametrize("payload", [None, {}, {"uid": "squirrel"}])
+    async def test_identity_without_an_email_is_unhealthy(self, adapter, httpx_mock: HTTPXMock, payload):
+        # Recent entries refuse the same payload, so the probe must not report ok.
+        httpx_mock.add_response(url=f"{BASE}/v1/users/me", json=_envelope(payload))
+
+        health = await adapter.health()
+
+        assert health.healthy is False
+        assert "no email" in health.last_error
+
     async def test_rejected_token_is_unhealthy(self, adapter, httpx_mock: HTTPXMock):
         httpx_mock.add_response(status_code=401, json={"errorCode": -1, "errorMessage": "Not authenticated"})
 
@@ -296,7 +306,8 @@ class TestFromConfig:
         try:
             assert adapter.app == "squirrel"
             assert adapter._client.headers["x-app-token"] == "tok"
-            assert str(adapter._client.base_url) == f"{BASE}"
+            # httpx may or may not normalize a trailing slash onto base_url, depending on version.
+            assert str(adapter._client.base_url).rstrip("/") == BASE
         finally:
             await adapter.close()
 
