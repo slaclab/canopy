@@ -81,3 +81,4 @@ services. A fresh database serves nothing until its first migration.
 | `GET /health` | Process liveness — used by the container healthchecks and the deploy pipeline |
 | `GET /<module>/v1/health/watchdog` | Per-module liveness heartbeat (version, uptime) |
 | `GET /<module>/v1/health/summary` | Per-module status rollup (requires read access) — e.g. Hare's reports backend, client and monitor counts |
+| `GET /metrics` | Prometheus exposition (unauthenticated, like `/health`): request counts and latency per module route, plus module gauges — see [Metrics](../observability/metrics.md) |
