@@ -103,7 +103,8 @@ async def test_a_leader_that_loses_its_lease_closes_its_monitors():
     try:
         await redis.set(LEADER_KEY, "someone-else")
         assert await wait_for(lambda: not monitor.is_leader)
-        assert sorted(connector.closed) == ["A", "B"]
+        # Leadership drops before the monitors finish closing, so wait for those too.
+        assert await wait_for(lambda: sorted(connector.closed) == ["A", "B"])
         # It doesn't clobber the new leader's report on the way out.
         assert (await redis.get(LEADER_KEY)) == b"someone-else"
     finally:
