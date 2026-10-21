@@ -43,28 +43,35 @@ class FacilityService:
         self.session = session
         self.facility_repo = FacilityRepository(session)
 
-    def _to_dto(self, facility: Facility) -> FacilityDTO:
+    def _to_dto(self, facility: Facility, parent_slug: str | None) -> FacilityDTO:
         return FacilityDTO(
             id=facility.id,
             slug=facility.slug,
             name=facility.name,
             description=facility.description,
-            parent_id=facility.parent_id,
+            parent=parent_slug,
         )
+
+    async def _with_parent(self, facility: Facility) -> FacilityDTO:
+        """``_to_dto`` for a single row, looking up its parent's slug."""
+        parent = await self.facility_repo.get_by_id(facility.parent_id) if facility.parent_id else None
+        return self._to_dto(facility, parent.slug if parent else None)
 
     async def get_all(self) -> list[FacilityDTO]:
         """Full hierarchy, flat — unfiltered by key. Facility existence isn't a
         secret, only the data is filtered."""
         facilities = await self.facility_repo.get_all()
-        return [self._to_dto(f) for f in facilities]
+        # Every parent is in the same list, so no extra query is needed.
+        slug_by_id = {f.id: f.slug for f in facilities}
+        return [self._to_dto(f, slug_by_id.get(f.parent_id)) for f in facilities]
 
     async def get_by_id(self, facility_id: str) -> FacilityDTO | None:
         facility = await self.facility_repo.get_by_id(facility_id)
-        return self._to_dto(facility) if facility else None
+        return await self._with_parent(facility) if facility else None
 
     async def get_by_slug(self, slug: str) -> FacilityDTO | None:
         facility = await self.facility_repo.get_by_slug(slug)
-        return self._to_dto(facility) if facility else None
+        return await self._with_parent(facility) if facility else None
 
     async def _resolve_parent_id(self, parent_slug: str) -> str:
         """Parent *slug* -> its id. Unknown slug is a hard ``FacilityNotFound``."""
@@ -85,6 +92,11 @@ class FacilityService:
         at a time."""
         return await self.facility_repo.ids_by_slug(slugs)
 
+    async def slugs_by_id(self, ids: list[str] | set[str]) -> dict[str, str]:
+        """``{id: slug}`` for the subset of ``ids`` that exist. The reverse of
+        ``ids_by_slug``, for turning stored ids back into slugs on the way out."""
+        return await self.facility_repo.slugs_by_id(ids)
+
     async def create(self, data: FacilityCreate) -> FacilityDTO:
         if await self.facility_repo.get_by_slug(data.slug):
             raise FacilitySlugConflict(f"Facility with slug '{data.slug}' already exists")
@@ -94,7 +106,7 @@ class FacilityService:
             facility = await self.facility_repo.create(facility)
         except IntegrityError as e:
             raise FacilitySlugConflict(f"Facility with slug '{data.slug}' already exists") from e
-        return self._to_dto(facility)
+        return self._to_dto(facility, data.parent)
 
     async def update(self, facility_id: str, data: FacilityUpdate) -> FacilityDTO | None:
         facility = await self.facility_repo.get_by_id(facility_id)
@@ -110,7 +122,7 @@ class FacilityService:
         if data.description is not None:
             facility.description = data.description
         facility = await self.facility_repo.update(facility)
-        return self._to_dto(facility)
+        return await self._with_parent(facility)
 
     async def delete(self, facility_id: str) -> bool:
         facility = await self.facility_repo.get_by_id(facility_id)

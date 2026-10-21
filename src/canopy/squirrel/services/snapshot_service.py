@@ -302,6 +302,12 @@ class SnapshotService:
         if facility_id not in self.facility_scope:
             raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility")
 
+    async def _facility_slug(self, facility_id: str | None) -> str | None:
+        """A stored facility id as the slug reported on the wire."""
+        if facility_id is None:
+            return None
+        return (await facilities_gateway.slugs_by_id([facility_id])).get(facility_id)
+
     def _in_facility_scope(self, facility_id: str | None) -> bool:
         """Same membership rule as ``_require_facility_write``, as a predicate rather
         than a raise. Read paths use this to report an out-of-scope snapshot as
@@ -375,6 +381,7 @@ class SnapshotService:
         # One grouped query for all value counts (avoids N+1).
         snapshot_ids = [snap.id for snap in snapshots]
         counts = await self.snapshot_repo.get_value_counts_batch(snapshot_ids)
+        slug_by_id = await facilities_gateway.slugs_by_id({s.facility_id for s in snapshots if s.facility_id})
 
         meta_pvs = [pv.pv_id for pv in await self.meta_pv_repo.get(active=True)]
         result = []
@@ -387,7 +394,7 @@ class SnapshotService:
                     created_date=snap.created_at,
                     created_by=snap.created_by,
                     pv_count=counts.get(snap.id, 0),
-                    facility_id=snap.facility_id,
+                    facility=slug_by_id.get(snap.facility_id),
                     meta_pvs=await self._get_meta_pv_values_for_snapshot(snap.id, meta_pvs),
                 )
             )
@@ -455,7 +462,7 @@ class SnapshotService:
             created_date=snapshot.created_at,
             created_by=snapshot.created_by,
             pv_count=total_count,
-            facility_id=snapshot.facility_id,
+            facility=await self._facility_slug(snapshot.facility_id),
             pv_values=pv_values,
             meta_pvs=await self._get_meta_pv_values_for_snapshot(snapshot.id, meta_pvs),
         )
@@ -486,7 +493,7 @@ class SnapshotService:
             created_date=snapshot.created_at,
             created_by=snapshot.created_by,
             pv_count=pv_count,
-            facility_id=snapshot.facility_id,
+            facility=await self._facility_slug(snapshot.facility_id),
             meta_pvs=await self._get_meta_pv_values_for_snapshot(snapshot.id, meta_pvs),
         )
 
@@ -631,7 +638,7 @@ class SnapshotService:
             created_date=snapshot.created_at,
             created_by=snapshot.created_by,
             pv_count=count,
-            facility_id=snapshot.facility_id,
+            facility=await self._facility_slug(snapshot.facility_id),
             meta_pvs=await self._get_meta_pv_values_for_snapshot(snapshot.id, meta_pvs),
         )
 

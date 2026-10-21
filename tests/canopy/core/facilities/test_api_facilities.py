@@ -26,7 +26,7 @@ async def test_list_facilities(facilities_client, session, session_maker, fake_k
     slugs = {f["slug"] for f in r.json()}
     assert {"lcls", "lcls-sc"} <= slugs
     sc = next(f for f in r.json() if f["slug"] == "lcls-sc")
-    assert sc["parentId"] == lcls.id
+    assert sc["parent"] == "lcls"
 
 
 async def test_facilities_require_read_auth(facilities_client):
@@ -41,14 +41,14 @@ async def test_create_then_read_back(facilities_client, session_maker, fake_keys
     )
     assert created.status_code == 200, created.text
     assert created.json()["slug"] == "lcls"
-    assert created.json()["parentId"] is None
+    assert created.json()["parent"] is None
 
     listed = facilities_client.get("/v1/facilities", headers=READ_HEADERS)
     assert [f["slug"] for f in listed.json()] == ["lcls"]
 
 
 async def test_create_child_by_parent_slug(facilities_client, session_maker, fake_keys):
-    parent = facilities_client.post("/v1/facilities", json={"slug": "lcls", "name": "LCLS"}, headers=ADMIN_HEADERS)
+    facilities_client.post("/v1/facilities", json={"slug": "lcls", "name": "LCLS"}, headers=ADMIN_HEADERS)
     child = facilities_client.post(
         "/v1/facilities",
         json={"slug": "lcls-sc", "name": "LCLS-II SC", "parent": "lcls"},
@@ -56,9 +56,7 @@ async def test_create_child_by_parent_slug(facilities_client, session_maker, fak
     )
 
     assert child.status_code == 200, child.text
-    # The request names the parent by slug; the response reports it by id, which is
-    # what a client walks to assemble the tree.
-    assert child.json()["parentId"] == parent.json()["id"]
+    assert child.json()["parent"] == "lcls"
 
 
 async def test_create_rejects_unknown_parent_slug(facilities_client, session_maker, fake_keys):
@@ -95,7 +93,7 @@ async def test_create_rejects_leading_hyphen_slug(facilities_client, session_mak
 
 async def test_update_name_and_reparent_by_slug(facilities_client, session_maker, fake_keys):
     facilities_client.post("/v1/facilities", json={"slug": "lcls", "name": "LCLS"}, headers=ADMIN_HEADERS)
-    lcls2 = facilities_client.post("/v1/facilities", json={"slug": "lcls2", "name": "LCLS 2"}, headers=ADMIN_HEADERS)
+    facilities_client.post("/v1/facilities", json={"slug": "lcls2", "name": "LCLS 2"}, headers=ADMIN_HEADERS)
     facilities_client.post(
         "/v1/facilities", json={"slug": "lcls-sc", "name": "SC", "parent": "lcls"}, headers=ADMIN_HEADERS
     )
@@ -108,7 +106,7 @@ async def test_update_name_and_reparent_by_slug(facilities_client, session_maker
 
     assert r.status_code == 200, r.text
     assert r.json()["name"] == "LCLS-II Superconducting"
-    assert r.json()["parentId"] == lcls2.json()["id"]
+    assert r.json()["parent"] == "lcls2"
     assert r.json()["slug"] == "lcls-sc"
 
 
