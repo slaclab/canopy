@@ -5,7 +5,8 @@ Same image as ``canopy-api``, different command::
     arq canopy.worker.WorkerSettings
 
 Runs long operations (snapshot create/restore) off the request path. Each
-persistent module contributes its task functions; ``on_startup`` builds the
+persistent module contributes its task functions — on a read-only mirror
+(``CANOPY_ROLE=mirror``) only the stateless ones; ``on_startup`` builds the
 process-wide resources a task needs - the EPICS connector - and stashes them in
 the Arq context so every job reuses one connection set rather than rebuilding it.
 """
@@ -68,9 +69,19 @@ async def on_shutdown(ctx: dict) -> None:
 # Task functions registered with Arq. Each module appends its tasks here.
 FUNCTIONS = [ping, convert_batch, create_snapshot_task, restore_snapshot_task]
 
+# What a read-only mirror's worker runs: tasks that write no replicated table and
+# touch no machine state. Snapshot create/restore are simply not registered there,
+# so a job that reached a mirror's queue anyway fails instead of running.
+MIRROR_FUNCTIONS = [ping, convert_batch]
+
+
+def worker_functions(role: str) -> list:
+    """The task functions a worker registers for an instance ``role`` (``Settings.role``)."""
+    return MIRROR_FUNCTIONS if role == "mirror" else FUNCTIONS
+
 
 class WorkerSettings:
-    functions = FUNCTIONS
+    functions = worker_functions(get_settings().role)
     on_startup = on_startup
     on_shutdown = on_shutdown
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
