@@ -28,6 +28,18 @@ class Settings(BaseSettings):
         Connections the pool may open beyond ``database_pool_size``.
     redis_url : str
         Redis DSN backing the Arq job queue and per-job progress.
+    role : {"primary", "mirror"}
+        ``"mirror"`` makes this instance a read-only copy of a primary's data: write
+        and admin routes refuse with ``read_only_instance`` (API-key management
+        excepted) and the worker registers only stateless tasks.
+    instance : str | None
+        Name of the deployment this process belongs to (e.g. ``"lcls"``), reported
+        by ``GET /v1/instance``.
+    history_url : str | None
+        Base URL of the read-only history instance holding this instance's full
+        history, reported by ``GET /v1/instance`` so clients can link to it.
+    window_days : int | None
+        Days of history this instance keeps; ``None`` means it keeps everything.
     """
 
     model_config = SettingsConfigDict(
@@ -62,6 +74,14 @@ class Settings(BaseSettings):
 
     # Redis — Arq job queue + per-job progress; used by canopy-worker and the jobs module.
     redis_url: str = "redis://localhost:6379/0"
+
+    # Instance role. A "mirror" serves a read-only copy of a primary's database
+    # (fed by Postgres logical replication), so nothing here may write the
+    # replicated tables. Reported, with the fields below, by GET /v1/instance.
+    role: Literal["primary", "mirror"] = "primary"
+    instance: str | None = None
+    history_url: str | None = None
+    window_days: int | None = None
 
 
 @lru_cache

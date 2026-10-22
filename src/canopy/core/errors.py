@@ -29,6 +29,7 @@ class ErrorCode(StrEnum):
     API_KEY_NOT_FOUND = auto()
     API_KEY_SELF_DEACTIVATION = auto()
     KEY_STORE_UNAVAILABLE = auto()
+    READ_ONLY_INSTANCE = auto()
 
     # Mole
     ARCHIVER_NOT_CONFIGURED = auto()
@@ -187,6 +188,18 @@ class KeyStoreUnavailable(CanopyError):
 
     status_code = 503
     error_code = ErrorCode.KEY_STORE_UNAVAILABLE
+
+
+class ReadOnlyInstance(CanopyError):
+    """Refused a write or admin request because this instance is a read-only mirror.
+
+    Distinct from `InsufficientWriteAccess`: no key would succeed here, so a
+    client should send the request to the primary (or hide the control) rather
+    than ask for a different key.
+    """
+
+    status_code = 403
+    error_code = ErrorCode.READ_ONLY_INSTANCE
 
 
 def register_canopy_error_handler(app: FastAPI) -> None:
