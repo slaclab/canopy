@@ -43,8 +43,14 @@ async def test_pv_search_filtered_by_facility_includes_descendants(client: Async
     addrs = {p["setpointAddress"] for p in r.json()["results"]}
     assert addrs == {"SC:PV:SP", "FACET:PV:SP"}
 
-    r = await client.get("/v1/pvs/paged?facility=does-not-exist", headers=READ_HEADERS)
-    assert r.json()["results"] == []
+
+async def test_filtering_by_an_unknown_facility_is_404(client: AsyncClient, db_session: AsyncSession):
+    await _seed_facility(db_session, "lcls")
+
+    for path in ("/v1/pvs", "/v1/pvs/paged", "/v1/pvs/search", "/v1/snapshots"):
+        r = await client.get(f"{path}?facility=does-not-exist", headers=READ_HEADERS)
+        assert r.status_code == 404, f"{path}: {r.text}"
+        assert r.json()["code"] == "facility_not_found"
 
 
 async def test_pv_in_two_facilities_visible_under_both(client: AsyncClient, db_session: AsyncSession):
@@ -81,9 +87,6 @@ async def test_snapshot_list_filtered_by_facility(client: AsyncClient, db_sessio
     r = await client.get("/v1/snapshots", headers=READ_HEADERS)
     titles = {s["title"] for s in r.json()["results"]}
     assert {"sc-snap", "facet-snap", "no-facility-snap"} <= titles
-
-    r = await client.get("/v1/snapshots?facility=unknown-slug", headers=READ_HEADERS)
-    assert r.json()["results"] == []
 
 
 async def test_create_snapshot_enqueues_with_facility(client: AsyncClient, enqueued: list, db_session: AsyncSession):

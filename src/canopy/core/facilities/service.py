@@ -132,15 +132,17 @@ class FacilityService:
         """Slug -> {facility_id, all descendant facility_ids}.
 
         ``slug=None`` means "no filter requested" and returns ``None``, so the caller
-        applies no facility filter. A given-but-unknown slug returns ``set()`` —
-        "filter requested, nothing matches" — never ``None``, which would leak every
-        facility's data for a typo'd slug. Callers must test ``is not None``, not
-        truthiness.
+        applies no facility filter. A given-but-unknown slug raises ``FacilityNotFound``
+        rather than degrading to "no filter", which would leak every facility's data for
+        a typo'd slug. Facility existence isn't a secret (``GET /v1/facilities`` lists
+        them all), so the 404 reveals nothing.
         """
         if slug is None:
             return None
         result = await self.facility_repo.resolve_facility_scope(slug)
-        return result if result is not None else set()
+        if result is None:
+            raise FacilityNotFound(f"Facility '{slug}' not found")
+        return result
 
     async def resolve_key_facility_scope(self, slugs: frozenset[str]) -> set[str] | None:
         """A credential's granted slugs -> the union of each one's descendant id set.
