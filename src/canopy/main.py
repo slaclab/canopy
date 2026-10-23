@@ -35,6 +35,7 @@ from canopy.analytics.app import app as analytics_app
 from canopy.analytics.app import analytics_lifespan
 from canopy.converter.app import app as converter_app
 from canopy.converter.app import converter_lifespan
+from canopy.core.instance import router as instance_router
 from canopy.core.security import bind_key_registry
 from canopy.core.keys.routes import router as api_keys_router
 from canopy.core.keys.registry import build_key_registry
@@ -108,6 +109,7 @@ register_canopy_error_handler(app)
 tag_module(app, "core")
 
 app.include_router(api_keys_router)
+app.include_router(instance_router)
 
 app.mount("/mole", mole_app)
 app.mount("/hare", hare_app)
