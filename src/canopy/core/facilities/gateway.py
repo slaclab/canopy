@@ -23,6 +23,13 @@ async def resolve_facility_scope(slug: str | None) -> set[str] | None:
         return await FacilityService(session).resolve_facility_scope(slug)
 
 
+async def descendant_ids(facility_id: str) -> set[str]:
+    """``{facility_id, all descendant facility_ids}`` — ``resolve_facility_scope`` for a
+    caller already holding an id (the snapshot worker, which is handed one)."""
+    async with session_scope() as session:
+        return await FacilityService(session).descendant_ids(facility_id)
+
+
 async def resolve_key_facility_scope(slugs: frozenset[str]) -> set[str] | None:
     """A credential's granted slugs -> union of their descendant id sets, or ``None``
     if unrestricted. See ``FacilityService.resolve_key_facility_scope``.
@@ -59,6 +66,14 @@ async def known_slugs(slugs: list[str]) -> set[str]:
     point a reference to one is *written* (e.g. minting an API key's grant)."""
     async with session_scope() as session:
         return await FacilityService(session).known_slugs(slugs)
+
+
+async def ids_by_slug(slugs: list[str] | set[str]) -> dict[str, str]:
+    """``{slug: id}`` for the subset of ``slugs`` that exist, in one round trip. For a
+    caller resolving many slugs at once (a bulk PV import naming several facilities)
+    instead of one ``get_by_slug`` call per slug."""
+    async with session_scope() as session:
+        return await FacilityService(session).ids_by_slug(slugs)
 
 
 def register_in_use_checker(checker: Callable[[str, str], Awaitable[bool]], what: str) -> None:

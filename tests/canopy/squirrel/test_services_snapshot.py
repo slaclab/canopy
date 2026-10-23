@@ -12,9 +12,10 @@ from collections import Counter
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from canopy.squirrel.data.models import Pv
+from canopy.squirrel.data.models import Pv, pv_facility
+from canopy.core.facilities.models import Facility
 from canopy.squirrel.schemas.snapshot import NewSnapshotDTO, RestoreRequestDTO
-from canopy.squirrel.adapters.epics_io import EpicsValue
+from canopy.squirrel.adapters.epics_io import EpicsIO, EpicsValue, ProgressCallback
 from canopy.squirrel.restore_hooks.base import RestoreHook, RestoreHookError
 from canopy.squirrel.restore_hooks.magnet_trim import MagnetTrimHook
 from canopy.squirrel.services.snapshot_service import SnapshotService
@@ -28,24 +29,32 @@ class _NoHook(RestoreHook):
         return []
 
 
-class FakeEpicsIO:
-    """In-memory stand-in for the EpicsIO adapter (records writes, serves canned reads)."""
+class FakeEpicsIO(EpicsIO):
+    """In-memory stand-in for the EpicsIO adapter (records writes, serves canned reads).
+
+    Subclasses ``EpicsIO`` only so it type-checks where one is expected; ``__init__``
+    deliberately skips ``super()``, since there is no connector behind it.
+    """
 
     def __init__(self, reads: dict[str, EpicsValue] | None = None):
         self.reads = reads or {}
         self.writes: dict[str, Any] = {}
         self.fail_writes: set[str] = set()
 
-    async def get_many(self, addrs: list[str]) -> dict[str, EpicsValue]:
-        return {a: self.reads.get(a, EpicsValue(value=None, connected=False, error="no value")) for a in addrs}
+    async def get_many(self, pv_names: list[str]) -> dict[str, EpicsValue]:
+        return {a: self.reads.get(a, EpicsValue(value=None, connected=False, error="no value")) for a in pv_names}
 
-    async def get_many_with_progress(self, addrs, cb=None) -> dict[str, EpicsValue]:
-        return await self.get_many(addrs)
+    async def get_many_with_progress(
+        self, pv_names: list[str], progress_callback: ProgressCallback | None = None
+    ) -> dict[str, EpicsValue]:
+        return await self.get_many(pv_names)
 
     async def put_many(self, values: dict[str, Any]) -> dict[str, tuple[bool, str | None]]:
         return await self.put_many_with_progress(values, None)
 
-    async def put_many_with_progress(self, values, cb=None) -> dict[str, tuple[bool, str | None]]:
+    async def put_many_with_progress(
+        self, values: dict[str, Any], progress_callback: ProgressCallback | None = None
+    ) -> dict[str, tuple[bool, str | None]]:
         out: dict[str, tuple[bool, str | None]] = {}
         for addr, val in values.items():
             if addr in self.fail_writes:
@@ -53,8 +62,8 @@ class FakeEpicsIO:
             else:
                 self.writes[addr] = val
                 out[addr] = (True, None)
-        if cb and values:
-            await cb(len(values), len(values), f"Wrote {len(values)}/{len(values)} PVs...")
+        if progress_callback and values:
+            await progress_callback(len(values), len(values), f"Wrote {len(values)}/{len(values)} PVs...")
         return out
 
 
@@ -126,6 +135,32 @@ async def test_create_skips_disconnected_reads(db_session: AsyncSession):
     by_name = {v.pv_name: v for v in full.pv_values}
     assert by_name["OK:SP"].setpoint_value.value == 1.0
     assert by_name["DEAD:SP"].setpoint_value is None  # disconnected read stored no blob
+
+
+async def test_facility_snapshot_captures_only_that_facility_and_its_descendants(db_session: AsyncSession):
+    lcls = Facility(slug="lcls", name="LCLS")
+    facet = Facility(slug="facet", name="FACET")
+    db_session.add_all([lcls, facet])
+    await db_session.commit()
+    sc = Facility(slug="lcls-sc", name="SC", parent_id=lcls.id)
+    db_session.add(sc)
+    await db_session.commit()  # the gateway resolves facilities in its own session
+
+    for address, facility in [("LCLS:SP", lcls), ("SC:SP", sc), ("FACET:SP", facet), ("NONE:SP", None)]:
+        pv = await _seed_pv(db_session, address)
+        if facility is not None:
+            await db_session.execute(pv_facility.insert().values(pv_id=pv.id, facility_id=facility.id))
+    reads = {a: _ev(1.0) for a in ("LCLS:SP", "SC:SP", "FACET:SP", "NONE:SP")}
+    svc = SnapshotService(db_session, FakeEpicsIO(reads), restore_hooks=[_NoHook()])
+
+    lcls_snap = await svc.create_snapshot(NewSnapshotDTO(title="lcls", facility="lcls"))
+    assert {v.pv_name for v in (await svc.get_by_id(lcls_snap.id)).pv_values} == {"LCLS:SP", "SC:SP"}
+
+    sc_snap = await svc.create_snapshot(NewSnapshotDTO(title="sc", facility="lcls-sc"))
+    assert {v.pv_name for v in (await svc.get_by_id(sc_snap.id)).pv_values} == {"SC:SP"}
+
+    machine = await svc.create_snapshot(NewSnapshotDTO(title="all"))
+    assert machine.pv_count == 4
 
 
 async def test_paginated_get_does_not_delete_values(db_session: AsyncSession):
@@ -446,6 +481,21 @@ async def test_restore_subset_by_pv_ids(db_session: AsyncSession):
     result = await svc.restore_snapshot(summary.id, RestoreRequestDTO(pv_ids=[pv_a.id]))
     assert result.total_pvs == 1
     assert io.writes == {"A:SP": 1.0}  # only the requested PV
+
+
+async def test_restore_with_an_empty_pv_list_writes_nothing(db_session: AsyncSession):
+    """`pv_ids=[]` is "restore nothing", not "restore all" — the worker must never widen a
+    write set the route narrowed."""
+    await _seed_pv(db_session, "A:SP")
+    await _seed_pv(db_session, "B:SP")
+    io = FakeEpicsIO({"A:SP": _ev(1.0), "B:SP": _ev(2.0)})
+    svc = SnapshotService(db_session, io, restore_hooks=[_NoHook()])
+    summary = await svc.create_snapshot(NewSnapshotDTO(title="s"))
+
+    io.writes.clear()
+    result = await svc.restore_snapshot(summary.id, RestoreRequestDTO(pv_ids=[]))
+    assert result.total_pvs == 0
+    assert io.writes == {}
 
 
 async def test_compare_detects_value_difference(db_session: AsyncSession):

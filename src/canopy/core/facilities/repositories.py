@@ -35,6 +35,15 @@ class FacilityRepository(BaseRepository[Facility]):
         result = await self.session.execute(select(Facility.slug).where(Facility.slug.in_(slugs)))
         return {row[0] for row in result.all()}
 
+    async def ids_by_slug(self, slugs: list[str] | set[str]) -> dict[str, str]:
+        """``{slug: id}`` for the subset of ``slugs`` that exist, in one query. An
+        unknown slug is simply absent from the result — the caller decides whether
+        that's fatal."""
+        if not slugs:
+            return {}
+        result = await self.session.execute(select(Facility.slug, Facility.id).where(Facility.slug.in_(slugs)))
+        return {slug: id_ for slug, id_ in result.all()}
+
     async def resolve_facility_scope(self, slug: str) -> set[str] | None:
         """Slug -> {facility_id, all descendant facility_ids}. ``None`` if the slug
         is unknown — distinct from ``set()``, which means "known slug, no facilities
@@ -46,8 +55,11 @@ class FacilityRepository(BaseRepository[Facility]):
         root = await self.get_by_slug(slug)
         if root is None:
             return None
+        return await self.descendant_ids(root.id)
 
-        hierarchy = select(Facility.id).where(Facility.id == root.id).cte("facility_scope", recursive=True)
+    async def descendant_ids(self, facility_id: str) -> set[str]:
+        """``{facility_id, all descendant facility_ids}``, by id rather than slug."""
+        hierarchy = select(Facility.id).where(Facility.id == facility_id).cte("facility_scope", recursive=True)
         children = select(Facility.id).join(hierarchy, Facility.parent_id == hierarchy.c.id)
         hierarchy = hierarchy.union_all(children)
 
