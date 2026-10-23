@@ -127,7 +127,7 @@ speculatively.
 
 Candidates deliberately **not** built yet, each its own follow-up: Hare event
 queue depth and dropped updates, Mole archiver round-trip latency, Vole
-ring-buffer bytes and evictions, Fox evaluation latency, Squirrel restore
+ring-buffer bytes and evictions, Formula Engine evaluation latency, Squirrel restore
 durations (a worker-side metric, so it also waits on the worker exposition
 above).
 
