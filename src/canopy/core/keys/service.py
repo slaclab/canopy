@@ -18,6 +18,7 @@ from canopy.core.errors import (
 )
 from canopy.core.modules import MODULES, WILDCARD, split_modules
 from canopy.core.security import invalidate_key_id
+from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.keys.models import ApiKey
 from canopy.core.keys.tokens import hash_token, mint_token
 from canopy.core.keys.schemas import ApiKeyDTO, ApiKeyCreateResultDTO
@@ -35,6 +36,7 @@ def to_dto(api_key: ApiKey) -> ApiKeyDTO:
         write_access=api_key.write_access,
         admin_access=api_key.admin_access,
         modules=api_key.modules,
+        facilities=api_key.facilities,
         created_at=api_key.created_at,
         updated_at=api_key.updated_at,
         last_used_at=api_key.last_used_at,
@@ -74,6 +76,22 @@ def _require_module_containment(target_modules, acting_modules) -> None:
         raise InsufficientModuleAccess(f"Acting API key is not scoped to module(s) {sorted(outside)}")
 
 
+def _normalize_facilities(facilities: list[str]) -> list[str]:
+    """Canonicalize a requested facility list.
+
+    Unlike ``_normalize_modules``, an empty list is valid and meaningful —
+    "provisioned but not yet assigned to a facility" / "data-suspended without
+    revoking the credential" — so it is returned as-is rather than rejected.
+
+    Whether the named slugs *exist* is checked separately, in ``create_key``,
+    where there's a session in hand; this stays a pure string transform.
+    """
+    cleaned = {f.strip() for f in facilities if f.strip()}
+    if WILDCARD in cleaned:
+        return [WILDCARD]
+    return sorted(cleaned)
+
+
 class ApiKeyService:
     """Create and manage API keys."""
 
@@ -90,6 +108,7 @@ class ApiKeyService:
         admin: bool = False,
         modules: list[str],
         acting_key_modules: list[str] | None = None,
+        facilities: list[str] | None = None,
     ) -> ApiKeyCreateResultDTO:
         """Mint a key and return it with its plaintext token — the only time the
         token exists outside the caller's hands. Only its hash is stored.
@@ -104,6 +123,10 @@ class ApiKeyService:
         ``acting_key_modules`` is the module set of the admin key making this
         request (``None`` for the CLI). A module-scoped admin can only delegate
         modules it itself holds — it cannot mint a key scoped wider than itself.
+
+        ``facilities`` defaults to no grants (``[]``) rather than every module's
+        implicit ``[WILDCARD]`` — unlike modules, an unassigned key is a valid,
+        unprivileged state here, not a mistake.
         """
         app_name = app_name.strip()
         if not app_name:
@@ -112,6 +135,18 @@ class ApiKeyService:
             raise BadRequest("Cannot create an API key with no access; pass at least one scope")
         module_list = _normalize_modules(modules)
         _require_module_containment(module_list, acting_key_modules)
+        facility_list = _normalize_facilities(facilities or [])
+        # A grant naming a nonexistent facility is a hard reject: it resolves to
+        # "matches nothing" at request time, so the key would authenticate and then
+        # see and write nothing, with no error to point at the typo. `[WILDCARD]`
+        # names no slug, so there's nothing to check.
+        if facility_list and facility_list != [WILDCARD]:
+            unknown = set(facility_list) - await facilities_gateway.known_slugs(facility_list)
+            if unknown:
+                raise BadRequest(
+                    f"Unknown facility slug(s) {sorted(unknown)}; create them first "
+                    f"(scripts/create_facility.py or POST /v1/facilities)"
+                )
 
         token = mint_token()
         created = await self.repo.create(
@@ -122,6 +157,7 @@ class ApiKeyService:
                 write_access=write,
                 admin_access=admin,
                 modules=module_list,
+                facilities=facility_list,
             )
         )
         # The token itself is never logged — app_name and id are the audit trail.
