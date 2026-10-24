@@ -101,7 +101,7 @@ name = "Converter reaches other modules only through their public gateway"
 type = "forbidden"
 source_modules = ["canopy.converter"]
 forbidden_modules = [
-    "canopy.fox",
+    "canopy.formula_engine",
     "canopy.mole",
     "canopy.hare",
     "canopy.vole",
@@ -109,7 +109,7 @@ forbidden_modules = [
     "canopy.jobs",
 ]
 ignore_imports = [
-    "canopy.converter.dependencies -> canopy.fox.gateway",
+    "canopy.converter.dependencies -> canopy.formula_engine.gateway",
     "canopy.converter.api.v1.conversions -> canopy.jobs.gateway",
     "canopy.converter.tasks -> canopy.jobs.gateway",
 ]

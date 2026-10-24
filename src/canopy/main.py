@@ -10,8 +10,6 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from canopy import __version__
-from canopy.fox.app import app as fox_app
-from canopy.fox.app import fox_lifespan
 from canopy.hare.app import app as hare_app
 from canopy.hare.app import hare_lifespan
 from canopy.jobs.app import app as jobs_app
@@ -38,6 +36,8 @@ from canopy.converter.app import converter_lifespan
 from canopy.core.security import bind_key_registry
 from canopy.core.keys.routes import router as api_keys_router
 from canopy.core.keys.registry import build_key_registry
+from canopy.formula_engine.app import app as formula_engine_app
+from canopy.formula_engine.app import formula_engine_lifespan
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ API_MODULES = (
     ("hare", "Hare"),
     ("raccoon", "Raccoon"),
     ("vole", "Vole"),
-    ("fox", "Fox"),
+    ("formula-engine", "Formula Engine"),
     ("squirrel", "Squirrel"),
     ("magpie", "Magpie"),
     ("jobs", "Jobs"),
@@ -71,7 +71,7 @@ async def lifespan(app: FastAPI):
         hare_lifespan(),
         raccoon_lifespan(),
         vole_lifespan(),
-        fox_lifespan(),
+        formula_engine_lifespan(),
         squirrel_lifespan(),
         magpie_lifespan(),
         jobs_lifespan(),
@@ -113,7 +113,7 @@ app.mount("/mole", mole_app)
 app.mount("/hare", hare_app)
 app.mount("/raccoon", raccoon_app)
 app.mount("/vole", vole_app)
-app.mount("/fox", fox_app)
+app.mount("/formula-engine", formula_engine_app)
 app.mount("/squirrel", squirrel_app)
 app.mount("/magpie", magpie_app)
 app.mount("/jobs", jobs_app)
@@ -124,7 +124,7 @@ tag_module(mole_app, "mole")
 tag_module(hare_app, "hare")
 tag_module(raccoon_app, "raccoon")
 tag_module(vole_app, "vole")
-tag_module(fox_app, "fox")
+tag_module(formula_engine_app, "formula-engine")
 tag_module(squirrel_app, "squirrel")
 tag_module(magpie_app, "magpie")
 tag_module(jobs_app, "jobs")
