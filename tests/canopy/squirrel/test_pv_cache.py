@@ -203,11 +203,12 @@ async def test_a_former_leader_cannot_write_after_losing_its_lease():
     monitor, connector = await _leader(redis, {"A"})
     try:
         await monitor.flush()
-        report_before = await redis.get(STATUS_KEY)
         await redis.hdel(VALUES_KEY, "A")
 
         await redis.set(LEADER_KEY, "new-leader-generation")  # taken over during a pause
         connector.emit(_pv("A", 99.0))
+        # Read after the takeover: until then the flush loop may still heartbeat.
+        report_before = await redis.get(STATUS_KEY)
         await monitor.flush()  # runs before the renew loop notices
 
         assert not await redis.hexists(VALUES_KEY, "A")
