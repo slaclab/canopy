@@ -26,6 +26,7 @@ from canopy.squirrel.restore_hooks import (
     RestoreHookError,
     get_restore_hooks,
 )
+from canopy.squirrel.pv_cache.reader import PVCacheReader
 from canopy.squirrel.schemas.snapshot import (
     PVValueDTO,
     TagInfoDTO,
@@ -447,9 +448,17 @@ class SnapshotService:
         )
 
     async def create_snapshot(
-        self, data: NewSnapshotDTO, created_by: str | None = None, progress_callback: Callable | None = None
+        self,
+        data: NewSnapshotDTO,
+        created_by: str | None = None,
+        progress_callback: Callable | None = None,
+        pv_cache: PVCacheReader | None = None,
     ) -> SnapshotSummaryDTO:
-        """Create a snapshot by reading every registered PV from EPICS (the hot read path)."""
+        """Create a snapshot by reading every registered PV from EPICS (the hot read path).
+
+        With ``pv_cache``, values the worker's PV cache can vouch for are taken from it
+        and only the rest are read live; the stored snapshot has the same shape either way.
+        """
         logger.info("Creating snapshot: %s", data.title)
         start_time = datetime.now(UTC)
 
@@ -472,17 +481,33 @@ class SnapshotService:
         all_addresses = list(set(setpoint_map.keys()) | set(readback_map.keys()))
         logger.info("Reading %d unique EPICS addresses for %d PVs", len(all_addresses), total_pv_count)
 
-        # Rescale address-level progress to PV-level so the user sees "N/total PVs".
-        async def pv_progress_callback(current_addr: int, total_addr: int, _message: str) -> None:
-            pv_progress_count = int((current_addr / total_addr) * total_pv_count) if total_addr > 0 else 0
+        cached: dict[str, Any] = {}
+        to_read = all_addresses
+        if pv_cache is not None:
+            lookup = await pv_cache.lookup(all_addresses)
+            cached, to_read = lookup.hits, lookup.misses
+            if lookup.skipped:
+                logger.warning("PV cache not used, reading every PV live: %s", lookup.skipped)
+            logger.info(
+                "PV cache: %d of %d addresses from cache, %d read live", len(cached), len(all_addresses), len(to_read)
+            )
+        cache_note = f"{len(cached):,} from cache; " if cached else ""
+        total_addresses = len(all_addresses)
+
+        # Rescale address-level progress to PV-level so the user sees "N/total PVs";
+        # cached addresses count as already read.
+        async def pv_progress_callback(current_addr: int, _total_addr: int, _message: str) -> None:
+            done = len(cached) + current_addr
+            pv_progress_count = int((done / total_addresses) * total_pv_count) if total_addresses > 0 else 0
             await progress_callback(
-                pv_progress_count, total_pv_count, f"Read {pv_progress_count:,}/{total_pv_count:,} PVs"
+                pv_progress_count, total_pv_count, f"{cache_note}Read {pv_progress_count:,}/{total_pv_count:,} PVs"
             )
 
-        if progress_callback:
-            epics_values = await self.epics.get_many_with_progress(all_addresses, pv_progress_callback)
+        if progress_callback and to_read:
+            live_values = await self.epics.get_many_with_progress(to_read, pv_progress_callback)
         else:
-            epics_values = await self.epics.get_many(all_addresses)
+            live_values = await self.epics.get_many(to_read) if to_read else {}
+        epics_values = {**cached, **live_values}
 
         logger.info("EPICS read completed in %.2fs", (datetime.now(UTC) - start_time).total_seconds())
 

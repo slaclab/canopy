@@ -105,12 +105,27 @@ async def list_snapshots(
 
 
 @router.post("", dependencies=[Security(require_write_access)])
-async def create_snapshot(data: NewSnapshotDTO) -> JobCreatedDTO:
+async def create_snapshot(
+    data: NewSnapshotDTO,
+    use_cache: Annotated[
+        bool,
+        Query(
+            alias="useCache",
+            description=(
+                "Take values from the worker's PV cache where it can vouch for them and read only the rest "
+                "live from EPICS. The cache must be enabled on the worker (CANOPY_SQUIRREL__PV_CACHE__ENABLED); "
+                "without a live cache every PV is read live, as with useCache=false."
+            ),
+        ),
+    ] = False,
+) -> JobCreatedDTO:
     """Enqueue a snapshot of every registered PV. The worker reads EPICS and persists it."""
     # No SnapshotServiceDep / pre-check here (unlike restore's snapshot_exists guard): create
     # targets *all* registered PVs, so there is no caller-supplied id that could make the job
     # doomed up front — nothing to validate before enqueueing.
-    job_id = await jobs_gateway.enqueue("create_snapshot_task", title=data.title, description=data.description)
+    # use_cache goes to the job only when set, so a worker one release behind still runs a plain snapshot.
+    extra = {"use_cache": True} if use_cache else {}
+    job_id = await jobs_gateway.enqueue("create_snapshot_task", title=data.title, description=data.description, **extra)
     return JobCreatedDTO(job_id=job_id, status_url=f"/jobs/v1/{job_id}")
 
 
