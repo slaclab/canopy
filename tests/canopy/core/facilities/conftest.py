@@ -132,6 +132,27 @@ def fake_keys():
             facilities=frozenset(),
             name="scoped-admin",
         ),
+        # Facility-granted keys, for GET /v1/facilities/access
+        "test-lcls": APIKey(
+            token="test-lcls", read=True, write=True, modules=frozenset({WILDCARD}), facilities=frozenset({"lcls"})
+        ),
+        "test-sc-facet": APIKey(
+            token="test-sc-facet",
+            read=True,
+            write=True,
+            modules=frozenset({WILDCARD}),
+            facilities=frozenset({"lcls-sc", "facet"}),
+        ),
+        "test-wild": APIKey(
+            token="test-wild", read=True, write=True, modules=frozenset({WILDCARD}), facilities=frozenset({WILDCARD})
+        ),
+        "test-squirrel-only": APIKey(
+            token="test-squirrel-only",
+            read=True,
+            write=True,
+            modules=frozenset({"squirrel"}),
+            facilities=frozenset({"lcls"}),
+        ),
     }
 
     class FakeRegistry:

@@ -19,10 +19,16 @@ from fastapi import Security, APIRouter
 
 from canopy.core.errors import FacilityNotFound
 from canopy.core.security import (
+    ReadKeyDep,
     require_read_or_admin_access,
     require_wildcard_facility_access,
 )
-from canopy.core.facilities.schemas import FacilityDTO, FacilityCreate, FacilityUpdate
+from canopy.core.facilities.schemas import (
+    FacilityDTO,
+    FacilityCreate,
+    FacilityUpdate,
+    FacilityAccessDTO,
+)
 from canopy.core.facilities.dependencies import FacilityServiceDep
 
 router = APIRouter(prefix="/v1/facilities", tags=["Facilities"])
@@ -32,6 +38,18 @@ router = APIRouter(prefix="/v1/facilities", tags=["Facilities"])
 async def list_facilities(service: FacilityServiceDep) -> list[FacilityDTO]:
     """Full facility hierarchy, flat with ``parent`` — the client assembles the tree."""
     return await service.get_all()
+
+
+@router.get("/access")
+async def get_facility_access(key: ReadKeyDep, service: FacilityServiceDep) -> FacilityAccessDTO:
+    """The facilities the *calling* key can reach, so a client can check access before
+    a write instead of discovering it from a 403.
+
+    Read-gated like the list it's a subset of, and about the caller only, so it reveals
+    nothing another key could use. Lives here rather than under ``/v1/api-keys``, which is
+    admin-only: the keys that need this answer are ordinary facility-scoped ones.
+    """
+    return await service.key_access(key.facilities)
 
 
 @router.post("", dependencies=[Security(require_wildcard_facility_access)])

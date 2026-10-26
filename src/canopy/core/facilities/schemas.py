@@ -19,6 +19,19 @@ class FacilityDTO(CanopyModel):
     parent: str | None = None
 
 
+class FacilityAccessDTO(CanopyModel):
+    """The facilities the calling key can reach.
+
+    ``unrestricted`` is true for a key granted every facility; ``facilities`` is then
+    empty and means nothing. Otherwise ``facilities`` lists every reachable slug, with a
+    parent grant expanded to its descendants, so a client can test membership directly.
+    An empty list with ``unrestricted`` false is a key granted no facility at all.
+    """
+
+    unrestricted: bool
+    facilities: list[str] = []
+
+
 # Lowercase alphanumerics and single internal hyphens, not leading or trailing with
 # a hyphen, and no doubled hyphen. Rejected rather than normalized: silently
 # lowercasing `LCLS` would hand back a slug that doesn't match what the caller then
