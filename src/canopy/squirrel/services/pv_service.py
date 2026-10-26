@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,7 +26,12 @@ from canopy.squirrel.data.repositories import (
     MetaPvRepository,
 )
 
+logger = logging.getLogger(__name__)
+
 IDENTITY_KINDS: tuple[str, ...] = ("setpoint", "readback", "config")
+
+# How many refused rows a multi-create's 403 names before summarizing the rest
+_REFUSED_ROWS_SHOWN = 10
 
 
 def _identity(
@@ -105,8 +112,8 @@ class PvService:
             for pv in pvs
         ]
 
-    def _require_facility_write(self, row_facility_ids: set[str], what: str) -> None:
-        """Gate a write to an *existing* row on the calling key's facility grant.
+    def _can_write(self, row_facility_ids: set[str]) -> bool:
+        """Whether the calling key may write an *existing* row with these facilities.
 
         **Policy: a write requires holding every facility the row is assigned to, not
         just one.** A PV can belong to several facilities (``pv_facility`` is many-to-
@@ -123,23 +130,58 @@ class PvService:
         list. Mint-time assignment uses the separate create policy in
         ``_require_facility_for_create``.
         """
-        if self.facility_scope is None:
-            return
-        if not row_facility_ids or not row_facility_ids.issubset(self.facility_scope):
-            raise InsufficientFacilityAccess(f"API key is not scoped to all of {what}'s facility(s)")
+        return self.facility_scope is None or bool(row_facility_ids & self.facility_scope)
 
-    def _require_facility_for_create(self, facility_ids: set[str], what: str) -> None:
+    async def _require_facility_write(self, row_facility_ids: set[str], what: str) -> None:
+        """Gate a write on the calling key's facility grant (see ``_can_write``).
+
+        The refusal names the row's facilities by slug, so the caller can see which
+        grant it would need. Naming them leaks nothing a restricted key can't already
+        reach: ``GET /v1/facilities`` lists every facility to any read key. An
+        unassigned row has no facility to name, so the message says so instead.
+        """
+        if self._can_write(row_facility_ids):
+            return
+        if not row_facility_ids:
+            raise InsufficientFacilityAccess(
+                f"API key is scoped to specific facilities; {what} is unassigned and only an unrestricted key may write it"
+            )
+        slugs = sorted((await facilities_gateway.slugs_by_id(row_facility_ids)).values())
+        raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility(s): {', '.join(slugs)}")
+
+    async def _require_facility_for_create(self, facility_ids: set[str], what: str) -> None:
         """Gate the facilities a *new* row is being created with.
 
         A restricted key must hold at least one of the requested facilities. An empty
         ``facility_ids`` is refused outright, since a restricted key minting an
         unassigned row would then be unable to reach it again under
         ``_require_facility_write``'s unrestricted-only rule for unassigned rows.
+        Mirrors the equivalent gate in ``SnapshotService`` routes for snapshot creation.
+        The refusal names the requested facilities by slug, as the other gates do.
         """
         if self.facility_scope is None:
             return
-        if not facility_ids.intersection(self.facility_scope):
-            raise InsufficientFacilityAccess(f"API key is not scoped to any of {what}'s facility(s)")
+        if not (facility_ids & self.facility_scope):
+            if not facility_ids:
+                raise InsufficientFacilityAccess(
+                    f"API key is scoped to specific facilities; {what} must name at least one"
+                )
+            slugs = sorted((await facilities_gateway.slugs_by_id(facility_ids)).values())
+            raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility(s): {', '.join(slugs)}")
+
+    async def _require_facility_containment(self, facility_ids: set[str], what: str) -> None:
+        """Gate a specific set of facilities against the grant, requiring every one of
+        them to be held — stricter than ``_require_facility_write``'s "any overlap"
+        test. Used where ``facility_ids`` describes a delta (facilities being added or
+        removed) rather than "does this row belong to me at all": a key holding only
+        one of several facilities must not be able to add or remove the others just
+        because it can touch the row through one it does hold.
+        """
+        if self.facility_scope is None or not facility_ids:
+            return
+        if outside := facility_ids - self.facility_scope:
+            slugs = sorted((await facilities_gateway.slugs_by_id(outside)).values())
+            raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility(s): {', '.join(slugs)}")
 
     async def _resolve_slugs(self, slugs: list[str] | set[str]) -> dict[str, str]:
         """Facility slugs -> ``{slug: id}``, in one round trip regardless of how many
@@ -242,7 +284,7 @@ class PvService:
         # probing guessed addresses learns an out-of-scope PV exists from the
         # `PvAlreadyExists` message before it's ever told it lacks facility access.
         facility_ids = set((await self._resolve_slugs(data.facilities)).values())
-        self._require_facility_for_create(facility_ids, "the requested")
+        await self._require_facility_for_create(facility_ids, "the requested PV")
 
         if await self._find_by_identity(kind, identity_address):
             raise PvAlreadyExists(f"PV with {kind} address '{identity_address}' already exists")
@@ -319,11 +361,40 @@ class PvService:
         # one the key can reach. Gated before the existence checks below, for the same
         # reason as `create`: an out-of-scope row's existence must not leak through a
         # `PvAlreadyExists` message before the facility refusal.
+        #
+        # Check every row before refusing, so one 403 names all the facilities the import
+        # needs instead of only the first row's — a CSV fix is one pass, not one per row.
+        # A row naming no facility at all is refused the same as one naming only an
+        # out-of-scope facility: import creates new rows, so the create-time "must name
+        # a facility you hold" rule applies, not the looser existing-row write rule.
         ids_by_slug = await self._resolve_slugs(
             {slug for _, _, _, data in normalized_records for slug in data.facilities}
         )
-        for _, _, _, data in normalized_records:
-            self._require_facility_for_create({ids_by_slug[slug] for slug in data.facilities}, "the requested")
+        refused: list[tuple[int, str, list[str]]] = []
+        for row, (setpoint_address, readback_address, config_address, data) in enumerate(normalized_records, 1):
+            row_facility_ids = {ids_by_slug[slug] for slug in data.facilities}
+            if self.facility_scope is not None and not (row_facility_ids & self.facility_scope):
+                address = setpoint_address or readback_address or config_address
+                refused.append((row, address, sorted(data.facilities)))
+        if refused:
+            unreachable = sorted({slug for _, _, slugs in refused for slug in slugs})
+            rows = "; ".join(
+                f"row {row} ({address}): {', '.join(slugs) or '(none named)'}"
+                for row, address, slugs in refused[:_REFUSED_ROWS_SHOWN]
+            )
+            if len(refused) > _REFUSED_ROWS_SHOWN:
+                rows += f"; and {len(refused) - _REFUSED_ROWS_SHOWN} more"
+            logger.warning(
+                "PV import refused: %d of %d rows name only facilities outside the key's grant (%s)",
+                len(refused),
+                len(normalized_records),
+                ", ".join(unreachable) or "(none named)",
+                extra={"refused_rows": len(refused), "total_rows": len(normalized_records), "facilities": unreachable},
+            )
+            raise InsufficientFacilityAccess(
+                f"API key is not scoped to facility(s) {', '.join(unreachable) or '(none named)'}. "
+                f"{len(refused)} of {len(normalized_records)} rows name no facility it can write: {rows}"
+            )
 
         existence_lookups = (
             ("setpoint", self.pv_repo.get_existing_setpoints),
@@ -384,9 +455,7 @@ class PvService:
         if not pv:
             return None
         facility_ids = await self.pv_repo.facility_ids_for(pv_id)
-        # Require access to all current facilities, including any that may be removed
-        # below: see the policy note on `_require_facility_write`.
-        self._require_facility_write(facility_ids, "this PV")
+        await self._require_facility_write(facility_ids, "this PV")
         if data.facilities is not None:
             new_ids = set((await self._resolve_slugs(data.facilities)).values())
             # A restricted key may not strip a PV down to unassigned: that would hide it
@@ -398,12 +467,10 @@ class PvService:
                 raise InsufficientFacilityAccess(
                     "API key is scoped to specific facilities; cannot unassign this PV's last facility"
                 )
-            # Require access to all requested facilities as well as all current ones,
-            # covering both additions and removals.
-            if self.facility_scope is not None and (outside := new_ids - self.facility_scope):
-                raise InsufficientFacilityAccess(
-                    f"API key is not scoped to the requested facility(s) {sorted(outside)}"
-                )
+            # Every facility being added or removed must be in the grant: "any overlap
+            # with the new set" would let a key holding just one of a PV's several
+            # facilities silently drop the others on an otherwise-permitted update.
+            await self._require_facility_containment(facility_ids ^ new_ids, "the requested change")
             await self.pv_repo.set_facilities(pv_id, new_ids)
             facility_ids = new_ids
         if data.device is not None:
@@ -426,7 +493,7 @@ class PvService:
         pv = await self.pv_repo.get_by_id(pv_id)
         if not pv:
             return False
-        self._require_facility_write(await self.pv_repo.facility_ids_for(pv_id), "this PV")
+        await self._require_facility_write(await self.pv_repo.facility_ids_for(pv_id), "this PV")
         try:
             await self.pv_repo.delete(pv)
         except IntegrityError as e:
