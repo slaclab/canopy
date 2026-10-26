@@ -20,7 +20,12 @@ from canopy.core.errors import (
 )
 from canopy.core.modules import WILDCARD
 from canopy.core.facilities.models import Facility
-from canopy.core.facilities.schemas import FacilityDTO, FacilityCreate, FacilityUpdate
+from canopy.core.facilities.schemas import (
+    FacilityDTO,
+    FacilityCreate,
+    FacilityUpdate,
+    FacilityAccessDTO,
+)
 from canopy.core.facilities.repositories import FacilityRepository
 
 # Async `(facility_id, slug) -> bool` callables, each answering "is this facility still
@@ -97,6 +102,17 @@ class FacilityService:
         """``{id: slug}`` for the subset of ``ids`` that exist. The reverse of
         ``ids_by_slug``, for turning stored ids back into slugs on the way out."""
         return await self.facility_repo.slugs_by_id(ids)
+
+    async def key_access(self, slugs: frozenset[str]) -> FacilityAccessDTO:
+        """A credential's grant as the slugs it can reach, descendants included.
+
+        Built on ``resolve_key_facility_scope``, the same resolution every facility gate
+        uses, so what this reports is what a write would be checked against.
+        """
+        scope = await self.resolve_key_facility_scope(slugs)
+        if scope is None:
+            return FacilityAccessDTO(unrestricted=True)
+        return FacilityAccessDTO(unrestricted=False, facilities=sorted((await self.slugs_by_id(scope)).values()))
 
     async def create(self, data: FacilityCreate) -> FacilityDTO:
         if await self.facility_repo.get_by_slug(data.slug):
