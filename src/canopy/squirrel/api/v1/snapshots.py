@@ -131,7 +131,7 @@ async def create_snapshot(data: NewSnapshotDTO, key: WriteKeyDep) -> JobCreatedD
         if facility_id is None:
             raise InsufficientFacilityAccess("API key is scoped to specific facilities; 'facility' is required")
         if facility_id not in key_scope:
-            raise InsufficientFacilityAccess("API key is not scoped to the requested facility")
+            raise InsufficientFacilityAccess(f"API key is not scoped to facility: {data.facility}")
 
     job_id = await jobs_gateway.enqueue(
         "create_snapshot_task", title=data.title, description=data.description, facility_id=facility_id

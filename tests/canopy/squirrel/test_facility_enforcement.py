@@ -249,6 +249,78 @@ async def test_multi_create_gates_each_row_not_the_import_s_union(client: AsyncC
     assert r.json()["results"] == []
 
 
+async def test_a_refused_import_names_every_unreachable_facility_and_row(
+    client: AsyncClient, db_session: AsyncSession, caplog: pytest.LogCaptureFixture
+):
+    """One 403 names all the facilities the import needs and the rows that need them,
+    not just the first refused row, so a CSV can be fixed in one pass. Rows the key can
+    reach through any one of their facilities aren't listed."""
+    await _seed_hierarchy(db_session)
+
+    with caplog.at_level("WARNING", logger="canopy.squirrel.services.pv_service"):
+        r = await client.post(
+            "/v1/pvs/multi",
+            headers=SC_HEADERS,
+            json=[
+                {"setpointAddress": "SC:PV:SP", "facilities": ["lcls-sc"]},
+                {"setpointAddress": "FACET:PV:SP", "facilities": ["facet"]},
+                {"setpointAddress": "SHARED:PV:SP", "facilities": ["lcls-sc", "facet"]},
+                {"readbackAddress": "NC:PV:RB", "facilities": ["lcls-nc", "facet"]},
+            ],
+        )
+
+    assert r.status_code == 403
+    assert r.json() == {
+        "code": "insufficient_facility_access",
+        "detail": (
+            "API key is not scoped to facility(s) facet, lcls-nc. 2 of 4 rows name no facility it can write: "
+            "row 2 (FACET:PV:SP): facet; row 4 (NC:PV:RB): facet, lcls-nc"
+        ),
+    }
+    [record] = caplog.records
+    assert record.getMessage() == (
+        "PV import refused: 2 of 4 rows name only facilities outside the key's grant (facet, lcls-nc)"
+    )
+    assert record.facilities == ["facet", "lcls-nc"]
+
+
+async def test_a_refused_import_lists_ten_rows_then_counts_the_rest(client: AsyncClient, db_session: AsyncSession):
+    await _seed_hierarchy(db_session)
+
+    r = await client.post(
+        "/v1/pvs/multi",
+        headers=SC_HEADERS,
+        json=[{"setpointAddress": f"FACET:PV:{i:02d}", "facilities": ["facet"]} for i in range(1, 13)],
+    )
+
+    assert r.status_code == 403
+    detail = r.json()["detail"]
+    assert detail.startswith("API key is not scoped to facility(s) facet. 12 of 12 rows name no facility it can write:")
+    assert "row 10 (FACET:PV:10): facet" in detail
+    assert "row 11" not in detail
+    assert detail.endswith("; and 2 more")
+
+
+async def test_single_pv_refusals_name_the_facility(client: AsyncClient, db_session: AsyncSession):
+    await _seed_hierarchy(db_session)
+
+    r = await client.post(
+        "/v1/pvs", headers=SC_HEADERS, json={"setpointAddress": "NC:PV:SP", "facilities": ["lcls-nc"]}
+    )
+    assert r.json()["detail"] == "API key is not scoped to the requested PV's facility(s): lcls-nc"
+
+    nc_pv = await _create_pv(client, WILD_HEADERS, "NC:PV:RB", ["lcls-nc", "facet"])
+    r = await client.put(f"/v1/pvs/{nc_pv}", headers=SC_HEADERS, json={"device": "d"})
+    assert r.json()["detail"] == "API key is not scoped to this PV's facility(s): facet, lcls-nc"
+    r = await client.delete(f"/v1/pvs/{nc_pv}", headers=SC_HEADERS)
+    assert r.json()["detail"] == "API key is not scoped to this PV's facility(s): facet, lcls-nc"
+
+    # The containment gate names only the facilities being added or removed out of scope.
+    sc_pv = await _create_pv(client, SC_HEADERS, "SC:PV:SP", ["lcls-sc"])
+    r = await client.put(f"/v1/pvs/{sc_pv}", headers=SC_HEADERS, json={"facilities": ["lcls-sc", "facet"]})
+    assert r.json()["detail"] == "API key is not scoped to the requested change's facility(s): facet"
+
+
 async def test_unknown_facility_slug_on_a_write_is_404_not_a_silent_no_op(
     client: AsyncClient, db_session: AsyncSession
 ):
@@ -319,6 +391,7 @@ async def test_scoped_key_must_name_a_facility_to_create_a_snapshot(
 
     r = await client.post("/v1/snapshots", headers=SC_HEADERS, json={"title": "T", "facility": "lcls-nc"})
     assert r.status_code == 403
+    assert r.json()["detail"] == "API key is not scoped to facility: lcls-nc"
     assert enqueued == []
 
     r = await client.post("/v1/snapshots", headers=SC_HEADERS, json={"title": "T", "facility": "lcls-sc"})
@@ -467,6 +540,7 @@ async def test_snapshot_metadata_and_delete_are_facility_gated(client: AsyncClie
 
     r = await client.put(f"/v1/snapshots/{snapshot.id}", headers=NC_HEADERS, json={"title": "hijacked"})
     assert r.status_code == 403
+    assert r.json()["detail"] == "API key is not scoped to this snapshot's facility: lcls-sc"
     r = await client.delete(f"/v1/snapshots/{snapshot.id}", headers=NC_HEADERS)
     assert r.status_code == 403
 
@@ -588,11 +662,11 @@ async def test_a_restricted_key_cannot_unassign_a_pv_it_fully_holds(client: Asyn
 
     r = await client.get("/v1/pvs/paged", headers=WILD_HEADERS)
     pv = next(p for p in r.json()["results"] if p["id"] == pv_id)
-    assert pv["facilityIds"] != []
+    assert pv["facilities"] != []
 
     r = await client.put(f"/v1/pvs/{pv_id}", headers=WILD_HEADERS, json={"facilities": []})
     assert r.status_code == 200, r.text
-    assert r.json()["facilityIds"] == []
+    assert r.json()["facilities"] == []
 
 
 async def test_a_restricted_key_cannot_create_an_unassigned_pv(client: AsyncClient, db_session: AsyncSession):

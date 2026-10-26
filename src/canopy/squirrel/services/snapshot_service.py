@@ -292,17 +292,23 @@ class SnapshotService:
                 )
         return meta_pv_values
 
-    def _require_facility_write(self, facility_id: str | None, what: str) -> None:
+    async def _require_facility_write(self, facility_id: str | None, what: str) -> None:
         """Gate a write on the calling key's facility grant. Unrestricted keys pass
         unconditionally; a restricted key — including an empty-grant one — needs the
         row's facility in its grant, and an *unassigned* row (``facility_id IS NULL``)
         is refused rather than passed, since no grant can cover it. Mirrors
         ``PvService._require_facility_write`` — a snapshot has at most one facility, so
-        "any overlap" degenerates to membership."""
+        "any overlap" degenerates to membership. The refusal names the facility by
+        slug, as the PV gate does; an unassigned row has none to name."""
         if self.facility_scope is None:
             return
-        if facility_id is None or facility_id not in self.facility_scope:
-            raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility")
+        if facility_id is None:
+            raise InsufficientFacilityAccess(
+                f"API key is scoped to specific facilities; {what} is unassigned and only an unrestricted key may write it"
+            )
+        if facility_id not in self.facility_scope:
+            slug = await self._facility_slug(facility_id)
+            raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility: {slug}")
 
     async def _facility_slug(self, facility_id: str | None) -> str | None:
         """A stored facility id as the slug reported on the wire."""
@@ -482,7 +488,7 @@ class SnapshotService:
         existing = await self.snapshot_repo.get_by_id(snapshot_id)
         if not existing:
             return None
-        self._require_facility_write(existing.facility_id, "this snapshot")
+        await self._require_facility_write(existing.facility_id, "this snapshot")
         snapshot = await self.snapshot_repo.update_metadata(snapshot_id, title=title, description=description)
         if not snapshot:
             return None
@@ -1002,5 +1008,5 @@ class SnapshotService:
         snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
         if not snapshot:
             return False
-        self._require_facility_write(snapshot.facility_id, "this snapshot")
+        await self._require_facility_write(snapshot.facility_id, "this snapshot")
         return await self.snapshot_repo.delete_with_values(snapshot_id)
