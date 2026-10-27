@@ -84,7 +84,7 @@ All routes live under `/elog/v1`. API keys need the module scope `elog`
 | Method and path | Access | Returns |
 |-----------------|--------|---------|
 | `GET /apps/{app}/config` | none | `{enabled, provider, defaultLogbookIds, reason}` |
-| `GET /apps/{app}/logbooks` | read | `[{id, name}]` |
+| `GET /apps/{app}/logbooks` | read | `[{id, name}]`, logbooks this app's token can post to |
 | `GET /apps/{app}/logbooks/{logbookId}/tags` | read | `[{id, name}]` |
 | `GET /apps/{app}/users?search=&limit=20` | read | `[{uid, commonName, surname, gecos, mail}]` (`search` 1–100 chars, `limit` 1–100) |
 | `GET /apps/{app}/recent-entries?logbookId=a&logbookId=b&limit=5` | read | `[{id, title, loggedAt, loggedBy}]`, entries this app's token posted (`limit` 1–20) |

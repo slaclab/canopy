@@ -50,6 +50,7 @@ async def get_app_config(app: str, service: ElogServiceDep) -> ElogConfigDTO:
 
 @router.get("/logbooks", dependencies=[Security(require_read_access)])
 async def list_logbooks(app: str, service: ElogServiceDep) -> list[ElogLogbookDTO]:
+    """Logbooks this app's token can post to."""
     return await service.list_logbooks(app)
 
 

@@ -227,7 +227,10 @@ class ElogPlusAdapter:
     # ------------------------------------------------------------------ #
 
     async def list_logbooks(self) -> list[ElogLogbookDTO]:
-        items = await self._call("GET", "/v1/logbooks") or []
+        # elog-plus defaults to the logbooks the token can read, plus every publicly
+        # readable one. Ask for Write (which includes Admin) so callers only see logbooks
+        # a post can go to. Root tokens get every logbook either way.
+        items = await self._call("GET", "/v1/logbooks", params={"filterForAuthorizationTypes": "Write"}) or []
         with _parsing("logbooks"):
             return [ElogLogbookDTO(id=item["id"], name=item["name"]) for item in items]
 

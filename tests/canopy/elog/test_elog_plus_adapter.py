@@ -35,7 +35,7 @@ def _entry(**overrides) -> ElogEntryCreateDTO:
 
 class TestRequests:
     async def test_sends_the_app_token_in_the_default_header(self, adapter, httpx_mock: HTTPXMock):
-        httpx_mock.add_response(url=f"{BASE}/v1/logbooks", json=_envelope([]))
+        httpx_mock.add_response(url=f"{BASE}/v1/logbooks?filterForAuthorizationTypes=Write", json=_envelope([]))
 
         await adapter.list_logbooks()
 
@@ -64,13 +64,21 @@ class TestRequests:
 class TestListing:
     async def test_strips_the_payload_envelope(self, adapter, httpx_mock: HTTPXMock):
         httpx_mock.add_response(
-            url=f"{BASE}/v1/logbooks",
+            url=f"{BASE}/v1/logbooks?filterForAuthorizationTypes=Write",
             json=_envelope([{"id": "lb1", "name": "Ops", "tags": []}, {"id": "lb2", "name": "Commissioning"}]),
         )
 
         logbooks = await adapter.list_logbooks()
 
         assert [(lb.id, lb.name) for lb in logbooks] == [("lb1", "Ops"), ("lb2", "Commissioning")]
+
+    async def test_lists_only_logbooks_the_token_can_post_to(self, adapter, httpx_mock: HTTPXMock):
+        # elog-plus defaults to Read, which adds every publicly readable logbook.
+        httpx_mock.add_response(json=_envelope([]))
+
+        await adapter.list_logbooks()
+
+        assert httpx_mock.get_request().url.params["filterForAuthorizationTypes"] == "Write"
 
     async def test_tolerates_a_missing_envelope(self, adapter, httpx_mock: HTTPXMock):
         httpx_mock.add_response(json=[{"id": "lb1", "name": "Ops"}])
