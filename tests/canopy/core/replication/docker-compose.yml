@@ -1,0 +1,38 @@
+# Two Postgres 16 servers for test_replication_e2e.py: a primary with
+# wal_level=logical, and a mirror that reaches it by service name.
+#
+#   docker compose -f tests/canopy/core/replication/docker-compose.yml up -d --wait
+#   export CANOPY_TEST_REPLICATION_PUBLISHER_DSN=postgresql://postgres:postgres@localhost:55442/postgres
+#   export CANOPY_TEST_REPLICATION_SUBSCRIBER_DSN=postgresql://postgres:postgres@localhost:55443/postgres
+#   export CANOPY_TEST_REPLICATION_PUBLISHER_CONNINFO="host=publisher port=5432"
+#   uv run pytest tests/canopy/core/replication/test_replication_e2e.py
+#   docker compose -f tests/canopy/core/replication/docker-compose.yml down
+
+name: canopy-replication-test
+
+x-postgres: &postgres
+  image: postgres:16
+  environment:
+    POSTGRES_PASSWORD: postgres
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U postgres"]
+    interval: 2s
+    timeout: 5s
+    retries: 30
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "3"
+
+services:
+  publisher:
+    <<: *postgres
+    command: ["postgres", "-c", "wal_level=logical"]
+    ports:
+      - "55442:5432"
+
+  subscriber:
+    <<: *postgres
+    ports:
+      - "55443:5432"

@@ -44,10 +44,17 @@ jobs:
     - name: Install dependencies
       run: uv sync --group dev
 
+    # A primary (wal_level=logical) and a mirror, for the replication end-to-end tests.
+    - name: Start the replication test servers
+      run: docker compose -f tests/canopy/core/replication/docker-compose.yml up -d --wait
+
     - name: Test with pytest
       run: uv run coverage run -m pytest tests/ -v
       env:
         COVERAGE_FILE: ".coverage.linux"
+        CANOPY_TEST_REPLICATION_PUBLISHER_DSN: postgresql://postgres:postgres@localhost:55442/postgres
+        CANOPY_TEST_REPLICATION_SUBSCRIBER_DSN: postgresql://postgres:postgres@localhost:55443/postgres
+        CANOPY_TEST_REPLICATION_PUBLISHER_CONNINFO: host=publisher port=5432
 
     - name: Store coverage file
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
