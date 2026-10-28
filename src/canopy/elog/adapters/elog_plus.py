@@ -169,8 +169,13 @@ class ElogPlusAdapter:
             logger.warning("elog-plus %s %s timed out for app %s", method, path, self.app)
             raise ElogUpstreamTimeout(f"elog-plus {method} {path} timed out") from exc
         except httpx.HTTPError as exc:
-            logger.warning("elog-plus %s %s failed for app %s: %s", method, path, self.app, exc)
-            raise ElogUpstreamError(f"elog-plus is unreachable: {exc}") from exc
+            # Name the error type only, and drop the cause from the traceback: some
+            # messages quote the request headers, token included (h11's "Illegal
+            # header value b'<token>\n'"), and this text reaches logs, the client's
+            # error detail and the health summary.
+            error = type(exc).__name__
+            logger.warning("elog-plus %s %s failed for app %s: %s", method, path, self.app, error)
+            raise ElogUpstreamError(f"elog-plus is unreachable ({error})") from None
         if not response.is_success:
             detail = _error_detail(response)
             logger.warning(

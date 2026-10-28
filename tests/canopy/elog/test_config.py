@@ -43,6 +43,17 @@ def test_per_app_token_lands_in_its_app(monkeypatch):
     assert config.apps["trace"].default_logbook_ids == []
 
 
+def test_whitespace_around_a_token_is_stripped(monkeypatch):
+    # A secret file ending in a newline; the header value would otherwise be illegal.
+    monkeypatch.setenv("CANOPY_ELOG__APPS__SQUIRREL__TOKEN", "squirrel-secret\n")
+    monkeypatch.setenv("CANOPY_ELOG__APPS__TRACE__TOKEN", " \n")
+
+    config = ElogConfig()
+
+    assert config.apps["squirrel"].token.get_secret_value() == "squirrel-secret"
+    assert config.apps["trace"].token.get_secret_value() == ""
+
+
 def test_tokens_never_appear_in_repr(monkeypatch):
     monkeypatch.setenv("CANOPY_ELOG__APPS__SQUIRREL__TOKEN", "squirrel-secret")
 

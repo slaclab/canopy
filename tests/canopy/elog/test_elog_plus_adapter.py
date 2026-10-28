@@ -1,6 +1,8 @@
 """`ElogPlusAdapter` against a mocked elog-plus (pytest-httpx)."""
 
 import json
+import logging
+import traceback
 from datetime import UTC, datetime, timezone, timedelta
 
 import httpx
@@ -266,6 +268,18 @@ class TestErrors:
         with pytest.raises(ElogUpstreamError, match="unreachable"):
             await adapter.list_logbooks()
 
+    async def test_transport_error_text_is_never_echoed(self, adapter, httpx_mock: HTTPXMock, caplog):
+        # What h11 raises for a token with a trailing newline: it quotes the header value.
+        httpx_mock.add_exception(httpx.LocalProtocolError("Illegal header value b'squirrel-token\\n'"))
+        caplog.set_level(logging.WARNING, logger="canopy.elog.adapters.elog_plus")
+
+        with pytest.raises(ElogUpstreamError, match=r"unreachable \(LocalProtocolError\)") as excinfo:
+            await adapter.list_logbooks()
+
+        assert "LocalProtocolError" in caplog.text
+        assert "squirrel-token" not in caplog.text
+        assert "squirrel-token" not in "".join(traceback.format_exception(excinfo.value))
+
     async def test_non_json_body_is_an_upstream_error(self, adapter, httpx_mock: HTTPXMock):
         httpx_mock.add_response(text="<html>login</html>")
 
@@ -301,6 +315,14 @@ class TestHealth:
 
         assert health.healthy is False
         assert "401" in health.last_error
+
+    async def test_transport_error_text_stays_out_of_last_error(self, adapter, httpx_mock: HTTPXMock):
+        httpx_mock.add_exception(httpx.LocalProtocolError("Illegal header value b'squirrel-token\\n'"))
+
+        health = await adapter.health()
+
+        assert health.healthy is False
+        assert health.last_error == "elog-plus is unreachable (LocalProtocolError)"
 
 
 class TestFromConfig:

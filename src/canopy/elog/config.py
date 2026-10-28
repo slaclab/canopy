@@ -38,6 +38,15 @@ class ElogAppConfig(BaseModel):
     # Logbooks a client preselects in its post dialog. JSON list in env.
     default_logbook_ids: list[str] = Field(default_factory=list)
 
+    @field_validator("token")
+    @classmethod
+    def _strip_token(cls, value: SecretStr | None) -> SecretStr | None:
+        # A token read from a secret file often ends in a newline, which no HTTP
+        # header value may carry; every request would then fail.
+        if value is None:
+            return None
+        return SecretStr(value.get_secret_value().strip())
+
 
 class ElogConfig(BaseSettings):
     model_config = SettingsConfigDict(
