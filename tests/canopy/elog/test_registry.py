@@ -95,11 +95,22 @@ def test_adapter_factory_failure_of_any_kind_disables_the_module():
     assert registry.disabled_reason == "adapter factory blew up"
 
 
-def test_dotted_path_to_a_missing_module_disables_the_module():
-    registry = build_registry(_config(provider="not_a_module:Adapter"))
+@pytest.mark.parametrize(
+    ("provider", "error"),
+    [
+        ("not_a_module:Adapter", "No module named 'not_a_module'"),
+        # import_module raises TypeError for a relative path and ValueError for an empty one.
+        (".adapter:Adapter", "relative import"),
+        (":Adapter", "Empty module name"),
+        ("tests.canopy.elog._raises_on_import:Adapter", "adapter module needs SOME_SETTING"),
+    ],
+)
+def test_dotted_path_whose_module_will_not_import_disables_the_module(provider, error):
+    registry = build_registry(_config(provider=provider, apps={"squirrel": ElogAppConfig(token="t")}))
 
     assert registry.enabled is False
-    assert "Cannot import" in registry.disabled_reason
+    assert registry.disabled_reason.startswith("Cannot import e-log adapter module")
+    assert error in registry.disabled_reason
 
 
 async def test_close_all_closes_every_adapter():

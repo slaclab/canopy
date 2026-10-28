@@ -94,7 +94,7 @@ def _resolve_provider_class(provider: str) -> type[ElogAdapter]:
         module_path, _, class_name = provider.partition(":")
         try:
             module = importlib.import_module(module_path)
-        except ImportError as exc:
+        except Exception as exc:  # a relative path is a TypeError, and the module's own code may raise anything
             raise ValueError(f"Cannot import e-log adapter module '{module_path}': {exc}") from exc
         cls = getattr(module, class_name, None)
         if cls is None:
@@ -122,7 +122,7 @@ def build_registry(config: ElogConfig) -> ElogRegistry:
         return ElogRegistry(None, disabled_reason="No e-log provider is configured (CANOPY_ELOG__PROVIDER is empty)")
     try:
         cls = _resolve_provider_class(config.provider)
-    except ValueError as exc:
+    except Exception as exc:  # whatever resolving the provider raises, it may not abort startup
         logger.error("E-log disabled: %s", exc)
         return ElogRegistry(None, disabled_reason=str(exc))
 
