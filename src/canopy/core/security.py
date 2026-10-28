@@ -76,7 +76,7 @@ class EnvKeyRegistry:
         CANOPY_API_KEYS="ro:read@*,rw:read+write@*"     # two keys
         CANOPY_API_KEYS="ops:admin@*"                   # key management only
         CANOPY_API_KEYS="ops:admin@core"                # admin, core routes only
-        CANOPY_API_KEYS="fox:read+write@squirrel+fox"   # scoped to two modules
+        CANOPY_API_KEYS="ui:read+write@squirrel+formula-engine"    # scoped to two modules
 
     Env keys are no longer a stop-gap: they are the statically stable layer in
     front of the Postgres-backed registry. Keys defined here keep working when the
