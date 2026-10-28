@@ -114,9 +114,9 @@
 | src/canopy/hare/api/v1/health.py                     |       11 |        0 |    100% |           |
 | src/canopy/hare/api/v1/pvs.py                        |       17 |        0 |    100% |           |
 | src/canopy/hare/api/v1/router.py                     |        8 |        0 |    100% |           |
-| src/canopy/hare/api/v1/ws.py                         |       41 |        4 |     90% | 77, 80-82 |
+| src/canopy/hare/api/v1/ws.py                         |       41 |        4 |     90% | 80, 83-85 |
 | src/canopy/hare/app.py                               |       32 |        0 |    100% |           |
-| src/canopy/hare/config.py                            |       13 |        0 |    100% |           |
+| src/canopy/hare/config.py                            |       15 |        0 |    100% |           |
 | src/canopy/hare/dependencies.py                      |        7 |        0 |    100% |           |
 | src/canopy/hare/errors.py                            |        2 |        2 |      0% |      9-12 |
 | src/canopy/hare/gateway.py                           |       11 |        1 |     91% |        29 |
@@ -127,7 +127,7 @@
 | src/canopy/hare/schemas/pv.py                        |        7 |        0 |    100% |           |
 | src/canopy/hare/schemas/ws.py                        |       23 |        0 |    100% |           |
 | src/canopy/hare/services/\_\_init\_\_.py             |        0 |        0 |    100% |           |
-| src/canopy/hare/services/broker.py                   |      354 |       48 |     86% |80, 115, 132-135, 138-143, 206, 271, 274, 379, 409, 414-415, 435-436, 448-449, 459-460, 500, 522-533, 538, 541-548, 565, 618-619, 629-630 |
+| src/canopy/hare/services/broker.py                   |      440 |       51 |     88% |94, 129, 152-153, 160-161, 224, 286, 289, 386, 408, 420-421, 449, 482, 484, 491-492, 578, 608, 613-614, 635-636, 651-652, 662-663, 717, 739-750, 755, 758-765, 782, 835-836, 846-847 |
 | src/canopy/hare/services/subscriptions.py            |       51 |        2 |     96% |    30, 72 |
 | src/canopy/jobs/\_\_init\_\_.py                      |        0 |        0 |    100% |           |
 | src/canopy/jobs/api/\_\_init\_\_.py                  |        0 |        0 |    100% |           |
@@ -280,7 +280,7 @@
 | src/canopy/vole/services/hare\_ingest.py             |       92 |       11 |     88% |47-48, 55, 77, 103, 121, 131-132, 152-155 |
 | src/canopy/vole/services/notifier.py                 |       35 |        2 |     94% |     33-34 |
 | src/canopy/worker.py                                 |       37 |        6 |     84% | 32, 61-65 |
-| **TOTAL**                                            | **8118** |  **716** | **91%** |           |
+| **TOTAL**                                            | **8206** |  **719** | **91%** |           |
 
 
 ## Setup coverage badge
