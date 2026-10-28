@@ -75,7 +75,7 @@
 | src/canopy/epics/\_\_init\_\_.py                     |        0 |        0 |    100% |           |
 | src/canopy/epics/backends/\_\_init\_\_.py            |        0 |        0 |    100% |           |
 | src/canopy/epics/backends/epics\_backend.py          |      328 |       79 |     76% |56, 75-76, 84, 88, 118-119, 165-166, 171, 211-212, 227-232, 235-240, 247-248, 286, 289-318, 324-325, 349, 358-360, 370, 373-389, 410, 415-416, 474-475, 517, 535, 556-557, 559, 569, 589-592, 602-603 |
-| src/canopy/epics/backends/simulation.py              |      143 |        8 |     94% |143, 145-148, 334, 336, 368 |
+| src/canopy/epics/backends/simulation.py              |      150 |        8 |     95% |151, 153-156, 346, 350, 382 |
 | src/canopy/epics/base.py                             |       53 |        8 |     85% |64, 157, 161, 165, 169, 175, 179, 185 |
 | src/canopy/epics/config.py                           |       24 |        0 |    100% |           |
 | src/canopy/epics/gateway.py                          |       10 |        0 |    100% |           |
@@ -280,7 +280,7 @@
 | src/canopy/vole/services/hare\_ingest.py             |       92 |       11 |     88% |47-48, 55, 77, 103, 121, 131-132, 152-155 |
 | src/canopy/vole/services/notifier.py                 |       35 |        2 |     94% |     33-34 |
 | src/canopy/worker.py                                 |       37 |        6 |     84% | 32, 61-65 |
-| **TOTAL**                                            | **8206** |  **719** | **91%** |           |
+| **TOTAL**                                            | **8213** |  **719** | **91%** |           |
 
 
 ## Setup coverage badge
