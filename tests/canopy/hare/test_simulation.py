@@ -1,5 +1,8 @@
 """Simulation connector backend."""
 
+import time
+from types import SimpleNamespace
+
 import pytest
 
 from tests.conftest import wait_for
@@ -54,7 +57,7 @@ async def test_waveform_value_and_describe():
 
 @pytest.mark.parametrize("pv", ["SIM:NAMES:STR_WAVEFORM", "SIM:NAMES:STR_WF", "pva://SIM:NAMES:STR_WF"])
 async def test_string_waveform_value_and_describe(monkeypatch, pv):
-    monkeypatch.setattr(simulation.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(simulation, "time", SimpleNamespace(monotonic=lambda: 0.0, time_ns=time.time_ns))
     monkeypatch.setattr(SimulationConnector, "_phase", staticmethod(lambda pv: 0.0))
     conn = SimulationConnector(waveform_length=4)
     value = await conn.get(pv)
