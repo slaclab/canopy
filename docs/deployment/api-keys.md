@@ -282,6 +282,27 @@ write would silently do nothing, which is worse than an error. The rules:
   not the read-masking one), so they report `403` rather than `404` for the
   same case — both refuse the write; only the status code differs.
 
+A `403 insufficient_facility_access` names the facilities the key lacks. A refused
+`POST /v1/pvs/multi` names every one the import needs, and lists the refused rows,
+since one bad row refuses the whole batch.
+
+**Checking access ahead of a write.** `GET /v1/facilities/access` returns the
+calling key's own reach, so a client can check before writing instead of finding
+out from a `403` (an import preview, or a facility picker that shows only what the
+key can use):
+
+```json
+{"unrestricted": false, "facilities": ["lcls", "lcls-nc", "lcls-sc"]}
+```
+
+`facilities` lists every reachable slug, with a parent grant expanded to its
+descendants, so a client tests membership directly. An unrestricted key gets
+`{"unrestricted": true, "facilities": []}`. An `admin` key reports its own grant
+like any other. It's read-gated like `GET /v1/facilities` and needs the `core`
+module, so a key scoped only to `squirrel` gets a `403` here. It's under
+`/v1/facilities` rather than `/v1/api-keys` because key management is admin-only,
+and the keys that need this answer aren't admin keys.
+
 **Where facilities come from.** Both are set by the user. A PV's facilities (it
 can have several) are assigned when it's created or edited, through `facilities`
 on `POST`/`PUT /v1/pvs`. A snapshot has at most one facility, chosen when it's
