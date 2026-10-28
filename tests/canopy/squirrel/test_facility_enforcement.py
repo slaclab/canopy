@@ -27,6 +27,7 @@ SC_HEADERS = {"X-API-Key": "sc-key"}
 NC_HEADERS = {"X-API-Key": "nc-key"}
 LCLS_HEADERS = {"X-API-Key": "lcls-key"}
 NONE_HEADERS = {"X-API-Key": "none-key"}
+SC_FACET_HEADERS = {"X-API-Key": "sc-facet-key"}
 WILD_HEADERS = {"X-API-Key": "wild-key"}
 ADMIN_HEADERS = {"X-API-Key": "admin-key"}
 
@@ -69,6 +70,13 @@ def scoped_keys():
                     facilities=frozenset({"lcls"}),
                 ),
                 APIKey(token="none-key", read=True, write=True, modules=frozenset({WILDCARD}), facilities=frozenset()),
+                APIKey(
+                    token="sc-facet-key",
+                    read=True,
+                    write=True,
+                    modules=frozenset({WILDCARD}),
+                    facilities=frozenset({"lcls-sc", "facet"}),
+                ),
                 APIKey(
                     token="wild-key",
                     read=True,
@@ -134,13 +142,28 @@ async def test_parent_grant_covers_a_child_facility(client: AsyncClient, db_sess
     assert r.status_code == 200, r.text
 
 
-async def test_holding_one_of_a_pvs_facilities_is_enough(client: AsyncClient, db_session: AsyncSession):
+async def test_holding_only_one_of_a_pvs_several_facilities_is_not_enough(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """Every write to a multi-facility PV — not just a change to its facility list —
+    requires holding *all* of its facilities, not just one. Otherwise a key scoped to
+    `lcls-sc` could edit, or (far worse) delete, a PV also assigned to `facet` on the
+    strength of a single shared facility, reaching data and destroying a row it was
+    never granted any access to via `facet`."""
     facilities = await _seed_hierarchy(db_session)
     pv_id = await _create_pv(client, WILD_HEADERS, "SHARED:PV:SP", ["lcls-sc", "facet"])
 
     r = await client.put(f"/v1/pvs/{pv_id}", headers=SC_HEADERS, json={"device": "d"})
+    assert r.status_code == 403, r.text
+    assert r.json()["code"] == "insufficient_facility_access"
+
+    r = await client.delete(f"/v1/pvs/{pv_id}", headers=SC_HEADERS)
+    assert r.status_code == 403, r.text
+
+    # A key holding every one of the PV's facilities — not just the wildcard — can
+    # still write it.
+    r = await client.put(f"/v1/pvs/{pv_id}", headers=SC_FACET_HEADERS, json={"device": "d"})
     assert r.status_code == 200, r.text
-    # The write didn't quietly drop the facility the key can't reach.
     assert set(r.json()["facilityIds"]) == {facilities["lcls-sc"].id, facilities["facet"].id}
 
 
@@ -202,6 +225,33 @@ async def test_assigning_a_pv_outside_the_grant_is_refused(client: AsyncClient, 
     pv_id = await _create_pv(client, SC_HEADERS, "SC:PV:SP", ["lcls-sc"])
     r = await client.put(f"/v1/pvs/{pv_id}", headers=SC_HEADERS, json={"facilities": ["lcls-nc"]})
     assert r.status_code == 403
+
+
+async def test_creating_a_pv_in_several_facilities_needs_all_of_them_held(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """Naming one facility the key holds alongside one it doesn't must not let the
+    create through — a key scoped to `lcls-sc` could otherwise mint a PV into `facet`
+    for free, just by also naming `lcls-sc`."""
+    await _seed_hierarchy(db_session)
+
+    r = await client.post(
+        "/v1/pvs",
+        headers=SC_HEADERS,
+        json={"setpointAddress": "SHARED:PV:SP", "facilities": ["lcls-sc", "facet"]},
+    )
+    assert r.status_code == 403
+    assert r.json()["code"] == "insufficient_facility_access"
+
+    r = await client.get("/v1/pvs/paged", headers=WILD_HEADERS)
+    assert r.json()["results"] == []
+
+    r = await client.post(
+        "/v1/pvs",
+        headers=SC_FACET_HEADERS,
+        json={"setpointAddress": "SHARED:PV:SP", "facilities": ["lcls-sc", "facet"]},
+    )
+    assert r.status_code == 200, r.text
 
 
 async def test_create_does_not_leak_an_out_of_scope_pv_s_existence_via_409(
