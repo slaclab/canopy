@@ -40,11 +40,17 @@ def upgrade() -> None:
     )
     op.create_index(op.f("ix_core_facility_parent_id"), "facility", ["parent_id"], unique=False, schema="core")
     op.create_index(op.f("ix_core_facility_slug"), "facility", ["slug"], unique=True, schema="core")
+    # Backfill every pre-existing row to `{"*"}` — every facility — the same way
+    # `e2a7c1f5b6d3` backfilled `modules`, so a key minted before this column existed
+    # keeps seeing everything it could before. Only new rows should default to `{}`
+    # ("provisioned but not yet assigned"), so the server default is narrowed to that
+    # right after the backfill, in the same migration.
     op.add_column(
         "api_key",
-        sa.Column("facilities", sa.ARRAY(sa.String()), server_default=sa.text("'{}'::text[]"), nullable=False),
+        sa.Column("facilities", sa.ARRAY(sa.String()), server_default=sa.text("'{*}'::text[]"), nullable=False),
         schema="core",
     )
+    op.alter_column("api_key", "facilities", server_default=sa.text("'{}'::text[]"), schema="core")
 
 
 def downgrade() -> None:

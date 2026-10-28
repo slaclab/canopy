@@ -88,6 +88,7 @@ class ErrorCode(StrEnum):
     FACILITY_SLUG_CONFLICT = auto()
     FACILITY_HAS_CHILDREN = auto()
     FACILITY_IN_USE = auto()
+    FACILITY_CYCLE = auto()
 
     # Converter
     CONVERTER_UNSUPPORTED_INPUT = auto()
@@ -232,6 +233,14 @@ class FacilityInUse(CanopyError):
 
     status_code = 400
     error_code = ErrorCode.FACILITY_IN_USE
+
+
+class FacilityCycle(CanopyError):
+    """Refused a reparent that would make a facility its own ancestor — includes
+    the self-parent case, not just a deeper cycle."""
+
+    status_code = 400
+    error_code = ErrorCode.FACILITY_CYCLE
 
 
 def register_canopy_error_handler(app: FastAPI) -> None:

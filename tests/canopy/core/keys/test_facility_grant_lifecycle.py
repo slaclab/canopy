@@ -60,7 +60,13 @@ def admin_client(session_maker) -> TestClient:
         async def get(self, token: str) -> APIKey | None:
             if token == "test-admin":
                 return APIKey(
-                    token=token, read=True, write=True, admin=True, modules=frozenset({WILDCARD}), name="admin"
+                    token=token,
+                    read=True,
+                    write=True,
+                    admin=True,
+                    modules=frozenset({WILDCARD}),
+                    facilities=frozenset({WILDCARD}),
+                    name="admin",
                 )
             return None
 

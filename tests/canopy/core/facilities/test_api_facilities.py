@@ -1,13 +1,16 @@
 """API tests for the facility endpoints.
 
-Reads are read-gated, writes are admin-gated; the ``fake_keys`` fixture binds one
-key of each so both halves can be shown against the same router.
+Reads are read-gated, writes require the facility wildcard (stricter than plain
+``admin``, since editing the hierarchy can widen what an existing grant resolves
+to); the ``fake_keys`` fixture binds a read key and a wildcard-facility admin key
+so both halves can be shown against the same router.
 """
 
 from canopy.core.facilities.models import Facility
 
 READ_HEADERS = {"X-API-Key": "test-read"}
 ADMIN_HEADERS = {"X-API-Key": "test-admin"}
+SCOPED_ADMIN_HEADERS = {"X-API-Key": "test-scoped-admin"}
 
 
 async def _seed_facility(session, slug: str, parent_id: str | None = None) -> Facility:
@@ -158,6 +161,30 @@ async def test_read_key_may_list_but_not_write(facilities_client, session_maker,
     )
     assert facilities_client.put("/v1/facilities/lcls", json={"name": "Nope"}, headers=READ_HEADERS).status_code == 403
     assert facilities_client.delete("/v1/facilities/lcls", headers=READ_HEADERS).status_code == 403
+
+
+async def test_admin_without_facility_wildcard_may_list_but_not_write(facilities_client, session_maker, fake_keys):
+    """Writing the hierarchy needs the facility wildcard, not just ``admin`` —
+    stricter than key management, since reparenting or deleting a node can widen
+    what an *existing* grant on an ancestor resolves to. A plain admin key (no
+    facility grant) is refused all three write verbs, same as a read key, while its
+    ``GET`` still works."""
+    facilities_client.post("/v1/facilities", json={"slug": "lcls", "name": "LCLS"}, headers=ADMIN_HEADERS)
+
+    denied_create = facilities_client.post(
+        "/v1/facilities", json={"slug": "x", "name": "X"}, headers=SCOPED_ADMIN_HEADERS
+    )
+    assert denied_create.status_code == 403
+    assert denied_create.json()["code"] == "insufficient_facility_access"
+    assert (
+        facilities_client.put("/v1/facilities/lcls", json={"name": "Nope"}, headers=SCOPED_ADMIN_HEADERS).status_code
+        == 403
+    )
+    assert facilities_client.delete("/v1/facilities/lcls", headers=SCOPED_ADMIN_HEADERS).status_code == 403
+
+    listed = facilities_client.get("/v1/facilities", headers=SCOPED_ADMIN_HEADERS)
+    assert listed.status_code == 200
+    assert [f["slug"] for f in listed.json()] == ["lcls"]
 
     listed = facilities_client.get("/v1/facilities", headers=READ_HEADERS)
     assert listed.status_code == 200

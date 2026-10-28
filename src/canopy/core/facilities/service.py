@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.core.errors import (
+    FacilityCycle,
     FacilityInUse,
     FacilityNotFound,
     FacilityHasChildren,
@@ -95,8 +96,11 @@ class FacilityService:
             return None
         if data.parent is not None:
             parent_id = await self._resolve_parent_id(data.parent)
-            if parent_id == facility_id:
-                raise FacilityHasChildren("A facility cannot be its own parent")
+            # Catches both the self-parent case and reparenting under a descendant —
+            # either makes the facility its own ancestor, which `resolve_facility_scope`'s
+            # recursive CTE would then never terminate walking.
+            if await self.facility_repo.is_ancestor(facility_id, parent_id):
+                raise FacilityCycle("A facility cannot be reparented under itself or one of its own descendants")
             facility.parent_id = parent_id
         if data.name is not None:
             facility.name = data.name

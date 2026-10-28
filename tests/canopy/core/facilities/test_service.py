@@ -1,13 +1,14 @@
 """Tests for FacilityService — hierarchy resolution and CRUD guards."""
 
 from canopy.core.errors import (
+    FacilityCycle,
     FacilityInUse,
     FacilityNotFound,
     FacilityHasChildren,
     FacilitySlugConflict,
 )
 from canopy.core.facilities.models import Facility
-from canopy.core.facilities.schemas import FacilityCreate
+from canopy.core.facilities.schemas import FacilityCreate, FacilityUpdate
 from canopy.core.facilities.service import FacilityService, register_in_use_checker
 
 
@@ -91,6 +92,38 @@ async def test_create_facility_rejects_unknown_parent(session, session_maker):
         assert False, "expected FacilityNotFound"
     except FacilityNotFound:
         pass
+
+
+async def test_update_rejects_self_as_parent(session, session_maker):
+    facility = await _seed_facility(session, "lcls")
+    await session.commit()
+
+    service = FacilityService(session)
+    try:
+        await service.update(facility.id, FacilityUpdate(parent="lcls"))
+        assert False, "expected FacilityCycle"
+    except FacilityCycle:
+        pass
+
+
+async def test_update_rejects_reparenting_under_a_descendant(session, session_maker):
+    root = await _seed_facility(session, "lcls")
+    child = await _seed_facility(session, "lcls-sc", parent_id=root.id)
+    grandchild = await _seed_facility(session, "lcls-sc-leaf", parent_id=child.id)
+    await session.commit()
+
+    service = FacilityService(session)
+    try:
+        await service.update(root.id, FacilityUpdate(parent="lcls-sc-leaf"))
+        assert False, "expected FacilityCycle"
+    except FacilityCycle:
+        pass
+
+    # Unaffected: a descendant can still be reparented under a sibling of its old parent.
+    sibling = await _seed_facility(session, "lcls-nc", parent_id=root.id)
+    await session.commit()
+    updated = await service.update(grandchild.id, FacilityUpdate(parent="lcls-nc"))
+    assert updated.parent_id == sibling.id
 
 
 async def test_delete_blocked_by_children(session, session_maker):

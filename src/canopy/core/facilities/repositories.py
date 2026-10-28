@@ -41,7 +41,10 @@ class FacilityRepository(BaseRepository[Facility]):
         currently match" (not reachable for a single root, but kept for symmetry with
         callers that intersect multiple scopes).
 
-        A recursive CTE over ``parent_id`` starting at the named facility.
+        A recursive CTE over ``parent_id`` starting at the named facility. Plain
+        ``union`` (not ``union_all``) — de-duplicating on each step means a cycle
+        that got into the table some other way still terminates, instead of looping
+        forever on every scope lookup that reaches it.
         """
         root = await self.get_by_slug(slug)
         if root is None:
@@ -49,7 +52,24 @@ class FacilityRepository(BaseRepository[Facility]):
 
         hierarchy = select(Facility.id).where(Facility.id == root.id).cte("facility_scope", recursive=True)
         children = select(Facility.id).join(hierarchy, Facility.parent_id == hierarchy.c.id)
-        hierarchy = hierarchy.union_all(children)
+        hierarchy = hierarchy.union(children)
 
         result = await self.session.execute(select(hierarchy.c.id))
         return {row[0] for row in result.all()}
+
+    async def is_ancestor(self, candidate_id: str, facility_id: str) -> bool:
+        """Is ``candidate_id`` ``facility_id`` itself or one of its ancestors?
+
+        Walks ``parent_id`` upward from ``facility_id``. Used to reject reparenting
+        a facility under its own descendant — the forward (descendant) direction is
+        ``resolve_facility_scope``; this is the same walk run backward, since a
+        facility's ancestor set isn't expressible as a single recursive CTE rooted at
+        itself the way its descendant set is.
+        """
+        current_id: str | None = facility_id
+        while current_id is not None:
+            if current_id == candidate_id:
+                return True
+            facility = await self.get_by_id(current_id)
+            current_id = facility.parent_id if facility else None
+        return False

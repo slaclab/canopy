@@ -92,17 +92,34 @@ async def session(session_maker) -> AsyncSession:
 
 @pytest.fixture
 def fake_keys():
-    """Bind a registry serving one read key and one admin key, then restore.
+    """Bind a registry serving a read key, a wildcard-facility admin key, and an
+    admin key with no facility grant, then restore.
 
     The bound registry is process-global, so restoring keeps a facilities-flavored
-    registry from leaking into everything that runs after. Two keys because writes
-    are admin-gated while ``GET`` stays read-gated — the pair is what lets a test
-    show a read key is refused a write and still allowed the read.
+    registry from leaking into everything that runs after. Three keys: writes are
+    read-refused (the read key), wildcard-facility-admin-allowed (the admin key),
+    and plain-admin-refused (the scoped-admin key, which holds ``admin`` but not the
+    facility wildcard the hierarchy-write routes additionally require).
     """
     keys = {
         "test-read": APIKey(token="test-read", read=True, write=False, modules=frozenset({WILDCARD}), name="read"),
         "test-admin": APIKey(
-            token="test-admin", read=True, write=True, admin=True, modules=frozenset({WILDCARD}), name="admin"
+            token="test-admin",
+            read=True,
+            write=True,
+            admin=True,
+            modules=frozenset({WILDCARD}),
+            facilities=frozenset({WILDCARD}),
+            name="admin",
+        ),
+        "test-scoped-admin": APIKey(
+            token="test-scoped-admin",
+            read=True,
+            write=True,
+            admin=True,
+            modules=frozenset({WILDCARD}),
+            facilities=frozenset(),
+            name="scoped-admin",
         ),
     }
 

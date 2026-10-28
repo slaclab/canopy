@@ -15,6 +15,7 @@ from canopy.core.errors import (
     InsufficientAdminAccess,
     InsufficientWriteAccess,
     InsufficientModuleAccess,
+    InsufficientFacilityAccess,
 )
 from canopy.core.modules import JOBS, WILDCARD, split_modules, module_for_app
 
@@ -286,6 +287,23 @@ def require_admin_access(key: APIKeyDep) -> APIKey:
 
 
 AdminKeyDep = Annotated[APIKey, Security(require_admin_access)]
+
+
+def require_wildcard_facility_access(key: AdminKeyDep) -> APIKey:
+    """Gate for editing the facility hierarchy itself, not just a key's grant.
+
+    There is no facility equivalent to ``_require_module_containment`` *at this
+    layer* — a facility-scoped admin delegating a narrower grant is handled in
+    ``core.keys.service``. This is a stricter, separate gate: reparenting or
+    deleting a facility can widen what every existing grant resolves to (a grant
+    on a parent silently covers a newly attached child), so only a key with
+    unrestricted facility access may touch the hierarchy at all, regardless of
+    what it's otherwise an admin for.
+    """
+    if not key.unrestricted_facilities:
+        raise InsufficientFacilityAccess("API key must hold the facility wildcard to manage the facility hierarchy")
+    return key
+
 
 # For handlers and service factories that need the key *object*, not just the gate.
 # FastAPI caches a dependency per request, so taking one of these alongside an existing
