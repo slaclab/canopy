@@ -26,6 +26,8 @@ from canopy.squirrel.pv_cache.keys import LEADER_KEY, encode_entry
 FAST = PVCacheConfig(
     enabled=True, lease_ttl_s=0.3, flush_interval_s=0.02, reconcile_interval_s=0.05, heartbeat_max_age_s=5
 )
+# Background loops that stay quiet for the length of a test, so it controls every write.
+QUIET = PVCacheConfig(enabled=True, lease_ttl_s=30, flush_interval_s=60, reconcile_interval_s=60, heartbeat_max_age_s=5)
 
 
 def _pv(address: str, value=1.5, *, connected=True, ts_ns=1_700_000_000_000_000_000) -> PVValue:
@@ -75,12 +77,34 @@ def _loader(addresses: set[str]):
     return load
 
 
-async def _leader(redis, addresses: set[str], connector=None, **kwargs) -> tuple[PVCacheMonitor, FakeConnector]:
+async def _leader(
+    redis, addresses: set[str], connector=None, config=FAST, **kwargs
+) -> tuple[PVCacheMonitor, FakeConnector]:
     connector = connector or FakeConnector()
-    monitor = PVCacheMonitor(connector, redis, FAST, _loader(addresses), **kwargs)
+    monitor = PVCacheMonitor(connector, redis, config, _loader(addresses), **kwargs)
     monitor.start()
     assert await wait_for(lambda: monitor.is_leader and set(connector.callbacks) == addresses)
     return monitor, connector
+
+
+def _before_next_exec(redis, hook) -> None:
+    """Await `hook` once, just before the next transaction's EXEC (after its WATCH)."""
+    real_pipeline = redis.pipeline
+    hooks = [hook]
+
+    def pipeline(*args, **kwargs):
+        pipe = real_pipeline(*args, **kwargs)
+        real_execute = pipe.execute
+
+        async def execute(*a, **kw):
+            if hooks:
+                await hooks.pop()()
+            return await real_execute(*a, **kw)
+
+        pipe.execute = execute
+        return pipe
+
+    redis.pipeline = pipeline
 
 
 # --- leader election -------------------------------------------------------- #
@@ -213,6 +237,56 @@ async def test_a_former_leader_cannot_write_after_losing_its_lease():
 
         assert not await redis.hexists(VALUES_KEY, "A")
         assert await redis.get(STATUS_KEY) == report_before
+    finally:
+        await monitor.stop()
+
+
+async def test_the_leaders_own_renewal_does_not_cost_it_a_write():
+    """A renewal landing between a write's WATCH and EXEC trips the WATCH; the write retries."""
+    redis = fakeredis.aioredis.FakeRedis()
+    monitor, connector = await _leader(redis, {"A"}, config=QUIET)
+    try:
+        connector.emit(_pv("A", 2.5))
+
+        async def renew() -> None:
+            await redis.pexpire(LEADER_KEY, 30_000)
+
+        _before_next_exec(redis, renew)
+        await monitor.flush()
+
+        assert json.loads(await redis.hget(VALUES_KEY, "A"))["pv"]["value"] == 2.5
+        assert (await read_status(redis))["seen"] == 1
+    finally:
+        await monitor.stop()
+
+
+async def test_a_flush_in_flight_cannot_bring_back_a_removed_entry():
+    """A flush already holding a removed address's value can't rewrite its entry after the delete."""
+    redis = fakeredis.aioredis.FakeRedis()
+    addresses = {"A", "B"}
+    monitor, connector = await _leader(redis, addresses, config=QUIET)
+    try:
+        connector.emit(_pv("A"))
+        reached, release = asyncio.Event(), asyncio.Event()
+
+        async def hold() -> None:
+            reached.set()
+            await release.wait()
+
+        _before_next_exec(redis, hold)
+        flushing = asyncio.create_task(monitor.flush())
+        await reached.wait()  # A's value is out of the buffer, not yet written
+
+        addresses.discard("A")
+        removing = asyncio.create_task(monitor.reconcile())
+        await asyncio.wait({removing}, timeout=0.1)  # it mustn't get past the flush
+        release.set()
+        await asyncio.gather(flushing, removing)
+
+        addresses.add("A")  # re-registered before its new monitor reports
+        await monitor.reconcile()
+        assert "A" in connector.callbacks
+        assert not await redis.hexists(VALUES_KEY, "A")
     finally:
         await monitor.stop()
 

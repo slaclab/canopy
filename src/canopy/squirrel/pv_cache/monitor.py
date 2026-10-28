@@ -10,9 +10,10 @@ as the heartbeat readers check before trusting the cache.
 Each lease acquisition gets a fresh generation token, stored as the lease value and
 in every entry and status report the leader writes; readers trust only entries from
 the generation the status report names. Every write is conditional on still holding
-that lease (WATCH/MULTI), so a former leader that resumes after a pause can't
-overwrite the new leader's cache. A leader that can't renew its lease (another worker
-took it, or Redis is unreachable) closes its subscriptions and goes back to waiting.
+that lease (WATCH/MULTI, retried when only the leader's own renewal got in the way),
+so a former leader that resumes after a pause can't overwrite the new leader's cache.
+A leader that can't renew its lease (another worker took it, or Redis is unreachable)
+closes its subscriptions and goes back to waiting.
 """
 
 from __future__ import annotations
@@ -88,6 +89,8 @@ class PVCacheMonitor:
 
         self._stopping = asyncio.Event()
         self._task: asyncio.Task | None = None
+        # Held for a whole flush and while reconcile drops removed addresses.
+        self._flush_lock = asyncio.Lock()
 
         # Leader-only state, cleared on every step-down.
         self._generation: str | None = None  # this lease's token; also the lease value
@@ -191,23 +194,25 @@ class PVCacheMonitor:
         """Run the commands `queue` adds, atomically, only while this generation holds the lease.
 
         WATCH/MULTI rather than Lua: the commands are discarded if the lease changes
-        hands (or expires) between the ownership check and EXEC.
+        hands (or expires) between the ownership check and EXEC. This worker's own
+        renewal (PEXPIRE) trips the WATCH too, so a conflict re-checks ownership and
+        retries; only a lease that's gone counts as lost.
         """
         if self._generation is None:
             return False
         async with self._redis.pipeline(transaction=True) as pipe:
-            try:
-                await pipe.watch(LEADER_KEY)
-                if _text(await pipe.get(LEADER_KEY)) != self._generation:
-                    self._lease_lost = True
-                    return False
-                pipe.multi()
-                queue(pipe)
-                await pipe.execute()
-                return True
-            except WatchError:
-                self._lease_lost = True
-                return False
+            while True:
+                try:
+                    await pipe.watch(LEADER_KEY)
+                    if _text(await pipe.get(LEADER_KEY)) != self._generation:
+                        self._lease_lost = True
+                        return False
+                    pipe.multi()
+                    queue(pipe)
+                    await pipe.execute()
+                    return True
+                except WatchError:
+                    continue
 
     async def _renew_loop(self) -> None:
         failures = 0
@@ -243,11 +248,17 @@ class PVCacheMonitor:
         the last wanted set, so a subscription that failed is retried next time.
         """
         wanted = await self._load_addresses()
-        self._configured = len(wanted)
-        # `_wanted` first, so an event already queued for a removed address is dropped.
-        self._wanted = set(wanted)
-        added = sorted(wanted - self._subs.keys())
-        removed = sorted(self._subs.keys() - wanted)
+        # Not while a flush is writing: its buffer may hold values for addresses
+        # removed here, and writing them after the delete below would bring them back.
+        # Once this is done, no later flush has them.
+        async with self._flush_lock:
+            self._configured = len(wanted)
+            # `_wanted` first, so an event already queued for a removed address is dropped.
+            self._wanted = set(wanted)
+            added = sorted(wanted - self._subs.keys())
+            removed = sorted(self._subs.keys() - wanted)
+            for address in removed:
+                self._pending.pop(address, None)
 
         for address in removed:
             sub = self._subs.pop(address)
@@ -255,7 +266,6 @@ class PVCacheMonitor:
                 await sub.close()
             except Exception:
                 logger.exception("Closing the PV cache monitor for %s failed", address)
-            self._pending.pop(address, None)
             self._connected.pop(address, None)
             self._seen.discard(address)
         # Entries go once their monitors are closed. A failed delete is retried next
@@ -321,27 +331,28 @@ class PVCacheMonitor:
 
     async def flush(self) -> None:
         """Write buffered values, then the status report (the heartbeat), while holding the lease."""
-        now = self._clock()
-        generation = self._generation
-        pending, self._pending = self._pending, {}
-        items = list(pending.items())
-        try:
-            for start in range(0, len(items), BATCH_SIZE):
-                mapping = {
-                    addr: encode_entry(value, now, generation) for addr, value in items[start : start + BATCH_SIZE]
-                }
-                if not await self._write_if_leader(
-                    lambda pipe, mapping=mapping: pipe.hset(VALUES_KEY, mapping=mapping)
-                ):
-                    return  # the lease is gone: these values are no longer ours to write
-            await self._write_if_leader(lambda pipe: pipe.set(STATUS_KEY, json.dumps(self.status_report(now))))
-        except RedisError:
-            # Put back whatever newer events haven't superseded, so a dropped
-            # disconnect isn't lost and the cache doesn't keep serving the old value.
-            for address, value in items:
-                if address in self._wanted:
-                    self._pending.setdefault(address, value)
-            raise
+        async with self._flush_lock:
+            now = self._clock()
+            generation = self._generation
+            pending, self._pending = self._pending, {}
+            items = list(pending.items())
+            try:
+                for start in range(0, len(items), BATCH_SIZE):
+                    mapping = {
+                        addr: encode_entry(value, now, generation) for addr, value in items[start : start + BATCH_SIZE]
+                    }
+                    if not await self._write_if_leader(
+                        lambda pipe, mapping=mapping: pipe.hset(VALUES_KEY, mapping=mapping)
+                    ):
+                        return  # the lease is gone: these values are no longer ours to write
+                await self._write_if_leader(lambda pipe: pipe.set(STATUS_KEY, json.dumps(self.status_report(now))))
+            except RedisError:
+                # Put back whatever newer events haven't superseded, so a dropped
+                # disconnect isn't lost and the cache doesn't keep serving the old value.
+                for address, value in items:
+                    if address in self._wanted:
+                        self._pending.setdefault(address, value)
+                raise
 
     def status_report(self, now: float) -> dict[str, Any]:
         monitored = len(self._subs)
