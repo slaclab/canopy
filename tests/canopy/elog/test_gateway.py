@@ -3,6 +3,7 @@
 import pytest
 
 from canopy.elog import gateway
+from canopy.elog.errors import ElogAttachmentTooLarge
 from canopy.elog.schemas.elog import ElogEntryCreateDTO
 from tests.canopy.elog._fakes import FakeElogAdapter
 from tests.canopy.elog.conftest import build_service
@@ -29,6 +30,19 @@ async def test_upload_attachment(bound_adapter):
     result = await gateway.upload_attachment("squirrel", filename="a.txt", content_type="text/plain", data=b"x")
 
     assert result.id == "att-1"
+
+
+async def test_upload_over_the_limit_is_refused_before_the_provider():
+    adapter = FakeElogAdapter("squirrel")
+    gateway.bind(build_service({"squirrel": adapter}, max_attachment_bytes=8))
+    try:
+        with pytest.raises(ElogAttachmentTooLarge, match="9 bytes; limit is 8 bytes"):
+            await gateway.upload_attachment("squirrel", filename="big.bin", content_type=None, data=b"123456789")
+        await gateway.upload_attachment("squirrel", filename="ok.bin", content_type=None, data=b"12345678")
+    finally:
+        gateway.bind(None)
+
+    assert [op for op, *_ in adapter.calls] == ["upload_attachment"]
 
 
 def test_app_config(bound_adapter):

@@ -11,7 +11,12 @@ import logging
 from typing import Literal
 
 from canopy.elog.config import ElogConfig
-from canopy.elog.errors import InvalidAppName, ElogAppNotFound, ElogNotConfigured
+from canopy.elog.errors import (
+    InvalidAppName,
+    ElogAppNotFound,
+    ElogNotConfigured,
+    ElogAttachmentTooLarge,
+)
 from canopy.elog.validation import APP_NAME_RULE, is_app
 from canopy.elog.schemas.elog import (
     ElogTagDTO,
@@ -92,6 +97,10 @@ class ElogService:
     async def upload_attachment(
         self, app: str, *, filename: str, content_type: str | None, data: bytes
     ) -> ElogAttachmentDTO:
+        # Checked here, not only in the route, so gateway uploads get the limit too.
+        limit = self.max_attachment_bytes
+        if len(data) > limit:
+            raise ElogAttachmentTooLarge(f"Attachment is {len(data)} bytes; limit is {limit} bytes")
         return await self._adapter_for(app).upload_attachment(filename, content_type, data)
 
     async def create_entry(self, app: str, entry: ElogEntryCreateDTO, *, requested_by: str) -> ElogEntryResultDTO:

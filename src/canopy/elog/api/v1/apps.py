@@ -28,14 +28,11 @@ router = APIRouter(prefix="/apps/{app}", tags=["Elog / Apps"])
 
 async def _read_upload(file: UploadFile, max_bytes: int) -> bytes:
     # Reject on the declared size first so an oversized body is not fully buffered
-    # into memory before the check. Content-Length can be absent or wrong, so the
-    # post-read length check below stays as the authoritative backstop.
+    # into memory before the check. The size can be absent or wrong, so the
+    # service's check on the bytes actually read stays the authoritative one.
     if file.size is not None and file.size > max_bytes:
         raise ElogAttachmentTooLarge(f"Attachment is {file.size} bytes; limit is {max_bytes} bytes")
-    data = await file.read()
-    if len(data) > max_bytes:
-        raise ElogAttachmentTooLarge(f"Attachment is {len(data)} bytes; limit is {max_bytes} bytes")
-    return data
+    return await file.read()
 
 
 @router.get("/config")
