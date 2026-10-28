@@ -258,16 +258,28 @@ write would silently do nothing, which is worse than an error. The rules:
 
 - Mutating a row assigned to facilities requires the key to hold **any one** of
   them. Holding one of a PV's facilities is enough.
-- A row with no facility assignment is writable by any write-scoped key, mirroring
-  the read side, where an unfiltered query returns it.
-- Creating a *new* snapshot is the exception: a facility-restricted key must name
-  a facility it holds. Minting new unscoped data would create rows the key could
-  not otherwise have reached.
+- A row with **no** facility assignment is writable only by an **unrestricted**
+  key. No grant can cover a row that names no facility, so a restricted key —
+  even one holding every facility that currently exists — is refused, the same
+  way it's refused a row assigned to a facility it doesn't hold. This also
+  means a restricted key can't strip a row's last facility and un-assign it:
+  that write is refused outright, not silently let through because the key
+  held everything the row used to be assigned to.
+- Creating a *new* PV or snapshot is the parallel rule at mint time: a
+  facility-restricted key must name at least one facility it holds. A
+  restricted key can never mint an unassigned row — if it could, the row would
+  be reachable by every other write-scoped key but not reliably by the one
+  that created it, once "unassigned requires unrestricted" applies on the next
+  write.
 - Restoring a snapshot is gated on the snapshot's facility, the same as viewing
-  it: a snapshot the key can't see is a `404`. Within a visible snapshot, any PV
-  whose facility was changed after capture to one the key doesn't hold is
-  skipped and reported in the job result's `skippedPvIds`; if every PV is
-  skipped, the restore is a `403`.
+  it: a snapshot the key can't see is a `404`, including an unassigned one for
+  a restricted key. Within a visible snapshot, any PV whose facility was
+  changed after capture to one the key doesn't hold — or that has no facility
+  at all — is skipped and reported in the job result's `skippedPvIds`; if every
+  PV is skipped, the restore is a `403`. Update and delete gate the same
+  unassigned-row rule through a different path (the row's own facility check,
+  not the read-masking one), so they report `403` rather than `404` for the
+  same case — both refuse the write; only the status code differs.
 
 **Where facilities come from.** Both are set by the user. A PV's facilities (it
 can have several) are assigned when it's created or edited, through `facilities`
@@ -279,10 +291,13 @@ same set `GET /v1/pvs?facility=<slug>` returns. An `lcls` snapshot holds the
 left out. A snapshot with no `facility` captures every registered PV, and only
 an unrestricted key can create one.
 
-Note the deliberate asymmetry: an unassigned PV is *invisible* to a restricted
-key's facility-filtered reads (it has no assignment to match) but *writable* by
-it. Read filtering is set membership; write enforcement is a permission check on
-a claim nobody has made.
+**Snapshot reads and restore can disagree on an old snapshot.** A snapshot
+taken before facility scoping existed holds every PV's values as of capture.
+If a PV held then is later reassigned to a different facility a key holds, that
+key can still read the old values in the snapshot (the snapshot's own facility
+gate is what's checked, not each PV's current one) but `restore` skips that PV,
+since restore checks each PV's *current* facility. The read is correct as
+history; only a future restore follows today's assignment.
 
 This check and a concurrent mint aren't serialized against each other — each
 runs in its own transaction with no lock between them — so a delete and a mint
@@ -290,6 +305,16 @@ of a key granted the same facility, racing within the same narrow window, could
 each see the other's not-yet-committed state. In practice this needs two admin
 actions targeting the same facility at nearly the same instant, which is far
 outside normal operation; it isn't a guarantee against that specific race.
+
+A related race exists between deleting a facility and a snapshot job already
+queued against it: the in-use check only looks at PVs and snapshots that exist
+*when the facility is deleted*, not jobs already in Redis. A snapshot job
+enqueued for a facility that's deleted before the worker picks it up resolves
+an empty capture scope and produces a zero-PV snapshot whose `facility_id` no
+longer exists in `core.facility` — visible and repairable only by an
+unrestricted key, since a restricted key's facility-filtered reads can't match
+an id with no corresponding row. This is the same class of narrow,
+admin-action-timed race as the one above, not a routine occurrence.
 
 **Meta-PVs are exempt.** Which PVs are meta-PVs (shown as summary columns on every
 snapshot), their display names, and whether they're active are global settings, not
