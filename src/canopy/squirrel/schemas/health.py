@@ -4,6 +4,7 @@ from datetime import datetime
 from canopy.contracts.base import CanopyModel
 
 RestoreHooksState = Literal["disabled", "active", "unknown", "partial"]
+PVCacheState = Literal["disabled", "down", "degraded", "ok"]
 
 
 class RestoreHooksViewDTO(CanopyModel):
@@ -50,3 +51,36 @@ class RestoreHooksStatusDTO(CanopyModel):
     worker: WorkerRestoreHooksViewDTO | None = None
     worker_error: str | None = None
     matches_api: bool | None = None
+
+
+class PVCacheStatusDTO(CanopyModel):
+    """The worker-side PV cache that cached snapshots (``useCache=true``) read from.
+
+    ``status`` is ``"disabled"`` when no worker has ever led the cache and this API
+    process has it disabled too; ``"down"`` when the cache can't be used (no report
+    although the API has it enabled, a heartbeat older than the configured maximum,
+    or Redis unreachable: ``error`` says which); ``"degraded"`` while the leader is
+    still hearing from its PVs after taking over (``warm`` false) or when some
+    monitored PVs are disconnected; ``"ok"`` otherwise. Snapshots still work in every
+    state: what the cache can't vouch for is read live.
+
+    ``configured`` counts the registered setpoint/readback addresses, ``monitored``
+    the ones with an open monitor, ``connected`` those currently connected, ``seen``
+    those that delivered a value since ``leaderSince``, and ``cached`` the entries in
+    Redis. ``enabled`` is this API process's ``CANOPY_SQUIRREL__PV_CACHE__ENABLED``.
+    """
+
+    status: PVCacheState
+    enabled: bool
+    host: str | None = None
+    instance: str | None = None
+    leader_since: datetime | None = None
+    heartbeat_at: datetime | None = None
+    heartbeat_age_s: float | None = None
+    configured: int | None = None
+    monitored: int | None = None
+    connected: int | None = None
+    seen: int | None = None
+    warm: bool | None = None
+    cached: int | None = None
+    error: str | None = None
