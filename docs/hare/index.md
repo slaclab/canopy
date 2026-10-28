@@ -78,7 +78,9 @@ Environment variables with prefix `CANOPY_HARE__`:
 | `CANOPY_HARE__MAX_PVS_PER_MESSAGE` | `5000` | Max PV names accepted in a single subscribe frame (excess dropped) |
 | `CANOPY_HARE__MAX_SUBSCRIPTIONS_PER_CLIENT` | `20000` | Max distinct PVs one client may hold subscriptions to |
 | `CANOPY_HARE__EVENT_QUEUE_MAXSIZE` | `100000` | Bound on the internal update queue (overflow drops newest + warns) |
-| `CANOPY_HARE__SEED_CONCURRENCY` | `32` | Max concurrent reads when seeding a fresh subscribe batch |
+| `CANOPY_HARE__SEED_CONCURRENCY` | `32` | Max concurrent metadata fetches (describes) across all clients; a describe runs only once a PV's channel has connected, so channels that never connect take no slot |
+| `CANOPY_HARE__SEED_TIMEOUT_S` | `2.0` | How long a newly subscribed PV waits for its monitor's first value before being reported `connected: false`; the monitor still delivers the value when the channel connects |
+| `CANOPY_HARE__SEED_RETRY_BACKOFF_S` | `30.0` | How long before a subscribe retries a describe that failed on a connected channel |
 
 The connector's own settings use the `CANOPY_EPICS__` prefix — see
 `.env.example` at the repo root for the full annotated list.
