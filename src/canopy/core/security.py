@@ -286,6 +286,19 @@ def require_admin_access(key: APIKeyDep) -> APIKey:
     return key
 
 
+def require_read_or_admin_access(key: APIKeyDep) -> APIKey:
+    """Gate for a read endpoint that an admin-only provisioning key also needs.
+
+    An admin key minting facility-scoped grants has no reason to also hold
+    ``read`` — it never touches data — but it still needs to see what it just
+    created. Using this instead of ``require_read_access`` on such a route avoids
+    forcing every provisioning key to carry an unrelated data-plane scope.
+    """
+    if not (key.read or key.admin):
+        raise InsufficientReadAccess("API key does not have read or admin access")
+    return key
+
+
 AdminKeyDep = Annotated[APIKey, Security(require_admin_access)]
 
 

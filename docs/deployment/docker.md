@@ -52,8 +52,9 @@ once.
 
 Facilities are not seeded by a migration and are not read from an env var — a
 facility is a row in `core.facility`, created explicitly. Nothing can reference
-a facility slug that doesn't exist: a PV or snapshot write naming an unknown
-slug is a 404, and minting an API key with an unknown grant is a 400.
+a facility slug that doesn't exist: minting an API key with an unknown grant is
+a 400. (A PV or snapshot write naming an unknown slug is also rejected, once
+Squirrel's facility enforcement — not yet merged — reads this table.)
 
 For the dev stack, seed the SLAC hierarchy in one step (idempotent, safe to
 re-run):
@@ -74,16 +75,21 @@ uv run python scripts/create_facility.py lcls-sc --name "LCLS-II SC" --parent lc
 uv run python scripts/list_facilities.py
 ```
 
-Slugs are lowercase alphanumerics with internal hyphens; `LCLS` is rejected
-rather than silently lowercased. A slug is **immutable** once created — it's
+Slugs are lowercase alphanumerics with single internal hyphens — not leading,
+trailing, or doubled; `LCLS` is rejected rather than silently lowercased. A
+handful of slugs (`snapshots`, `tags`, `pv-browser`, `api-keys`, `meta-pvs`,
+`comparison`, `snapshot-details`) are reserved, since they collide with
+react-squirrel's own page routes. A slug is **immutable** once created — it's
 what `?facility=` filters and API key grants reference — so correcting one
 means deleting and recreating, which is refused while the facility has
 children or while any PV, snapshot, or active key grant still references it.
 
 An `admin` key can also manage facilities over HTTP: `POST /v1/facilities`,
-`PUT /v1/facilities/{slug}`, `DELETE /v1/facilities/{slug}`. The CLI stays the
-bootstrap path, since those routes need an admin key that itself may need a
-facility grant.
+`PUT /v1/facilities/{slug}`, `DELETE /v1/facilities/{slug}`. These routes
+additionally require the key to hold the facility wildcard (`*`), not just
+`admin` — reparenting or deleting a facility can widen what an existing grant
+on an ancestor resolves to, so only an unrestricted key may touch the
+hierarchy at all. The CLI stays the bootstrap path, since it needs no key.
 
 ### Using a local IOC
 

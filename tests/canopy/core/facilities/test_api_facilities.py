@@ -36,6 +36,18 @@ async def test_facilities_require_read_auth(facilities_client):
     assert facilities_client.get("/v1/facilities").status_code == 401
 
 
+async def test_admin_only_key_with_no_read_can_still_list(facilities_client, session, session_maker, fake_keys):
+    """An admin-only provisioning key — no ``read`` at all — still needs to see
+    what it just created; ``GET`` accepts ``admin`` as an alternative to ``read``
+    rather than forcing every provisioning key to carry an unrelated data scope."""
+    await _seed_facility(session, "lcls")
+
+    r = facilities_client.get("/v1/facilities", headers={"X-API-Key": "test-admin-only"})
+
+    assert r.status_code == 200, r.text
+    assert [f["slug"] for f in r.json()] == ["lcls"]
+
+
 async def test_create_then_read_back(facilities_client, session_maker, fake_keys):
     created = facilities_client.post(
         "/v1/facilities",
@@ -93,6 +105,24 @@ async def test_create_rejects_uppercase_slug_rather_than_lowercasing_it(faciliti
 
 async def test_create_rejects_leading_hyphen_slug(facilities_client, session_maker, fake_keys):
     r = facilities_client.post("/v1/facilities", json={"slug": "-bad", "name": "Bad"}, headers=ADMIN_HEADERS)
+    assert r.status_code == 422, r.text
+
+
+async def test_create_rejects_trailing_hyphen_slug(facilities_client, session_maker, fake_keys):
+    r = facilities_client.post("/v1/facilities", json={"slug": "bad-", "name": "Bad"}, headers=ADMIN_HEADERS)
+    assert r.status_code == 422, r.text
+
+
+async def test_create_rejects_doubled_hyphen_slug(facilities_client, session_maker, fake_keys):
+    r = facilities_client.post("/v1/facilities", json={"slug": "a--b", "name": "Bad"}, headers=ADMIN_HEADERS)
+    assert r.status_code == 422, r.text
+
+
+async def test_create_rejects_a_slug_reserved_by_react_squirrels_routes(facilities_client, session_maker, fake_keys):
+    """``snapshots`` collides with react-squirrel's static `/{facility}/snapshots`
+    page route (slaclab/react-squirrel#208) and would be unreachable through the
+    frontend if allowed."""
+    r = facilities_client.post("/v1/facilities", json={"slug": "snapshots", "name": "Snapshots"}, headers=ADMIN_HEADERS)
     assert r.status_code == 422, r.text
 
 

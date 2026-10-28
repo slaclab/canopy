@@ -182,10 +182,15 @@ out-of-scope, not out-of-read.
 ### Facility scoping
 
 A key can also be restricted to one or more `core.facility` slugs — a global
-attribute of the key, independent of module scope, that a data-serving module
-(today, only Squirrel) consults on both reads and writes. Naming a facility
-grants that facility and everything beneath it in the hierarchy, the same
-"itself plus descendants" rule `?facility=` filtering itself uses.
+attribute of the key, independent of module scope. Naming a facility grants
+that facility and everything beneath it in the hierarchy, the same "itself
+plus descendants" rule `?facility=` filtering itself uses.
+
+The grant itself is defined and validated here; nothing yet *consults* it. A
+data-serving module (Squirrel) reading and enforcing this scope on its own
+reads and writes is separate, not-yet-merged work — until it lands, a
+facility-scoped key authenticates and passes module/read/write checks
+normally, but every module ignores its facility grant.
 
 Unlike module scope, an **empty** facility list is valid and meaningful — it's
 the default for a newly minted key, and means "provisioned but not yet
@@ -225,6 +230,13 @@ For the same reason, a facility that any *active* key grants cannot be deleted:
 `DELETE /v1/facilities/{slug}` is refused with `facility_in_use` until the
 grants are gone, since slugs are immutable and deleting one would silently turn
 those keys deny-all. Deactivating a key releases its grants.
+
+This check and a concurrent mint aren't serialized against each other — each
+runs in its own transaction with no lock between them — so a delete and a mint
+of a key granted the same facility, racing within the same narrow window, could
+each see the other's not-yet-committed state. In practice this needs two admin
+actions targeting the same facility at nearly the same instant, which is far
+outside normal operation; it isn't a guarantee against that specific race.
 
 ### Why `admin`, not `write`
 
