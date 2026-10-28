@@ -22,8 +22,7 @@ def upgrade() -> None:
     # "formula-engine". A stored key scoped to "fox" would otherwise silently
     # lose access to it, so carry the scope over in place.
     op.execute(
-        "UPDATE core.api_key SET modules = array_replace(modules, 'fox', 'formula-engine') "
-        "WHERE 'fox' = ANY(modules)"
+        "UPDATE core.api_key SET modules = array_replace(modules, 'fox', 'formula-engine') WHERE 'fox' = ANY(modules)"
     )
 
 
