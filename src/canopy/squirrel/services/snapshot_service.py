@@ -293,21 +293,24 @@ class SnapshotService:
         return meta_pv_values
 
     def _require_facility_write(self, facility_id: str | None, what: str) -> None:
-        """Gate a write on the calling key's facility grant. Unrestricted keys and
-        unassigned rows (``facility_id IS NULL``) pass; otherwise the row's facility must
-        be in the grant. Mirrors ``PvService._require_facility_write`` — a snapshot has at
-        most one facility, so "any overlap" degenerates to membership."""
-        if self.facility_scope is None or facility_id is None:
+        """Gate a write on the calling key's facility grant. Unrestricted keys pass
+        unconditionally; a restricted key — including an empty-grant one — needs the
+        row's facility in its grant, and an *unassigned* row (``facility_id IS NULL``)
+        is refused rather than passed, since no grant can cover it. Mirrors
+        ``PvService._require_facility_write`` — a snapshot has at most one facility, so
+        "any overlap" degenerates to membership."""
+        if self.facility_scope is None:
             return
-        if facility_id not in self.facility_scope:
+        if facility_id is None or facility_id not in self.facility_scope:
             raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility")
 
     def _in_facility_scope(self, facility_id: str | None) -> bool:
         """Same membership rule as ``_require_facility_write``, as a predicate rather
         than a raise. Read paths use this to report an out-of-scope snapshot as
         not-found rather than forbidden — existence itself must not leak to a key that
-        cannot reach the snapshot's facility."""
-        return self.facility_scope is None or facility_id is None or facility_id in self.facility_scope
+        cannot reach the snapshot's facility. An unassigned row is in scope only for an
+        unrestricted key, matching ``list_snapshots``'s filter."""
+        return self.facility_scope is None or (facility_id is not None and facility_id in self.facility_scope)
 
     async def list_snapshots(
         self,
@@ -661,9 +664,10 @@ class SnapshotService:
         allowed, skipped = [], []
         for pv_id in candidate_ids:
             assigned = by_pv.get(pv_id, set())
-            # Same rule as `_require_facility_write`: unassigned PVs are writable by any
-            # write-scoped key, and one shared facility is enough for the rest.
-            (allowed if not assigned or assigned & self.facility_scope else skipped).append(pv_id)
+            # Same rule as `_require_facility_write`: a restricted key needs one shared
+            # facility; an unassigned PV has none to share, so it is skipped rather than
+            # let through — a restore is a real EPICS setpoint write, not a filtered read.
+            (allowed if assigned & self.facility_scope else skipped).append(pv_id)
         return allowed, skipped
 
     async def restore_snapshot(

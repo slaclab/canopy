@@ -170,13 +170,23 @@ async def test_an_update_cannot_silently_drop_a_facility_the_key_cant_reach(
     assert r.status_code == 403
 
 
-async def test_unassigned_pv_is_writable_by_any_write_scoped_key(client: AsyncClient, db_session: AsyncSession):
+async def test_unassigned_pv_is_writable_only_by_an_unrestricted_key(client: AsyncClient, db_session: AsyncSession):
+    """An unassigned row isn't covered by any grant, so a restricted key — even one
+    holding every facility it names elsewhere — can't write it; only an unrestricted
+    key can. This is the write-side mirror of list filtering hiding the row from a
+    restricted key's reads."""
     await _seed_hierarchy(db_session)
     pv_id = await _create_pv(client, WILD_HEADERS, "ORPHAN:PV:SP", [])
 
     r = await client.put(f"/v1/pvs/{pv_id}", headers=NC_HEADERS, json={"device": "d"})
-    assert r.status_code == 200, r.text
+    assert r.status_code == 403, r.text
+    assert r.json()["code"] == "insufficient_facility_access"
     r = await client.delete(f"/v1/pvs/{pv_id}", headers=NONE_HEADERS)
+    assert r.status_code == 403, r.text
+
+    r = await client.put(f"/v1/pvs/{pv_id}", headers=WILD_HEADERS, json={"device": "d"})
+    assert r.status_code == 200, r.text
+    r = await client.delete(f"/v1/pvs/{pv_id}", headers=WILD_HEADERS)
     assert r.status_code == 200, r.text
 
 
@@ -192,6 +202,28 @@ async def test_assigning_a_pv_outside_the_grant_is_refused(client: AsyncClient, 
     pv_id = await _create_pv(client, SC_HEADERS, "SC:PV:SP", ["lcls-sc"])
     r = await client.put(f"/v1/pvs/{pv_id}", headers=SC_HEADERS, json={"facilities": ["lcls-nc"]})
     assert r.status_code == 403
+
+
+async def test_create_does_not_leak_an_out_of_scope_pv_s_existence_via_409(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """The facility gate must run before the address-uniqueness check: otherwise a
+    restricted key probing guessed addresses could learn an out-of-scope PV exists
+    from a ``PvAlreadyExists`` 409 before ever being told it lacks facility access."""
+    await _seed_hierarchy(db_session)
+    await _create_pv(client, NC_HEADERS, "NC:PV:SP", ["lcls-nc"])
+
+    r = await client.post(
+        "/v1/pvs", headers=SC_HEADERS, json={"setpointAddress": "NC:PV:SP", "facilities": ["lcls-nc"]}
+    )
+    assert r.status_code == 403
+    assert r.json()["code"] == "insufficient_facility_access"
+
+    r = await client.post(
+        "/v1/pvs/multi", headers=SC_HEADERS, json=[{"setpointAddress": "NC:PV:SP", "facilities": ["lcls-nc"]}]
+    )
+    assert r.status_code == 403
+    assert r.json()["code"] == "insufficient_facility_access"
 
 
 async def test_multi_create_gates_each_row_not_the_import_s_union(client: AsyncClient, db_session: AsyncSession):
@@ -476,8 +508,103 @@ async def test_compare_snapshots_outside_the_grant_is_404(client: AsyncClient, d
     assert r.status_code == 404, r.text
     assert r.json()["code"] == "snapshot_not_found"
 
-    r = await client.get(f"/v1/snapshots/{out_of_scope.id}/compare/{in_scope.id}", headers=SC_HEADERS)
+
+async def test_unassigned_snapshot_is_hidden_from_a_restricted_key_by_id_too(
+    client: AsyncClient, db_session: AsyncSession, enqueued: list
+):
+    """An unassigned snapshot (``facility_id IS NULL``) is already hidden from a
+    restricted key's list; this pins that getting it directly by id, or comparing it,
+    doesn't leak it either — a snapshot captured before facility scoping existed
+    (or taken with no facility) must not expose every PV's values to a key that can
+    list none of them."""
+    await _seed_hierarchy(db_session)
+    sc_pv = await _create_pv(client, WILD_HEADERS, "SC:PV:SP", ["lcls-sc"])
+    snapshot = Snapshot(title="unassigned")
+    db_session.add(snapshot)
+    await db_session.commit()
+    db_session.add(
+        SnapshotValue(snapshot_id=snapshot.id, pv_id=sc_pv, pv_name="SC:PV:SP", setpoint_value={"value": 1.0})
+    )
+    await db_session.commit()
+
+    for headers in (SC_HEADERS, NONE_HEADERS):
+        r = await client.get(f"/v1/snapshots/{snapshot.id}", headers=headers)
+        assert r.status_code == 404, r.text
+        assert r.json()["code"] == "snapshot_not_found"
+
+    r = await client.get(f"/v1/snapshots/{snapshot.id}", headers=WILD_HEADERS)
+    assert r.status_code == 200, r.text
+
+    r = await client.get(f"/v1/snapshots/{snapshot.id}/compare/{snapshot.id}", headers=SC_HEADERS)
     assert r.status_code == 404, r.text
+
+
+async def test_unassigned_snapshot_is_not_writable_or_restorable_by_a_restricted_key(
+    client: AsyncClient, db_session: AsyncSession, enqueued: list
+):
+    """Mirrors the unassigned-PV write gate: an unassigned snapshot has no facility a
+    grant can cover, so update/delete/restore are refused for any restricted key —
+    including one holding every facility that exists — not just an empty-grant one."""
+    await _seed_hierarchy(db_session)
+    sc_pv = await _create_pv(client, WILD_HEADERS, "SC:PV:SP", ["lcls-sc"])
+    snapshot = Snapshot(title="unassigned")
+    db_session.add(snapshot)
+    await db_session.commit()
+    db_session.add(
+        SnapshotValue(snapshot_id=snapshot.id, pv_id=sc_pv, pv_name="SC:PV:SP", setpoint_value={"value": 1.0})
+    )
+    await db_session.commit()
+    enqueued.clear()
+
+    # update/delete go through `_require_facility_write`, which refuses an unassigned
+    # row with 403 (it's known to exist, just not writable); restore goes through
+    # `snapshot_exists`, which uses the read-side masking rule, so it's 404.
+    r = await client.put(f"/v1/snapshots/{snapshot.id}", headers=SC_HEADERS, json={"title": "renamed"})
+    assert r.status_code == 403, r.text
+    r = await client.delete(f"/v1/snapshots/{snapshot.id}", headers=SC_HEADERS)
+    assert r.status_code == 403, r.text
+    r = await client.post(f"/v1/snapshots/{snapshot.id}/restore", headers=SC_HEADERS, json={})
+    assert r.status_code == 404, r.text
+    assert enqueued == []
+
+    r = await client.post(f"/v1/snapshots/{snapshot.id}/restore", headers=WILD_HEADERS, json={})
+    assert r.status_code == 200, r.text
+    # Unrestricted: `plan_restore` passes the original `pv_ids=None` straight through,
+    # keeping its "restore everything" meaning rather than expanding it to a list.
+    assert enqueued[-1][2]["pv_ids"] is None
+
+
+async def test_a_restricted_key_cannot_unassign_a_pv_it_fully_holds(client: AsyncClient, db_session: AsyncSession):
+    """Holding every one of a PV's current facilities is enough to *edit* it, but not
+    enough to strip it down to unassigned: that would hand write access to every other
+    write-scoped key and hide it from every facility-filtered read, including the key
+    doing the stripping once it moves on to another facility."""
+    await _seed_hierarchy(db_session)
+    pv_id = await _create_pv(client, SC_HEADERS, "SC:PV:SP", ["lcls-sc"])
+
+    r = await client.put(f"/v1/pvs/{pv_id}", headers=SC_HEADERS, json={"facilities": []})
+    assert r.status_code == 403
+    assert r.json()["code"] == "insufficient_facility_access"
+
+    r = await client.get("/v1/pvs/paged", headers=WILD_HEADERS)
+    pv = next(p for p in r.json()["results"] if p["id"] == pv_id)
+    assert pv["facilityIds"] != []
+
+    r = await client.put(f"/v1/pvs/{pv_id}", headers=WILD_HEADERS, json={"facilities": []})
+    assert r.status_code == 200, r.text
+    assert r.json()["facilityIds"] == []
+
+
+async def test_a_restricted_key_cannot_create_an_unassigned_pv(client: AsyncClient, db_session: AsyncSession):
+    """The create-time counterpart: a restricted key must name a facility it holds when
+    minting a PV, the same rule ``POST /v1/snapshots`` already applies. Allowing an
+    unassigned create would hand the new row to every write-scoped key, including ones
+    with no overlap with the key that made it."""
+    await _seed_hierarchy(db_session)
+
+    r = await client.post("/v1/pvs", headers=SC_HEADERS, json={"setpointAddress": "ORPHAN:PV:SP", "facilities": []})
+    assert r.status_code == 403
+    assert r.json()["code"] == "insufficient_facility_access"
 
 
 # --- facility deletion ------------------------------------------------------- #
