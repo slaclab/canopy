@@ -102,47 +102,43 @@ class PvService:
     def _require_facility_write(self, row_facility_ids: set[str], what: str) -> None:
         """Gate a write to an *existing* row on the calling key's facility grant.
 
-        Allowed when the key is unrestricted, or when the row's facilities overlap the
-        grant *at all* — holding one of a PV's facilities is enough. An *unassigned* row
-        (``row_facility_ids`` empty) is refused for a restricted key: no grant can cover
-        a row with no facility, so only an unrestricted key may touch one, mirroring the
-        read side once ``_in_facility_scope``-style filtering excludes it from a
-        restricted key's list. Mint-time assignment is a separate, looser check — see
+        **Policy: a write requires holding every facility the row is assigned to, not
+        just one.** A PV can belong to several facilities (``pv_facility`` is many-to-
+        many); a key holding only one of them must not be able to mutate or delete the
+        row on behalf of a facility it was never granted — update, delete, and any
+        other write go through this same full-containment check, not a looser
+        "overlap" one. (A snapshot has at most one facility, so this degenerates to
+        plain membership there — see ``SnapshotService._require_facility_write``.)
+
+        Allowed when the key is unrestricted. An *unassigned* row (``row_facility_ids``
+        empty) is refused for a restricted key: no grant can cover a row with no
+        facility, so only an unrestricted key may touch one, mirroring the read side
+        once ``_in_facility_scope``-style filtering excludes it from a restricted key's
+        list. Mint-time assignment is a separate, equally strict check — see
         ``_require_facility_for_create`` — since minting new unscoped data is a
         different act from mutating an existing unassigned row.
         """
         if self.facility_scope is None:
             return
-        if not (row_facility_ids & self.facility_scope):
-            raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility")
+        if not row_facility_ids or not row_facility_ids.issubset(self.facility_scope):
+            raise InsufficientFacilityAccess(f"API key is not scoped to all of {what}'s facility(s)")
 
     def _require_facility_for_create(self, facility_ids: set[str], what: str) -> None:
         """Gate the facilities a *new* row is being created with.
 
-        A restricted key must name at least one facility it holds — unlike
-        ``_require_facility_write``, an empty ``facility_ids`` is refused outright here
-        rather than treated as "no row to check," since a restricted key minting an
-        unassigned row would then be unable to reach it again under
-        ``_require_facility_write``'s unrestricted-only rule for unassigned rows.
+        **Same full-containment policy as ``_require_facility_write``:** a restricted
+        key must hold *every* facility it's naming, not just one — otherwise it could
+        mint a row into a facility it was never granted, just by also naming one it
+        does hold. An empty ``facility_ids`` is refused outright (unlike a bare
+        ``row_facility_ids & self.facility_scope`` check would allow), since a
+        restricted key minting an unassigned row would then be unable to reach it again
+        under ``_require_facility_write``'s unrestricted-only rule for unassigned rows.
         Mirrors the equivalent gate in ``SnapshotService`` routes for snapshot creation.
         """
         if self.facility_scope is None:
             return
-        if not (facility_ids & self.facility_scope):
-            raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility")
-
-    def _require_facility_containment(self, facility_ids: set[str], what: str) -> None:
-        """Gate a specific set of facilities against the grant, requiring every one of
-        them to be held — stricter than ``_require_facility_write``'s "any overlap"
-        test. Used where ``facility_ids`` describes a delta (facilities being added or
-        removed) rather than "does this row belong to me at all": a key holding only
-        one of several facilities must not be able to add or remove the others just
-        because it can touch the row through one it does hold.
-        """
-        if self.facility_scope is None or not facility_ids:
-            return
-        if outside := facility_ids - self.facility_scope:
-            raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility(s) {sorted(outside)}")
+        if not facility_ids or not facility_ids.issubset(self.facility_scope):
+            raise InsufficientFacilityAccess(f"API key is not scoped to all of {what}'s facility(s)")
 
     async def _resolve_slugs(self, slugs: list[str] | set[str]) -> dict[str, str]:
         """Facility slugs -> ``{slug: id}``, in one round trip regardless of how many
@@ -313,11 +309,12 @@ class PvService:
                 raise BadRequest(f"Duplicate {kind} addresses in import: {sorted(duplicates[kind])[:10]}")
 
         # Resolve the whole import's distinct slugs up front — one gateway round trip
-        # each instead of one per (row, slug) pair — but gate per row: collapsing the
-        # import into one set and requiring only that it overlap the grant would let a
-        # row assigned solely to an out-of-scope facility ride in alongside one the key
-        # can reach. Gated before the existence checks below, for the same reason as
-        # `create`: an out-of-scope row's existence must not leak through a
+        # each instead of one per (row, slug) pair — but gate per row, with full
+        # containment of each row's own facilities (see `_require_facility_for_create`):
+        # collapsing the import into one set and requiring only that it overlap the
+        # grant would let a row naming an out-of-scope facility ride in alongside one
+        # the key can reach. Gated before the existence checks below, for the same
+        # reason as `create`: an out-of-scope row's existence must not leak through a
         # `PvAlreadyExists` message before the facility refusal.
         ids_by_slug = await self._resolve_slugs(
             {slug for _, _, _, data in normalized_records for slug in data.facilities}
@@ -381,6 +378,8 @@ class PvService:
         if not pv:
             return None
         facility_ids = await self.pv_repo.facility_ids_for(pv_id)
+        # Full containment of the PV's *current* facilities, not just one of them: see
+        # the policy note on `_require_facility_write`.
         self._require_facility_write(facility_ids, "this PV")
         if data.facilities is not None:
             new_ids = set((await self._resolve_slugs(data.facilities)).values())
@@ -393,10 +392,15 @@ class PvService:
                 raise InsufficientFacilityAccess(
                     "API key is scoped to specific facilities; cannot unassign this PV's last facility"
                 )
-            # Every facility being added or removed must be in the grant: "any overlap
-            # with the new set" would let a key holding just one of a PV's several
-            # facilities silently drop the others on an otherwise-permitted update.
-            self._require_facility_containment(facility_ids ^ new_ids, "the requested")
+            # Full containment of the *new* set too: a key holding only one of several
+            # facilities a PV is being assigned to must not be able to add the others on
+            # its say alone. `facility_ids` (the current set) is already fully contained
+            # by the check above, so this alone covers both the added and removed sides
+            # of the change.
+            if self.facility_scope is not None and (outside := new_ids - self.facility_scope):
+                raise InsufficientFacilityAccess(
+                    f"API key is not scoped to the requested facility(s) {sorted(outside)}"
+                )
             await self.pv_repo.set_facilities(pv_id, new_ids)
             facility_ids = new_ids
         if data.device is not None:

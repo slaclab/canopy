@@ -256,8 +256,14 @@ not filtered.
 **Writes** are refused, with a `403 insufficient_facility_access` — a filtered
 write would silently do nothing, which is worse than an error. The rules:
 
-- Mutating a row assigned to facilities requires the key to hold **any one** of
-  them. Holding one of a PV's facilities is enough.
+- **Mutating a row requires the key to hold *every* facility it's assigned
+  to, not just one.** A PV can carry several facilities; a key scoped to only
+  one of them cannot update, delete, or otherwise write a PV that also
+  belongs to another one. Holding one shared facility is **not** enough to
+  reach the rest of the row — that would let a `lcls-sc`-only key delete a PV
+  also assigned to `facet`, destroying data for a facility it was never
+  granted. (A snapshot has at most one facility, so this is just plain
+  membership there.)
 - A row with **no** facility assignment is writable only by an **unrestricted**
   key. No grant can cover a row that names no facility, so a restricted key —
   even one holding every facility that currently exists — is refused, the same
@@ -265,11 +271,13 @@ write would silently do nothing, which is worse than an error. The rules:
   means a restricted key can't strip a row's last facility and un-assign it:
   that write is refused outright, not silently let through because the key
   held everything the row used to be assigned to.
-- Creating a *new* PV or snapshot is the parallel rule at mint time: a
-  facility-restricted key must name at least one facility it holds. A
-  restricted key can never mint an unassigned row — if it could, the row would
-  be reachable by every other write-scoped key but not reliably by the one
-  that created it, once "unassigned requires unrestricted" applies on the next
+- Creating a *new* PV or snapshot follows the same full-containment rule at
+  mint time: a facility-restricted key must hold **every** facility it's
+  naming, not just one — naming a facility it holds alongside one it doesn't
+  must not let the create through for the facility it lacks. A restricted key
+  can never mint an unassigned row either — if it could, the row would be
+  reachable by every other write-scoped key but not reliably by the one that
+  created it, once "unassigned requires unrestricted" applies on the next
   write.
 - Restoring a snapshot is gated on the snapshot's facility, the same as viewing
   it: a snapshot the key can't see is a `404`, including an unassigned one for
