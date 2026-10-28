@@ -4,9 +4,10 @@ Hare/Vole own live values and the EPICS module owns connectivity probing. So all
 the PV registry: search (keyset + offset), CRUD, bulk import, device list, and meta-PVs.
 """
 
-import json
+from uuid import UUID
 
 from fastapi import Query, Security, APIRouter
+from pydantic import TypeAdapter, ValidationError
 
 from canopy.core.errors import BadRequest
 from canopy.core.security import require_read_access, require_write_access
@@ -28,6 +29,17 @@ from canopy.squirrel.schemas.meta_pv import (
 from canopy.squirrel.api.v1._validation import is_uuid
 
 router = APIRouter(prefix="/pvs", tags=["PVs"])
+
+# ``tagFilters`` is JSON inside a query string, so FastAPI can't validate it for us. One adapter
+# checks JSON syntax, shape and UUID form together: an unparseable tag id must not reach asyncpg.
+_TAG_FILTERS = TypeAdapter(dict[str, list[UUID]])
+
+
+def _first_problem(error: ValidationError) -> str:
+    """The first pydantic error with its location, e.g. ``g.0: Input should be a valid UUID``."""
+    first = error.errors()[0]
+    loc = ".".join(str(part) for part in first["loc"])
+    return f"{loc}: {first['msg']}" if loc else first["msg"]
 
 
 @router.get("", dependencies=[Security(require_read_access)])
@@ -51,19 +63,28 @@ async def search_pvs_paged(
     """Keyset-paginated search with optional tag filtering.
 
     ``tagFilters`` is ``{group: [tag, ...]}`` — a PV matches when it has at least one tag
-    from every listed group (OR within a group, AND across groups).
+    from every listed group (OR within a group, AND across groups). A ``continuationToken``
+    that is not a PV id, or ``tagFilters`` that is not an object of UUID lists, is a 400.
     """
+    # Normalise through UUID() rather than just gating on is_uuid: forms it accepts but asyncpg
+    # rejects ("{...}", "urn:uuid:...") would otherwise still reach the database as a 500.
+    try:
+        continuation_token = str(UUID(continuationToken)) if continuationToken else None
+    except ValueError as e:
+        raise BadRequest("Invalid continuationToken") from e
+
     tag_filters = None
     if tagFilters:
         try:
-            tag_filters = json.loads(tagFilters) or None
-        except json.JSONDecodeError as e:
-            raise BadRequest(f"Invalid tagFilters JSON: {e}") from e
+            parsed = _TAG_FILTERS.validate_json(tagFilters)
+        except ValidationError as e:
+            raise BadRequest(f"Invalid tagFilters: {_first_problem(e)}") from e
+        tag_filters = {group: [str(tag) for tag in tags] for group, tags in parsed.items()} or None
 
     return await service.search_paged(
         search=pvName,
         page_size=pageSize,
-        continuation_token=continuationToken,
+        continuation_token=continuation_token,
         tag_filters=tag_filters,
     )
 

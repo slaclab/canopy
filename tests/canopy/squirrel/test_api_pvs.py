@@ -1,5 +1,6 @@
 """API tests for the PV registry + meta-PV endpoints."""
 
+import pytest
 from httpx import AsyncClient
 
 from tests.canopy.squirrel.conftest import READ_HEADERS, WRITE_HEADERS
@@ -95,9 +96,60 @@ async def test_paged_and_filtered_search(client: AsyncClient, sample_pv: dict):
     assert body["totalCount"] >= 1 and body["limit"] == 10
 
 
-async def test_paged_bad_tagfilters_is_400(client: AsyncClient):
-    r = await client.get("/v1/pvs/paged?tagFilters=NOT_JSON", headers=READ_HEADERS)
-    assert r.status_code == 400
+async def test_paged_follows_continuation_token(client: AsyncClient, sample_pv: dict):
+    await client.post("/v1/pvs", headers=WRITE_HEADERS, json={"setpointAddress": "SECOND:SP"})
+
+    first = await client.get("/v1/pvs/paged?pageSize=1", headers=READ_HEADERS)
+    assert first.status_code == 200, first.text
+    token = first.json()["continuationToken"]
+    assert token is not None
+
+    second = await client.get(f"/v1/pvs/paged?pageSize=1&continuationToken={token}", headers=READ_HEADERS)
+    assert second.status_code == 200, second.text
+    assert second.json()["results"][0]["id"] != first.json()["results"][0]["id"]
+    assert second.json()["continuationToken"] is None
+
+
+async def test_paged_normalises_token_forms_and_empty_token(client: AsyncClient, sample_pv: dict):
+    """Forms uuid.UUID() accepts must be normalised, not handed raw to asyncpg (500)."""
+    await client.post("/v1/pvs", headers=WRITE_HEADERS, json={"setpointAddress": "SECOND:SP"})
+    first = await client.get("/v1/pvs/paged?pageSize=1", headers=READ_HEADERS)
+    token = first.json()["continuationToken"]
+    plain = await client.get(f"/v1/pvs/paged?pageSize=1&continuationToken={token}", headers=READ_HEADERS)
+
+    for form in ("{" + token + "}", f"urn:uuid:{token}", token.upper()):
+        r = await client.get("/v1/pvs/paged", params={"pageSize": 1, "continuationToken": form}, headers=READ_HEADERS)
+        assert r.status_code == 200, f"{form!r} -> {r.status_code} {r.text}"
+        assert r.json() == plain.json()
+
+    # An empty token means the first page, as it did before the guard existed.
+    r = await client.get("/v1/pvs/paged?pageSize=1&continuationToken=", headers=READ_HEADERS)
+    assert r.status_code == 200 and r.json() == first.json()
+
+
+async def test_paged_malformed_continuation_token_400(client: AsyncClient):
+    """A bad token must not reach asyncpg as an invalid UUID comparison (500)."""
+    for token in ("garbage", "0" * 40, "not-a-uuid-but-36-chars-long-aaaaaaaa"):
+        r = await client.get(f"/v1/pvs/paged?continuationToken={token}", headers=READ_HEADERS)
+        assert r.status_code == 400, f"{token!r} -> {r.status_code} {r.text}"
+        assert r.json()["code"] == "bad_request"
+
+
+@pytest.mark.parametrize(
+    "tag_filters",
+    [
+        "NOT_JSON",
+        '{"g": ["garbage"]}',  # tag id is not a UUID
+        '{"g": [1, 2]}',  # tag ids are not strings
+        '{"g": "notalist"}',  # group value is not a list
+        "[1, 2]",  # not an object
+    ],
+)
+async def test_paged_bad_tagfilters_is_400(client: AsyncClient, tag_filters: str):
+    """Malformed tagFilters must be rejected before the query is built (not a 500 from the DB)."""
+    r = await client.get("/v1/pvs/paged", params={"tagFilters": tag_filters}, headers=READ_HEADERS)
+    assert r.status_code == 400, f"{tag_filters!r} -> {r.status_code} {r.text}"
+    assert r.json()["code"] == "bad_request"
 
 
 async def test_paged_tag_filter(client: AsyncClient, sample_tag_group: dict):
