@@ -77,7 +77,7 @@ class SnapshotSummaryDTO(SnapshotBase):
     created_date: datetime
     created_by: str | None = None
     pv_count: int = 0
-    facility_id: str | None = None
+    facility: str | None = None  # slug
     meta_pvs: list[MetaPVValueDTO] = Field(default_factory=list)
 
 

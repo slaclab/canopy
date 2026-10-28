@@ -77,7 +77,7 @@ class PvService:
         self.meta_pv_repo = MetaPvRepository(session)
         self.tag_repo = TagRepository(session)
 
-    def _to_dto(self, pv: Pv, facility_ids: set[str] | None = None) -> PVElementDTO:
+    def _to_dto(self, pv: Pv, facilities: list[str]) -> PVElementDTO:
         return PVElementDTO(
             id=pv.id,
             setpoint_address=pv.setpoint_address,
@@ -88,16 +88,22 @@ class PvService:
             abs_tolerance=pv.abs_tolerance,
             rel_tolerance=pv.rel_tolerance,
             tags=[TagDTO(id=t.id, name=t.name, description=t.description) for t in pv.tags],
-            facility_ids=sorted(facility_ids or ()),
+            facilities=facilities,
             created_date=pv.created_at,
             last_modified_date=pv.updated_at,
         )
 
-    async def _to_dtos(self, pvs: list[Pv]) -> list[PVElementDTO]:
-        """``_to_dto`` over a result set, with one batched ``pv_facility`` read instead
-        of one per row."""
-        by_pv = await self.pv_repo.facility_ids_for_many([pv.id for pv in pvs])
-        return [self._to_dto(pv, by_pv.get(pv.id, set())) for pv in pvs]
+    async def _to_dtos(self, pvs: list[Pv], ids_by_pv: dict[str, set[str]] | None = None) -> list[PVElementDTO]:
+        """``_to_dto`` over a result set. Facility ids are stored but reported as slugs,
+        resolved in one batched lookup for the whole set. ``ids_by_pv`` defaults to
+        reading ``pv_facility`` for these PVs."""
+        if ids_by_pv is None:
+            ids_by_pv = await self.pv_repo.facility_ids_for_many([pv.id for pv in pvs])
+        slug_by_id = await facilities_gateway.slugs_by_id({fid for ids in ids_by_pv.values() for fid in ids})
+        return [
+            self._to_dto(pv, sorted(slug_by_id[fid] for fid in ids_by_pv.get(pv.id, ()) if fid in slug_by_id))
+            for pv in pvs
+        ]
 
     def _require_facility_write(self, row_facility_ids: set[str], what: str) -> None:
         """Gate a write to an *existing* row on the calling key's facility grant.
@@ -193,7 +199,7 @@ class PvService:
         pvs = await self.pv_repo.get_by_ids([pv_id])
         if not pvs:
             return None
-        return self._to_dto(pvs[0], await self.pv_repo.facility_ids_for(pv_id))
+        return (await self._to_dtos(pvs))[0]
 
     async def _find_by_identity(self, kind: str, address: str) -> Pv | None:
         """Look up the PV already holding an identity.
@@ -272,7 +278,7 @@ class PvService:
             raise PvAlreadyExists(f"PV addresses violate uniqueness constraints: {e}") from e
         if facility_ids:
             await self.pv_repo.set_facilities(pv.id, facility_ids)
-        return self._to_dto(pv, facility_ids)
+        return (await self._to_dtos([pv], {pv.id: facility_ids}))[0]
 
     async def create_many(self, data_list: list[NewPVElementDTO]) -> list[PVElementDTO]:
         """Register many PVs in one import.
@@ -373,8 +379,7 @@ class PvService:
             if data.facilities
         ]
         await self.pv_repo.add_facilities_many(assignments)
-        ids_by_pv = dict(assignments)
-        return [self._to_dto(pv, ids_by_pv.get(pv.id, set())) for pv in pvs]
+        return await self._to_dtos(pvs, dict(assignments))
 
     async def update(self, pv_id: str, data: UpdatePVElementDTO) -> PVElementDTO | None:
         pv = await self.pv_repo.get_by_id(pv_id)
@@ -413,7 +418,7 @@ class PvService:
                 raise BadRequest("One or more tag IDs are invalid")
             pv.tags = tags
         pv = await self.pv_repo.update(pv)
-        return self._to_dto(pv, facility_ids)
+        return (await self._to_dtos([pv], {pv.id: facility_ids}))[0]
 
     async def delete(self, pv_id: str) -> bool:
         pv = await self.pv_repo.get_by_id(pv_id)

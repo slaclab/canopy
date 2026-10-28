@@ -6,13 +6,17 @@ from canopy.contracts.base import CanopyModel
 
 
 class FacilityDTO(CanopyModel):
-    """A facility node. Flat, with ``parent_id`` — the client assembles the tree."""
+    """A facility node. Flat, with ``parent`` — the client assembles the tree.
+
+    Facilities are referenced by slug everywhere on the wire; ``id`` is included for
+    debugging only.
+    """
 
     id: str
     slug: str
     name: str
     description: str | None = None
-    parent_id: str | None = None
+    parent: str | None = None
 
 
 # Lowercase alphanumerics and single internal hyphens, not leading or trailing with
@@ -33,8 +37,7 @@ class FacilityCreate(CanopyModel):
     slug: str = Field(..., min_length=1, max_length=64, pattern=SLUG_PATTERN)
     name: str = Field(..., min_length=1, max_length=255)
     description: str | None = None
-    # A parent *slug*, not an id, matching the slug-keyed routes. ``FacilityDTO``
-    # still returns ``parent_id``, since that's what a client walks to build the tree.
+    # A parent *slug*, matching the slug-keyed routes and ``FacilityDTO.parent``.
     parent: str | None = None
 
     @field_validator("slug")
