@@ -14,6 +14,7 @@ from datetime import datetime
 from sqlalchemy import (
     Text,
     Float,
+    Index,
     Table,
     Column,
     String,
@@ -133,7 +134,12 @@ class Snapshot(UUIDMixin, TimestampMixin, Base):
     """A captured machine state: metadata + one ``SnapshotValue`` per read address."""
 
     __tablename__ = "snapshot"
-    __table_args__ = {"schema": SQUIRREL_SCHEMA}
+    __table_args__ = (
+        # Serves the newest-first keyset listing (scanned backward) and range scans by
+        # creation time, such as a cutoff for pruning old snapshots.
+        Index("ix_squirrel_snapshot_created_at_id", "created_at", "id"),
+        {"schema": SQUIRREL_SCHEMA},
+    )
 
     title: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[str | None] = mapped_column(Text)
