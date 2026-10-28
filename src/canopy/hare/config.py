@@ -32,8 +32,23 @@ class HareConfig(BaseSettings):
     # Bound on the internal event queue so a fast producer can't grow it without
     # limit (OOM). At capacity the oldest-losing policy is "drop newest + warn".
     event_queue_maxsize: int = 100_000
-    # Max concurrent seed (get+describe) calls when activating a subscribe batch.
+    # Max concurrent seed (get+describe) calls across all subscribes. Every
+    # channel that never connects holds a slot for `seed_timeout_s`, so a burst
+    # of dead channels can delay other PVs' metadata by that long per batch of
+    # `seed_concurrency`; raise it for screens with many dead fields. For CA the
+    # read rides the channel the monitor already opened, so this adds no connections.
     seed_concurrency: int = 32
+    seed_timeout_s: float = 2.0
+    """Seconds a seed's one-shot read waits for a channel before reporting it disconnected.
+
+    Shorter than the connector's own 5.0 s CA and PVA timeouts on purpose: the
+    seed only supplies a prompt first value, and the PV's monitor delivers the
+    value anyway once a slow channel connects. A channel that never connects
+    holds one of the ``seed_concurrency`` slots for this long instead of for
+    two connector timeouts; twice this long for an unprefixed name when
+    ``CANOPY_EPICS__UNPREFIXED_PVA_FALLBACK`` is on, since the read then tries
+    CA and PVA in turn, each with this timeout.
+    """
     seed_retry_backoff_s: float = 30.0
     """Seconds a subscribe waits before re-seeding a PV whose last seed left its value or metadata missing.
 

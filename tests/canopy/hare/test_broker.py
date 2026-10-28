@@ -1,7 +1,8 @@
 """PVBroker: on-demand monitors, diff fan-out, refcounted teardown.
 
 Driven deterministically via FakeConnector (emit on demand) + FakeWebSocket,
-without starting the background loops — tests call `_drain_nowait` / `_flush`.
+without starting the background loops — tests call `_drain_nowait` / `_flush`,
+and `drain_seeds` to wait for the background seed a subscribe starts.
 """
 
 import asyncio
@@ -51,6 +52,7 @@ async def test_subscribe_starts_monitor_and_sends_initial(broker, fake_connector
     ws = FakeWebSocket()
     broker.add_client("c1", ws)
     await broker.subscribe("c1", ["PV:A"])
+    await broker.drain_seeds()
 
     assert "PV:A" in fake_connector.callbacks  # monitor started
     assert ws.sent and ws.sent[0]["type"] == "initial"
@@ -170,6 +172,7 @@ async def test_initial_frame_includes_metadata(broker, fake_connector):
     ws = FakeWebSocket()
     broker.add_client("c1", ws)
     await broker.subscribe("c1", ["PV:A"])
+    await broker.drain_seeds()
 
     initial = ws.sent[0]
     assert initial["type"] == "initial"
@@ -221,6 +224,7 @@ async def test_put_invalidates_cache_so_read_is_fresh(broker, fake_connector):
     # stale cache -- it re-reads through the connector so put-then-read is consistent.
     broker.add_client("c1", FakeWebSocket())
     await broker.subscribe("c1", ["PV:A"])
+    await broker.drain_seeds()
     fake_connector.emit("PV:A", 1.0)
     await broker._drain_nowait()
     assert (await broker.get_value("PV:A")).value == 1.0  # served from cache
@@ -363,12 +367,262 @@ def _initial_frames(ws: FakeWebSocket) -> list[dict]:
     return [m for m in ws.sent if m["type"] == "initial"]
 
 
+def _disconnected(pv: str) -> PVValue:
+    """Build the ``connected: false`` value a connector returns for a channel whose read timed out."""
+    return PVValue(pv=pv, value=None, severity=AlarmSeverity.INVALID, ts_ns=0, connected=False)
+
+
+def _gate_get(connector, gated: set[str], *, dead: bool = False) -> tuple[asyncio.Event, list[str]]:
+    """Make ``connector.get`` hold the given PVs' reads until the returned gate opens, recording every call.
+
+    Stands in for a CA channel: a PV not in ``gated`` answers at once; a gated
+    PV answers only once the gate opens, with ``connected: false`` when ``dead``
+    is set (a read that timed out) and its normal value otherwise.
+
+    Parameters
+    ----------
+    connector : FakeConnector
+        Connector whose ``get`` is replaced on the instance.
+    gated : set[str]
+        PV names whose reads block on the gate.
+    dead : bool, optional
+        Whether a gated read reports the channel disconnected when released.
+
+    Returns
+    -------
+    tuple[asyncio.Event, list[str]]
+        The gate to open, and the PV names passed to ``get`` in call order.
+    """
+    original = connector.get
+    gate = asyncio.Event()
+    calls: list[str] = []
+
+    async def gated_get(pv, **kwargs):
+        calls.append(pv)
+        if pv in gated:
+            await gate.wait()
+            if dead:
+                return _disconnected(pv)
+        return await original(pv, **kwargs)
+
+    connector.get = gated_get
+    return gate, calls
+
+
+def _initials_with_meta(ws: FakeWebSocket, pv: str) -> list[dict]:
+    """Return the ``initial`` frames a client received that carry metadata for ``pv``."""
+    return [m for m in _initial_frames(ws) if pv in m["meta"]]
+
+
+async def test_subscribe_returns_before_the_seed_read_answers(fake_connector):
+    """``subscribe`` returns while the PV's read is still pending; the value arrives later in its own ``initial``."""
+    broker = PVBroker(fake_connector, HareConfig())
+    gate, gets = _gate_get(fake_connector, {"PV:SLOW"})
+    ws = FakeWebSocket()
+    broker.add_client("c1", ws)
+
+    await asyncio.wait_for(broker.subscribe("c1", ["PV:SLOW"]), 0.5)
+    await asyncio.sleep(0)
+    assert gets == ["PV:SLOW"]
+    assert not _initial_frames(ws)
+
+    gate.set()
+    await broker.drain_seeds()
+    (initial,) = _initial_frames(ws)
+    assert "PV:SLOW" in initial["data"]
+    assert "PV:SLOW" in initial["meta"]
+
+
+async def test_dead_pv_in_a_batch_does_not_delay_the_live_pvs(fake_connector):
+    """A live PV's value and metadata arrive while a dead PV in the same batch is still pending.
+
+    The dead PV follows in its own frame as ``connected: false`` without
+    metadata once its read gives up, and is never described.
+    """
+    broker = PVBroker(fake_connector, HareConfig())
+    gate, _ = _gate_get(fake_connector, {"PV:DEAD"}, dead=True)
+    describes = _record_calls(fake_connector, "describe")
+    ws = FakeWebSocket()
+    broker.add_client("c1", ws)
+
+    await broker.subscribe("c1", ["PV:LIVE", "PV:DEAD"])
+    assert await wait_for(lambda: _initials_with_meta(ws, "PV:LIVE"), timeout=1.0)
+    assert not any("PV:DEAD" in m["data"] for m in _initial_frames(ws))
+
+    gate.set()
+    await broker.drain_seeds()
+    (dead_frame,) = [m for m in _initial_frames(ws) if "PV:DEAD" in m["data"]]
+    assert dead_frame["data"]["PV:DEAD"]["connected"] is False
+    assert "PV:DEAD" not in dead_frame["meta"]
+    assert describes == ["PV:LIVE"]
+
+
+async def test_dead_pv_in_an_earlier_frame_does_not_delay_a_later_subscribe(fake_connector):
+    """A client's later subscribe is answered while a dead PV from an earlier frame is still pending."""
+    broker = PVBroker(fake_connector, HareConfig())
+    gate, _ = _gate_get(fake_connector, {"PV:DEAD"}, dead=True)
+    ws = FakeWebSocket()
+    broker.add_client("c1", ws)
+
+    await broker.subscribe("c1", ["PV:DEAD"])
+    await asyncio.wait_for(broker.subscribe("c1", ["PV:LIVE"]), 0.5)
+    assert await wait_for(lambda: _initials_with_meta(ws, "PV:LIVE"), timeout=1.0)
+
+    gate.set()
+    await broker.drain_seeds()
+
+
+async def test_seed_read_uses_the_seed_timeout(fake_connector):
+    """The seed's read passes ``seed_timeout_s`` instead of leaving the connector to its own timeout."""
+    broker = PVBroker(fake_connector, HareConfig(seed_timeout_s=0.25))
+    original = fake_connector.get
+    timeouts: list[float | None] = []
+
+    async def recording_get(pv, *, timeout=None):
+        timeouts.append(timeout)
+        return await original(pv, timeout=timeout)
+
+    fake_connector.get = recording_get
+    broker.add_client("c1", FakeWebSocket())
+    await broker.subscribe("c1", ["PV:A"])
+    await broker.drain_seeds()
+
+    assert timeouts == [0.25]
+
+
+async def test_disconnected_read_skips_describe_and_is_served_from_cache_within_backoff(fake_connector):
+    """A read answered ``connected: false`` is cached, sets the retry deadline and skips the describe.
+
+    A subscriber inside the backoff window gets the disconnected value from the
+    cache without another read.
+    """
+    broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=3600))
+    gate, gets = _gate_get(fake_connector, {"PV:DEAD"}, dead=True)
+    gate.set()
+    describes = _record_calls(fake_connector, "describe")
+
+    broker.add_client("c1", FakeWebSocket())
+    await broker.subscribe("c1", ["PV:DEAD"])
+    await broker.drain_seeds()
+    assert broker._latest["PV:DEAD"].connected is False
+    assert "PV:DEAD" not in broker._meta
+    assert "PV:DEAD" in broker._seed_retry_after
+    assert describes == []
+
+    late = FakeWebSocket()
+    broker.add_client("c2", late)
+    await broker.subscribe("c2", ["PV:DEAD"])
+    await broker.drain_seeds()
+    assert gets == ["PV:DEAD"]
+    (initial,) = _initial_frames(late)
+    assert initial["data"]["PV:DEAD"]["connected"] is False
+
+
+async def test_disconnected_seed_is_re_read_after_backoff(fake_connector):
+    """A PV whose seed found it disconnected is read again by a subscribe after the backoff, and described once it answers.
+
+    Every subscriber then receives an ``initial`` with the connected value and
+    its metadata.
+    """
+    broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=0))
+    original = fake_connector.get
+    gets: list[str] = []
+
+    async def flaky_get(pv, **kwargs):
+        gets.append(pv)
+        if len(gets) == 1:
+            return _disconnected(pv)
+        return await original(pv, **kwargs)
+
+    fake_connector.get = flaky_get
+    describes = _record_calls(fake_connector, "describe")
+
+    first = FakeWebSocket()
+    broker.add_client("c1", first)
+    await broker.subscribe("c1", ["PV:FLAKY"])
+    await broker.drain_seeds()
+    assert broker._latest["PV:FLAKY"].connected is False
+    assert describes == []
+
+    broker.add_client("c2", FakeWebSocket())
+    await broker.subscribe("c2", ["PV:FLAKY"])
+    await broker.drain_seeds()
+
+    assert gets == ["PV:FLAKY", "PV:FLAKY"]
+    assert describes == ["PV:FLAKY"]
+    assert broker._latest["PV:FLAKY"].connected is True
+    assert "PV:FLAKY" not in broker._seed_retry_after
+    (with_meta,) = _initials_with_meta(first, "PV:FLAKY")
+    assert with_meta["data"]["PV:FLAKY"]["connected"] is True
+
+
+async def test_channel_connecting_after_a_dead_seed_gets_its_metadata(fake_connector):
+    """The first connected monitor update of a PV whose seed found it dead starts its describe, despite the backoff.
+
+    The subscriber then receives an ``initial`` carrying both the value and the
+    metadata; the value itself is not read again.
+    """
+    broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=3600))
+    gate, gets = _gate_get(fake_connector, {"PV:DEAD"}, dead=True)
+    gate.set()
+    describes = _record_calls(fake_connector, "describe")
+    ws = FakeWebSocket()
+    broker.add_client("c1", ws)
+    await broker.subscribe("c1", ["PV:DEAD"])
+    await broker.drain_seeds()
+    assert describes == []
+
+    fake_connector.emit("PV:DEAD", 1.5)
+    await broker._drain_nowait()
+    await broker.drain_seeds()
+
+    assert gets == ["PV:DEAD"]
+    assert describes == ["PV:DEAD"]
+    assert "PV:DEAD" not in broker._seed_retry_after
+    (with_meta,) = _initials_with_meta(ws, "PV:DEAD")
+    assert with_meta["data"]["PV:DEAD"]["value"] == 1.5
+
+
+async def test_connected_updates_do_not_repeat_a_failed_describe(fake_connector):
+    """Only the connect edge starts a describe; further connected updates inside the backoff window do not."""
+    broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=3600))
+    describes = _record_calls(fake_connector, "describe", failures=5)
+    broker.add_client("c1", FakeWebSocket())
+    await broker.subscribe("c1", ["PV:A"])
+    await broker.drain_seeds()
+    assert describes == ["PV:A"]
+
+    for value in (1.0, 2.0, 3.0):
+        fake_connector.emit("PV:A", value)
+        await broker._drain_nowait()
+        await broker.drain_seeds()
+
+    assert describes == ["PV:A"]
+
+
+async def test_monitor_update_during_the_seed_read_is_kept(fake_connector):
+    """A monitor update that lands while the seed's read is pending is newer and is not overwritten by the read."""
+    broker = PVBroker(fake_connector, HareConfig())
+    gate, _ = _gate_get(fake_connector, {"PV:A"})
+    broker.add_client("c1", FakeWebSocket())
+    await broker.subscribe("c1", ["PV:A"])
+    await asyncio.sleep(0)
+
+    fake_connector.emit("PV:A", 7.0)
+    await broker._drain_nowait()
+    gate.set()
+    await broker.drain_seeds()
+
+    assert broker._latest["PV:A"].value == 7.0
+    assert "PV:A" in broker._meta
+
+
 async def test_failed_seed_is_retried_for_late_subscribers(fake_connector):
     """A later subscribe of an already-monitored PV retries a seed whose ``get`` failed.
 
-    With a zero backoff window, the late subscriber receives the PV's value in
-    its ``initial`` frame once the connector recovers, even though the monitor
-    never ticked.
+    With a zero backoff window, the retry's result is fanned out to every
+    subscriber of the PV, so the first client also gets the value its own seed
+    could not fetch.
     """
     broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=0))
     _record_calls(fake_connector, "get", failures=1)
@@ -376,36 +630,41 @@ async def test_failed_seed_is_retried_for_late_subscribers(fake_connector):
     first = FakeWebSocket()
     broker.add_client("c1", first)
     await broker.subscribe("c1", ["PV:SEED"])
-    initial_frames = _initial_frames(first)
-    assert not initial_frames or "PV:SEED" not in initial_frames[0].get("data", {})
+    await broker.drain_seeds()
+    assert not _initial_frames(first)
 
     late = FakeWebSocket()
     broker.add_client("c2", late)
     await broker.subscribe("c2", ["PV:SEED"])
-    late_initials = _initial_frames(late)
-    assert late_initials and "PV:SEED" in late_initials[0]["data"]
+    await broker.drain_seeds()
+    for ws in (first, late):
+        (initial,) = _initial_frames(ws)
+        assert "PV:SEED" in initial["data"]
+        assert "PV:SEED" in initial["meta"]
 
 
 async def test_failed_seed_is_not_retried_within_backoff(fake_connector):
     """A subscribe inside the backoff window does not call ``get`` again for a PV whose seed failed.
 
-    The late subscriber still receives the metadata that did seed, but no value.
+    With no value to show the channel connected, the describe is skipped too,
+    so nothing is cached and the late subscriber gets no ``initial`` for it.
     """
     broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=3600))
     gets = _record_calls(fake_connector, "get", failures=1)
+    describes = _record_calls(fake_connector, "describe")
 
     broker.add_client("c1", FakeWebSocket())
     await broker.subscribe("c1", ["PV:SEED"])
+    await broker.drain_seeds()
 
     late = FakeWebSocket()
     broker.add_client("c2", late)
     await broker.subscribe("c2", ["PV:SEED"])
+    await broker.drain_seeds()
 
     assert gets == ["PV:SEED"]
-    late_initials = _initial_frames(late)
-    assert late_initials
-    assert "PV:SEED" not in late_initials[0]["data"]
-    assert "PV:SEED" in late_initials[0]["meta"]
+    assert describes == []
+    assert not _initial_frames(late)
 
 
 async def test_failed_seed_is_retried_after_backoff_and_success_clears_deadline(fake_connector):
@@ -415,10 +674,12 @@ async def test_failed_seed_is_retried_after_backoff_and_success_clears_deadline(
 
     broker.add_client("c1", FakeWebSocket())
     await broker.subscribe("c1", ["PV:SEED"])
+    await broker.drain_seeds()
     assert "PV:SEED" in broker._seed_retry_after
 
     broker.add_client("c2", FakeWebSocket())
     await broker.subscribe("c2", ["PV:SEED"])
+    await broker.drain_seeds()
 
     assert gets == ["PV:SEED", "PV:SEED"]
     assert "PV:SEED" in broker._latest
@@ -441,8 +702,10 @@ async def test_describe_failure_retries_only_describe_after_backoff(fake_connect
 
     broker.add_client("c1", FakeWebSocket())
     await broker.subscribe("c1", ["PV:META"])
+    await broker.drain_seeds()
     broker.add_client("c2", FakeWebSocket())
     await broker.subscribe("c2", ["PV:META"])
+    await broker.drain_seeds()
 
     assert gets == ["PV:META"]
     assert describes == ["PV:META"] * expected_describes
@@ -455,6 +718,7 @@ async def test_stop_monitors_clears_seed_retry_deadline(fake_connector):
 
     broker.add_client("c1", FakeWebSocket())
     await broker.subscribe("c1", ["PV:SEED"])
+    await broker.drain_seeds()
     assert "PV:SEED" in broker._seed_retry_after
     assert "PV:SEED" in broker._seed_locks
 
@@ -465,75 +729,120 @@ async def test_stop_monitors_clears_seed_retry_deadline(fake_connector):
     again = FakeWebSocket()
     broker.add_client("c2", again)
     await broker.subscribe("c2", ["PV:SEED"])
+    await broker.drain_seeds()
 
     assert gets == ["PV:SEED", "PV:SEED"]
     assert "PV:SEED" in _initial_frames(again)[0]["data"]
 
 
-@pytest.mark.parametrize("get_fails", [pytest.param(True, id="unreachable"), pytest.param(False, id="slow")])
-async def test_concurrent_subscribes_share_one_seed_attempt(fake_connector, get_fails):
-    """Concurrent subscribes of an unseeded PV make one ``get`` and one ``describe`` between them.
+async def test_concurrent_subscribes_share_one_seed_attempt(fake_connector):
+    """Two clients subscribing an unseeded PV while its read is pending share one ``get`` and ``describe``.
 
-    The first subscriber's ``get`` stalls until released, so the second
-    subscribe reaches the seed step while that attempt is still in flight. It
-    waits for the attempt instead of starting its own, then sees the value it
-    produced or, when it failed, the retry deadline it set.
+    Both receive the result when it lands.
     """
     broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=3600))
-    original_get = fake_connector.get
-    release = asyncio.Event()
-    gets: list[str] = []
-
-    async def stalled_get(pv, **kwargs):
-        gets.append(pv)
-        await release.wait()
-        if get_fails:
-            raise TimeoutError("get timed out")
-        return await original_get(pv, **kwargs)
-
-    fake_connector.get = stalled_get
+    gate, gets = _gate_get(fake_connector, {"PV:SEED"})
     describes = _record_calls(fake_connector, "describe")
 
     first, second = FakeWebSocket(), FakeWebSocket()
     broker.add_client("c1", first)
     broker.add_client("c2", second)
-    subscribes = [
-        asyncio.create_task(broker.subscribe("c1", ["PV:SEED"])),
-        asyncio.create_task(broker.subscribe("c2", ["PV:SEED"])),
-    ]
-    await asyncio.sleep(0.05)
-    release.set()
-    await asyncio.wait_for(asyncio.gather(*subscribes), 1.0)
+    await broker.subscribe("c1", ["PV:SEED"])
+    await broker.subscribe("c2", ["PV:SEED"])
+    assert len(broker._seed_tasks) == 1
+
+    gate.set()
+    await broker.drain_seeds()
 
     assert gets == ["PV:SEED"]
     assert describes == ["PV:SEED"]
     for ws in (first, second):
         (initial,) = _initial_frames(ws)
-        assert ("PV:SEED" in initial["data"]) is not get_fails
+        assert "PV:SEED" in initial["data"]
         assert "PV:SEED" in initial["meta"]
 
 
-async def test_seed_finishing_after_release_leaves_no_cached_state(fake_connector):
-    """A seed still in flight when its PV is released caches nothing once it finishes.
+async def test_unsubscribe_during_a_pending_seed_leaves_the_leaver_nothing(fake_connector):
+    """A client that unsubscribes while the seed is pending gets no frame when it completes; the other subscriber does."""
+    broker = PVBroker(fake_connector, HareConfig())
+    gate, _ = _gate_get(fake_connector, {"PV:SEED"})
+    stayer, leaver = FakeWebSocket(), FakeWebSocket()
+    broker.add_client("c1", stayer)
+    broker.add_client("c2", leaver)
+    await broker.subscribe("c1", ["PV:SEED"])
+    await broker.subscribe("c2", ["PV:SEED"])
 
-    The next subscriber therefore seeds the PV afresh instead of being served
-    the orphaned attempt's value.
+    await broker.unsubscribe("c2", ["PV:SEED"])
+    gate.set()
+    await broker.drain_seeds()
+
+    assert "PV:SEED" in _initial_frames(stayer)[0]["data"]
+    assert not _initial_frames(leaver)
+    assert "PV:SEED" not in broker.registry.client_pvs("c2")
+
+
+async def test_release_cancels_the_pending_seed(fake_connector):
+    """Releasing a PV cancels its pending seed, so nothing is cached and the next subscriber seeds afresh."""
+    broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=3600))
+    gate, gets = _gate_get(fake_connector, {"PV:SEED"})
+
+    broker.add_client("c1", FakeWebSocket())
+    await broker.subscribe("c1", ["PV:SEED"])
+    await asyncio.sleep(0)
+    task = broker._seed_tasks["PV:SEED"]
+    await broker.unsubscribe("c1", ["PV:SEED"])
+    await asyncio.wait([task], timeout=1.0)
+
+    assert task.cancelled()
+    assert "PV:SEED" not in broker._seed_tasks
+    assert "PV:SEED" not in broker._latest
+    assert "PV:SEED" not in broker._meta
+    assert "PV:SEED" not in broker._seed_retry_after
+
+    gate.set()
+    later = FakeWebSocket()
+    broker.add_client("c2", later)
+    await broker.subscribe("c2", ["PV:SEED"])
+    await broker.drain_seeds()
+    assert gets == ["PV:SEED", "PV:SEED"]
+    assert "PV:SEED" in _initial_frames(later)[0]["data"]
+
+
+def _uncancellable(gate: asyncio.Event):
+    """Wait on ``gate`` even when cancelled, like a connector read that cannot be aborted mid-flight."""
+
+    async def wait() -> None:
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            await gate.wait()
+
+    return wait
+
+
+async def test_seed_finishing_after_release_leaves_no_cached_state(fake_connector):
+    """A seed whose read outlives its PV's release caches nothing once it finishes.
+
+    The read ignores the cancellation the release sends, standing in for a
+    connector call that cannot be aborted; the stale seed lock keeps its late
+    result out of the cache, and the next subscriber seeds the PV afresh.
     """
     broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=3600))
     original_get = fake_connector.get
     release = asyncio.Event()
     gets: list[str] = []
 
-    async def stalled_get(pv, **kwargs):
+    async def stubborn_get(pv, **kwargs):
         gets.append(pv)
-        await release.wait()
+        await _uncancellable(release)()
         return await original_get(pv, **kwargs)
 
-    fake_connector.get = stalled_get
+    fake_connector.get = stubborn_get
 
     broker.add_client("c1", FakeWebSocket())
-    orphaned = asyncio.create_task(broker.subscribe("c1", ["PV:SEED"]))
-    await asyncio.sleep(0.02)
+    await broker.subscribe("c1", ["PV:SEED"])
+    await asyncio.sleep(0)
+    orphaned = broker._seed_tasks["PV:SEED"]
     await broker.unsubscribe("c1", ["PV:SEED"])
     release.set()
     await asyncio.wait_for(orphaned, 1.0)
@@ -545,6 +854,7 @@ async def test_seed_finishing_after_release_leaves_no_cached_state(fake_connecto
     later = FakeWebSocket()
     broker.add_client("c2", later)
     await broker.subscribe("c2", ["PV:SEED"])
+    await broker.drain_seeds()
     assert gets == ["PV:SEED", "PV:SEED"]
     assert "PV:SEED" in _initial_frames(later)[0]["data"]
 
@@ -552,8 +862,9 @@ async def test_seed_finishing_after_release_leaves_no_cached_state(fake_connecto
 async def test_orphaned_seed_finishing_last_keeps_the_newer_seed(fake_connector):
     """A released PV's seed that finishes after a re-subscribe's seed does not overwrite it.
 
-    The first ``get`` is released only after the second one has completed, so
-    the orphaned attempt finishes last; the cache keeps the second value.
+    The first read ignores its cancellation and is released only after the
+    second has completed, so the orphaned attempt finishes last; the cache
+    keeps the second value.
     """
     broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=3600))
     gates = [asyncio.Event(), asyncio.Event()]
@@ -563,63 +874,74 @@ async def test_orphaned_seed_finishing_last_keeps_the_newer_seed(fake_connector)
         nonlocal calls
         index = calls
         calls += 1
-        await gates[index].wait()
+        await _uncancellable(gates[index])()
         return PVValue(pv=pv, value=float(index + 1), severity=AlarmSeverity.NO_ALARM, ts_ns=index + 1, connected=True)
 
     fake_connector.get = gated_get
 
     broker.add_client("c1", FakeWebSocket())
-    orphaned = asyncio.create_task(broker.subscribe("c1", ["PV:SEED"]))
-    await asyncio.sleep(0.02)
+    await broker.subscribe("c1", ["PV:SEED"])
+    await asyncio.sleep(0)
+    orphaned = broker._seed_tasks["PV:SEED"]
     await broker.unsubscribe("c1", ["PV:SEED"])
     broker.add_client("c2", FakeWebSocket())
-    fresh = asyncio.create_task(broker.subscribe("c2", ["PV:SEED"]))
-    await asyncio.sleep(0.02)
+    await broker.subscribe("c2", ["PV:SEED"])
+    await asyncio.sleep(0)
+    assert calls == 2
 
     gates[1].set()
-    await asyncio.wait_for(fresh, 1.0)
+    await broker.drain_seeds()
+    assert broker._latest["PV:SEED"].value == 2.0
+
     gates[0].set()
     await asyncio.wait_for(orphaned, 1.0)
-
     assert broker._latest["PV:SEED"].value == 2.0
 
 
 async def test_seed_queued_for_a_slot_skips_a_pv_released_meanwhile(fake_connector):
-    """A seed still waiting for a ``seed_concurrency`` slot when its PV is released caches nothing.
+    """A seed still waiting for a ``seed_concurrency`` slot when its PV is released is cancelled and caches nothing.
 
-    With one slot, PV:B's seed queues behind PV:A's stalled read and PV:B is
+    With one slot, PV:B's seed queues behind PV:A's pending read and PV:B is
     released before the slot frees, so the next subscriber of PV:B seeds it afresh.
     """
     broker = PVBroker(fake_connector, HareConfig(seed_concurrency=1, seed_retry_backoff_s=3600))
-    original_get = fake_connector.get
-    release = asyncio.Event()
-    gets: list[str] = []
-
-    async def stalled_get(pv, **kwargs):
-        gets.append(pv)
-        if pv == "PV:A":
-            await release.wait()
-        return await original_get(pv, **kwargs)
-
-    fake_connector.get = stalled_get
+    gate, gets = _gate_get(fake_connector, {"PV:A"})
 
     broker.add_client("c1", FakeWebSocket())
-    first = asyncio.create_task(broker.subscribe("c1", ["PV:A", "PV:B"]))
-    await asyncio.sleep(0.02)
+    await broker.subscribe("c1", ["PV:A", "PV:B"])
+    await asyncio.sleep(0)
+    assert gets == ["PV:A"]
     await broker.unsubscribe("c1", ["PV:B"])
-    release.set()
-    await asyncio.wait_for(first, 1.0)
+    gate.set()
+    await broker.drain_seeds()
 
     assert gets == ["PV:A"]
     assert "PV:B" not in broker._latest
     assert "PV:B" not in broker._meta
     assert "PV:B" not in broker._seed_locks
+    assert "PV:B" not in broker._seed_tasks
 
     later = FakeWebSocket()
     broker.add_client("c2", later)
     await broker.subscribe("c2", ["PV:B"])
+    await broker.drain_seeds()
     assert gets == ["PV:A", "PV:B"]
     assert "PV:B" in _initial_frames(later)[0]["data"]
+
+
+async def test_stop_cancels_pending_seeds(fake_connector):
+    """``stop`` cancels seeds still in flight rather than waiting for their reads."""
+    broker = PVBroker(fake_connector, HareConfig())
+    _gate_get(fake_connector, {"PV:SLOW"})
+    broker.add_client("c1", FakeWebSocket())
+    await broker.subscribe("c1", ["PV:SLOW"])
+    await asyncio.sleep(0)
+    task = broker._seed_tasks["PV:SLOW"]
+
+    await asyncio.wait_for(broker.stop(), 1.0)
+
+    assert task.cancelled()
+    assert not broker._seed_tasks
 
 
 async def test_monitor_update_queued_before_release_is_not_cached(broker, fake_connector):
@@ -648,10 +970,12 @@ async def test_released_monitor_update_delivered_after_resubscribe_is_not_cached
     """
     broker.add_client("c1", FakeWebSocket())
     await broker.subscribe("c1", ["PV:A"])
+    await broker.drain_seeds()
     released_callback = fake_connector.callbacks["PV:A"]
     await broker.unsubscribe("c1", ["PV:A"])
     broker.add_client("c2", FakeWebSocket())
     await broker.subscribe("c2", ["PV:A"])
+    await broker.drain_seeds()
 
     released_callback(PVValue(pv="PV:A", value=7.0, severity=AlarmSeverity.NO_ALARM, ts_ns=2, connected=True))
     await broker._drain_nowait()
