@@ -409,6 +409,21 @@ def _gate_get(connector, gated: set[str], *, dead: bool = False) -> tuple[asynci
     return gate, calls
 
 
+class _GatedWebSocket(FakeWebSocket):
+    """A client whose first send blocks until ``release`` is set, so a fan-out can be caught mid-send."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+        self.blocked = False
+
+    async def send_json(self, data) -> None:
+        if not self.blocked:
+            self.blocked = True
+            await self.release.wait()
+        await super().send_json(data)
+
+
 def _initials_with_meta(ws: FakeWebSocket, pv: str) -> list[dict]:
     """Return the ``initial`` frames a client received that carry metadata for ``pv``."""
     return [m for m in _initial_frames(ws) if pv in m["meta"]]
@@ -581,6 +596,58 @@ async def test_channel_connecting_after_a_dead_seed_gets_its_metadata(fake_conne
     assert "PV:DEAD" not in broker._seed_retry_after
     (with_meta,) = _initials_with_meta(ws, "PV:DEAD")
     assert with_meta["data"]["PV:DEAD"]["value"] == 1.5
+
+
+async def test_connect_edge_during_a_pending_initial_send_is_not_lost(fake_connector):
+    """A channel that connects while its dead seed's ``initial`` send is pending still gets its metadata.
+
+    The running task cannot be started again, so it seeds once more after the
+    send instead, and the describe is not dropped.
+    """
+    broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=3600))
+    gate, gets = _gate_get(fake_connector, {"PV:DEAD"}, dead=True)
+    gate.set()
+    describes = _record_calls(fake_connector, "describe")
+    ws = _GatedWebSocket()
+    broker.add_client("c1", ws)
+
+    await broker.subscribe("c1", ["PV:DEAD"])
+    assert await wait_for(lambda: ws.blocked)
+    fake_connector.emit("PV:DEAD", 2.5)
+    await broker._drain_nowait()
+    assert describes == []
+
+    ws.release.set()
+    await asyncio.wait_for(broker.drain_seeds(), 1.0)
+
+    assert gets == ["PV:DEAD"]
+    assert describes == ["PV:DEAD"]
+    (with_meta,) = _initials_with_meta(ws, "PV:DEAD")
+    assert with_meta["data"]["PV:DEAD"]["value"] == 2.5
+    assert not broker._seed_again
+
+
+async def test_client_unsubscribing_during_fan_out_receives_no_initial(fake_connector):
+    """A client that unsubscribes while an earlier client's send is pending gets nothing from that fan-out."""
+    broker = PVBroker(fake_connector, HareConfig())
+    gate, _ = _gate_get(fake_connector, {"PV:SEED"})
+    first, second = _GatedWebSocket(), _GatedWebSocket()
+    broker.add_client("c1", first)
+    broker.add_client("c2", second)
+    await broker.subscribe("c1", ["PV:SEED"])
+    await broker.subscribe("c2", ["PV:SEED"])
+
+    gate.set()
+    assert await wait_for(lambda: first.blocked or second.blocked)
+    stayer, leaver, leaver_id = (first, second, "c2") if first.blocked else (second, first, "c1")
+    await broker.unsubscribe(leaver_id, ["PV:SEED"])
+    stayer.release.set()
+    # A send to the leaver would block on its unreleased gate and time this out.
+    await asyncio.wait_for(broker.drain_seeds(), 1.0)
+
+    assert "PV:SEED" in _initial_frames(stayer)[0]["data"]
+    assert not _initial_frames(leaver)
+    leaver.release.set()
 
 
 async def test_connected_updates_do_not_repeat_a_failed_describe(fake_connector):

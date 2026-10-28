@@ -67,6 +67,9 @@ class PVBroker:
         # task is cancelled when the PV is released.
         self._seed_sem = asyncio.Semaphore(config.seed_concurrency)
         self._seed_tasks: dict[str, asyncio.Task] = {}
+        # PVs whose running seed task must seed again after its fan-out, because
+        # the channel connected while that fan-out was in progress.
+        self._seed_again: set[str] = set()
         self._buffer: dict[str, PVValue] = {}
         self._buffer_lock = asyncio.Lock()
         # Bounded so a fast producer can't grow the queue without limit; the
@@ -139,6 +142,7 @@ class PVBroker:
         for task in self._seed_tasks.values():
             task.cancel()
         await self.drain_seeds()
+        self._seed_again.clear()
         for pv, sub in list(self._monitors.items()):
             try:
                 await sub.close()
@@ -339,7 +343,7 @@ class PVBroker:
         now = time.monotonic()
         return now >= self._seed_retry_after.get(pv, now)
 
-    def _ensure_seed_task(self, pv: str) -> None:
+    def _ensure_seed_task(self, pv: str, *, again_if_running: bool = False) -> None:
         """Start a PV's background seed unless one is already running.
 
         The task takes a broker-wide ``seed_concurrency`` slot and the PV's seed
@@ -354,9 +358,15 @@ class PVBroker:
         ----------
         pv : str
             Validated name of a subscribed PV.
+        again_if_running : bool, optional
+            When a task is already running, ask it to seed once more after its
+            fan-out instead of doing nothing. Used for a channel that connects
+            while its task is still sending the result of the previous attempt.
         """
         running = self._seed_tasks.get(pv)
         if running is not None and not running.done():
+            if again_if_running:
+                self._seed_again.add(pv)
             return
         lock = self._seed_locks.get(pv)
         if lock is None:
@@ -373,6 +383,12 @@ class PVBroker:
     async def _run_seed(self, pv: str, lock: asyncio.Lock) -> None:
         """Seed one PV under the concurrency bound, then fan the result out to its subscribers.
 
+        Each send re-checks that the PV is still current and the client still
+        subscribed, since an earlier client's send can block while another
+        unsubscribes or the PV is released. A connect edge that `_ingest` sees
+        during the fan-out is recorded in ``_seed_again``, and the task seeds once
+        more afterwards rather than dropping the describe.
+
         Parameters
         ----------
         pv : str
@@ -381,16 +397,23 @@ class PVBroker:
             The PV's seed lock when the task was created.
         """
         try:
-            async with self._seed_sem, lock:
-                if self._seed_locks.get(pv) is not lock:
+            while True:
+                async with self._seed_sem, lock:
+                    if self._seed_locks.get(pv) is not lock:
+                        return
+                    if pv in self._latest and pv in self._meta:
+                        return
+                    await self._seed_pv(pv, lock)
+                # An edge seen during the attempt was handled by the attempt
+                # itself; only one seen from here on needs another pass.
+                self._seed_again.discard(pv)
+                for client_id in list(self._registry.subscribers(pv)):
+                    if self._seed_locks.get(pv) is not lock:
+                        return
+                    if client_id in self._registry.subscribers(pv):
+                        await self._send_initial(client_id, [pv])
+                if self._seed_locks.get(pv) is not lock or pv not in self._seed_again:
                     return
-                if pv in self._latest and pv in self._meta:
-                    return
-                await self._seed_pv(pv, lock)
-            if self._seed_locks.get(pv) is not lock:
-                return
-            for client_id in list(self._registry.subscribers(pv)):
-                await self._send_initial(client_id, [pv])
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -554,6 +577,7 @@ class PVBroker:
             self._meta.pop(pv, None)
             self._seed_retry_after.pop(pv, None)
             self._seed_locks.pop(pv, None)
+            self._seed_again.discard(pv)
             self._cancel_seed(pv)
 
     # --- event ingestion ------------------------------------------------- #
@@ -598,7 +622,9 @@ class PVBroker:
         value was missing or disconnected, starts a background describe through
         `_ensure_seed_task` regardless of any retry deadline: the channel has
         just connected, so the metadata its seed could not fetch is available
-        now. Later connected updates do not repeat a describe that failed.
+        now. If the PV's seed task is still sending its previous result, the
+        task seeds again afterwards instead. Later connected updates do not
+        repeat a describe that failed.
 
         Parameters
         ----------
@@ -612,7 +638,7 @@ class PVBroker:
         previous = self._latest.get(value.pv)
         self._latest[value.pv] = value
         if value.connected and value.pv not in self._meta and (previous is None or not previous.connected):
-            self._ensure_seed_task(value.pv)
+            self._ensure_seed_task(value.pv, again_if_running=True)
         async with self._buffer_lock:
             self._buffer[value.pv] = value
 
