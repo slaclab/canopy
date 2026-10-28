@@ -32,9 +32,9 @@ async def ws_pvs(websocket: WebSocket, broker: PVBrokerDep) -> None:
     Server -> client:
     - ``{"type": "initial", "data": {"PV1": {...PVValue}}, "meta": {"PV1": {...PVMeta}}, "count": N}``
       — sent on subscribe with whatever is already cached, then once more per PV
-      as its background seed (one-shot read + describe) completes, so a channel
-      that never connects delays only itself; merge ``initial`` frames by PV
-      name. ``data`` is the dynamic value; ``meta`` is the static per-channel
+      as its monitor connects and its metadata is fetched in the background, so
+      a channel that never connects delays only itself; merge ``initial`` frames
+      by PV name. ``data`` is the dynamic value; ``meta`` is the static per-channel
       metadata (``valueKind``, units, precision, ``enumChoices``,
       display/control/alarm limits) a client reads once to configure a display.
     - ``{"type": "diff", "data": {"PV1": {...PVValue}}, "count": N, "timestamp": T}``

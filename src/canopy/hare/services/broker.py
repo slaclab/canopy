@@ -5,8 +5,8 @@ background loops (consume / flush / heartbeat). Monitors are started and stopped
 on demand: the first subscriber to a PV starts an EPICS monitor, the last to
 leave stops it. Updates are buffered and flushed as diffs every
 ``ws_batch_interval_ms`` to the clients subscribed to each PV. A newly
-subscribed PV is seeded (one-shot read + describe) by a background task of its
-own, so a subscribe never waits on the connector.
+subscribed PV is seeded by its monitor's first update and a background
+describe, so a subscribe never waits on the connector.
 """
 
 import time
@@ -20,6 +20,7 @@ from canopy.epics.base import PVConnector, Subscription
 from canopy.core.errors import ErrorCode
 from canopy.hare.config import HareConfig
 from canopy.contracts.pv import PVMeta, PVValue, PVWriteValue
+from canopy.contracts.sample import AlarmSeverity
 from canopy.epics.pv_protocol import InvalidPVName, validate_pv_name
 from canopy.hare.services.subscriptions import SubscriptionRegistry
 
@@ -61,15 +62,17 @@ class PVBroker:
         # updates carry the lock they started under and are cached only while
         # it is still the PV's, so replacing a live PV's lock drops its updates.
         self._seed_locks: dict[str, asyncio.Lock] = {}
-        # Seeds run in one background task per PV, shared by every subscriber
-        # and bounded broker-wide, so a subscribe returns before any connector
-        # read and a channel that never connects delays only itself. A PV's
-        # task is cancelled when the PV is released.
+        # Seeding runs in background tasks, one per PV and shared by every
+        # subscriber, so a subscribe never waits on the connector. A connect
+        # timer reports a channel that delivers no value within seed_timeout_s;
+        # a describe, bounded broker-wide, fetches metadata once the channel is
+        # connected. Both are cancelled when the PV is released.
         self._seed_sem = asyncio.Semaphore(config.seed_concurrency)
-        self._seed_tasks: dict[str, asyncio.Task] = {}
-        # PVs whose running seed task must seed again after its fan-out, because
-        # the channel connected while that fan-out was in progress.
-        self._seed_again: set[str] = set()
+        self._connect_timers: dict[str, asyncio.Task] = {}
+        self._describe_tasks: dict[str, asyncio.Task] = {}
+        # PVs whose running describe task must run again after its fan-out,
+        # because the channel reconnected while that fan-out was in progress.
+        self._describe_again: set[str] = set()
         self._buffer: dict[str, PVValue] = {}
         self._buffer_lock = asyncio.Lock()
         # Bounded so a fast producer can't grow the queue without limit; the
@@ -139,10 +142,10 @@ class PVBroker:
             except asyncio.CancelledError:
                 pass
         self._tasks = []
-        for task in self._seed_tasks.values():
+        for task in (*self._connect_timers.values(), *self._describe_tasks.values()):
             task.cancel()
         await self.drain_seeds()
-        self._seed_again.clear()
+        self._describe_again.clear()
         for pv, sub in list(self._monitors.items()):
             try:
                 await sub.close()
@@ -247,12 +250,13 @@ class PVBroker:
         The client is sent one ``initial`` frame at once with whatever value and
         static metadata the broker already holds for the batch. Every accepted
         PV still missing either half is then seeded in the background (see
-        `_ensure_seed_task`) and arrives in a further one-PV ``initial`` frame
-        when its seed completes, so a channel that never connects delays neither
-        the other PVs in the batch nor the client's later frames. A PV whose
-        last seed left either half missing is not re-seeded until its
-        ``seed_retry_backoff_s`` window has elapsed, so repeated subscribes of
-        an unreachable PV do not each cost a connector timeout.
+        `_schedule_seed`): its value arrives through its monitor's first update,
+        its metadata through a describe started once the channel is connected,
+        and each lands in a further one-PV ``initial`` frame. A channel that
+        delivers no value within ``seed_timeout_s`` is reported
+        ``connected: false``. No connector call is made on the subscribe path,
+        so a channel that never connects delays neither the other PVs in the
+        batch nor the client's later frames.
 
         Parameters
         ----------
@@ -293,8 +297,7 @@ class PVBroker:
             await self._fire_activation_hooks(new_for_client, client_id)
         await self._send_initial(client_id, pvs)
         for pv in pvs:
-            if self._needs_seed(pv):
-                self._ensure_seed_task(pv)
+            self._schedule_seed(pv)
         return pvs
 
     async def _send_initial(self, client_id: str, pvs: Iterable[str]) -> None:
@@ -324,8 +327,28 @@ class PVBroker:
             },
         )
 
-    def _needs_seed(self, pv: str) -> bool:
-        """Report whether a PV is missing its cached value or metadata and is past its retry deadline.
+    def _schedule_seed(self, pv: str) -> None:
+        """Start whatever a just-subscribed PV still needs: a connect timer or a describe.
+
+        A PV with no cached value gets a connect timer. Its monitor delivers the
+        current value as soon as the channel connects, so no one-shot read is
+        made; the timer only reports the channel ``connected: false`` if nothing
+        has arrived within ``seed_timeout_s``. A PV whose cached value shows the
+        channel connected but whose metadata is missing gets a describe, unless
+        a failed describe's retry deadline is still pending.
+
+        Parameters
+        ----------
+        pv : str
+            Validated name of a subscribed PV.
+        """
+        if pv not in self._latest:
+            self._ensure_connect_timer(pv)
+        elif self._needs_describe(pv):
+            self._ensure_describe_task(pv)
+
+    def _needs_describe(self, pv: str) -> bool:
+        """Report whether a PV's channel is connected, its metadata missing and its retry deadline past.
 
         Parameters
         ----------
@@ -335,21 +358,74 @@ class PVBroker:
         Returns
         -------
         bool
-            ``True`` when either half is uncached and no retry deadline is
-            pending, otherwise ``False``.
+            ``True`` when a describe should be started, otherwise ``False``.
         """
-        if pv in self._latest and pv in self._meta:
+        cached = self._latest.get(pv)
+        if cached is None or not cached.connected or pv in self._meta:
             return False
         now = time.monotonic()
         return now >= self._seed_retry_after.get(pv, now)
 
-    def _ensure_seed_task(self, pv: str, *, again_if_running: bool = False) -> None:
-        """Start a PV's background seed unless one is already running.
+    def _ensure_connect_timer(self, pv: str) -> None:
+        """Start a PV's connect timer unless one is already running.
+
+        One timer serves every subscriber of the PV; `_ingest` cancels it when
+        the first value arrives and `_stop_monitors` when the PV is released. A
+        PV with no seed lock has already been released and is skipped.
+
+        Parameters
+        ----------
+        pv : str
+            Validated name of a subscribed PV.
+        """
+        running = self._connect_timers.get(pv)
+        if running is not None and not running.done():
+            return
+        lock = self._seed_locks.get(pv)
+        if lock is None:
+            return
+        task = asyncio.create_task(self._run_connect_timer(pv, lock), name=f"connect-timer:{pv}")
+        self._connect_timers[pv] = task
+        task.add_done_callback(lambda done, pv=pv: self._forget_task(self._connect_timers, pv, done))
+
+    async def _run_connect_timer(self, pv: str, lock: asyncio.Lock) -> None:
+        """Report a PV ``connected: false`` to its subscribers if no value arrives within ``seed_timeout_s``.
+
+        The placeholder is cached so later subscribers see the state at once;
+        the monitor's first real update replaces it and, through `_ingest`,
+        starts the describe.
+
+        Parameters
+        ----------
+        pv : str
+            Validated name of a subscribed PV.
+        lock : asyncio.Lock
+            The PV's seed lock when the timer was started.
+        """
+        try:
+            await asyncio.sleep(self._config.seed_timeout_s)
+            if self._seed_locks.get(pv) is not lock or pv in self._latest:
+                return
+            self._latest[pv] = PVValue(
+                pv=pv,
+                value=None,
+                severity=AlarmSeverity.INVALID,
+                ts_ns=time.time_ns(),
+                connected=False,
+                error=f"no value within {self._config.seed_timeout_s:g}s of subscribing",
+            )
+            await self._fan_out(pv, lock)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("connect timer for %s failed", pv)
+
+    def _ensure_describe_task(self, pv: str, *, again_if_running: bool = False) -> None:
+        """Start a PV's background describe unless one is already running.
 
         The task takes a broker-wide ``seed_concurrency`` slot and the PV's seed
-        lock, runs `_seed_pv`, and then sends every current subscriber of the PV
-        a one-PV ``initial`` frame with whatever the seed left cached, including
-        a ``connected: false`` value for a channel that did not answer. One task
+        lock, runs `_describe_pv`, and then sends every current subscriber of
+        the PV a one-PV ``initial`` frame with its value and metadata. One task
         serves every subscriber; `_stop_monitors` cancels it when the PV is
         released. A PV with no seed lock has already been released and is
         skipped.
@@ -359,35 +435,36 @@ class PVBroker:
         pv : str
             Validated name of a subscribed PV.
         again_if_running : bool, optional
-            When a task is already running, ask it to seed once more after its
-            fan-out instead of doing nothing. Used for a channel that connects
-            while its task is still sending the result of the previous attempt.
+            When a task is already running, ask it to describe once more after
+            its fan-out instead of doing nothing. Used for a channel that
+            reconnects while its task is still sending the previous result.
         """
-        running = self._seed_tasks.get(pv)
+        running = self._describe_tasks.get(pv)
         if running is not None and not running.done():
             if again_if_running:
-                self._seed_again.add(pv)
+                self._describe_again.add(pv)
             return
         lock = self._seed_locks.get(pv)
         if lock is None:
             return
-        task = asyncio.create_task(self._run_seed(pv, lock), name=f"seed:{pv}")
-        self._seed_tasks[pv] = task
-        task.add_done_callback(lambda done, pv=pv: self._forget_seed_task(pv, done))
+        task = asyncio.create_task(self._run_describe(pv, lock), name=f"describe:{pv}")
+        self._describe_tasks[pv] = task
+        task.add_done_callback(lambda done, pv=pv: self._forget_task(self._describe_tasks, pv, done))
 
-    def _forget_seed_task(self, pv: str, task: asyncio.Task) -> None:
-        """Done-callback: drop a finished seed task unless a newer one has replaced it."""
-        if self._seed_tasks.get(pv) is task:
-            del self._seed_tasks[pv]
+    @staticmethod
+    def _forget_task(tasks: dict[str, asyncio.Task], pv: str, task: asyncio.Task) -> None:
+        """Done-callback: drop a finished task from ``tasks`` unless a newer one has replaced it."""
+        if tasks.get(pv) is task:
+            del tasks[pv]
 
-    async def _run_seed(self, pv: str, lock: asyncio.Lock) -> None:
-        """Seed one PV under the concurrency bound, then fan the result out to its subscribers.
+    async def _run_describe(self, pv: str, lock: asyncio.Lock) -> None:
+        """Describe one connected PV under the concurrency bound, then fan the result out to its subscribers.
 
-        Each send re-checks that the PV is still current and the client still
-        subscribed, since an earlier client's send can block while another
-        unsubscribes or the PV is released. A connect edge that `_ingest` sees
-        during the fan-out is recorded in ``_seed_again``, and the task seeds once
-        more afterwards rather than dropping the describe.
+        The describe is skipped when the cached value no longer shows the
+        channel connected, since describing a channel that is not answering
+        would only time out. A connect edge that `_ingest` sees once an attempt
+        has started is recorded in ``_describe_again`` and the task runs once
+        more afterwards rather than dropping it.
 
         Parameters
         ----------
@@ -398,80 +475,31 @@ class PVBroker:
         """
         try:
             while True:
+                self._describe_again.discard(pv)
                 async with self._seed_sem, lock:
-                    if self._seed_locks.get(pv) is not lock:
+                    cached = self._latest.get(pv)
+                    if self._seed_locks.get(pv) is not lock or pv in self._meta:
                         return
-                    if pv in self._latest and pv in self._meta:
+                    if cached is None or not cached.connected:
                         return
-                    await self._seed_pv(pv, lock)
-                # An edge seen during the attempt was handled by the attempt
-                # itself; only one seen from here on needs another pass.
-                self._seed_again.discard(pv)
-                for client_id in list(self._registry.subscribers(pv)):
-                    if self._seed_locks.get(pv) is not lock:
-                        return
-                    if client_id in self._registry.subscribers(pv):
-                        await self._send_initial(client_id, [pv])
-                if self._seed_locks.get(pv) is not lock or pv not in self._seed_again:
+                    await self._describe_pv(pv, lock)
+                await self._fan_out(pv, lock)
+                if self._seed_locks.get(pv) is not lock or pv not in self._describe_again:
                     return
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("background seed of %s failed", pv)
+            logger.exception("background describe of %s failed", pv)
 
-    def _cancel_seed(self, pv: str) -> None:
-        """Forget a PV's seed task and cancel it, unless it is the task running now.
+    async def _describe_pv(self, pv: str, lock: asyncio.Lock) -> None:
+        """Fetch a connected PV's static metadata and set or clear its retry deadline.
 
-        A seed task can release its own PV when the send to the PV's last
-        subscriber fails. Cancelling itself there would abort the release
-        half-way, so it is left to finish; its stale lock stops it caching or
-        sending anything.
-
-        Parameters
-        ----------
-        pv : str
-            Validated name of a PV being released.
-        """
-        task = self._seed_tasks.pop(pv, None)
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
-
-    async def drain_seeds(self) -> None:
-        """Wait for every seed task in flight to finish. Drives `stop`; also called directly by tests."""
-        while True:
-            pending = [task for task in self._seed_tasks.values() if not task.done()]
-            if not pending:
-                return
-            await asyncio.gather(*pending, return_exceptions=True)
-
-    async def _seed_pv(self, pv: str, lock: asyncio.Lock) -> None:
-        """Fetch whichever of the seed value and static metadata a PV is missing.
-
-        The value is read whenever no connected value is cached, so a PV whose
-        earlier read found it disconnected is read again once its retry window
-        allows. The read uses ``seed_timeout_s``, shorter than the connector's
-        own timeout: the PV's monitor delivers the value anyway once a slow
-        channel connects, so a channel that never connects costs one short read
-        rather than two connector timeouts. A connected monitor update that
-        lands during the read is newer than the read's result and is kept.
-
-        Metadata is fetched only once the cached value shows the channel
-        connected, since describing a channel that did not answer the read
-        would only time out as well. For a channel that connects later,
-        `_ingest` starts the describe when its first connected update arrives.
-        Per-PV failures are logged and swallowed.
-
-        When either half is still missing after the attempt, the PV's retry
-        deadline is set ``seed_retry_backoff_s`` ahead; when both halves are
-        present the deadline is cleared. A deadline whose PV later receives its
-        value through the monitor is kept until `_stop_monitors` releases the
-        PV, so the deadlines are bounded by the PVs that have subscribers.
-
+        A failure is logged and sets the deadline ``seed_retry_backoff_s``
+        ahead, so a later subscribe does not retry at once; success clears it.
         `_stop_monitors` discards the PV's seed lock on release and a later
-        subscribe creates a new one, so the attempt writes only while ``lock``
-        is still the PV's. An attempt that outlives its PV's release leaves no
-        cached value, metadata or deadline behind and never overwrites what a
-        newer attempt fetched.
+        subscribe creates a new one, so the result is cached only while ``lock``
+        is still the PV's: an attempt that outlives its PV's release leaves
+        nothing behind and never overwrites what a newer attempt fetched.
 
         Parameters
         ----------
@@ -480,38 +508,70 @@ class PVBroker:
         lock : asyncio.Lock
             The PV's seed lock, held by the caller.
         """
-
-        def current() -> bool:
-            return self._seed_locks.get(pv) is lock
-
-        def connected_value_cached() -> bool:
-            cached = self._latest.get(pv)
-            return cached is not None and cached.connected
-
-        if not connected_value_cached():
-            try:
-                value = await self._connector.get(pv, timeout=self._config.seed_timeout_s)
-            except Exception as exc:
-                logger.debug("initial get failed for %s: %s", pv, exc)
-            else:
-                if current() and not connected_value_cached():
-                    self._latest[pv] = value
-        if not current():
+        try:
+            meta = await self._connector.describe(pv)
+        except Exception as exc:
+            logger.debug("describe failed for %s: %s", pv, exc)
+            meta = None
+        if self._seed_locks.get(pv) is not lock:
             return
-        if connected_value_cached() and pv not in self._meta:
-            try:
-                meta = await self._connector.describe(pv)
-            except Exception as exc:
-                logger.debug("describe failed for %s: %s", pv, exc)
-            else:
-                if current():
-                    self._meta[pv] = meta
-        if not current():
-            return
-        if pv in self._latest and pv in self._meta:
-            self._seed_retry_after.pop(pv, None)
-        else:
+        if meta is None:
             self._seed_retry_after[pv] = time.monotonic() + self._config.seed_retry_backoff_s
+        else:
+            self._meta[pv] = meta
+            self._seed_retry_after.pop(pv, None)
+
+    async def _fan_out(self, pv: str, lock: asyncio.Lock) -> None:
+        """Send the PV's current subscribers a one-PV ``initial`` frame.
+
+        An earlier client's send can block while another client unsubscribes
+        or the PV is released, so the PV's lock and the client's membership are
+        re-checked before each send.
+
+        Parameters
+        ----------
+        pv : str
+            Validated name of a subscribed PV.
+        lock : asyncio.Lock
+            The PV's seed lock when the sending task started.
+        """
+        for client_id in list(self._registry.subscribers(pv)):
+            if self._seed_locks.get(pv) is not lock:
+                return
+            if client_id in self._registry.subscribers(pv):
+                await self._send_initial(client_id, [pv])
+
+    @staticmethod
+    def _cancel_task(tasks: dict[str, asyncio.Task], pv: str) -> None:
+        """Forget a PV's task in ``tasks`` and cancel it, unless it is the task running now.
+
+        A task can release its own PV when the send to the PV's last subscriber
+        fails. Cancelling itself there would abort the release half-way, so it
+        is left to finish; its stale lock stops it caching or sending anything.
+
+        Parameters
+        ----------
+        tasks : dict[str, asyncio.Task]
+            ``_connect_timers`` or ``_describe_tasks``.
+        pv : str
+            Validated name of the PV.
+        """
+        task = tasks.pop(pv, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    async def drain_seeds(self) -> None:
+        """Wait for every connect timer and describe in flight to finish. Drives `stop`; also called directly by tests."""
+        while True:
+            pending = [
+                task
+                for tasks in (self._connect_timers, self._describe_tasks)
+                for task in tasks.values()
+                if not task.done()
+            ]
+            if not pending:
+                return
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def unsubscribe(self, client_id: str, pvs: list[str]) -> None:
         if not pvs:
@@ -557,9 +617,10 @@ class PVBroker:
         """Close the monitors of released PVs and discard their cached state.
 
         A monitor that fails to close is logged and does not stop the rest of
-        the batch. The cached value, static metadata, seed retry deadline, seed
-        lock and pending seed task of every given PV are dropped whether or not
-        it had a monitor, so a later subscribe seeds the PV afresh.
+        the batch. The cached value, static metadata, describe retry deadline,
+        seed lock, connect timer and pending describe of every given PV are
+        dropped whether or not it had a monitor, so a later subscribe seeds the
+        PV afresh.
 
         Parameters
         ----------
@@ -577,8 +638,9 @@ class PVBroker:
             self._meta.pop(pv, None)
             self._seed_retry_after.pop(pv, None)
             self._seed_locks.pop(pv, None)
-            self._seed_again.discard(pv)
-            self._cancel_seed(pv)
+            self._describe_again.discard(pv)
+            self._cancel_task(self._connect_timers, pv)
+            self._cancel_task(self._describe_tasks, pv)
 
     # --- event ingestion ------------------------------------------------- #
 
@@ -618,13 +680,14 @@ class PVBroker:
         queued at release or delivered after a re-subscribe, is neither cached
         nor buffered.
 
-        A connected update for a PV with no cached metadata, whose previous
-        value was missing or disconnected, starts a background describe through
-        `_ensure_seed_task` regardless of any retry deadline: the channel has
-        just connected, so the metadata its seed could not fetch is available
-        now. If the PV's seed task is still sending its previous result, the
-        task seeds again afterwards instead. Later connected updates do not
-        repeat a describe that failed.
+        The first update of a PV cancels its connect timer. A connected update
+        for a PV with no cached metadata, whose previous value was missing or
+        disconnected, starts a background describe through
+        `_ensure_describe_task` regardless of any retry deadline: the channel
+        has just connected, so its metadata is available now. If the PV's
+        describe task is still sending its previous result, the task runs again
+        afterwards instead. Later connected updates do not repeat a describe
+        that failed.
 
         Parameters
         ----------
@@ -637,8 +700,10 @@ class PVBroker:
             return
         previous = self._latest.get(value.pv)
         self._latest[value.pv] = value
+        if previous is None:
+            self._cancel_task(self._connect_timers, value.pv)
         if value.connected and value.pv not in self._meta and (previous is None or not previous.connected):
-            self._ensure_seed_task(value.pv, again_if_running=True)
+            self._ensure_describe_task(value.pv, again_if_running=True)
         async with self._buffer_lock:
             self._buffer[value.pv] = value
 

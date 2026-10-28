@@ -111,12 +111,12 @@ The server responds with `pong`.
 
 Sent after a `subscribe`, in one or more frames. The first carries whatever
 Hare already holds for the batch (PVs another client is watching). Each
-remaining PV is seeded in the background with a one-shot read and a describe,
-and arrives in its own `initial` frame as soon as its seed completes, so a
-channel that never connects delays only itself — never the other PVs in the
-batch, nor later `subscribe`, `unsubscribe` or `ping` frames on the socket.
-Merge `initial` frames by PV name: a PV may appear in a later frame with the
-metadata an earlier one lacked.
+remaining PV's value comes from its monitor's first update; Hare then fetches
+the PV's metadata in the background and sends both in a one-PV `initial`
+frame, so a channel that never connects delays only itself — never the other
+PVs in the batch, nor later `subscribe`, `unsubscribe` or `ping` frames on the
+socket, nor other clients. Merge `initial` frames by PV name: a PV may appear
+in a later frame with the metadata an earlier one lacked.
 
 `data` maps PV name to its current value; `meta` maps PV name to its static
 display metadata (units, precision, `enumChoices`, limits) — read `meta` once,
@@ -152,10 +152,10 @@ then rely on diffs for the values.
 }
 ```
 
-A channel that does not answer within `CANOPY_HARE__SEED_TIMEOUT_S` (default
-2 s) arrives with `connected: false` and no `meta`. When it later connects, its
-first `diff` carries the value and a further `initial` carries the metadata
-Hare fetches at that point. If nothing in a batch yields a value or metadata,
+A channel that has delivered no value within `CANOPY_HARE__SEED_TIMEOUT_S`
+(default 2 s) arrives with `connected: false` and no `meta`. When it later
+connects, its first `diff` carries the value and a further `initial` carries
+the metadata Hare fetches at that point. If nothing in a batch yields a value or metadata,
 no `initial` is sent, so do not treat it as a subscribe acknowledgement.
 
 ### diff

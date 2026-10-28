@@ -1,7 +1,6 @@
 """Hare WebSocket endpoint — end-to-end over the simulation backend."""
 
 import time
-import asyncio
 
 import pytest
 from fastapi import WebSocketDisconnect
@@ -144,8 +143,8 @@ class _SilentSubscription:
 class _NeverConnects:
     """Wrap the live connector so ``DEAD:*`` PVs behave like CA channels that never connect.
 
-    Their read blocks until the broker cancels it at shutdown and their monitor
-    never emits; every other PV goes to the wrapped connector.
+    Their monitor never emits, so only the broker's connect timer ever reports
+    them; every other PV goes to the wrapped connector.
     """
 
     def __init__(self, inner) -> None:
@@ -154,11 +153,6 @@ class _NeverConnects:
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
-
-    async def get(self, pv, *, timeout=None):
-        if pv.startswith("DEAD:"):
-            await asyncio.sleep(3600)
-        return await self._inner.get(pv, timeout=timeout)
 
     async def subscribe(self, pv, on_event):
         if pv.startswith("DEAD:"):
