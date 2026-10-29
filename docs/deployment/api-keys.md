@@ -164,9 +164,10 @@ curl -X POST -H "X-API-Key: <admin-token>" -H "Content-Type: application/json" \
   http://localhost:<API_PORT>/v1/api-keys
 ```
 
-For an env-layer key, the `@<module>[+<module>]` suffix is **required** — an
-entry with no `@` at all is skipped as malformed, the same as an empty token.
-Use `@*` for every module:
+For an env-layer key, always give the `@<module>[+<module>]` suffix. An entry
+with no `@` at all still works for now: it is treated as `@*` (every module)
+and logs a deprecation warning at startup. This fallback will eventually be
+removed. Use `@*` to apply permissions to every module:
 
 ```bash
 CANOPY_API_KEYS="trace:read@fox+vole,ops:admin@*"
