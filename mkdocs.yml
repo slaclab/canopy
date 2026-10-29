@@ -65,6 +65,7 @@ copyright: Copyright © 2026, The Board of Trustees of the Leland Stanford Junio
 # Extensions
 markdown_extensions:
   - admonition
+  - pymdownx.details
   - attr_list
   - md_in_html
   - toc:
@@ -101,6 +102,12 @@ nav:
       - vole/index.md
       - REST API: vole/rest_api.md
       - Configuration: vole/configuration.md
+    - Squirrel:
+      - squirrel/index.md
+      - REST API: squirrel/rest_api.md
+      - Configuration: squirrel/configuration.md
+      - Restore Hooks: squirrel/restore_hooks.md
+      - Testing: squirrel/testing.md
   - Deployment:
     - deployment/index.md
     - Docker Compose: deployment/docker.md
@@ -109,6 +116,7 @@ nav:
   - How To:
     - Custom archiver adapter: how_to/custom_archiver_adapter.md
     - Custom directory adapter: how_to/custom_directory_adapter.md
+    - Custom restore hook: how_to/custom_restore_hook.md
   - Observability:
     - observability/index.md
     - Setup guide: observability/setup_guide.md
@@ -116,3 +124,4 @@ nav:
   - API Reference:
     - Fox: api_reference/fox.md
     - Vole: api_reference/vole.md
+    - Squirrel: api_reference/squirrel.md

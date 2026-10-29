@@ -45,8 +45,8 @@ CANOPY_DATABASE_URL=postgresql+asyncpg://canopy:canopy@localhost:5432/canopy \
   uv run alembic upgrade head
 ```
 
-Postgres-backed endpoints (Squirrel) return errors until this has been run
-once.
+Postgres-backed endpoints ([Squirrel](../squirrel/index.md), Magpie, and
+database-managed API keys) return errors until this has been run once.
 
 ### Using a local IOC
 
