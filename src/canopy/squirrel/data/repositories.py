@@ -15,6 +15,7 @@ from collections.abc import Callable, Awaitable
 
 from sqlalchemy import (
     ARRAY,
+    Row,
     Select,
     ColumnElement,
     or_,
@@ -118,8 +119,9 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         *,
         title: str | None = None,
         description: str | None = None,
+        retain: bool | None = None,
     ) -> Snapshot | None:
-        """Update a live snapshot's title and/or description."""
+        """Update a live snapshot's title, description and/or ``retain`` flag."""
         snapshot = await self.get_by_id(snapshot_id)
         if not snapshot:
             return None
@@ -128,6 +130,8 @@ class SnapshotRepository(BaseRepository[Snapshot]):
             snapshot.title = title
         if description is not None:
             snapshot.description = description
+        if retain is not None:
+            snapshot.retain = retain
 
         await self.session.flush()
         return snapshot
@@ -338,6 +342,33 @@ class SnapshotValueRepository(BaseRepository[SnapshotValue]):
             )
         )
         return list(result.scalars().all())
+
+    async def get_export_rows(self, snapshot_id: str) -> list[Row]:
+        """A snapshot's values with their PV's current addresses, ordered by ``pv_name``.
+
+        Plain columns rather than ORM objects, since a full save has 16k–100k values. The
+        PV is outer-joined and never filtered: a deleted PV still exports its addresses,
+        and a value whose PV row is missing (foreign keys aren't checked when a mirror
+        applies changes) still exports, without them.
+        """
+        result = await self.session.execute(
+            select(
+                SnapshotValue.pv_id,
+                SnapshotValue.pv_name,
+                Pv.setpoint_address,
+                Pv.readback_address,
+                Pv.config_address,
+                SnapshotValue.setpoint_value,
+                SnapshotValue.readback_value,
+                SnapshotValue.status,
+                SnapshotValue.severity,
+                SnapshotValue.timestamp,
+            )
+            .outerjoin(Pv, Pv.id == SnapshotValue.pv_id)
+            .where(SnapshotValue.snapshot_id == snapshot_id)
+            .order_by(SnapshotValue.pv_name)
+        )
+        return list(result.all())
 
 
 class PvRepository(BaseRepository[Pv]):
@@ -657,6 +688,16 @@ class PvRepository(BaseRepository[Pv]):
         rows = [{"pv_id": pv_id, "facility_id": fid} for pv_id, fids in assignments for fid in sorted(fids)]
         if rows:
             await self.session.execute(insert(pv_facility), rows)
+
+    async def get_existing_ids(self, ids: list[str], *, include_deleted: bool = False) -> set[str]:
+        """The subset of ``ids`` that are PVs here, without loading the rows."""
+        existing: set[str] = set()
+        for i in range(0, len(ids), PARAM_BATCH_SIZE):
+            query = select(Pv.id).where(Pv.id.in_(ids[i : i + PARAM_BATCH_SIZE]))
+            if not include_deleted:
+                query = query.where(Pv.deleted_at.is_(None))
+            existing.update((await self.session.execute(query)).scalars())
+        return existing
 
     async def get_by_ids(self, ids: list[str], *, include_deleted: bool = False) -> list[Pv]:
         """Get many PVs by id, batched under the Postgres parameter limit.
