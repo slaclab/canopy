@@ -439,6 +439,32 @@ async def test_restore_skips_a_pv_reassigned_out_of_scope_after_capture(
     assert kwargs["skipped_pv_ids"] == [moved_pv]
 
 
+async def test_restore_includes_a_multi_facility_pv_on_one_shared_facility(
+    client: AsyncClient, db_session: AsyncSession, enqueued: list
+):
+    """One shared facility is enough to restore a multi-facility PV, matching capture
+    and listing (both include a PV assigned to *any* facility in scope). Restore only
+    writes the value captured under this snapshot's own facility — it never touches the
+    PV's other facilities — so it must not apply the full-containment rule that guards
+    update/delete, which do mutate the shared row itself. Requiring every facility here
+    would skip a PV the key can see in this very snapshot and is legitimately restoring
+    a value scoped to the facility it does hold."""
+    facilities = await _seed_hierarchy(db_session)
+    shared_pv = await _create_pv(client, WILD_HEADERS, "SHARED:PV:SP", ["lcls-sc", "facet"])
+    snapshot = Snapshot(title="sc", facility_id=facilities["lcls-sc"].id)
+    db_session.add(snapshot)
+    await db_session.commit()
+    db_session.add(
+        SnapshotValue(snapshot_id=snapshot.id, pv_id=shared_pv, pv_name="SHARED:PV:SP", setpoint_value={"value": 1.0})
+    )
+    await db_session.commit()
+    enqueued.clear()
+
+    r = await client.post(f"/v1/snapshots/{snapshot.id}/restore", headers=SC_HEADERS, json={})
+    assert r.status_code == 200, r.text
+    assert enqueued[-1][2]["pv_ids"] == [shared_pv]
+
+
 async def test_restore_with_every_pv_out_of_scope_is_403(client: AsyncClient, db_session: AsyncSession, enqueued: list):
     """A visible snapshot whose PVs have all been reassigned out of the key's reach: the
     key may see the snapshot but write none of it, which is a refusal, not a no-op job."""
