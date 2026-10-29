@@ -79,6 +79,6 @@ def test_publications_are_well_formed():
 
 
 def test_derived_views():
-    assert REGISTRY.local == ["core.api_key"]
+    assert REGISTRY.local == ["core.api_key", "core.history_heartbeat"]
     assert REGISTRY.schemas == ["core", "magpie", "squirrel"]
     assert set(REGISTRY.replicated) == {name for name, cls in REGISTRY.tables.items() if cls is not TableClass.LOCAL}

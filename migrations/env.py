@@ -26,6 +26,7 @@ import canopy.core.keys.models  # noqa: F401, E402
 import canopy.magpie.data.models  # noqa: F401, E402
 import canopy.squirrel.data.models  # noqa: F401, E402
 import canopy.core.facilities.models  # noqa: F401, E402
+import canopy.core.replication.models  # noqa: F401, E402
 from canopy.core.db import Base
 from canopy.core.config import get_settings
 from canopy.core.replication.migration import side_for_role

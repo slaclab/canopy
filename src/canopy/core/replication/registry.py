@@ -113,6 +113,7 @@ REGISTRY = ReplicationRegistry(
             "squirrel.snapshot": TableClass.TIME_SERIES,
             "squirrel.snapshot_value": TableClass.TIME_SERIES,
             "core.api_key": TableClass.LOCAL,
+            "core.history_heartbeat": TableClass.LOCAL,
         }
     ),
     # One publication until the primary prunes old rows. TRUNCATE is left out on

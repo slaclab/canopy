@@ -29,6 +29,7 @@ import canopy.core.keys.models  # noqa: F401 — register every persistent modul
 import canopy.magpie.data.models  # noqa: F401
 import canopy.squirrel.data.models  # noqa: F401
 import canopy.core.facilities.models  # noqa: F401
+import canopy.core.replication.models  # noqa: F401
 from canopy.core.db import Base
 from canopy.core.replication.config import ReplicationConfig
 from canopy.core.replication.metrics import ReplicationCollector
