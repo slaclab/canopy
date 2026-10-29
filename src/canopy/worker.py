@@ -72,7 +72,7 @@ async def on_shutdown(ctx: dict) -> None:
 # Task functions registered with Arq. Each module appends its tasks here.
 FUNCTIONS = [ping, convert_batch, create_snapshot_task, restore_snapshot_task]
 
-# What a read-only mirror's worker runs: tasks that write no replicated table and
+# What a mirror's (or forward instance's) worker runs: tasks that write no replicated table and
 # touch no machine state. Snapshot create/restore are simply not registered there,
 # so a job that reached a mirror's queue anyway fails instead of running.
 MIRROR_FUNCTIONS = [ping, convert_batch]
@@ -80,7 +80,7 @@ MIRROR_FUNCTIONS = [ping, convert_batch]
 
 def worker_functions(role: str) -> list:
     """The task functions a worker registers for an instance ``role`` (``Settings.role``)."""
-    return MIRROR_FUNCTIONS if role == "mirror" else FUNCTIONS
+    return FUNCTIONS if role == "primary" else MIRROR_FUNCTIONS
 
 
 def worker_cron_jobs(role: str) -> list:

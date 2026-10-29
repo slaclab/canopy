@@ -67,6 +67,10 @@ def test_mirror_reports_its_role_and_history_fields(client, history_settings):
     }
 
 
+def test_forward_reports_its_role(client, forward_role):
+    assert client.get("/v1/instance", headers={"X-API-Key": "ro"}).json()["role"] == "forward"
+
+
 def test_requires_a_key(client):
     assert client.get("/v1/instance").status_code == 401
 

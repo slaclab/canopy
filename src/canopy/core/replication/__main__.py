@@ -17,11 +17,12 @@ A primary that prunes old rows moves to the split publication layout once:
 on the primary again (see ``canopy.core.replication.publisher``).
 
 The database is ``CANOPY_DATABASE_URL`` and the side is ``CANOPY_ROLE`` (each
-command refuses on the wrong one). ``subscribe`` and ``refresh`` name the
-subscription after ``CANOPY_INSTANCE``; ``subscribe`` reads the primary's
-connection string from ``CANOPY_REPLICATION__PUBLISHER_DSN``, never from the
-command line, and nothing the CLI prints contains it. ``heartbeat`` and ``switch``
-reach the primary through ``CANOPY_REPLICATION__HEARTBEAT_DSN``, handled the same way.
+command refuses on the wrong one; ``forward`` counts as a mirror). ``subscribe``
+and ``refresh`` name the subscription after ``CANOPY_INSTANCE``; ``subscribe``
+reads the primary's connection string from ``CANOPY_REPLICATION__PUBLISHER_DSN``,
+never from the command line, and nothing the CLI prints contains it. ``heartbeat``
+and ``switch`` reach the primary through ``CANOPY_REPLICATION__HEARTBEAT_DSN``,
+handled the same way.
 
 Logs go to stderr (JSON with ``CANOPY_LOG_FORMAT=json``), so stdout carries only
 ``status`` output. Exit status: 0 done (including "nothing to do"), 1 a database
@@ -51,6 +52,7 @@ from canopy.core.replication.sql import (
     require_role,
 )
 from canopy.core.replication.config import get_replication_config
+from canopy.core.replication.migration import side_for_role
 from canopy.core.replication.publisher import publish, publisher_status
 from canopy.core.replication.subscriber import (
     grants,
@@ -203,7 +205,7 @@ async def run(command: str, options: argparse.Namespace | None = None) -> int:
                 wal_archive_ok=options.wal_archive_ok,
                 drift_ok=options.drift_ok,
             )
-        elif settings.role == "mirror":
+        elif side_for_role(settings.role) == "subscriber":
             print(json.dumps(await subscriber_status(conn, instance=settings.instance), indent=2))
         else:
             print(json.dumps(await publisher_status(conn, config=config), indent=2))

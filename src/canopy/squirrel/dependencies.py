@@ -6,6 +6,8 @@ EPICS (snapshot create/restore run in the worker, which injects the connector).
 
 The PV and snapshot factories also take the calling key's facility grant, resolved to an
 id set by ``get_facility_scope`` below — the single chokepoint, so no route can forget it.
+When a forward instance sent the request, the grant is narrowed to its caller's. A route
+that gates before queueing a job (snapshot create) takes ``FacilityScopeDep`` directly.
 ``None`` means unrestricted, which is what a service built anywhere else (the Arq worker)
 gets by default: the worker acts on a request the route already authorized.
 """
@@ -15,7 +17,7 @@ from typing import Annotated
 from fastapi import Depends
 
 from canopy.core.db import SessionDep
-from canopy.core.security import APIKeyDep
+from canopy.core.security import APIKeyDep, forwarded_facilities
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.squirrel.services.pv_service import PvService
 from canopy.squirrel.services.tag_service import TagService
@@ -23,7 +25,14 @@ from canopy.squirrel.services.snapshot_service import SnapshotService
 
 
 async def get_facility_scope(key: APIKeyDep) -> set[str] | None:
-    return await facilities_gateway.resolve_key_facility_scope(key.facilities)
+    scope = await facilities_gateway.resolve_key_facility_scope(key.facilities)
+    # A forward instance's service key acts for a caller whose grant comes with the
+    # request; the request reaches only what both keys reach.
+    if (caller := forwarded_facilities()) is not None:
+        caller_scope = await facilities_gateway.resolve_key_facility_scope(caller)
+        if caller_scope is not None:
+            scope = caller_scope if scope is None else scope & caller_scope
+    return scope
 
 
 # FastAPI caches a dependency's result per request by default, so a route pulling in

@@ -36,6 +36,7 @@ def to_dto(api_key: ApiKey) -> ApiKeyDTO:
         read_access=api_key.read_access,
         write_access=api_key.write_access,
         admin_access=api_key.admin_access,
+        is_service=api_key.is_service,
         modules=api_key.modules,
         facilities=api_key.facilities,
         created_at=api_key.created_at,
@@ -135,6 +136,7 @@ class ApiKeyService:
         read: bool = False,
         write: bool = False,
         admin: bool = False,
+        service: bool = False,
         modules: list[str],
         acting_key_modules: list[str] | None = None,
         facilities: list[str] | None = None,
@@ -161,6 +163,10 @@ class ApiKeyService:
         ``acting_key_facilities`` (``None`` for the CLI) is the same delegation check
         as ``acting_key_modules``, for facility scope: a facility-scoped admin cannot
         mint a key granted a facility outside its own resolved scope, or the wildcard.
+
+        ``service`` mints a key for another Canopy instance, which may name the
+        caller it acts for (``X-Canopy-On-Behalf-Of``). Only the CLI passes it: a
+        service key can write under any name, so no HTTP caller can mint one.
         """
         app_name = app_name.strip()
         if not app_name:
@@ -191,12 +197,13 @@ class ApiKeyService:
                 read_access=read,
                 write_access=write,
                 admin_access=admin,
+                is_service=service,
                 modules=module_list,
                 facilities=facility_list,
             )
         )
         # The token itself is never logged — app_name and id are the audit trail.
-        logger.info("Created API key id=%s app_name=%s", created.id, created.app_name)
+        logger.info("Created %sAPI key id=%s app_name=%s", "service " if service else "", created.id, created.app_name)
         return ApiKeyCreateResultDTO(token=token, **to_dto(created).model_dump())
 
     async def list_keys(self, active_only: bool = False, app_name: str | None = None) -> list[ApiKeyDTO]:

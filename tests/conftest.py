@@ -35,6 +35,24 @@ async def wait_for(predicate, timeout: float = 5.0, interval: float = 0.01) -> b
 
 
 @pytest.fixture
+def forward_role(monkeypatch):
+    """Run the test as a forward instance (``CANOPY_ROLE=forward``) named ``site_a``.
+
+    Points ``CANOPY_FORWARD__*`` at a placeholder primary; tests mock it with
+    ``httpx_mock``. Clears the cached ``Settings`` like ``mirror_role``.
+    """
+    from canopy.core.config import get_settings
+
+    monkeypatch.setenv("CANOPY_ROLE", "forward")
+    monkeypatch.setenv("CANOPY_INSTANCE", "site_a")
+    monkeypatch.setenv("CANOPY_FORWARD__PRIMARY_URL", "https://primary.example.org")
+    monkeypatch.setenv("CANOPY_FORWARD__SERVICE_KEY", "service-token")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture
 def mirror_role(monkeypatch):
     """Run the test as a read-only mirror (``CANOPY_ROLE=mirror``).
 

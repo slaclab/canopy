@@ -18,7 +18,11 @@ from typing import Annotated
 from fastapi import Path, Query, Security, APIRouter
 
 from canopy.core.errors import BadRequest
-from canopy.core.security import require_read_access, require_write_access
+from canopy.core.security import (
+    forwarded_for,
+    require_read_access,
+    require_write_access,
+)
 from canopy.magpie.errors import ConfigNotFound, InvalidAppName
 from canopy.magpie.dependencies import ConfigServiceDep
 from canopy.contracts.pagination import PagedResult
@@ -44,8 +48,14 @@ def _validate_app_name(app: str) -> None:
 
 @router.post("/{app}", dependencies=[Security(require_write_access)])
 async def create_config(app: AppPath, data: NewConfigDTO, service: ConfigServiceDep) -> ConfigDTO:
-    """Create a config under ``app``."""
+    """Create a config under ``app``.
+
+    ``createdBy`` is the client's to set, except on a write a forward instance sent
+    on someone's behalf: that one records the name it gave.
+    """
     _validate_app_name(app)
+    if (caller := forwarded_for()) is not None:
+        data = data.model_copy(update={"created_by": caller})
     return await service.create(app, data)
 
 

@@ -49,6 +49,7 @@ def _to_api_key(row: ApiKey) -> APIKey:
         read=row.read_access,
         write=row.write_access,
         admin=row.admin_access,
+        is_service=row.is_service,
         name=row.app_name,
         id=row.id,
         modules=frozenset(row.modules),

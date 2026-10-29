@@ -13,6 +13,7 @@ Run::
     uv run python scripts/create_key.py operator-tools -r -w
     uv run python scripts/create_key.py ops -a
     uv run python scripts/create_key.py trace -r -m mole -m fox   # scoped to two modules
+    uv run python scripts/create_key.py history-site-a -r -w -m squirrel --service  # a forward instance
 
     # In a container (local Docker Compose, or a facility instance where the
     # database is only reachable from the running api container):
@@ -35,6 +36,14 @@ async def main() -> int:
     parser.add_argument("-r", "--read", action="store_true", help="Grant read access")
     parser.add_argument("-w", "--write", action="store_true", help="Grant write access (PV puts, snapshots, configs)")
     parser.add_argument("-a", "--admin", action="store_true", help="Grant admin access (API key management)")
+    parser.add_argument(
+        "--service",
+        action="store_true",
+        help=(
+            "Mint a service key, for a forward instance on this primary: it may name the user it acts for "
+            "(X-Canopy-On-Behalf-Of), which the primary trusts only with CANOPY_ACCEPT_FORWARDED_WRITES"
+        ),
+    )
     parser.add_argument(
         "-m",
         "--module",
@@ -60,6 +69,7 @@ async def main() -> int:
                 read=args.read,
                 write=args.write,
                 admin=args.admin,
+                service=args.service,
                 modules=args.modules or [WILDCARD],
                 facilities=args.facilities or [],
             )
@@ -79,6 +89,8 @@ async def main() -> int:
     print(f"  Access:    {', '.join(scopes)}")
     print(f"  Modules:   {', '.join(key.modules)}")
     print(f"  Facilities:{' ' + ', '.join(key.facilities) if key.facilities else ' (none)'}")
+    if key.is_service:
+        print("  Service:   yes (may send X-Canopy-On-Behalf-Of)")
     print(f"  Created:   {key.created_at}")
     print(f"  Token:     {key.token}")
     print()
