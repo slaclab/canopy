@@ -130,12 +130,17 @@ async def subscribe(
     instance: str | None,
     config: ReplicationConfig,
     registry: ReplicationRegistry = REGISTRY,
+    copy_data: bool = True,
 ) -> dict:
     """Create this mirror's subscription to the primary, copying every published table.
 
     Idempotent: when the subscription exists, logs where it differs from what this
     would create and changes nothing. Doesn't wait for the initial copy; ``status``
     shows its progress.
+
+    With ``copy_data=False`` (used by ``reseed``) nothing is copied, the tables may
+    already hold rows, and the subscription starts disabled: its slot keeps the
+    primary's changes from now on while ``reseed`` fills in what came before.
 
     Run it as the role that owns the tables, granted ``pg_create_subscription``:
     Postgres 16 applies changes as each table's owner, which then needs no superuser.
@@ -154,6 +159,8 @@ async def subscribe(
         Supplies ``publisher_dsn``.
     registry : ReplicationRegistry
         Publications to subscribe to, and the tables that must be empty first.
+    copy_data : bool
+        ``False`` for a disabled subscription without the initial copy.
 
     Returns
     -------
@@ -184,7 +191,8 @@ async def subscribe(
     present = await tables_present(conn, registry.schemas)
     if missing := sorted(set(registry.replicated) - present):
         logger.info("Not in this database yet, not copied: %s", ", ".join(missing))
-    await _require_empty(conn, sorted(set(registry.replicated) & present), "subscribe")
+    if copy_data:
+        await _require_empty(conn, sorted(set(registry.replicated) & present), "subscribe")
 
     superuser = await is_superuser(conn)
     if not superuser and not await conn.fetchval(
@@ -206,16 +214,20 @@ async def subscribe(
         )
 
     publications = ", ".join(quote_ident(p.name) for p in registry.publications)
+    options = "copy_data = true" if copy_data else "copy_data = false, enabled = false"
     try:
         await conn.execute(
             f"CREATE SUBSCRIPTION {quote_ident(name)} CONNECTION {quote_literal(dsn)} "
-            f"PUBLICATION {publications} WITH (copy_data = true, streaming = parallel)"
+            f"PUBLICATION {publications} WITH ({options}, streaming = parallel)"
         )
     except asyncpg.PostgresError as exc:
         raise ReplicationError(f"CREATE SUBSCRIPTION failed: {redact(str(exc), [dsn])}") from None
     sub = await _subscription(conn, name)
     tables = await _subscribed_tables(conn, sub["oid"])
-    logger.info("Created subscription %s; initial copy of %d tables started", name, len(tables))
+    if copy_data:
+        logger.info("Created subscription %s; initial copy of %d tables started", name, len(tables))
+    else:
+        logger.info("Created subscription %s, disabled and without an initial copy", name)
     return {"name": name, "created": True, "tables": tables}
 
 

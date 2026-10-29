@@ -12,9 +12,10 @@ Each test gets its own databases and roles on both servers.
 import os
 import sys
 import json
+import asyncio
 import subprocess
 from uuid import uuid4
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass
 
 import pytest
@@ -22,9 +23,11 @@ import asyncpg
 import pytest_asyncio
 from pydantic import SecretStr
 
+import canopy.core.replication.reseed as reseed_module
 from canopy.core.replication.sql import Refused, ReplicationError
 from canopy.core.replication.drift import SESSION, drift_check
 from canopy.core.replication.config import ReplicationConfig
+from canopy.core.replication.reseed import reseed
 from canopy.core.replication.metrics import read_status
 from canopy.core.replication.registry import REGISTRY, TableClass, ReplicationRegistry
 from canopy.core.replication.publisher import publish, publisher_status
@@ -451,3 +454,268 @@ async def test_drift_check_command_exit_status(pair: Pair):
     assert failed.returncode == 2
     assert "password authentication failed" in failed.stderr
     assert wrong not in failed.stderr + failed.stdout
+
+
+async def _lose_subscription(p: Pair) -> None:
+    """What a lost slot leaves behind once cleaned up: the mirror's rows, no subscription, no slot."""
+    name = f"canopy_history_{p.instance}"
+    await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
+
+    async def worker_gone():
+        return not await p.sub_admin.fetchval(
+            "SELECT count(*) FROM pg_stat_subscription s JOIN pg_subscription u ON u.oid = s.subid "
+            "WHERE u.subname = $1 AND s.pid IS NOT NULL",
+            name,
+        )
+
+    await eventually(worker_gone)
+    await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" SET (slot_name = NONE)')
+    await p.sub_admin.execute(f'DROP SUBSCRIPTION "{name}"')
+    await p.pub.execute("SELECT pg_drop_replication_slot($1)", name)
+
+
+async def _newest_on_mirror(p: Pair) -> datetime:
+    return await p.sub.fetchval("SELECT max(created_at) FROM squirrel.snapshot")
+
+
+async def test_reseed_after_a_lost_slot(pair: Pair):
+    p = pair
+    ids = await _subscribed(p)
+    since = await _newest_on_mirror(p)
+    await _lose_subscription(p)
+
+    # The gap: changes the mirror never received.
+    gap_snapshot = str(uuid4())
+    async with p.pub.transaction():
+        await p.pub.execute("INSERT INTO squirrel.snapshot (id, title) VALUES ($1, 'In the gap')", gap_snapshot)
+        await p.pub.execute(
+            "INSERT INTO squirrel.snapshot_value (id, snapshot_id, pv_id, pv_name) "
+            "VALUES (gen_random_uuid(), $1, $2, 'SIM:PV:1:SETPOINT')",
+            gap_snapshot,
+            ids["pv"],
+        )
+    await p.pub.execute("UPDATE squirrel.pv SET description = 'edited in the gap'")
+    await p.pub.execute("UPDATE squirrel.snapshot SET title = 'Renamed in the gap' WHERE id = $1", ids["snapshot"])
+    async with p.pub.transaction():
+        await p.pub.execute("DELETE FROM squirrel.pv_tag WHERE pv_id = $1", ids["pv"])
+        await p.pub.execute("INSERT INTO squirrel.pv_tag (pv_id, tag_id) VALUES ($1, $2)", ids["pv"], ids["tag_b"])
+    await p.pub.execute("DELETE FROM squirrel.tag WHERE id = $1", ids["tag_a"])
+
+    primary, mirror = await _drift_connections(p)
+    try:
+        report = await reseed(primary, mirror, role="mirror", instance=p.instance, config=p.config, since=since)
+        assert report["created"] is True and report["skipped"] == {}
+        assert report["tables"]["squirrel.snapshot"]["read"] == 2
+        assert report["tables"]["squirrel.tag"]["deleted"] == 1
+
+        # Replication carries on from the cut.
+        await p.pub.execute("UPDATE squirrel.pv SET description = 'after the re-seed'")
+        await eventually(lambda: _in_step(p))
+        status = (await subscriber_status(p.sub_admin, instance=p.instance))["subscription"]
+        assert status["enabled"] and status["apply_error_count"] == 0
+        assert (await drift_check(primary, mirror, instance=p.instance))["in_step"]
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+async def test_reseed_copies_a_facility_tree(pair: Pair):
+    """``core.facility`` references itself, so a parent and its child go in the same statement."""
+    p = pair
+    ids = await _subscribed(p)
+    gone, gone_child = str(uuid4()), str(uuid4())
+    async with p.pub.transaction():
+        await p.pub.execute("INSERT INTO core.facility (id, slug, name) VALUES ($1, 'gone', 'Gone')", gone)
+        await p.pub.execute(
+            "INSERT INTO core.facility (id, slug, name, parent_id) VALUES ($1, 'gone-a', 'Gone A', $2)",
+            gone_child,
+            gone,
+        )
+    await eventually(lambda: _in_step(p))
+    since = await _newest_on_mirror(p)
+    await _lose_subscription(p)
+
+    # The gap: the old tree removed child first, as the parent's RESTRICT makes the primary
+    # do, and a new tree with a PV assigned to its child.
+    await p.pub.execute("DELETE FROM core.facility WHERE id = $1", gone_child)
+    await p.pub.execute("DELETE FROM core.facility WHERE id = $1", gone)
+    site, site_a = str(uuid4()), str(uuid4())
+    async with p.pub.transaction():
+        await p.pub.execute("INSERT INTO core.facility (id, slug, name) VALUES ($1, 'site', 'Site')", site)
+        await p.pub.execute(
+            "INSERT INTO core.facility (id, slug, name, parent_id) VALUES ($1, 'site-a', 'Site A', $2)", site_a, site
+        )
+        await p.pub.execute("INSERT INTO squirrel.pv_facility (pv_id, facility_id) VALUES ($1, $2)", ids["pv"], site_a)
+
+    primary, mirror = await _drift_connections(p)
+    try:
+        report = await reseed(primary, mirror, role="mirror", instance=p.instance, config=p.config, since=since)
+
+        assert report["tables"]["core.facility"]["deleted"] == 2
+        assert await p.sub.fetch(
+            "SELECT f.slug, parent.slug AS parent FROM core.facility f "
+            "LEFT JOIN core.facility parent ON parent.id = f.parent_id ORDER BY f.slug"
+        ) == [("site", None), ("site-a", "site")]
+        assert (
+            await p.sub.fetchval("SELECT facility_id::text FROM squirrel.pv_facility WHERE pv_id = $1", ids["pv"])
+            == site_a
+        )
+        assert (await drift_check(primary, mirror, instance=p.instance))["in_step"]
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+async def test_reseed_hands_over_to_replication_at_the_cut(pair: Pair):
+    """Committed before the cut: copied, not replayed. Committed after the snapshot: streamed, not copied."""
+    p = pair
+    await _subscribed(p)
+    name = f"canopy_history_{p.instance}"
+    since = await _newest_on_mirror(p)
+    await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
+    before, after = str(uuid4()), str(uuid4())
+    # Still in the slot, since the mirror is disabled: replaying it after the copy would stop apply.
+    await p.pub.execute("INSERT INTO squirrel.snapshot (id, title) VALUES ($1, 'Before the cut')", before)
+
+    async def write_after_the_snapshot():
+        await p.pub.execute("INSERT INTO squirrel.snapshot (id, title) VALUES ($1, 'After the snapshot')", after)
+
+    primary, mirror = await _drift_connections(p)
+    try:
+        report = await reseed(
+            primary,
+            mirror,
+            role="mirror",
+            instance=p.instance,
+            config=p.config,
+            since=since,
+            after_snapshot=write_after_the_snapshot,
+        )
+        assert report["created"] is False
+        assert report["tables"]["squirrel.snapshot"]["read"] == 2  # the seeded one and `before`
+
+        await eventually(lambda: _in_step(p))
+        titles = {row["title"] for row in await p.sub.fetch("SELECT title FROM squirrel.snapshot")}
+        assert {"Before the cut", "After the snapshot"} <= titles
+        status = (await subscriber_status(p.sub_admin, instance=p.instance))["subscription"]
+        assert status["apply_error_count"] == 0
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+async def test_reseed_refusals(pair: Pair):
+    p = pair
+    await _subscribed(p)
+    name = f"canopy_history_{p.instance}"
+    newest = await _newest_on_mirror(p)
+    primary, mirror = await _drift_connections(p)
+    try:
+        with pytest.raises(Refused, match="is enabled"):
+            await reseed(primary, mirror, role="mirror", instance=p.instance, config=p.config, since=newest)
+        await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
+        with pytest.raises(Refused, match="later than the newest snapshot"):
+            await reseed(
+                primary,
+                mirror,
+                role="mirror",
+                instance=p.instance,
+                config=p.config,
+                since=newest + timedelta(seconds=1),
+            )
+        # The tables' owner can't advance a replication origin without a grant.
+        with pytest.raises(Refused, match="pg_replication_origin_advance"):
+            await reseed(primary, p.sub, role="mirror", instance=p.instance, config=p.config, since=newest)
+        with pytest.raises(Refused, match="runs on a mirror"):
+            await reseed(primary, mirror, role="primary", instance=p.instance, config=p.config, since=newest)
+        assert not (await subscriber_status(p.sub_admin, instance=p.instance))["subscription"]["enabled"]
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+async def test_reseed_command(pair: Pair):
+    p = pair
+    await _subscribed(p)
+    name = f"canopy_history_{p.instance}"
+    since = (await _newest_on_mirror(p)).isoformat()
+    database = await p.sub.fetchval("SELECT current_database()")
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "CANOPY_ROLE": "mirror",
+        "CANOPY_INSTANCE": p.instance,
+        "CANOPY_DATABASE_URL": server_dsn(SUBSCRIBER_ADMIN, database=database).replace(
+            "postgresql://", "postgresql+asyncpg://", 1
+        ),
+        "CANOPY_REPLICATION__READER_DSN": await _reader_dsn(p),
+    }
+
+    def reseed_command() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "canopy.core.replication", "reseed", "--since", since],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    refused = reseed_command()
+    assert refused.returncode == 2 and "is enabled" in refused.stderr
+
+    await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
+    done = reseed_command()
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout)["subscription"] == name
+    await p.pub.execute("UPDATE squirrel.pv SET description = 'after the command'")
+    await eventually(lambda: _in_step(p))
+
+
+async def test_reseed_cut_waits_for_open_write_transactions(pair: Pair, monkeypatch):
+    p = pair
+    await _subscribed(p)
+    name = f"canopy_history_{p.instance}"
+    since = await _newest_on_mirror(p)
+    await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
+    primary, mirror = await _drift_connections(p)
+    writer = await asyncpg.connect(
+        server_dsn(PUBLISHER_ADMIN, database=await p.pub.fetchval("SELECT current_database()"))
+    )
+    try:
+        # Too long: refused before the mirror is touched.
+        monkeypatch.setattr(reseed_module, "CUT_WAIT_S", 0.5)
+        open_write = writer.transaction()
+        await open_write.start()
+        await writer.execute("INSERT INTO squirrel.snapshot (id, title) VALUES (gen_random_uuid(), 'Open')")
+        with pytest.raises(Refused, match="has been open"):
+            await reseed(primary, mirror, role="mirror", instance=p.instance, config=p.config, since=since)
+        assert not (await subscriber_status(p.sub_admin, instance=p.instance))["subscription"]["enabled"]
+
+        # Long enough: the cut waits until the transaction ends (here, rolled back).
+        monkeypatch.setattr(reseed_module, "CUT_WAIT_S", 30.0)
+        task = asyncio.create_task(
+            reseed(primary, mirror, role="mirror", instance=p.instance, config=p.config, since=since)
+        )
+        await asyncio.sleep(0.5)
+        assert not task.done()
+        await open_write.rollback()
+        report = await task
+        assert report["open_at_cut"] >= 1  # the writer, plus anything else running on the server
+        await eventually(lambda: _in_step(p))
+    finally:
+        await writer.close()
+        await primary.close()
+        await mirror.close()
+
+
+async def test_reseed_waits_for_the_apply_worker_to_stop(pair: Pair, monkeypatch):
+    p = pair
+    await _subscribed(p)
+    oid = await p.sub_admin.fetchval(
+        "SELECT oid FROM pg_subscription WHERE subname = $1", f"canopy_history_{p.instance}"
+    )
+    monkeypatch.setattr(reseed_module, "WORKER_WAIT_S", 0.5)
+    with pytest.raises(Refused, match="apply worker is still running"):
+        await reseed_module._wait_for_no_worker(p.sub_admin, oid)
+    await p.sub_admin.execute(f'ALTER SUBSCRIPTION "canopy_history_{p.instance}" DISABLE')
+    monkeypatch.setattr(reseed_module, "WORKER_WAIT_S", 10.0)
+    await reseed_module._wait_for_no_worker(p.sub_admin, oid)
