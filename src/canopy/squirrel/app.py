@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from canopy.core.errors import register_canopy_error_handler
+from canopy.core.modules import tag_module
 from canopy.squirrel.runtime import mark_started
 from canopy.squirrel.api.v1.router import router as v1_router
 
@@ -33,4 +34,5 @@ app = FastAPI(
 )
 
 register_canopy_error_handler(app)
+tag_module(app, "squirrel")
 app.include_router(v1_router)

@@ -8,6 +8,7 @@ from pydantic_settings import SettingsError
 from canopy.elog import gateway
 from canopy.core.errors import register_canopy_error_handler
 from canopy.elog.config import ElogConfig, get_elog_config, describe_settings_error
+from canopy.core.modules import tag_module
 from canopy.elog.runtime import mark_started
 from canopy.elog.api.v1.router import router as v1_router
 from canopy.elog.adapters.registry import ElogRegistry, build_registry
@@ -57,4 +58,5 @@ app = FastAPI(
 )
 
 register_canopy_error_handler(app)
+tag_module(app, "elog")
 app.include_router(v1_router)

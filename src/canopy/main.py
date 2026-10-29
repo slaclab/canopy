@@ -143,18 +143,6 @@ app.mount("/converter", converter_app)
 app.mount("/analytics", analytics_app)
 app.mount("/elog", elog_app)
 
-tag_module(mole_app, "mole")
-tag_module(hare_app, "hare")
-tag_module(raccoon_app, "raccoon")
-tag_module(vole_app, "vole")
-tag_module(formula_engine_app, "formula-engine")
-tag_module(squirrel_app, "squirrel")
-tag_module(magpie_app, "magpie")
-tag_module(jobs_app, "jobs")
-tag_module(converter_app, "converter")
-tag_module(analytics_app, "analytics")
-tag_module(elog_app, "elog")
-
 
 @app.get("/health", tags=["meta"])
 async def health() -> dict[str, str]:
