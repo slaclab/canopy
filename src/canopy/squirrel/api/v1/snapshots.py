@@ -172,7 +172,7 @@ async def update_snapshot(
 
 @router.delete("/{snapshot_id}", dependencies=[Security(require_write_access)])
 async def delete_snapshot(snapshot_id: str, service: SnapshotServiceDep) -> bool:
-    """Delete a snapshot and its values."""
+    """Delete a snapshot: it is no longer listed or served, but its row and values are kept."""
     if not is_uuid(snapshot_id):
         raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
     if not await service.delete_snapshot(snapshot_id):

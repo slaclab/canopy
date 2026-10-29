@@ -16,7 +16,9 @@ from collections.abc import Callable, Awaitable
 from sqlalchemy import (
     ARRAY,
     Select,
+    ColumnElement,
     or_,
+    and_,
     any_,
     func,
     delete,
@@ -26,7 +28,7 @@ from sqlalchemy import (
     update,
     literal,
 )
-from sqlalchemy.orm import noload, selectinload
+from sqlalchemy.orm import noload, raiseload, selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import UUID
 
@@ -63,6 +65,21 @@ class SnapshotRepository(BaseRepository[Snapshot]):
     def __init__(self, session: AsyncSession):
         super().__init__(Snapshot, session)
 
+    async def get_by_id(self, id: str, *, include_deleted: bool = False) -> Snapshot | None:
+        """A snapshot without its values; a deleted one only with ``include_deleted``."""
+        query = select(Snapshot).where(Snapshot.id == id).options(raiseload(Snapshot.values))
+        if not include_deleted:
+            query = query.where(Snapshot.deleted_at.is_(None))
+        result = await self.session.execute(query)
+        return result.scalar_one_or_none()
+
+    async def is_live(self, snapshot_id: str) -> bool:
+        """Whether ``snapshot_id`` exists and hasn't been deleted."""
+        result = await self.session.execute(
+            select(Snapshot.id).where(Snapshot.id == snapshot_id, Snapshot.deleted_at.is_(None))
+        )
+        return result.scalar_one_or_none() is not None
+
     async def get_with_values(
         self, snapshot_id: str, limit: int | None = None, offset: int = 0
     ) -> tuple[Snapshot, list[SnapshotValue]] | None:
@@ -75,7 +92,9 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         relationship's selectin default so a huge snapshot isn't fully loaded just to page it.
         """
         result = await self.session.execute(
-            select(Snapshot).where(Snapshot.id == snapshot_id).options(noload(Snapshot.values))
+            select(Snapshot)
+            .where(Snapshot.id == snapshot_id, Snapshot.deleted_at.is_(None))
+            .options(noload(Snapshot.values))
         )
         snapshot = result.scalar_one_or_none()
         if not snapshot:
@@ -100,9 +119,8 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         title: str | None = None,
         description: str | None = None,
     ) -> Snapshot | None:
-        """Update a snapshot's title and/or description."""
-        result = await self.session.execute(select(Snapshot).where(Snapshot.id == snapshot_id))
-        snapshot = result.scalar_one_or_none()
+        """Update a live snapshot's title and/or description."""
+        snapshot = await self.get_by_id(snapshot_id)
         if not snapshot:
             return None
 
@@ -124,6 +142,8 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         facility_ids: set[str] | None,
     ) -> Select:
         """Apply the snapshot listing filters to ``query``; shared by the page and count queries."""
+        query = query.where(Snapshot.deleted_at.is_(None))
+
         if title:
             query = query.where(Snapshot.title.ilike(f"%{title}%"))
 
@@ -243,15 +263,15 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         )
         return {row[0]: row[1] for row in result.all()}
 
-    async def delete_with_values(self, snapshot_id: str) -> bool:
-        """Delete a snapshot; its values go via the DB ``ON DELETE CASCADE``."""
-        result = await self.session.execute(select(Snapshot.id).where(Snapshot.id == snapshot_id))
-        if not result.scalar_one_or_none():
-            return False
-
-        await self.session.execute(delete(Snapshot).where(Snapshot.id == snapshot_id))
+    async def soft_delete(self, snapshot_id: str) -> bool:
+        """Mark a live snapshot deleted, keeping its values; ``False`` when there is none."""
+        result = await self.session.execute(
+            update(Snapshot)
+            .where(Snapshot.id == snapshot_id, Snapshot.deleted_at.is_(None))
+            .values(deleted_at=func.now())
+        )
         await self.session.flush()
-        return True
+        return result.rowcount > 0
 
 
 class SnapshotValueRepository(BaseRepository[SnapshotValue]):
@@ -321,35 +341,74 @@ class SnapshotValueRepository(BaseRepository[SnapshotValue]):
 
 
 class PvRepository(BaseRepository[Pv]):
-    """Repository for PV operations."""
+    """Repository for PV operations.
+
+    Deleted PVs (``deleted_at`` set) are left out of every lookup except those taking
+    ``include_deleted``: registering an address again finds the deleted row to bring it
+    back, and reading a past snapshot still resolves the PVs its values belong to.
+    """
 
     def __init__(self, session: AsyncSession):
         super().__init__(Pv, session)
 
+    @staticmethod
+    def _identity_filter(kind: str, addresses: list[str]) -> ColumnElement[bool]:
+        """Match PVs whose identifying address of ``kind`` is one of ``addresses``.
+
+        The rule of ``pv_service._identity``: a setpoint address identifies its PV, a
+        readback address only a PV without a setpoint, and a config address only a PV
+        with neither.
+        """
+        if kind == "setpoint":
+            return Pv.setpoint_address.in_(addresses)
+        if kind == "readback":
+            return and_(Pv.setpoint_address.is_(None), Pv.readback_address.in_(addresses))
+        return and_(Pv.setpoint_address.is_(None), Pv.readback_address.is_(None), Pv.config_address.in_(addresses))
+
+    async def get_by_id(self, id: str, *, include_deleted: bool = False) -> Pv | None:
+        """A PV by id; a deleted one only with ``include_deleted``."""
+        query = select(Pv).where(Pv.id == id)
+        if not include_deleted:
+            query = query.where(Pv.deleted_at.is_(None))
+        result = await self.session.execute(query)
+        return result.scalar_one_or_none()
+
     async def find_by_address(self, address: str) -> Pv | None:
-        """Find a PV by any of its addresses (setpoint, readback, or config)."""
+        """Find a live PV by any of its addresses (setpoint, readback, or config)."""
         result = await self.session.execute(
             select(Pv)
             .options(selectinload(Pv.tags).selectinload(Tag.group))
+            .where(Pv.deleted_at.is_(None))
             .where(or_(Pv.setpoint_address == address, Pv.readback_address == address, Pv.config_address == address))
         )
         return result.scalar_one_or_none()
 
-    async def find_by_setpoint(self, setpoint_address: str) -> Pv | None:
-        result = await self.session.execute(
+    async def _find_by_identity(self, kind: str, address: str, include_deleted: bool) -> Pv | None:
+        query = (
             select(Pv)
             .options(selectinload(Pv.tags).selectinload(Tag.group))
-            .where(Pv.setpoint_address == setpoint_address)
+            .where(self._identity_filter(kind, [address]))
         )
-        return result.scalar_one_or_none()
+        if not include_deleted:
+            query = query.where(Pv.deleted_at.is_(None))
+        # One PV at most holds an identity, deleted or not; a live one would come first.
+        result = await self.session.execute(query.order_by(Pv.deleted_at.is_not(None)).limit(1))
+        return result.scalars().first()
 
-    async def find_by_readback_without_setpoint(self, readback_address: str) -> Pv | None:
+    async def find_by_setpoint(self, setpoint_address: str, *, include_deleted: bool = False) -> Pv | None:
+        return await self._find_by_identity("setpoint", setpoint_address, include_deleted)
+
+    async def find_by_readback_without_setpoint(
+        self, readback_address: str, *, include_deleted: bool = False
+    ) -> Pv | None:
         """Find a setpoint-less PV by its readback address.
 
         Parameters
         ----------
         readback_address : str
             Readback address to match.
+        include_deleted : bool
+            Also match a deleted PV.
 
         Returns
         -------
@@ -357,21 +416,17 @@ class PvRepository(BaseRepository[Pv]):
             A PV whose ``setpoint_address`` is NULL and whose ``readback_address`` equals
             ``readback_address``, or ``None`` when no such PV exists.
         """
-        result = await self.session.execute(
-            select(Pv)
-            .options(selectinload(Pv.tags).selectinload(Tag.group))
-            .where(Pv.setpoint_address.is_(None), Pv.readback_address == readback_address)
-            .limit(1)
-        )
-        return result.scalars().first()
+        return await self._find_by_identity("readback", readback_address, include_deleted)
 
-    async def find_by_config_only(self, config_address: str) -> Pv | None:
+    async def find_by_config_only(self, config_address: str, *, include_deleted: bool = False) -> Pv | None:
         """Find a config-only PV by its config address.
 
         Parameters
         ----------
         config_address : str
             Config address to match.
+        include_deleted : bool
+            Also match a deleted PV.
 
         Returns
         -------
@@ -379,20 +434,24 @@ class PvRepository(BaseRepository[Pv]):
             A PV whose ``setpoint_address`` and ``readback_address`` are both NULL and whose
             ``config_address`` equals ``config_address``, or ``None`` when no such PV exists.
         """
-        result = await self.session.execute(
-            select(Pv)
-            .options(selectinload(Pv.tags).selectinload(Tag.group))
-            .where(
-                Pv.setpoint_address.is_(None),
-                Pv.readback_address.is_(None),
-                Pv.config_address == config_address,
+        return await self._find_by_identity("config", config_address, include_deleted)
+
+    async def _existing_identities(self, kind: str, addresses: list[str]) -> set[str]:
+        """The subset of ``addresses`` already identifying a live PV as ``kind``."""
+        if not addresses:
+            return set()
+        column = getattr(Pv, f"{kind}_address")
+        existing: set[str] = set()
+        for i in range(0, len(addresses), PARAM_BATCH_SIZE):
+            batch = addresses[i : i + PARAM_BATCH_SIZE]
+            result = await self.session.execute(
+                select(column).where(self._identity_filter(kind, batch), Pv.deleted_at.is_(None))
             )
-            .limit(1)
-        )
-        return result.scalars().first()
+            existing.update({row[0] for row in result.all() if row[0]})
+        return existing
 
     async def get_existing_setpoints(self, setpoint_addresses: list[str]) -> set[str]:
-        """Return the subset of ``setpoint_addresses`` that already exist.
+        """Return the subset of ``setpoint_addresses`` held by a live PV.
 
         Parameters
         ----------
@@ -404,17 +463,10 @@ class PvRepository(BaseRepository[Pv]):
         set[str]
             The addresses already registered as a PV setpoint.
         """
-        if not setpoint_addresses:
-            return set()
-        existing: set[str] = set()
-        for i in range(0, len(setpoint_addresses), PARAM_BATCH_SIZE):
-            batch = setpoint_addresses[i : i + PARAM_BATCH_SIZE]
-            result = await self.session.execute(select(Pv.setpoint_address).where(Pv.setpoint_address.in_(batch)))
-            existing.update({row[0] for row in result.all() if row[0]})
-        return existing
+        return await self._existing_identities("setpoint", setpoint_addresses)
 
     async def get_existing_readbacks_without_setpoint(self, readback_addresses: list[str]) -> set[str]:
-        """Return the subset of ``readback_addresses`` already held by a setpoint-less PV.
+        """Return the subset of ``readback_addresses`` already held by a live setpoint-less PV.
 
         Parameters
         ----------
@@ -426,19 +478,10 @@ class PvRepository(BaseRepository[Pv]):
         set[str]
             The addresses carried by an existing PV whose ``setpoint_address`` is NULL.
         """
-        if not readback_addresses:
-            return set()
-        existing: set[str] = set()
-        for i in range(0, len(readback_addresses), PARAM_BATCH_SIZE):
-            batch = readback_addresses[i : i + PARAM_BATCH_SIZE]
-            result = await self.session.execute(
-                select(Pv.readback_address).where(Pv.setpoint_address.is_(None), Pv.readback_address.in_(batch))
-            )
-            existing.update({row[0] for row in result.all() if row[0]})
-        return existing
+        return await self._existing_identities("readback", readback_addresses)
 
     async def get_existing_config_only(self, config_addresses: list[str]) -> set[str]:
-        """Return the subset of ``config_addresses`` already held by a config-only PV.
+        """Return the subset of ``config_addresses`` already held by a live config-only PV.
 
         Parameters
         ----------
@@ -451,20 +494,42 @@ class PvRepository(BaseRepository[Pv]):
             The addresses carried by an existing PV whose ``setpoint_address`` and
             ``readback_address`` are both NULL.
         """
-        if not config_addresses:
-            return set()
-        existing: set[str] = set()
-        for i in range(0, len(config_addresses), PARAM_BATCH_SIZE):
-            batch = config_addresses[i : i + PARAM_BATCH_SIZE]
+        return await self._existing_identities("config", config_addresses)
+
+    async def get_deleted_by_identity(self, kind: str, addresses: list[str]) -> dict[str, Pv]:
+        """Deleted PVs whose identifying address of ``kind`` is one of ``addresses``.
+
+        Parameters
+        ----------
+        kind : str
+            Identity kind: ``"setpoint"``, ``"readback"`` or ``"config"``.
+        addresses : list[str]
+            Addresses to look up.
+
+        Returns
+        -------
+        dict[str, Pv]
+            Each deleted PV, with its tags loaded, keyed by the address that identifies it.
+        """
+        found: dict[str, Pv] = {}
+        for i in range(0, len(addresses), PARAM_BATCH_SIZE):
+            batch = addresses[i : i + PARAM_BATCH_SIZE]
             result = await self.session.execute(
-                select(Pv.config_address).where(
-                    Pv.setpoint_address.is_(None),
-                    Pv.readback_address.is_(None),
-                    Pv.config_address.in_(batch),
-                )
+                select(Pv)
+                .options(selectinload(Pv.tags).selectinload(Tag.group))
+                .where(self._identity_filter(kind, batch), Pv.deleted_at.is_not(None))
             )
-            existing.update({row[0] for row in result.all() if row[0]})
-        return existing
+            for pv in result.scalars():
+                found[getattr(pv, f"{kind}_address")] = pv
+        return found
+
+    async def soft_delete(self, pv_id: str) -> bool:
+        """Mark a live PV deleted, keeping its tags and values; ``False`` when there is none."""
+        result = await self.session.execute(
+            update(Pv).where(Pv.id == pv_id, Pv.deleted_at.is_(None)).values(deleted_at=func.now())
+        )
+        await self.session.flush()
+        return result.rowcount > 0
 
     async def search_by_name(
         self,
@@ -479,8 +544,8 @@ class PvRepository(BaseRepository[Pv]):
         ``tag_filters`` is OR within a group, AND across groups. ``facility_ids``
         (already descendant-expanded by the caller) filters via ``pv_facility``.
         """
-        query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group))
-        count_query = select(func.count()).select_from(Pv)
+        query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.deleted_at.is_(None))
+        count_query = select(func.count()).select_from(Pv).where(Pv.deleted_at.is_(None))
 
         if search:
             search_filter = or_(
@@ -526,12 +591,14 @@ class PvRepository(BaseRepository[Pv]):
     async def get_all_addresses(
         self, facility_ids: set[str] | None = None
     ) -> list[tuple[str, str | None, str | None, str | None]]:
-        """All ``(id, setpoint, readback, config)`` tuples — the snapshot-capture input.
+        """All live ``(id, setpoint, readback, config)`` tuples — the snapshot-capture input.
 
         ``facility_ids`` limits it to PVs assigned to any of them; unassigned PVs are
-        excluded. ``None`` returns every PV.
+        excluded. ``None`` returns every live PV.
         """
-        query = select(Pv.id, Pv.setpoint_address, Pv.readback_address, Pv.config_address)
+        query = select(Pv.id, Pv.setpoint_address, Pv.readback_address, Pv.config_address).where(
+            Pv.deleted_at.is_(None)
+        )
         if facility_ids is not None:
             pvs_in_facility = select(pv_facility.c.pv_id).where(pv_facility.c.facility_id.in_(facility_ids)).distinct()
             query = query.where(Pv.id.in_(pvs_in_facility))
@@ -578,22 +645,34 @@ class PvRepository(BaseRepository[Pv]):
                 insert(pv_facility), [{"pv_id": pv_id, "facility_id": fid} for fid in sorted(facility_ids)]
             )
 
+    async def clear_facilities_many(self, pv_ids: list[str]) -> None:
+        """Remove every facility assignment of the given PVs, batched like ``get_by_ids``."""
+        for i in range(0, len(pv_ids), PARAM_BATCH_SIZE):
+            await self.session.execute(
+                delete(pv_facility).where(pv_facility.c.pv_id.in_(pv_ids[i : i + PARAM_BATCH_SIZE]))
+            )
+
     async def add_facilities_many(self, assignments: list[tuple[str, set[str]]]) -> None:
         """Bulk-insert ``(pv_id, facility_ids)`` assignments for freshly created PVs."""
         rows = [{"pv_id": pv_id, "facility_id": fid} for pv_id, fids in assignments for fid in sorted(fids)]
         if rows:
             await self.session.execute(insert(pv_facility), rows)
 
-    async def get_by_ids(self, ids: list[str]) -> list[Pv]:
-        """Get many PVs by id, batched under the Postgres parameter limit."""
+    async def get_by_ids(self, ids: list[str], *, include_deleted: bool = False) -> list[Pv]:
+        """Get many PVs by id, batched under the Postgres parameter limit.
+
+        Deleted PVs come back only with ``include_deleted``, which a past snapshot's
+        values need to keep their addresses, tags and tolerances.
+        """
         if not ids:
             return []
         all_pvs: list[Pv] = []
         for i in range(0, len(ids), PARAM_BATCH_SIZE):
             batch_ids = ids[i : i + PARAM_BATCH_SIZE]
-            result = await self.session.execute(
-                select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.id.in_(batch_ids))
-            )
+            query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.id.in_(batch_ids))
+            if not include_deleted:
+                query = query.where(Pv.deleted_at.is_(None))
+            result = await self.session.execute(query)
             all_pvs.extend(result.scalars().all())
         return all_pvs
 
@@ -607,8 +686,8 @@ class PvRepository(BaseRepository[Pv]):
         facility_ids: set[str] | None = None,
     ) -> tuple[list[Pv], int]:
         """Offset-paginated, server-side filtered search. Returns ``(results, total_count)``."""
-        query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group))
-        count_query = select(func.count()).select_from(Pv)
+        query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.deleted_at.is_(None))
+        count_query = select(func.count()).select_from(Pv).where(Pv.deleted_at.is_(None))
 
         if search_term:
             search_filter = or_(
@@ -647,12 +726,14 @@ class PvRepository(BaseRepository[Pv]):
 
     async def get_all_devices(self) -> list[str]:
         result = await self.session.execute(
-            select(Pv.device).where(Pv.device.isnot(None)).distinct().order_by(Pv.device)
+            select(Pv.device).where(Pv.device.isnot(None), Pv.deleted_at.is_(None)).distinct().order_by(Pv.device)
         )
         return [r[0] for r in result.all() if r[0]]
 
     async def get_all_as_map(self) -> dict[str, Pv]:
-        result = await self.session.execute(select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)))
+        result = await self.session.execute(
+            select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.deleted_at.is_(None))
+        )
         pvs = result.scalars().all()
         return {pv.id: pv for pv in pvs}
 
@@ -759,6 +840,8 @@ class MetaPvRepository(BaseRepository[MetaPv]):
 
 async def facility_in_use(session: AsyncSession, facility_id: str) -> bool:
     """Whether any PV or snapshot still references ``facility_id``.
+
+    Deleted rows count: they keep their facility, and so does the history mirror's copy.
 
     Registered with ``core.facilities.gateway.register_in_use_checker`` at startup (see
     ``squirrel/app.py``) so core's ``FacilityService.delete`` can enforce its guard
