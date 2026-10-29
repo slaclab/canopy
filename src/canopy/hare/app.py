@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from canopy.hare import gateway, metrics
 from canopy.core.errors import register_canopy_error_handler
 from canopy.hare.config import get_hare_config
+from canopy.core.modules import tag_module
 from canopy.epics.config import get_epics_config
 from canopy.hare.runtime import mark_started
 from canopy.epics.gateway import build_connector
@@ -48,5 +49,6 @@ app = FastAPI(
 )
 
 register_canopy_error_handler(app)
+tag_module(app, "hare")
 app.include_router(v1_router)
 metrics.register()
