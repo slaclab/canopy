@@ -79,6 +79,13 @@ class FacilityService:
         reach this through the gateway, which opens a session per call."""
         return await self.facility_repo.existing_slugs(slugs)
 
+    async def ids_by_slug(self, slugs: list[str] | set[str]) -> dict[str, str]:
+        """``{slug: id}`` for the subset of ``slugs`` that exist. One query, not one
+        per slug — callers that also need to reject unknown slugs get every unknown
+        one back at once (``slugs - result.keys()``) rather than discovering them one
+        at a time."""
+        return await self.facility_repo.ids_by_slug(slugs)
+
     async def create(self, data: FacilityCreate) -> FacilityDTO:
         if await self.facility_repo.get_by_slug(data.slug):
             raise FacilitySlugConflict(f"Facility with slug '{data.slug}' already exists")
@@ -120,6 +127,10 @@ class FacilityService:
                 raise FacilityInUse(f"Cannot delete a facility that still has {what} assigned to it")
         await self.facility_repo.delete(facility)
         return True
+
+    async def descendant_ids(self, facility_id: str) -> set[str]:
+        """``{facility_id, all descendant facility_ids}``. Empty for an unknown id."""
+        return await self.facility_repo.descendant_ids(facility_id)
 
     async def resolve_facility_scope(self, slug: str | None) -> set[str] | None:
         """Slug -> {facility_id, all descendant facility_ids}.

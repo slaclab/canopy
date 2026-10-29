@@ -22,6 +22,10 @@ class NewPVElementDTO(PVBase):
     """DTO for creating a PV. At least one address is required."""
 
     tags: list[str] = []  # Tag IDs
+    # Facility *slugs*, not ids — consistent with `NewSnapshotDTO.facility` and with
+    # the slugs a key's facility grant carries. Empty means unassigned, which is a
+    # valid state: an unassigned PV is writable only by an unrestricted key.
+    facilities: list[str] = []
 
     @model_validator(mode="after")
     def validate_at_least_one_address(self):
@@ -38,6 +42,8 @@ class UpdatePVElementDTO(CanopyModel):
     abs_tolerance: float | None = None
     rel_tolerance: float | None = None
     tags: list[str] | None = None  # Tag IDs
+    # Facility slugs. ``None`` leaves assignments alone; ``[]`` clears them.
+    facilities: list[str] | None = None
 
 
 class PVElementDTO(PVBase):
@@ -45,6 +51,7 @@ class PVElementDTO(PVBase):
 
     id: str
     tags: list[TagDTO] = []
+    facility_ids: list[str] = []
     created_date: datetime
     last_modified_date: datetime
     created_by: str | None = None

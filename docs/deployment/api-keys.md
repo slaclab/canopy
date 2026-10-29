@@ -206,6 +206,12 @@ statically stable floor that has to keep working through a database outage, and
 resolving a facility grant requires reading the hierarchy from the database.
 Restrict by facility with a database-backed key.
 
+The rest of this section calls a key **unrestricted** if it is granted `*` or
+comes from `CANOPY_API_KEYS`, and **restricted** otherwise — including a key
+with an empty grant. Facility scope is independent of `read`/`write`/`admin`:
+those are flags on the key as a whole, and a key's one facility list applies to
+all of them. There is no "write here, read-only there."
+
 Set it with `-f`/`--facility` (repeatable) on `scripts/create_key.py`, or the
 `facilities` field on `POST /v1/api-keys`:
 
@@ -219,17 +225,96 @@ curl -X POST -H "X-API-Key: <admin-token>" -H "Content-Type: application/json" \
   http://localhost:<API_PORT>/v1/api-keys
 ```
 
-Every slug named in a grant must already exist — an unrecognized or mistyped
-one is a `400` naming it, not a shrug. A typo'd grant resolves to "matches
-nothing" at request time, so the key would authenticate normally and then see
-and write nothing, with no error anywhere to point at the mistake. Define the
-facility first (see [Defining facilities](docker.md#defining-facilities)). `*`
-names no slug, so it needs nothing defined.
+Every slug named in a grant must already exist — a mistyped one is a `400` naming
+it. A typo'd grant resolves to "matches nothing" at request time, so the key would
+authenticate normally and then see and write nothing, with no error to point at the
+mistake. Define the facility first (see
+[Defining facilities](docker.md#defining-facilities)). `*` names no slug, so it
+needs nothing defined.
 
 For the same reason, a facility that any *active* key grants cannot be deleted:
-`DELETE /v1/facilities/{slug}` is refused with `facility_in_use` until the
-grants are gone, since slugs are immutable and deleting one would silently turn
-those keys deny-all. Deactivating a key releases its grants.
+`DELETE /v1/facilities/{slug}` is refused with `facility_in_use` until the grants
+are gone. Deactivating a key releases its grants.
+
+**Reads** are filtered, not refused. Every PV and snapshot read a restricted key
+makes is filtered; there is no unfiltered read for it to fall back on:
+
+- **PV lists** (`GET /v1/pvs`, `/paged`, `/search`) return only PVs assigned to a
+  facility the key holds.
+- **The snapshot list** (`GET /v1/snapshots`) returns only snapshots filed under
+  a facility the key holds.
+- **A single snapshot or a comparison** (`GET /v1/snapshots/{id}`,
+  `/{id1}/compare/{id2}`) is a `404` if a snapshot is filed under a facility the
+  key doesn't hold, so it can't be read by id either.
+
+A request's own `?facility=` filter is intersected with the key's grant, so it
+can narrow results but never widen them. A key with an empty grant gets zero
+rows, and asking for a facility the key isn't granted returns nothing rather
+than everything. Tags, the device list, and meta-PVs (see below) are global and
+not filtered.
+
+**Writes** are refused, with a `403 insufficient_facility_access` — a filtered
+write would silently do nothing, which is worse than an error. The rules:
+
+- **Updating or deleting a PV requires the key to hold *every* facility
+  affected.** For any PV update, the key must hold all of the PV's current
+  facilities and, when changing its facility list, all of the requested
+  facilities too. This covers both facilities being added and facilities being
+  removed. Deleting a PV requires access to all its current facilities. A key
+  scoped to only one facility cannot update or delete a PV also assigned to
+  another one; holding one shared facility is **not** enough to reach the rest
+  of the row. (A snapshot has at most one facility, so updating or deleting it
+  requires membership in that facility.)
+- A row with **no** facility assignment is writable only by an **unrestricted**
+  key. No grant can cover a row that names no facility, so a restricted key —
+  even one holding every facility that currently exists — is refused, the same
+  way it's refused a row assigned to a facility it doesn't hold. This also
+  means a restricted key can't strip a row's last facility and un-assign it:
+  that write is refused outright, not silently let through because the key
+  held everything the row used to be assigned to. Update and delete report
+  this as `403` (the row's own facility check runs, not the read-masking one
+  reads use), unlike restore and read, which report an unreachable row as
+  `404` instead.
+- Creating a *new* PV requires a facility-restricted key to hold **at least
+  one** of the PV's requested facilities. A PV assigned to multiple facilities
+  may therefore include facilities outside the creator's grant, but each row
+  in a bulk create must independently include at least one facility the key
+  holds. A restricted key cannot create an unassigned PV: that row would not
+  be reachable under the "unassigned requires unrestricted" rule for later
+  writes.
+- Creating a snapshot requires a facility-restricted key to hold the snapshot's
+  facility. The facility is singular; a restricted key cannot create an
+  unassigned snapshot that captures every registered PV.
+- Restoring a snapshot is gated on the snapshot's facility, the same as viewing
+  it: a snapshot the key can't see is a `404`, including an unassigned one for
+  a restricted key. Within a visible snapshot, a PV is included in the restore
+  if the key holds **any one** of its facilities — the same rule capture and
+  listing use, not the full-containment rule update/delete use. Restore
+  only writes the value captured under *this* snapshot's own facility; it
+  never touches the PV's other facilities, so it isn't mutating the shared row
+  the way update/delete do, and doesn't need to require every facility on it.
+  A PV with no facility assignment left, or whose facility was reassigned
+  after capture to one the key holds none of, is skipped and reported in the
+  job result's `skippedPvIds`; if every PV is skipped, the restore is a `403`.
+
+**Where facilities come from.** Both are set by the user. A PV's facilities (it
+can have several) are assigned when it's created or edited, through `facilities`
+on `POST`/`PUT /v1/pvs`. A snapshot has at most one facility, chosen when it's
+taken through `facility` on `POST /v1/snapshots`, and that choice decides what it
+captures: only the PVs assigned to that facility or one of its descendants, the
+same set `GET /v1/pvs?facility=<slug>` returns. An `lcls` snapshot holds the
+`lcls`, `lcls-sc`, and `lcls-nc` PVs, never `facet`'s. PVs with no facility are
+left out. A snapshot with no `facility` captures every registered PV, and only
+an unrestricted key can create one.
+
+**Snapshot reads and restore can disagree on an old snapshot.** A snapshot
+taken before facility scoping existed holds every PV's values as of capture.
+If a PV held then is later reassigned to a facility the key holds none of,
+that key can still read the old values in the snapshot (the snapshot's own
+facility gate is what's checked, not each PV's current one) but `restore`
+skips that PV, since restore checks each PV's *current* facility membership —
+any one shared facility, same as capture and listing. The read is correct as
+history; only a future restore follows today's assignment.
 
 This check and a concurrent mint aren't serialized against each other — each
 runs in its own transaction with no lock between them — so a delete and a mint
@@ -237,6 +322,22 @@ of a key granted the same facility, racing within the same narrow window, could
 each see the other's not-yet-committed state. In practice this needs two admin
 actions targeting the same facility at nearly the same instant, which is far
 outside normal operation; it isn't a guarantee against that specific race.
+
+A related race exists between deleting a facility and a snapshot job already
+queued against it: the in-use check only looks at PVs and snapshots that exist
+*when the facility is deleted*, not jobs already in Redis. A snapshot job
+enqueued for a facility that's deleted before the worker picks it up resolves
+an empty capture scope and produces a zero-PV snapshot whose `facility_id` no
+longer exists in `core.facility` — visible and repairable only by an
+unrestricted key, since a restricted key's facility-filtered reads can't match
+an id with no corresponding row. This is the same class of narrow,
+admin-action-timed race as the one above, not a routine occurrence.
+
+**Meta-PVs are exempt.** Which PVs are meta-PVs (shown as summary columns on every
+snapshot), their display names, and whether they're active are global settings, not
+facility data. Any write-scoped key can add, rename, enable, disable, or remove one,
+and `GET /v1/pvs/meta` lists all of them regardless of the key's facility scope. The
+meta-PV *values* shown on a snapshot follow that snapshot's own facility gate.
 
 ### Why `admin`, not `write`
 
