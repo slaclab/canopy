@@ -4,9 +4,15 @@ One Postgres database, one schema per persistent module. All modules' ORM
 metadata lives on the shared ``canopy.core.db.Base``, so a single autogenerate
 pass sees every module's tables; ``include_schemas=True`` makes the comparison
 schema-aware, and the lone ``alembic_version`` table is pinned to ``public``.
+
+A history mirror runs this same tree against its own database, so the side being
+migrated (publisher or subscriber, from ``CANOPY_ROLE``) goes into the migration
+context, where ``canopy.core.replication.migration.on_publisher`` and
+``on_subscriber`` read it for the few steps that belong to one side only.
 """
 
 import asyncio
+import logging
 from logging.config import fileConfig
 
 from alembic import context
@@ -22,6 +28,7 @@ import canopy.squirrel.data.models  # noqa: F401, E402
 import canopy.core.facilities.models  # noqa: F401, E402
 from canopy.core.db import Base
 from canopy.core.config import get_settings
+from canopy.core.replication.migration import side_for_role
 
 config = context.config
 
@@ -34,7 +41,10 @@ target_metadata = Base.metadata
 # through config.set_main_option(): that stores into ConfigParser, whose
 # %-interpolation would mangle (or reject) a password containing a literal '%'.
 # We inject it straight into the engine config / migration context below instead.
-database_url = get_settings().database_url
+settings = get_settings()
+database_url = settings.database_url
+replication_side = side_for_role(settings.role)
+logging.getLogger("alembic.env").info("CANOPY_ROLE=%s: migrating the replication %s", settings.role, replication_side)
 
 
 def _include_object(obj, name, type_, reflected, compare_to) -> bool:
@@ -59,6 +69,7 @@ def run_migrations_offline() -> None:
         include_schemas=True,
         version_table_schema="public",
         include_object=_include_object,
+        canopy_replication_side=replication_side,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -71,6 +82,7 @@ def do_run_migrations(connection: Connection) -> None:
         include_schemas=True,
         version_table_schema="public",
         include_object=_include_object,
+        canopy_replication_side=replication_side,
     )
     with context.begin_transaction():
         context.run_migrations()

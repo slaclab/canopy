@@ -63,6 +63,58 @@ jobs:
         path: .coverage.linux
         include-hidden-files: true
 
+  # The tests build their tables with create_all, so this job runs the migration tree
+  # itself, as a deploy does: on an empty database as a primary, where `alembic check`
+  # must then find the models and the migrations in agreement, and as a history mirror.
+  # The order a mirror and its primary migrate in is tested in tests-linux
+  # (tests/canopy/core/replication/test_migration_order.py).
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: canopy
+          POSTGRES_PASSWORD: canopy
+          POSTGRES_DB: canopy
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      run: uv sync --group dev
+
+    - name: Migrate a primary
+      run: uv run alembic upgrade head
+      env:
+        CANOPY_DATABASE_URL: postgresql+asyncpg://canopy:canopy@localhost:5432/canopy
+
+    - name: Check the models match the migrations
+      run: uv run alembic check
+      env:
+        CANOPY_DATABASE_URL: postgresql+asyncpg://canopy:canopy@localhost:5432/canopy
+
+    - name: Migrate a history mirror
+      run: |
+        docker exec ${{ job.services.postgres.id }} createdb -U canopy canopy_mirror
+        uv run alembic upgrade head
+      env:
+        CANOPY_ROLE: mirror
+        CANOPY_DATABASE_URL: postgresql+asyncpg://canopy:canopy@localhost:5432/canopy_mirror
+
   # Windows/macOS runners can't run service containers, so skip those tests (their conftest
   # skips when Postgres is unreachable)
   tests-other:
