@@ -38,6 +38,7 @@ essentials:
 | `CANOPY_ROLE` | `primary` (default) or `mirror`. A mirror is a read-only copy of a primary's database: write and admin routes return 403 `read_only_instance` (API-key management still works, since keys are local to each instance), and the worker runs only `ping` and batch conversion. Set it on both the API and the worker |
 | `CANOPY_INSTANCE`, `CANOPY_HISTORY_URL`, `CANOPY_WINDOW_DAYS` | Optional. Reported by `GET /v1/instance` with the role and the Alembic head shipped in the image: the instance name, the URL of its read-only history copy, and how many days of history it keeps (unset means all) |
 | `CANOPY_REPLICATION__PUBLISHER_DSN` | Mirror only, for `python -m canopy.core.replication subscribe`: the libpq connection string the subscription uses to reach the primary as the replication role. Supply it from a secret; the CLI never prints it |
+| `CANOPY_REPLICATION__READER_DSN` | Mirror only, for `python -m canopy.core.replication drift-check`: a `postgresql://` URI to the primary as the read-only reader role. A secret, like the publisher DSN |
 | `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_ROLE`, `__APP_ROLE` | Role names for the replication CLI: on a primary, `publish` grants the replication role (default `replicator`) and the reader role (default `canopy_reader`) SELECT on the published tables; on a mirror, `grants` gives the app role (default `canopy_app`) read access to replicated tables and read-write on API keys |
 | `CANOPY_<MODULE>__<FIELD>` | Per-module tuning (e.g. `CANOPY_VOLE__GLOBAL_BYTES_MAX`) |
 
@@ -83,7 +84,9 @@ On a primary with a read-only history mirror, follow the upgrade with
 `python -m canopy.core.replication publish`, which keeps the replication
 publication in step with the tables. The mirror runs `alembic upgrade head`,
 then `grants` and `refresh`, before its primary deploys; `subscribe` runs once.
-`status` reports either side as JSON. Run each side's migrations with its own
+`status` reports either side as JSON, and `drift-check`, run on the mirror after
+the hourly `refresh`, compares each table with the primary: it exits 1 when the
+copy has drifted (a change replication skipped) and 2 when it can't check. Run each side's migrations with its own
 `CANOPY_ROLE`: a few migration steps run on the primary or on the mirror only (see
 "Database Migrations" in `CONTRIBUTING.md`).
 

@@ -14,5 +14,7 @@ canopy.core.replication`` (see ``__main__``) applies them:
 * mirror, once: ``subscribe``, as the tables' owner with ``pg_create_subscription``
   (or a superuser), with ``CANOPY_REPLICATION__PUBLISHER_DSN`` from a secret.
 
-``status`` reports either side as JSON.
+``status`` reports either side as JSON. ``drift-check`` runs on a mirror, hourly
+after ``refresh``, and compares each table with the primary over a read-only
+connection (``CANOPY_REPLICATION__READER_DSN``).
 """

@@ -7,6 +7,7 @@ Run::
     python -m canopy.core.replication refresh     # mirror: after `grants`, and hourly
     python -m canopy.core.replication subscribe   # mirror: once, after its first migration
     python -m canopy.core.replication status      # either side: JSON on stdout
+    python -m canopy.core.replication drift-check # mirror: compare with the primary, hourly after `refresh`
 
 The database is ``CANOPY_DATABASE_URL`` and the side is ``CANOPY_ROLE`` (each
 command refuses on the wrong one). ``subscribe`` and ``refresh`` name the
@@ -17,6 +18,8 @@ command line, and nothing the CLI prints contains it.
 Logs go to stderr (JSON with ``CANOPY_LOG_FORMAT=json``), so stdout carries only
 ``status`` output. Exit status: 0 done (including "nothing to do"), 1 a database
 step failed, 2 refused (wrong role or a failed precondition; nothing changed).
+``drift-check`` differs: 0 in step, 1 drift found, 2 the check couldn't run (see
+``canopy.core.replication.drift``).
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ import asyncpg
 
 from canopy.core.config import get_settings
 from canopy.core.logging import JsonFormatter
+from canopy.core.replication import drift
 from canopy.core.replication.sql import (
     Refused,
     ReplicationError,
@@ -65,7 +69,23 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("refresh", help="mirror: copy tables the primary has started publishing")
     commands.add_parser("grants", help="mirror: read access for the app role, read-write on local tables")
     commands.add_parser("status", help="either side: replication state as JSON on stdout")
+    check = commands.add_parser("drift-check", help="mirror: compare each table with the primary; exit 1 on drift")
+    check.add_argument("--days", type=_positive_int, help="compare time-series rows from the last DAYS days only")
+    check.add_argument(
+        "--settle",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="pause before re-reading tables that differ, to let apply catch up (default 30; 0 skips the re-check)",
+    )
     return parser
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, not {number}")
+    return number
 
 
 def _configure_logging(log_format: str) -> None:
@@ -135,6 +155,8 @@ async def run(command: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _configure_logging(get_settings().log_format)
+    if args.command == "drift-check":
+        return asyncio.run(drift.run(args))
     return asyncio.run(run(args.command))
 
 
