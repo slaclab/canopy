@@ -4,8 +4,8 @@ All compute is CPU-bound and runs via ``asyncio.to_thread`` to avoid blocking
 the event loop. Timeout is enforced via ``asyncio.wait_for``.
 """
 
-import asyncio
 import ast
+import asyncio
 from collections.abc import Iterable
 
 import numpy as np
@@ -106,14 +106,16 @@ def _bitwise_apply(operator, left: object, right: object | None = None) -> float
 
 def _bitwise_eval_namespace() -> dict[str, object]:
     namespace = build_eval_namespace()
-    namespace.update({
-        "_fox_bitand": lambda left, right: _bitwise_apply(int.__and__, left, right),
-        "_fox_bitor": lambda left, right: _bitwise_apply(int.__or__, left, right),
-        "_fox_bitxor": lambda left, right: _bitwise_apply(int.__xor__, left, right),
-        "_fox_lshift": lambda left, right: _bitwise_apply(int.__lshift__, left, right),
-        "_fox_rshift": lambda left, right: _bitwise_apply(int.__rshift__, left, right),
-        "_fox_invert": lambda value: _bitwise_apply(int.__invert__, value),
-    })
+    namespace.update(
+        {
+            "_fox_bitand": lambda left, right: _bitwise_apply(int.__and__, left, right),
+            "_fox_bitor": lambda left, right: _bitwise_apply(int.__or__, left, right),
+            "_fox_bitxor": lambda left, right: _bitwise_apply(int.__xor__, left, right),
+            "_fox_lshift": lambda left, right: _bitwise_apply(int.__lshift__, left, right),
+            "_fox_rshift": lambda left, right: _bitwise_apply(int.__rshift__, left, right),
+            "_fox_invert": lambda value: _bitwise_apply(int.__invert__, value),
+        }
+    )
     return namespace
 
 

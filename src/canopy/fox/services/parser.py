@@ -9,9 +9,9 @@ Steps:
 6. Return ParsedFormula
 """
 
+import io
 import re
 import ast
-import io
 import tokenize
 from functools import lru_cache
 from dataclasses import dataclass
@@ -218,7 +218,7 @@ def _check_numexpr_compatible(tree: ast.AST) -> bool:
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.FloorDiv):
             return False
         if isinstance(node, ast.BinOp) and isinstance(
-            node.op, (ast.BitAnd, ast.BitOr, ast.BitXor, ast.LShift, ast.RShift)
+            node.op, ast.BitAnd | ast.BitOr | ast.BitXor | ast.LShift | ast.RShift
         ):
             return False
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
@@ -265,9 +265,9 @@ def _normalize_bitwise_precedence(expression: str) -> str:
                     index = close
                     continue
             is_bitwise = token.type == tokenize.OP and token.string in bitwise
-            is_boundary = (
-                token.type == tokenize.OP and token.string in boundaries
-            ) or (token.type == tokenize.NAME and token.string in boundaries)
+            is_boundary = (token.type == tokenize.OP and token.string in boundaries) or (
+                token.type == tokenize.NAME and token.string in boundaries
+            )
             if is_bitwise or is_boundary:
                 has_bitwise = has_bitwise or is_bitwise
                 pending_segments.append((segment_start, index, comparison_in_segment))
@@ -283,9 +283,19 @@ def _normalize_bitwise_precedence(expression: str) -> str:
         for first, last, has_comparison in pending_segments:
             if not has_comparison:
                 continue
-            while first < last and tokens[first].type in (tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT):
+            while first < last and tokens[first].type in (
+                tokenize.NL,
+                tokenize.NEWLINE,
+                tokenize.INDENT,
+                tokenize.DEDENT,
+            ):
                 first += 1
-            while last > first and tokens[last - 1].type in (tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT):
+            while last > first and tokens[last - 1].type in (
+                tokenize.NL,
+                tokenize.NEWLINE,
+                tokenize.INDENT,
+                tokenize.DEDENT,
+            ):
                 last -= 1
             if first < last:
                 start_offset = _token_offset(expression, tokens[first].start)
