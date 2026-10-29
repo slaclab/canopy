@@ -250,8 +250,9 @@ makes is filtered; there is no unfiltered read for it to fall back on:
 A request's own `?facility=` filter is intersected with the key's grant, so it
 can narrow results but never widen them. A key with an empty grant gets zero
 rows, and asking for a facility the key isn't granted returns nothing rather
-than everything. Tags, the device list, and meta-PVs (see below) are global and
-not filtered.
+than everything. A `?facility=` naming a facility that doesn't exist is a
+`404 facility_not_found`. Tags, the device list, and meta-PVs (see below) are
+global and not filtered.
 
 **Writes** are refused, with a `403 insufficient_facility_access` — a filtered
 write would silently do nothing, which is worse than an error. The rules:
