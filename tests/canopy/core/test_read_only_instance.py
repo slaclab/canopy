@@ -27,10 +27,11 @@ from canopy.core.security import (
     require_write_access,
     ws_require_write_access,
     require_local_admin_access,
+    require_machine_write_access,
 )
 from canopy.core.forwarding import routes as forwarding_routes
 
-MIRROR_REFUSED_GATES = {require_write_access, require_admin_access}
+MIRROR_REFUSED_GATES = {require_write_access, require_admin_access, require_machine_write_access}
 
 # Non-GET routes that a mirror keeps serving. Read-scoped: they compute, validate
 # or subscribe, and write nothing replicated or on the machine.
@@ -113,13 +114,16 @@ def test_write_and_admin_routes_are_refused_on_a_mirror(method, path, mirror_rol
 
 
 # On a forward instance the middleware answers forwardable routes before any gate
-# runs (tests/canopy/core/forwarding); every other write or admin route is refused
-# there exactly as on a mirror. Shared-table writes count as refused: they are
-# forwarded only with CANOPY_FORWARD__ALLOW_SHARED.
+# runs, and machine writes depend on CANOPY_MACHINE_ACCESS (both in
+# tests/canopy/core/forwarding); every other write or admin route is refused there
+# exactly as on a mirror. Shared-table writes count as refused: they are forwarded
+# only with CANOPY_FORWARD__ALLOW_SHARED.
 FORWARD_REFUSED = [
     (method, path)
-    for method, path in REFUSED
-    if forwarding_routes.match(method, _concrete(path), allow_shared=False) is None
+    for method, path, route in ROUTES
+    if (method, path) in REFUSED
+    and forwarding_routes.match(method, _concrete(path), allow_shared=False) is None
+    and require_machine_write_access not in _calls(route.dependant)
 ]
 
 
@@ -134,14 +138,14 @@ def test_routes_not_forwarded_are_refused_on_a_forward_instance(method, path, fo
     assert resp.json() == {"code": "read_only_instance", "detail": security.NOT_FORWARDED_DETAIL}
 
 
-def test_a_forward_instance_still_refuses_restores_hare_puts_and_shared_tables():
+def test_a_forward_instance_still_refuses_shared_tables_and_debug_routes():
     assert {
-        ("POST", "/squirrel/v1/snapshots/{snapshot_id}/restore"),
-        ("PUT", "/hare/v1/pvs/{pv:path}"),
         ("POST", "/squirrel/v1/tags"),
         ("POST", "/magpie/v1/configs/{app}"),
+        ("POST", "/vole/v1/_debug/evict/{pv:path}"),
     } <= set(FORWARD_REFUSED)
     assert ("POST", "/squirrel/v1/snapshots") not in FORWARD_REFUSED
+    assert ("PUT", "/hare/v1/pvs/{pv:path}") not in FORWARD_REFUSED
 
 
 def test_the_refused_set_covers_the_machine_and_data_writes():

@@ -1,7 +1,11 @@
+import logging
 from typing import Literal
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -46,6 +50,12 @@ class Settings(BaseSettings):
         On a primary, trust ``X-Canopy-On-Behalf-Of`` from service keys, so a forward
         instance's writes are recorded under the user it sent them for. Off by
         default: the header is then refused from every key.
+    machine_access : {"read", "write"}
+        On a forward instance, ``"write"`` lets it change the machine: a Hare PV
+        write runs here, through this instance's own EPICS gateway, and a snapshot
+        restore is forwarded to the primary. With ``"read"`` (the default) both are
+        refused with ``machine_read_only``. Ignored on other roles: a primary always
+        controls the machine and a mirror never does.
     """
 
     model_config = SettingsConfigDict(
@@ -93,11 +103,24 @@ class Settings(BaseSettings):
 
     # Primary only: accept writes a forward instance sends on a user's behalf.
     accept_forwarded_writes: bool = False
+    # Forward only: whether machine writes (Hare PUT here, restore on the primary) are allowed.
+    machine_access: Literal["read", "write"] = "read"
 
     @property
     def is_replica(self) -> bool:
         """Whether this instance's database is a subscriber's copy (``mirror`` or ``forward``)."""
         return self.role != "primary"
+
+    @property
+    def machine_writes(self) -> bool:
+        """Whether this instance may change the machine, by itself or through its primary."""
+        return self.role == "primary" or (self.role == "forward" and self.machine_access == "write")
+
+    @model_validator(mode="after")
+    def _warn_on_inert_machine_access(self) -> "Settings":
+        if self.machine_access == "write" and self.role != "forward":
+            logger.warning("CANOPY_MACHINE_ACCESS=write has no effect with CANOPY_ROLE=%s", self.role)
+        return self
 
 
 @lru_cache

@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from canopy.core import db, security
 from canopy.main import app
+from canopy.core.config import get_settings
 from canopy.core.modules import WILDCARD
 from canopy.core.security import APIKey
 from canopy.core.forwarding import middleware
@@ -146,10 +147,10 @@ class TestRefusedHere:
         assert resp.status_code == 403
         assert resp.json() == {"code": "read_only_instance", "detail": security.NOT_FORWARDED_DETAIL}
 
-    def test_restore(self, client):
+    def test_restore_without_machine_access(self, client):
         resp = client.post(f"/squirrel/v1/snapshots/{SNAPSHOT_ID}/restore", headers=_as(WRITER))
 
-        assert resp.json()["code"] == "read_only_instance"
+        assert resp.json()["code"] == "machine_read_only"
 
 
 def test_shared_tables_with_the_policy(client, httpx_mock: HTTPXMock, monkeypatch):
@@ -288,6 +289,15 @@ class TestArchivedImmutable:
         resp = await http.request(
             method, f"/squirrel/v1/snapshots/{snapshot_id}", json={"retain": True}, headers=_as(WRITER)
         )
+
+        assert resp.json()["code"] == "archived_immutable"
+
+    async def test_an_old_restore_is_refused_here_too(self, http, windowed, monkeypatch):
+        monkeypatch.setenv("CANOPY_MACHINE_ACCESS", "write")
+        get_settings.cache_clear()
+        snapshot_id = await self._snapshot(400)
+
+        resp = await http.post(f"/squirrel/v1/snapshots/{snapshot_id}/restore", headers=_as(WRITER))
 
         assert resp.json()["code"] == "archived_immutable"
 

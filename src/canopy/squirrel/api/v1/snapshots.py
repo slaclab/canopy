@@ -230,9 +230,14 @@ async def delete_snapshot(snapshot_id: str, service: SnapshotServiceDep) -> bool
 async def restore_snapshot(
     snapshot_id: str,
     service: SnapshotServiceDep,
+    actor: ActorDep,
     request: RestoreRequestDTO | None = None,
 ) -> JobCreatedDTO:
-    """Enqueue a restore of a snapshot's setpoints to EPICS (``pv_ids=None`` restores all)."""
+    """Enqueue a restore of a snapshot's setpoints to EPICS (``pv_ids=None`` restores all).
+
+    Logs who asked (the key's name, or the user a forward instance sent it for):
+    a restore changes the machine and stores no row of its own.
+    """
     if not is_uuid(snapshot_id) or not await service.snapshot_exists(snapshot_id):
         raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
     # Narrow the write set to the key's facilities here, pre-enqueue — the worker has no
@@ -245,6 +250,13 @@ async def restore_snapshot(
         raise BadRequest("Nothing to restore: none of the requested PVs are in this snapshot")
     job_id = await jobs_gateway.enqueue(
         "restore_snapshot_task", snapshot_id=snapshot_id, pv_ids=pv_ids, skipped_pv_ids=skipped
+    )
+    logger.info(
+        "Restore of snapshot %s queued as job %s for %s (%s PVs)",
+        snapshot_id,
+        job_id,
+        actor,
+        "all" if pv_ids is None else len(pv_ids),
     )
     return JobCreatedDTO(job_id=job_id, status_url=f"/jobs/v1/{job_id}")
 

@@ -27,11 +27,12 @@ from canopy.core.config import get_settings
 from canopy.core.errors import (
     CanopyError,
     InvalidAPIKey,
+    MachineReadOnly,
     ArchivedImmutable,
     InsufficientWriteAccess,
     InsufficientModuleAccess,
 )
-from canopy.core.security import APIKey, get_registry
+from canopy.core.security import MACHINE_READ_ONLY_DETAIL, APIKey, get_registry
 from canopy.core.forwarding import routes
 from canopy.core.forwarding.client import (
     PASSED_RESPONSE_HEADERS,
@@ -158,7 +159,12 @@ class ForwardingMiddleware:
 
     @staticmethod
     async def _authorize(token: str | None, route: routes.ForwardRoute) -> APIKey:
-        """The caller's key on this instance, holding write scope on the route's module."""
+        """The caller's key on this instance, holding write scope on the route's module.
+
+        Same order as the gates: an unknown key is a 401 and a machine route without
+        machine access a ``machine_read_only`` before the key's scope is looked at,
+        so no key is suggested as the fix.
+        """
         if not token:
             raise InvalidAPIKey("Missing X-API-Key header")
         key = await get_registry().get(token)
@@ -166,6 +172,8 @@ class ForwardingMiddleware:
             raise InvalidAPIKey("Invalid API key")
         if not key.allows_module(route.module):
             raise InsufficientModuleAccess(f"API key is not scoped to '{route.module}'")
+        if route.route_class is routes.MACHINE and not get_settings().machine_writes:
+            raise MachineReadOnly(MACHINE_READ_ONLY_DETAIL)
         if not key.write:
             raise InsufficientWriteAccess("API key does not have write access")
         return key

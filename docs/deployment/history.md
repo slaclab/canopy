@@ -220,11 +220,13 @@ test fails when a new route is in neither list.
 |---|---|
 | Snapshots (capture, edit, retain, delete, import) and PVs | Yes |
 | Tag groups and tags, meta-PVs, Magpie configs, which every facility shares | Only with `CANOPY_FORWARD__ALLOW_SHARED=true` |
-| Snapshot restore, Hare PV write | No: they change the machine |
+| Snapshot restore | Only with `CANOPY_MACHINE_ACCESS=write`; the primary's worker restores |
+| Hare PV write | No; with `CANOPY_MACHINE_ACCESS=write` it runs on the forward instance, through its own EPICS gateway, which must allow writes |
 | API keys | No: each instance manages its own |
 | Facilities | No: define them on the primary; the mirror copies them |
 
-Anything not forwarded is refused as on a mirror, with 403 `read_only_instance`. A
+Anything not forwarded is refused as on a mirror, with 403 `read_only_instance`, and
+a machine write without machine access with 403 `machine_read_only`. A
 change to a snapshot older than `CANOPY_FORWARD__PRIMARY_WINDOW_DAYS` is refused with
 409 `archived_immutable` unless the snapshot is retained, since the primary may have
 pruned it. To bring such a snapshot back, export it here
@@ -232,7 +234,7 @@ pruned it. To bring such a snapshot back, export it here
 `POST /squirrel/v1/snapshots/import`, which is forwarded and creates a new snapshot on
 the primary.
 
-A forwarded capture runs as a job on the primary. Clients poll it here as usual:
+A forwarded capture or restore runs as a job on the primary. Clients poll it here as usual:
 `GET /jobs/v1/{id}` asks the primary about a job this instance doesn't have.
 
 ### Who wrote it
@@ -242,7 +244,7 @@ the primary with its service key and names the caller in `X-Canopy-On-Behalf-Of`
 `<key name>@<instance>`. The primary trusts that header only from a service key and
 only with `CANOPY_ACCEPT_FORWARDED_WRITES=true`; otherwise it refuses the request with
 403 `forwarded_write_refused`. It records the name in `createdBy` (snapshot captures,
-Magpie configs) and logs it for imports.
+Magpie configs) and logs it for restores and imports.
 
 The caller's facility grant goes with the request too, in
 `X-Canopy-On-Behalf-Of-Facilities`, and the primary requires it alongside
@@ -265,8 +267,8 @@ For a forwarded request that committed a write, the primary returns
 `X-Canopy-Commit-LSN`. The forward instance waits up to `CANOPY_FORWARD__WAIT_S`
 (2 s) for its subscription's applied position (`pg_replication_origin_status`) to
 reach it. If it doesn't, the answer carries `X-Canopy-Replica-Stale: true`: the write
-succeeded, but a read straight after it may not show it yet. A capture commits later,
-in the primary's worker, so it carries no position.
+succeeded, but a read straight after it may not show it yet. Captures and restores
+commit later, in the primary's worker, so they carry no position.
 
 The view is readable only by superusers by default. As a superuser on the forward
 instance's database, grant its app role both:
@@ -282,8 +284,8 @@ Without them every forwarded write is marked stale.
 
 On the forward instance: `CANOPY_ROLE=forward`, `CANOPY_FORWARD__PRIMARY_URL` (https),
 `CANOPY_FORWARD__SERVICE_KEY` from a secret, and `CANOPY_FORWARD__PRIMARY_WINDOW_DAYS`
-set to the primary's `CANOPY_WINDOW_DAYS`. Optional: `CANOPY_FORWARD__ALLOW_SHARED` and
-`CANOPY_FORWARD__CA_BUNDLE`. On the primary: `CANOPY_ACCEPT_FORWARDED_WRITES=true`. The
+set to the primary's `CANOPY_WINDOW_DAYS`. Optional: `CANOPY_FORWARD__ALLOW_SHARED`,
+`CANOPY_MACHINE_ACCESS` and `CANOPY_FORWARD__CA_BUNDLE`. On the primary: `CANOPY_ACCEPT_FORWARDED_WRITES=true`. The
 full list is in the [environment table](index.md). Deploy the forward instance from
 the same release as its primary, so what it forwards has the shapes the primary
 expects.

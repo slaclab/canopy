@@ -34,6 +34,7 @@ class ErrorCode(StrEnum):
     FORWARDED_WRITE_REFUSED = auto()
     ARCHIVED_IMMUTABLE = auto()
     PRIMARY_UNAVAILABLE = auto()
+    MACHINE_READ_ONLY = auto()
 
     # Mole
     ARCHIVER_NOT_CONFIGURED = auto()
@@ -296,6 +297,17 @@ class PrimaryUnavailable(CanopyError):
 
 class PrimaryTimeout(PrimaryUnavailable):
     status_code = 504
+
+
+class MachineReadOnly(CanopyError):
+    """A forward instance without machine access refused a machine write (a PV write, a restore).
+
+    Distinct from ``ReadOnlyInstance``: the instance does take some writes, just
+    not ones that change the machine (``CANOPY_MACHINE_ACCESS=read``).
+    """
+
+    status_code = 403
+    error_code = ErrorCode.MACHINE_READ_ONLY
 
 
 def register_canopy_error_handler(app: FastAPI) -> None:
