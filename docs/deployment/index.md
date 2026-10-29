@@ -41,6 +41,8 @@ essentials:
 | `CANOPY_INSTANCE`, `CANOPY_HISTORY_URL`, `CANOPY_WINDOW_DAYS` | Optional. Reported by `GET /v1/instance` with the role and the Alembic head shipped in the image: the instance name, the URL of its read-only history copy, and how many days of history it keeps (unset means all) |
 | `CANOPY_REPLICATION__PUBLISHER_DSN` | Mirror only, for `python -m canopy.core.replication subscribe`: the libpq connection string the subscription uses to reach the primary as the replication role. Supply it from a secret; the CLI never prints it |
 | `CANOPY_REPLICATION__READER_DSN` | Mirror only, for `python -m canopy.core.replication drift-check`: a `postgresql://` URI to the primary as the read-only reader role. A secret, like the publisher DSN |
+| `CANOPY_REPLICATION__HEARTBEAT_DSN` | Mirror only, for `heartbeat` and `switch`: a `postgresql://` URI to the primary as the heartbeat role. `heartbeat` records the mirror's backup, WAL-archive and drift checks in the primary's `core.history_heartbeat`; `switch` reads the subscription slot's position. Supply it from a secret; the CLI never prints it |
+| `CANOPY_REPLICATION__HEARTBEAT_ROLE` | The role `HEARTBEAT_DSN` logs in as (default `canopy_heartbeat`); `publish` lets it write `core.history_heartbeat` and nothing else |
 | `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_ROLE`, `__APP_ROLE` | Role names for the replication CLI: on a primary, `publish` grants the replication role (default `replicator`) and the reader role (default `canopy_reader`) SELECT on the published tables; on a mirror, `grants` gives the app role (default `canopy_app`) read access to replicated tables and read-write on API keys |
 | `CANOPY_<MODULE>__<FIELD>` | Per-module tuning (e.g. `CANOPY_VOLE__GLOBAL_BYTES_MAX`) |
 

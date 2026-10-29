@@ -6,7 +6,11 @@ import pytest
 
 from canopy.core.replication.sql import Refused
 from canopy.core.replication.registry import REGISTRY
-from canopy.core.replication.publisher import publish, publisher_status
+from canopy.core.replication.publisher import (
+    publish,
+    publisher_status,
+    publication_layout,
+)
 
 from .conftest import privileges
 
@@ -30,7 +34,11 @@ async def test_publish_creates_the_publication_from_the_registry(db, config, cap
     assert tuple(row.values()) == (True, True, True, False)
     assert result["publications"]["canopy_history"]["created"] is True
     assert result["missing"] == []
-    assert result["roles"] == {config.replicator_role: "absent", config.reader_role: "absent"}
+    assert result["roles"] == {
+        config.replicator_role: "absent",
+        config.reader_role: "absent",
+        config.heartbeat_role: "absent",
+    }
     assert "Not in this database yet" not in caplog.text
 
 
@@ -92,7 +100,11 @@ async def test_publish_grants_existing_roles_select_on_published_tables_only(db,
 
     result = await publish(db, role="primary", config=config)
 
-    assert result["roles"] == {config.replicator_role: "granted", config.reader_role: "granted"}
+    assert result["roles"] == {
+        config.replicator_role: "granted",
+        config.reader_role: "granted",
+        config.heartbeat_role: "absent",
+    }
     for role in (config.replicator_role, config.reader_role):
         for table in PRESENT:
             assert await privileges(db, role, table) == {"SELECT"}, (role, table)
@@ -134,7 +146,88 @@ async def test_publisher_status(db, config):
             "unexpected": [],
         }
     ]
-    assert after["roles"] == {config.replicator_role: True, config.reader_role: False}
+    assert after["roles"] == {config.replicator_role: True, config.reader_role: False, config.heartbeat_role: False}
     assert after["slots"] == []
     assert after["wal_level"] in {"replica", "logical"}
     assert after["current_lsn"]
+
+
+# --- the split layout --------------------------------------------------------- #
+
+REFERENCE = sorted(t for t in PRESENT if REGISTRY.tables[t].value == "reference")
+TIME_SERIES = sorted(t for t in PRESENT if REGISTRY.tables[t].value == "time_series")
+
+
+async def _publications(conn) -> dict[str, tuple[list[str], tuple]]:
+    rows = await conn.fetch("SELECT pubname, pubinsert, pubupdate, pubdelete, pubtruncate FROM pg_publication")
+    tables = await conn.fetch("SELECT pubname, schemaname || '.' || tablename AS name FROM pg_publication_tables")
+    return {
+        row["pubname"]: (
+            sorted(t["name"] for t in tables if t["pubname"] == row["pubname"]),
+            tuple(row.values())[1:],
+        )
+        for row in rows
+    }
+
+
+async def test_split_creates_the_pair_beside_canopy_history(db, config):
+    await publish(db, role="primary", config=config)
+    assert await publication_layout(db) == "single"
+
+    result = await publish(db, role="primary", config=config, split=True)
+
+    assert result["layout"] == "switching"
+    assert await _publications(db) == {
+        "canopy_history": (PRESENT, (True, True, True, False)),
+        "canopy_ref": (REFERENCE, (True, True, True, False)),
+        "canopy_ts": (TIME_SERIES, (True, True, False, False)),
+    }
+    # A deploy's plain publish keeps all three in step and switches nothing.
+    again = await publish(db, role="primary", config=config)
+    assert again["layout"] == "switching"
+    assert set(again["publications"]) == {"canopy_history", "canopy_ref", "canopy_ts"}
+
+
+async def test_split_keeps_canopy_history_until_a_mirror_is_seen_streaming_the_pair(db, config):
+    await publish(db, role="primary", config=config, split=True)
+    await db.execute("CREATE PUBLICATION canopy_history FOR TABLE squirrel.pv")
+
+    with pytest.raises(Refused, match="canopy_history is still needed: no history mirror's slot exists here"):
+        await publish(db, role="primary", config=config, split=True)
+
+    assert await publication_layout(db) == "switching"
+
+
+async def test_split_on_a_new_primary_creates_only_the_pair(db, config):
+    result = await publish(db, role="primary", config=config, split=True)
+
+    assert result["layout"] == "split"
+    assert set(await _publications(db)) == {"canopy_ref", "canopy_ts"}
+    status = await publisher_status(db, config=config)
+    assert status["layout"] == "split"
+    assert [p["name"] for p in status["publications"]] == ["canopy_ref", "canopy_ts"]
+    assert all(p["exists"] and not p["missing"] for p in status["publications"])
+
+
+async def test_status_reports_the_layout_in_use(db, config):
+    assert (await publisher_status(db, config=config))["layout"] == "none"
+    await publish(db, role="primary", config=config)
+    single = await publisher_status(db, config=config)
+    await publish(db, role="primary", config=config, split=True)
+    switching = await publisher_status(db, config=config)
+
+    assert (single["layout"], [p["name"] for p in single["publications"]]) == ("single", ["canopy_history"])
+    assert switching["layout"] == "switching"
+    assert [p["name"] for p in switching["publications"]] == ["canopy_history", "canopy_ref", "canopy_ts"]
+
+
+async def test_publish_lets_the_heartbeat_role_write_its_table_only(db, config):
+    await db.execute(f'CREATE ROLE "{config.heartbeat_role}"')
+    await db.execute(f'GRANT SELECT ON squirrel.pv TO "{config.heartbeat_role}"')
+
+    result = await publish(db, role="primary", config=config)
+
+    assert result["roles"][config.heartbeat_role] == "granted"
+    assert await privileges(db, config.heartbeat_role, "core.history_heartbeat") == {"SELECT", "INSERT", "UPDATE"}
+    for table in PRESENT + ["core.api_key"]:
+        assert await privileges(db, config.heartbeat_role, table) == set(), table
