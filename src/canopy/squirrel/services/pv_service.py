@@ -114,9 +114,8 @@ class PvService:
         empty) is refused for a restricted key: no grant can cover a row with no
         facility, so only an unrestricted key may touch one, mirroring the read side
         once ``_in_facility_scope``-style filtering excludes it from a restricted key's
-        list. Mint-time assignment is a separate, equally strict check — see
-        ``_require_facility_for_create`` — since minting new unscoped data is a
-        different act from mutating an existing unassigned row.
+        list. Mint-time assignment uses the separate create policy in
+        ``_require_facility_for_create``.
         """
         if self.facility_scope is None:
             return
@@ -126,19 +125,15 @@ class PvService:
     def _require_facility_for_create(self, facility_ids: set[str], what: str) -> None:
         """Gate the facilities a *new* row is being created with.
 
-        **Same full-containment policy as ``_require_facility_write``:** a restricted
-        key must hold *every* facility it's naming, not just one — otherwise it could
-        mint a row into a facility it was never granted, just by also naming one it
-        does hold. An empty ``facility_ids`` is refused outright (unlike a bare
-        ``row_facility_ids & self.facility_scope`` check would allow), since a
-        restricted key minting an unassigned row would then be unable to reach it again
-        under ``_require_facility_write``'s unrestricted-only rule for unassigned rows.
-        Mirrors the equivalent gate in ``SnapshotService`` routes for snapshot creation.
+        A restricted key must hold at least one of the requested facilities. An empty
+        ``facility_ids`` is refused outright, since a restricted key minting an
+        unassigned row would then be unable to reach it again under
+        ``_require_facility_write``'s unrestricted-only rule for unassigned rows.
         """
         if self.facility_scope is None:
             return
-        if not facility_ids or not facility_ids.issubset(self.facility_scope):
-            raise InsufficientFacilityAccess(f"API key is not scoped to all of {what}'s facility(s)")
+        if not facility_ids.intersection(self.facility_scope):
+            raise InsufficientFacilityAccess(f"API key is not scoped to any of {what}'s facility(s)")
 
     async def _resolve_slugs(self, slugs: list[str] | set[str]) -> dict[str, str]:
         """Facility slugs -> ``{slug: id}``, in one round trip regardless of how many
@@ -310,10 +305,10 @@ class PvService:
 
         # Resolve the whole import's distinct slugs up front — one gateway round trip
         # each instead of one per (row, slug) pair — but gate per row, with full
-        # containment of each row's own facilities (see `_require_facility_for_create`):
+        # overlap of each row's own facilities (see `_require_facility_for_create`):
         # collapsing the import into one set and requiring only that it overlap the
-        # grant would let a row naming an out-of-scope facility ride in alongside one
-        # the key can reach. Gated before the existence checks below, for the same
+        # grant would let a row with no facility the key can reach ride in alongside
+        # one the key can reach. Gated before the existence checks below, for the same
         # reason as `create`: an out-of-scope row's existence must not leak through a
         # `PvAlreadyExists` message before the facility refusal.
         ids_by_slug = await self._resolve_slugs(
@@ -378,8 +373,8 @@ class PvService:
         if not pv:
             return None
         facility_ids = await self.pv_repo.facility_ids_for(pv_id)
-        # Full containment of the PV's *current* facilities, not just one of them: see
-        # the policy note on `_require_facility_write`.
+        # Require access to all current facilities, including any that may be removed
+        # below: see the policy note on `_require_facility_write`.
         self._require_facility_write(facility_ids, "this PV")
         if data.facilities is not None:
             new_ids = set((await self._resolve_slugs(data.facilities)).values())
@@ -392,11 +387,8 @@ class PvService:
                 raise InsufficientFacilityAccess(
                     "API key is scoped to specific facilities; cannot unassign this PV's last facility"
                 )
-            # Full containment of the *new* set too: a key holding only one of several
-            # facilities a PV is being assigned to must not be able to add the others on
-            # its say alone. `facility_ids` (the current set) is already fully contained
-            # by the check above, so this alone covers both the added and removed sides
-            # of the change.
+            # Require access to all requested facilities as well as all current ones,
+            # covering both additions and removals.
             if self.facility_scope is not None and (outside := new_ids - self.facility_scope):
                 raise InsufficientFacilityAccess(
                     f"API key is not scoped to the requested facility(s) {sorted(outside)}"

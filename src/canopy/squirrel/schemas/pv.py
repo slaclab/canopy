@@ -24,7 +24,7 @@ class NewPVElementDTO(PVBase):
     tags: list[str] = []  # Tag IDs
     # Facility *slugs*, not ids — consistent with `NewSnapshotDTO.facility` and with
     # the slugs a key's facility grant carries. Empty means unassigned, which is a
-    # valid state: an unassigned PV is writable by any write-scoped key.
+    # valid state: an unassigned PV is writable only by an unrestricted key.
     facilities: list[str] = []
 
     @model_validator(mode="after")
