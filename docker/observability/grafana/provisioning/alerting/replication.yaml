@@ -1,0 +1,285 @@
+# Alert rules for replication to a history mirror, on the gauges from
+# canopy.core.replication.metrics (docs/observability/metrics.md, "Replication").
+# The primary's rules watch its logical slots: an inactive slot or a slot near the
+# WAL cap fills the primary's disk, and a lost slot means re-seeding the mirror.
+# The mirror's rules watch its subscription. Series that don't exist (a primary
+# with no mirror) evaluate to "no data", which is OK.
+#
+# Grafana loads these at startup; they are read-only in the UI, like the
+# provisioned dashboards. No contact point is provisioned: route the
+# `team: canopy` label from a notification policy where one is wanted.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: Replication
+    folder: Canopy
+    interval: 1m
+    rules:
+      - uid: canopy-replication-slot-inactive
+        title: Replication slot inactive
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical, team: canopy}
+        annotations:
+          summary: "Slot {{ $labels.slot }} on {{ $labels.instance }} has had no mirror streaming from it for 15 minutes."
+          description: >-
+            The primary keeps every WAL file the slot still needs until the mirror reconnects or
+            max_slot_wal_keep_size invalidates the slot. Check the mirror's subscription worker and
+            the network path to the primary's Postgres.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: canopy_replication_slot_active{kind!="other"}
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: lt, params: [1]}
+
+      - uid: canopy-replication-slot-wal-retained
+        title: Replication slot holds over half its WAL cap
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: canopy}
+        annotations:
+          summary: "Slot {{ $labels.slot }} on {{ $labels.instance }} keeps over half of max_slot_wal_keep_size."
+          description: >-
+            At the cap Postgres invalidates the slot (wal_status lost) and the mirror has to be
+            re-seeded. The mirror is behind or disconnected.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: >-
+                canopy_replication_slot_retained_bytes
+                / ignoring(slot, kind) group_left canopy_replication_max_slot_wal_keep_bytes
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0.5]}
+
+      - uid: canopy-replication-slot-wal-status
+        title: Replication slot WAL not reserved
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical, team: canopy}
+        annotations:
+          summary: "Slot {{ $labels.slot }} on {{ $labels.instance }} has left wal_status reserved."
+          description: >-
+            extended or unreserved: the slot is keeping WAL past max_wal_size and is heading for the
+            cap. lost: the WAL the mirror needs is gone; follow the slot-lost runbook.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: canopy_replication_slot_wal_status{kind!="other", wal_status="reserved"}
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: lt, params: [1]}
+
+      - uid: canopy-replication-no-wal-cap
+        title: Replication slot without a WAL cap
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: canopy}
+        annotations:
+          summary: "{{ $labels.instance }} has a replication slot but no max_slot_wal_keep_size."
+          description: >-
+            Without the cap a stalled mirror makes the primary keep WAL until its disk is full, and the
+            half-the-cap alert can't fire. Set max_slot_wal_keep_size on the primary.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: >-
+                count by (job, instance) (canopy_replication_slot_active)
+                unless on(job, instance) canopy_replication_max_slot_wal_keep_bytes
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+
+      - uid: canopy-replication-worker-down
+        title: Mirror apply worker not running
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical, team: canopy}
+        annotations:
+          summary: "Subscription {{ $labels.subscription }} on {{ $labels.instance }} has no apply worker."
+          description: >-
+            The mirror isn't receiving changes. The subscription may be disabled, or its worker may be
+            failing to connect to the primary or to apply a change (see the apply-errors alert).
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: canopy_replication_subscription_worker_up
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: lt, params: [1]}
+
+      - uid: canopy-replication-receive-stale
+        title: Mirror hasn't heard from the primary
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: canopy}
+        annotations:
+          summary: "Subscription {{ $labels.subscription }} on {{ $labels.instance }} has received nothing for 5 minutes."
+          description: >-
+            The primary sends a keepalive at least every half wal_sender_timeout, so silence means the
+            connection is down or stuck.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: canopy_replication_subscription_receive_age_seconds
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [300]}
+
+      - uid: canopy-replication-apply-errors
+        title: Mirror failing to apply changes
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical, team: canopy}
+        annotations:
+          summary: "Subscription {{ $labels.subscription }} on {{ $labels.instance }} hit apply or copy errors."
+          description: >-
+            Apply retries the same transaction until it succeeds, so one bad change (a column the
+            mirror lacks, a duplicate key) stops all replication. The mirror's Postgres log has the error.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 900, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: >-
+                increase(canopy_replication_subscription_apply_errors_total[15m])
+                + increase(canopy_replication_subscription_sync_errors_total[15m])
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+
+      - uid: canopy-replication-copy-stuck
+        title: Mirror table copy not finishing
+        condition: C
+        for: 1h
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: canopy}
+        annotations:
+          summary: "Subscription {{ $labels.subscription }} on {{ $labels.instance }} has tables still copying after an hour."
+          description: >-
+            A failed initial copy leaves the table unsynchronized and an inactive slot on the primary
+            holding WAL. Check the mirror's log and `python -m canopy.core.replication status`.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: canopy_replication_subscription_tables_not_ready
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+
+      - uid: canopy-replication-status-down
+        title: Replication status unreadable
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: canopy}
+        annotations:
+          summary: "{{ $labels.instance }} can't read its replication status, so its other replication alerts are blind."
+          description: >-
+            The API's metrics refresh can't query its database, or a mirror has no CANOPY_INSTANCE.
+            The API log has the reason.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: canopy_replication_status_up
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: lt, params: [1]}

@@ -125,11 +125,56 @@ speculatively.
   count includes in-process consumers (Vole holds a permanent broker client),
   exactly as the health summary does.
 
+- **Replication** to a history mirror (`canopy.core.replication.metrics`); see
+  [Replication](#replication) below.
+
 Candidates deliberately **not** built yet, each its own follow-up: Hare event
 queue depth and dropped updates, Mole archiver round-trip latency, Vole
 ring-buffer bytes and evictions, Fox evaluation latency, Squirrel restore
 durations (a worker-side metric, so it also waits on the worker exposition
 above).
+
+## Replication
+
+An instance with a history mirror reports its side of the replication, read
+from the same status function as `python -m canopy.core.replication status`.
+That status comes from database queries, which are async, and a collector's
+`collect()` is not, so this is the one collector that doesn't fetch at
+collect time: the `/metrics` handler awaits its refresh just before rendering.
+The refresh opens its own short-lived connection (`CANOPY_DATABASE_URL`,
+`application_name=canopy-metrics`) with a two-second budget. If it fails, the
+scrape still succeeds and carries only `canopy_replication_status_up 0`.
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `canopy_replication_status_up` | | 1 when this scrape read the status |
+| `canopy_replication_slot_active` | `slot`, `kind` | Primary: 1 while a mirror streams from the logical slot. `kind` is `subscription`, `tablesync` (an initial table copy) or `other` |
+| `canopy_replication_slot_wal_status` | `slot`, `kind`, `wal_status` | 1 for the slot's current `wal_status` (`reserved`, `extended`, `unreserved`, `lost`) |
+| `canopy_replication_slot_retained_bytes` | `slot`, `kind` | WAL the slot keeps on the primary's disk |
+| `canopy_replication_slot_lag_bytes` | `slot`, `kind` | WAL the mirror hasn't confirmed applying: **the** replication lag |
+| `canopy_replication_slot_safe_wal_bytes` | `slot`, `kind` | WAL left before the slot is lost (only under a cap) |
+| `canopy_replication_max_slot_wal_keep_bytes` | | The primary's `max_slot_wal_keep_size`; absent when unlimited |
+| `canopy_replication_subscription_exists`, `_enabled`, `_worker_up` | `subscription` | Mirror: the subscription, and whether its apply worker runs |
+| `canopy_replication_subscription_receive_age_seconds` | `subscription` | Seconds since the primary last sent anything, keepalives included; the API host's clock against the database's, so clock skew shows up here |
+| `canopy_replication_subscription_apply_errors_total`, `_sync_errors_total` | `subscription` | Errors applying changes, and during initial copies |
+| `canopy_replication_subscription_tables_not_ready` | `subscription` | Tables still in their initial copy |
+| `canopy_replication_subscription_applied_lsn_bytes` | `subscription` | The primary's WAL position of the last transaction applied: a position, not a lag |
+
+A mirror has no honest apply-lag figure of its own. Its received position
+follows every keepalive, which covers WAL the primary wrote to tables it
+doesn't publish, so received minus applied grows while nothing is waiting.
+Alert on the primary's `canopy_replication_slot_lag_bytes` instead. The
+applied position is readable only by a superuser unless a superuser grants
+the API's role both `SELECT ON pg_replication_origin_status` and
+`EXECUTE ON FUNCTION pg_show_replication_origin_status()` (`pg_read_all_stats`
+isn't enough). Without them that one series is absent.
+
+`docker/observability/grafana/provisioning/alerting/replication.yaml` holds
+the alert rules: on the primary, a slot inactive for 15 minutes, retaining
+over half the WAL cap, out of `reserved`, or a slot with no cap at all; on the
+mirror, a stopped apply worker, nothing received for five minutes, apply or
+copy errors, and a copy unfinished after an hour; on either, a status that
+can't be read. No contact point is provisioned.
 
 ## Adding a module metric
 

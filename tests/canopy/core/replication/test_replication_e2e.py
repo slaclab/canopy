@@ -19,6 +19,7 @@ from pydantic import SecretStr
 
 from canopy.core.replication.sql import Refused, ReplicationError
 from canopy.core.replication.config import ReplicationConfig
+from canopy.core.replication.metrics import read_status
 from canopy.core.replication.registry import REGISTRY, TableClass, ReplicationRegistry
 from canopy.core.replication.publisher import publish, publisher_status
 from canopy.core.replication.subscriber import (
@@ -37,6 +38,7 @@ from .conftest import (
     server_dsn,
     build_schema,
     requires_pair,
+    metric_samples,
 )
 
 pytestmark = requires_pair
@@ -266,3 +268,46 @@ async def test_a_failed_subscribe_never_shows_the_password(pair: Pair, caplog):
     assert wrong not in str(caught.value) and wrong not in caplog.text
     assert not (await subscriber_status(p.sub_admin, instance=p.instance))["subscription"]["exists"]
     assert not await p.pub.fetchval("SELECT count(*) FROM pg_replication_slots WHERE database = current_database()")
+
+
+async def test_gauges_on_both_sides(pair: Pair):
+    p = pair
+    await publish(p.pub, role="primary", config=p.config)
+    await _seed(p.pub)
+    await grants(p.sub, role="mirror", config=p.config)
+    await subscribe(p.sub, role="mirror", instance=p.instance, config=p.config)
+    await eventually(lambda: _copied(p))
+    # One streamed change, so the applied position moves past the initial copy's 0/0.
+    await p.pub.execute("UPDATE squirrel.pv SET description = 'streamed'")
+    await eventually(lambda: _in_step(p))
+    name = f"canopy_history_{p.instance}"
+    slot = frozenset({"slot": name, "kind": "subscription"}.items())
+
+    primary = metric_samples(await read_status(p.pub, role="primary", instance=None))
+    assert primary[("canopy_replication_slot_active", slot)] == 1
+    assert primary[("canopy_replication_slot_wal_status", slot | {("wal_status", "reserved")})] == 1
+    assert primary[("canopy_replication_slot_retained_bytes", slot)] >= 0
+    assert ("canopy_replication_slot_lag_bytes", slot) in primary
+
+    # The mirror's API reads its gauges as the app role, which can't see the applied position.
+    subscription = frozenset({"subscription": name}.items())
+    await p.sub_admin.execute(f'SET ROLE "{p.config.app_role}"')
+    mirror = metric_samples(await read_status(p.sub_admin, role="mirror", instance=p.instance))
+    await p.sub_admin.execute("RESET ROLE")
+    assert mirror[("canopy_replication_subscription_worker_up", subscription)] == 1
+    assert mirror[("canopy_replication_subscription_receive_age_seconds", subscription)] < 60
+    assert mirror[("canopy_replication_subscription_apply_errors_total", subscription)] == 0
+    assert mirror[("canopy_replication_subscription_tables_not_ready", subscription)] == 0
+    assert ("canopy_replication_subscription_applied_lsn_bytes", subscription) not in mirror
+
+    as_superuser = metric_samples(await read_status(p.sub_admin, role="mirror", instance=p.instance))
+    assert as_superuser[("canopy_replication_subscription_applied_lsn_bytes", subscription)] > 0
+
+    # A disabled subscription keeps its pg_stat_subscription row, without a worker.
+    await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
+
+    async def worker_stopped():
+        samples = metric_samples(await read_status(p.sub_admin, role="mirror", instance=p.instance))
+        return samples[("canopy_replication_subscription_worker_up", subscription)] == 0
+
+    await eventually(worker_stopped)
