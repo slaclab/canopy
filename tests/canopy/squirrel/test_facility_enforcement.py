@@ -227,29 +227,27 @@ async def test_assigning_a_pv_outside_the_grant_is_refused(client: AsyncClient, 
     assert r.status_code == 403
 
 
-async def test_creating_a_pv_in_several_facilities_needs_all_of_them_held(
+async def test_creating_a_pv_in_several_facilities_needs_one_of_them_held(
     client: AsyncClient, db_session: AsyncSession
 ):
-    """Naming one facility the key holds alongside one it doesn't must not let the
-    create through — a key scoped to `lcls-sc` could otherwise mint a PV into `facet`
-    for free, just by also naming `lcls-sc`."""
-    await _seed_hierarchy(db_session)
+    """A create is allowed when at least one requested facility is in the key's grant."""
+    facilities = await _seed_hierarchy(db_session)
 
     r = await client.post(
         "/v1/pvs",
         headers=SC_HEADERS,
         json={"setpointAddress": "SHARED:PV:SP", "facilities": ["lcls-sc", "facet"]},
     )
-    assert r.status_code == 403
-    assert r.json()["code"] == "insufficient_facility_access"
+    assert r.status_code == 200, r.text
+    assert set(r.json()["facilityIds"]) == {facilities["lcls-sc"].id, facilities["facet"].id}
 
     r = await client.get("/v1/pvs/paged", headers=WILD_HEADERS)
-    assert r.json()["results"] == []
+    assert len(r.json()["results"]) == 1
 
     r = await client.post(
         "/v1/pvs",
         headers=SC_FACET_HEADERS,
-        json={"setpointAddress": "SHARED:PV:SP", "facilities": ["lcls-sc", "facet"]},
+        json={"setpointAddress": "SHARED-2:PV:SP", "facilities": ["lcls-sc", "facet"]},
     )
     assert r.status_code == 200, r.text
 
@@ -277,10 +275,7 @@ async def test_create_does_not_leak_an_out_of_scope_pv_s_existence_via_409(
 
 
 async def test_multi_create_gates_each_row_not_the_import_s_union(client: AsyncClient, db_session: AsyncSession):
-    """A row assigned solely to an out-of-scope facility must not ride in on the back
-    of a sibling row the key can reach — gating the import's union of facilities
-    instead of each row would let it through, making ``/pvs/multi`` a way around the
-    single-create gate."""
+    """Every row must independently overlap the grant; a sibling row cannot authorize it."""
     await _seed_hierarchy(db_session)
 
     r = await client.post(
@@ -297,6 +292,15 @@ async def test_multi_create_gates_each_row_not_the_import_s_union(client: AsyncC
     # And the refused batch did not partially land.
     r = await client.get("/v1/pvs/paged", headers=WILD_HEADERS)
     assert r.json()["results"] == []
+
+    # A row may also name out-of-scope facilities if it names at least one in scope.
+    r = await client.post(
+        "/v1/pvs/multi",
+        headers=SC_HEADERS,
+        json=[{"setpointAddress": "SHARED:PV:SP", "facilities": ["lcls-sc", "facet"]}],
+    )
+    assert r.status_code == 200, r.text
+    assert len(r.json()) == 1
 
 
 async def test_unknown_facility_slug_on_a_write_is_404_not_a_silent_no_op(

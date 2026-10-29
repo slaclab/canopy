@@ -256,14 +256,15 @@ not filtered.
 **Writes** are refused, with a `403 insufficient_facility_access` — a filtered
 write would silently do nothing, which is worse than an error. The rules:
 
-- **Mutating a row requires the key to hold *every* facility it's assigned
-  to, not just one.** A PV can carry several facilities; a key scoped to only
-  one of them cannot update, delete, or otherwise write a PV that also
-  belongs to another one. Holding one shared facility is **not** enough to
-  reach the rest of the row — that would let a `lcls-sc`-only key delete a PV
-  also assigned to `facet`, destroying data for a facility it was never
-  granted. (A snapshot has at most one facility, so this is just plain
-  membership there.)
+- **Updating or deleting a PV requires the key to hold *every* facility
+  affected.** For any PV update, the key must hold all of the PV's current
+  facilities and, when changing its facility list, all of the requested
+  facilities too. This covers both facilities being added and facilities being
+  removed. Deleting a PV requires access to all its current facilities. A key
+  scoped to only one facility cannot update or delete a PV also assigned to
+  another one; holding one shared facility is **not** enough to reach the rest
+  of the row. (A snapshot has at most one facility, so updating or deleting it
+  requires membership in that facility.)
 - A row with **no** facility assignment is writable only by an **unrestricted**
   key. No grant can cover a row that names no facility, so a restricted key —
   even one holding every facility that currently exists — is refused, the same
@@ -274,19 +275,21 @@ write would silently do nothing, which is worse than an error. The rules:
   this as `403` (the row's own facility check runs, not the read-masking one
   reads use), unlike restore and read, which report an unreachable row as
   `404` instead.
-- Creating a *new* PV or snapshot follows the same full-containment rule at
-  mint time: a facility-restricted key must hold **every** facility it's
-  naming, not just one — naming a facility it holds alongside one it doesn't
-  must not let the create through for the facility it lacks. A restricted key
-  can never mint an unassigned row either — if it could, the row would be
-  reachable by every other write-scoped key but not reliably by the one that
-  created it, once "unassigned requires unrestricted" applies on the next
-  write.
+- Creating a *new* PV requires a facility-restricted key to hold **at least
+  one** of the PV's requested facilities. A PV assigned to multiple facilities
+  may therefore include facilities outside the creator's grant, but each row
+  in a bulk create must independently include at least one facility the key
+  holds. A restricted key cannot create an unassigned PV: that row would not
+  be reachable under the "unassigned requires unrestricted" rule for later
+  writes.
+- Creating a snapshot requires a facility-restricted key to hold the snapshot's
+  facility. The facility is singular; a restricted key cannot create an
+  unassigned snapshot that captures every registered PV.
 - Restoring a snapshot is gated on the snapshot's facility, the same as viewing
   it: a snapshot the key can't see is a `404`, including an unassigned one for
   a restricted key. Within a visible snapshot, a PV is included in the restore
   if the key holds **any one** of its facilities — the same rule capture and
-  listing use, not the full-containment rule update/delete/create use. Restore
+  listing use, not the full-containment rule update/delete use. Restore
   only writes the value captured under *this* snapshot's own facility; it
   never touches the PV's other facilities, so it isn't mutating the shared row
   the way update/delete do, and doesn't need to require every facility on it.
