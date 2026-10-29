@@ -172,3 +172,23 @@ class TestBooleanOperators:
     def test_not_equals_preserved(self, parser):
         result = parser.parse("{a} != {b}", {"a": "PV:A", "b": "PV:B"})
         assert "!=" in result.placeholder_expr
+
+
+class TestBitwiseOperators:
+    @pytest.mark.parametrize(
+        "operator",
+        ["&", "|", "^", "~", "<<", ">>"],
+    )
+    def test_bitwise_operators_allowed(self, parser, operator):
+        expression = "~{a}" if operator == "~" else f"{{a}} {operator} 2"
+        result = parser.parse(expression, {"a": "PV:A"})
+        assert not result.is_numexpr_compatible
+
+    def test_comparisons_bind_more_tightly_than_bitwise_operators(self, parser):
+        result = parser.parse("{a} & 4 == 4", {"a": "PV:A"})
+        assert " & (" in result.placeholder_expr
+        assert "== 4)" in result.placeholder_expr
+
+    def test_parentheses_override_epics_precedence(self, parser):
+        result = parser.parse("({a} & 4) == 4", {"a": "PV:A"})
+        assert result.placeholder_expr == "(__v0 & 4) == 4"

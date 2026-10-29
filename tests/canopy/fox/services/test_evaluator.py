@@ -34,6 +34,63 @@ class TestEvaluateScalar:
         result = await evaluate_scalar(parsed, {"__v0": 10.0, "__v1": 5.0}, timeout_s=1.0)
         assert result is True
 
+    @pytest.mark.parametrize(
+        ("expression", "value", "expected"),
+        [
+            ("{a} & 3", 6.9, 2.0),
+            ("{a} | 3", 4.9, 7.0),
+            ("{a} ^ 3", 6.9, 5.0),
+            ("~{a}", 1.9, -2.0),
+            ("{a} << 2", 3.9, 12.0),
+            ("{a} >> 2", 8.9, 2.0),
+        ],
+    )
+    async def test_bitwise_operators_use_integer_operands(self, parser, expression, value, expected):
+        parsed = parser.parse(expression, {"a": "PV:A"})
+        result = await evaluate_scalar(parsed, {"__v0": value}, timeout_s=1.0)
+        assert result == expected
+
+    async def test_epics_comparison_precedence(self, parser):
+        parsed = parser.parse("{a} & 4 == 4", {"a": "PV:A"})
+        result = await evaluate_scalar(parsed, {"__v0": 4.0}, timeout_s=1.0)
+        assert result == 0.0
+
+    async def test_explicit_parentheses_override_epics_precedence(self, parser):
+        parsed = parser.parse("({a} & 4) == 4", {"a": "PV:A"})
+        result = await evaluate_scalar(parsed, {"__v0": 4.0}, timeout_s=1.0)
+        assert result is True
+
+    @pytest.mark.parametrize("expression", ["{a} & 1", "~{a}"])
+    async def test_bitwise_rejects_nonfinite_operands(self, parser, expression):
+        from canopy.fox.errors import FormulaTypeError
+
+        parsed = parser.parse(expression, {"a": "PV:A"})
+        with pytest.raises(FormulaTypeError, match="finite"):
+            await evaluate_scalar(parsed, {"__v0": float("nan")}, timeout_s=1.0)
+
+    @pytest.mark.parametrize("shift", [-1, 64])
+    async def test_bitwise_rejects_out_of_range_shift_counts(self, parser, shift):
+        from canopy.fox.errors import FormulaTypeError
+
+        parsed = parser.parse(f"{{a}} << {shift}", {"a": "PV:A"})
+        with pytest.raises(FormulaTypeError, match="shift counts"):
+            await evaluate_scalar(parsed, {"__v0": 1.0}, timeout_s=1.0)
+
+    @pytest.mark.parametrize(
+        ("expression", "value", "expected"),
+        [
+            ("float({a})", 3, 3.0),
+            ("int({a})", 3.9, 3),
+            ("str({a})", 3.5, "3.5"),
+            ("isnan({a})", float("nan"), True),
+            ("np.isnan({a})", float("nan"), True),
+        ],
+    )
+    async def test_conversion_and_nan_functions(self, parser, expression, value, expected):
+        parsed = parser.parse(expression, {"a": "PV:A"})
+        result = await evaluate_scalar(parsed, {"__v0": value}, timeout_s=1.0)
+        assert result == expected
+
 
 class TestEvaluateArray:
     async def test_numexpr_path(self, parser):
@@ -68,6 +125,60 @@ class TestEvaluateArray:
         b = np.array([4.0, 5.0, 6.0])
         result = await evaluate_array(parsed, {"__v0": a, "__v1": b}, timeout_s=1.0)
         np.testing.assert_array_equal(result, [4.0, 10.0, 18.0])
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("{a} & 3", [0.0, 1.0, 2.0]),
+            ("{a} | 3", [3.0, 3.0, 3.0]),
+            ("{a} ^ 3", [3.0, 2.0, 1.0]),
+            ("~{a}", [-1.0, -2.0, -3.0]),
+            ("{a} << 1", [0.0, 2.0, 4.0]),
+            ("{a} >> 1", [0.0, 0.0, 1.0]),
+            ("int({a})", [0.0, 1.0, 2.0]),
+            ("float({a})", [0.5, 1.5, 2.5]),
+            ("isnan({a})", [False, False, False]),
+        ],
+    )
+    async def test_bitwise_and_conversion_functions_on_arrays(self, parser, expression, expected):
+        parsed = parser.parse(expression, {"a": "PV:A"})
+        result = await evaluate_array(parsed, {"__v0": np.array([0.5, 1.5, 2.5])}, timeout_s=1.0)
+        np.testing.assert_array_equal(result, expected)
+
+    async def test_int_array_rejects_nonfinite_values(self, parser):
+        from canopy.fox.errors import FormulaTypeError
+
+        parsed = parser.parse("int({a})", {"a": "PV:A"})
+        with pytest.raises(FormulaTypeError, match="NaN or infinity"):
+            await evaluate_array(parsed, {"__v0": np.array([1.0, np.nan])}, timeout_s=1.0)
+
+    @pytest.mark.parametrize(
+        ("values", "message"),
+        [
+            ([1.0, np.inf], "finite"),
+            ([1.0, float(2**63)], "signed 64-bit"),
+        ],
+    )
+    async def test_bitwise_array_rejects_invalid_integer_operands(self, parser, values, message):
+        from canopy.fox.errors import FormulaTypeError
+
+        parsed = parser.parse("{a} & 1", {"a": "PV:A"})
+        with pytest.raises(FormulaTypeError, match=message):
+            await evaluate_array(parsed, {"__v0": np.array(values)}, timeout_s=1.0)
+
+    async def test_int_array_rejects_values_outside_int64(self, parser):
+        from canopy.fox.errors import FormulaTypeError
+
+        parsed = parser.parse("int({a})", {"a": "PV:A"})
+        with pytest.raises(FormulaTypeError, match="signed 64-bit"):
+            await evaluate_array(parsed, {"__v0": np.array([float(2**63)])}, timeout_s=1.0)
+
+    async def test_str_array_is_rejected(self, parser):
+        from canopy.fox.errors import FormulaTypeError
+
+        parsed = parser.parse("str({a})", {"a": "PV:A"})
+        with pytest.raises(FormulaTypeError, match="scalar"):
+            await evaluate_array(parsed, {"__v0": np.array([1.0, 2.0])}, timeout_s=1.0)
 
 
 class TestSeverityPropagation:

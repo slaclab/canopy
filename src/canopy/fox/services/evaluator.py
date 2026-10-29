@@ -5,6 +5,7 @@ the event loop. Timeout is enforced via ``asyncio.wait_for``.
 """
 
 import asyncio
+import ast
 from collections.abc import Iterable
 
 import numpy as np
@@ -17,6 +18,103 @@ from canopy.fox.services.parser import ParsedFormula
 from canopy.fox.language.namespace import NUMEXPR_NAME_MAP, build_eval_namespace
 
 _SEVERITY_ORDER = [AlarmSeverity.NO_ALARM, AlarmSeverity.MINOR, AlarmSeverity.MAJOR, AlarmSeverity.INVALID]
+_BITWISE_HELPERS = {
+    ast.BitAnd: "_fox_bitand",
+    ast.BitOr: "_fox_bitor",
+    ast.BitXor: "_fox_bitxor",
+    ast.LShift: "_fox_lshift",
+    ast.RShift: "_fox_rshift",
+}
+_ARRAY_BITWISE_OPERATORS = {
+    int.__and__: np.bitwise_and,
+    int.__or__: np.bitwise_or,
+    int.__xor__: np.bitwise_xor,
+    int.__lshift__: np.left_shift,
+    int.__rshift__: np.right_shift,
+    int.__invert__: np.invert,
+}
+
+
+class _BitwiseTransformer(ast.NodeTransformer):
+    """Route bitwise AST nodes through EPICS-compatible integer coercion."""
+
+    def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+        self.generic_visit(node)
+        helper = _BITWISE_HELPERS.get(type(node.op))
+        if helper is None:
+            return node
+        call = ast.Call(
+            func=ast.Name(id=helper, ctx=ast.Load()),
+            args=[node.left, node.right],
+            keywords=[],
+        )
+        return ast.copy_location(call, node)
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.AST:
+        self.generic_visit(node)
+        if not isinstance(node.op, ast.Invert):
+            return node
+        call = ast.Call(
+            func=ast.Name(id="_fox_invert", ctx=ast.Load()),
+            args=[node.operand],
+            keywords=[],
+        )
+        return ast.copy_location(call, node)
+
+
+def _bitwise_integer(value: object) -> int | np.ndarray:
+    if isinstance(value, np.ndarray):
+        values = np.asarray(value, dtype=np.float64)
+        if not np.all(np.isfinite(values)):
+            raise ValueError("Bitwise operands must be finite")
+        values = np.trunc(values)
+        if np.any(values < -(2**63)) or np.any(values >= 2**63):
+            raise OverflowError("Bitwise array operands must fit in signed 64-bit integers")
+        return values.astype(np.int64)
+
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        raise ValueError("Bitwise operands must be finite")
+    return int(value)
+
+
+def _bitwise_apply(operator, left: object, right: object | None = None) -> float | np.ndarray:
+    left_int = _bitwise_integer(left)
+    right_int = None if right is None else _bitwise_integer(right)
+
+    if isinstance(left_int, np.ndarray) or isinstance(right_int, np.ndarray):
+        left_values = np.asarray(left_int, dtype=np.int64)
+        if right_int is None:
+            result = _ARRAY_BITWISE_OPERATORS[operator](left_values)
+        else:
+            right_values = np.asarray(right_int, dtype=np.int64)
+            if operator in (int.__lshift__, int.__rshift__):
+                if np.any(right_values < 0) or np.any(right_values >= 64):
+                    raise ValueError("Bitwise shift counts must be between 0 and 63")
+            result = _ARRAY_BITWISE_OPERATORS[operator](left_values, right_values)
+        return np.asarray(result, dtype=np.float64)
+
+    if right_int is None:
+        result = operator(left_int)
+    else:
+        if operator in (int.__lshift__, int.__rshift__) and (right_int < 0 or right_int >= 64):
+            raise ValueError("Bitwise shift counts must be between 0 and 63")
+        result = operator(left_int, right_int)
+    return float(result)
+
+
+def _bitwise_eval_namespace() -> dict[str, object]:
+    namespace = build_eval_namespace()
+    namespace.update({
+        "_fox_bitand": lambda left, right: _bitwise_apply(int.__and__, left, right),
+        "_fox_bitor": lambda left, right: _bitwise_apply(int.__or__, left, right),
+        "_fox_bitxor": lambda left, right: _bitwise_apply(int.__xor__, left, right),
+        "_fox_lshift": lambda left, right: _bitwise_apply(int.__lshift__, left, right),
+        "_fox_rshift": lambda left, right: _bitwise_apply(int.__rshift__, left, right),
+        "_fox_invert": lambda value: _bitwise_apply(int.__invert__, value),
+    })
+    return namespace
 
 
 def worst_severity(severities: Iterable[AlarmSeverity]) -> AlarmSeverity:
@@ -59,10 +157,12 @@ def _evaluate_array_numexpr(parsed: ParsedFormula, variables: dict[str, np.ndarr
 
 def _evaluate_array_asteval(parsed: ParsedFormula, variables: dict[str, np.ndarray]) -> np.ndarray:
     """Evaluate using asteval (fallback for expressions with unsupported functions)."""
-    interp = Interpreter(usersyms=build_eval_namespace())
+    interp = Interpreter(usersyms=_bitwise_eval_namespace())
     for name, arr in variables.items():
         interp.symtable[name] = arr
-    result = interp(parsed.placeholder_expr)
+    tree = ast.parse(parsed.placeholder_expr, mode="eval")
+    tree = ast.fix_missing_locations(_BitwiseTransformer().visit(tree))
+    result = interp.eval(ast.unparse(tree.body))
     if interp.error:
         msgs = [err.get_error()[1] for err in interp.error]
         raise FormulaTypeError(f"Evaluation error: {'; '.join(msgs)}")
@@ -75,10 +175,12 @@ def _evaluate_scalar_asteval(
     parsed: ParsedFormula, variables: dict[str, float | int | bool | str]
 ) -> float | int | bool | str:
     """Evaluate a scalar expression using asteval."""
-    interp = Interpreter(usersyms=build_eval_namespace())
+    interp = Interpreter(usersyms=_bitwise_eval_namespace())
     for name, val in variables.items():
         interp.symtable[name] = val
-    result = interp(parsed.placeholder_expr)
+    tree = ast.parse(parsed.placeholder_expr, mode="eval")
+    tree = ast.fix_missing_locations(_BitwiseTransformer().visit(tree))
+    result = interp.eval(ast.unparse(tree.body))
     if interp.error:
         msgs = [err.get_error()[1] for err in interp.error]
         raise FormulaTypeError(f"Evaluation error: {'; '.join(msgs)}")

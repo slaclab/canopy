@@ -9,7 +9,38 @@ import math
 
 import numpy as np
 
+
+def _float(value: object) -> float | np.ndarray:
+    if isinstance(value, np.ndarray):
+        return np.asarray(value, dtype=np.float64)
+    return float(value)
+
+
+def _int(value: object) -> int | np.ndarray:
+    if not isinstance(value, np.ndarray):
+        return int(value)
+
+    values = np.asarray(value, dtype=np.float64)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("int() cannot convert NaN or infinity")
+    values = np.trunc(values)
+    if np.any(values < -(2**63)) or np.any(values >= 2**63):
+        raise OverflowError("int() array values must fit in signed 64-bit integers")
+    return values.astype(np.int64)
+
+
+def _str(value: object) -> str:
+    if isinstance(value, np.ndarray):
+        raise TypeError("str() is only supported for scalar values")
+    return str(value)
+
+
 SAFE_FUNCS: dict[str, object] = {
+    # Conversion and classification
+    "float": _float,
+    "int": _int,
+    "str": _str,
+    "isnan": np.isnan,
     # Trigonometric
     "sin": np.sin,
     "cos": np.cos,
