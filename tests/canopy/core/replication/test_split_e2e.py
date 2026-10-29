@@ -21,6 +21,7 @@ from canopy.squirrel.prune import PRUNED_TABLES, prune
 from canopy.core.replication.sql import Refused
 from canopy.core.replication.gate import check_prune_gate
 from canopy.core.replication.config import PruneConfig
+from canopy.core.replication.reseed import reseed
 from canopy.core.replication.publisher import publish, publisher_status
 from canopy.core.replication.subscriber import (
     grants,
@@ -38,6 +39,7 @@ from .test_replication_e2e import (  # noqa: F401 — pair is a fixture
     _copied,
     eventually,
     pytestmark,
+    _drift_connections,
 )
 
 WINDOW_DAYS = 30
@@ -210,3 +212,31 @@ async def test_switch_refuses_before_the_primary_has_the_split_pair(split_pair: 
     await p.sub_admin.execute(f'ALTER SUBSCRIPTION "canopy_history_{p.instance}" DISABLE')
     with pytest.raises(Refused, match="is disabled"):
         await switch(p.sub, role="mirror", instance=p.instance, config=p.config, timeout=5)
+
+
+async def test_reseed_subscribes_a_mirror_of_a_split_primary_to_the_pair(split_pair: Pair):
+    p = split_pair
+    # A primary created after the switch, as when history is rebuilt for it: the pair only.
+    await publish(p.pub, role="primary", config=p.config, split=True)
+    await grants(p.sub, role="mirror", config=p.config)
+    await p.pub.execute("INSERT INTO squirrel.pv (id, setpoint_address) VALUES ($1, 'SIM:PV:1:SETPOINT')", str(uuid4()))
+    before = await _snapshot(p.pub, "before the re-seed")
+
+    primary, mirror = await _drift_connections(p)
+    try:
+        report = await reseed(
+            primary, mirror, role="mirror", instance=p.instance, config=p.config, since=datetime(2000, 1, 1, tzinfo=UTC)
+        )
+    finally:
+        await primary.close()
+        await mirror.close()
+
+    assert report["created"] is True and report["publications"] == ["canopy_ref", "canopy_ts"]
+    assert await _has(p.sub, "squirrel.snapshot", "id", before)
+    status = (await subscriber_status(p.sub_admin, instance=p.instance))["subscription"]
+    assert status["enabled"] and status["layout"] == "split"
+    # The pair's rule holds from the first transaction after the cut.
+    await p.pub.execute("DELETE FROM squirrel.snapshot WHERE id = $1", before)
+    marker = await _snapshot(p.pub, "marker")
+    await eventually(lambda: _has(p.sub, "squirrel.snapshot", "id", marker))
+    assert await _has(p.sub, "squirrel.snapshot", "id", before)
