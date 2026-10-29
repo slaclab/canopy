@@ -1,4 +1,5 @@
-"""``canopy-worker``'s task list per instance role: a mirror registers only stateless tasks."""
+"""``canopy-worker``'s task list per instance role: a mirror registers only stateless tasks, and only a
+primary schedules pruning."""
 
 import os
 import sys
@@ -9,6 +10,8 @@ from canopy.worker import (
     MIRROR_FUNCTIONS,
     ping,
     convert_batch,
+    prune_snapshots,
+    worker_cron_jobs,
     worker_functions,
 )
 
@@ -33,3 +36,11 @@ def test_worker_settings_follow_canopy_role():
 
     assert out.returncode == 0, out.stderr
     assert out.stdout.split() == ["ping", "convert_batch"]
+
+
+def test_only_a_primary_schedules_pruning():
+    [job] = worker_cron_jobs("primary")
+    assert job.coroutine is prune_snapshots
+    assert job.unique and not job.run_at_startup
+    assert worker_cron_jobs("mirror") == []
+    assert worker_cron_jobs("forward") == []
