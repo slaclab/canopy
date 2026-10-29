@@ -120,17 +120,6 @@ app.mount("/jobs", jobs_app)
 app.mount("/converter", converter_app)
 app.mount("/analytics", analytics_app)
 
-tag_module(mole_app, "mole")
-tag_module(hare_app, "hare")
-tag_module(raccoon_app, "raccoon")
-tag_module(vole_app, "vole")
-tag_module(fox_app, "fox")
-tag_module(squirrel_app, "squirrel")
-tag_module(magpie_app, "magpie")
-tag_module(jobs_app, "jobs")
-tag_module(converter_app, "converter")
-tag_module(analytics_app, "analytics")
-
 
 @app.get("/health", tags=["meta"])
 async def health() -> dict[str, str]:

@@ -4,6 +4,10 @@ Hardcoded rather than derived at import time (see ``canopy.core.modules`` for wh
 so this test is what keeps an eleventh mount from silently becoming un-scopable.
 """
 
+import sys
+import subprocess
+
+import pytest
 from starlette.routing import Mount
 
 from canopy.main import app
@@ -25,6 +29,24 @@ def test_every_mount_and_the_parent_app_are_tagged_with_their_module():
     for route in app.routes:
         if isinstance(route, Mount):
             assert module_for_app(route.app) == route.path.strip("/")
+
+
+@pytest.mark.parametrize("module", sorted(MODULES - {"core"}))
+def test_a_module_app_is_tagged_without_canopy_main(module):
+    # A module's own tests import only its app, so the tag must not depend on
+    # canopy.main having been imported. This process has already imported it, so
+    # check in a fresh interpreter.
+    code = (
+        "import sys\n"
+        f"from canopy.{module}.app import app\n"
+        "from canopy.core.modules import module_for_app\n"
+        "assert 'canopy.main' not in sys.modules\n"
+        "print(module_for_app(app))\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == module
 
 
 class TestSplitModules:

@@ -63,6 +63,10 @@ def tag_module(app, module: str) -> None:
     it would have returned ``canopy/hare`` instead of ``hare``. Each app carries
     its own module tag instead, independent of how anything in front of it
     rewrites the path.
+
+    Each module tags its own app in its ``app.py``, next to the app's creation,
+    so the tag is there however the app is imported: mounted by ``canopy.main``,
+    or used directly, as the module's own tests do.
     """
     app.state.canopy_module = module
 

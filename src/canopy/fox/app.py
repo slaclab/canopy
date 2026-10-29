@@ -10,6 +10,7 @@ from canopy.core.clock import SystemClock
 from canopy.fox.config import get_fox_config
 from canopy.core.errors import register_canopy_error_handler
 from canopy.fox.runtime import mark_started
+from canopy.core.modules import tag_module
 from canopy.vole.adapter import VoleDataSource
 from canopy.fox.api.v1.router import router as v1_router
 from canopy.fox.services.parser import Parser
@@ -67,4 +68,5 @@ app = FastAPI(
 )
 
 register_canopy_error_handler(app)
+tag_module(app, "fox")
 app.include_router(v1_router)

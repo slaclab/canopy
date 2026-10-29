@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from canopy.jobs import gateway
 from canopy.core.config import get_settings
 from canopy.core.errors import register_canopy_error_handler
+from canopy.core.modules import tag_module
 from canopy.jobs.runtime import mark_started
 from canopy.jobs.api.v1.router import router as v1_router
 
@@ -35,4 +36,5 @@ app = FastAPI(
 )
 
 register_canopy_error_handler(app)
+tag_module(app, "jobs")
 app.include_router(v1_router)
