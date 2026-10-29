@@ -270,7 +270,10 @@ write would silently do nothing, which is worse than an error. The rules:
   way it's refused a row assigned to a facility it doesn't hold. This also
   means a restricted key can't strip a row's last facility and un-assign it:
   that write is refused outright, not silently let through because the key
-  held everything the row used to be assigned to.
+  held everything the row used to be assigned to. Update and delete report
+  this as `403` (the row's own facility check runs, not the read-masking one
+  reads use), unlike restore and read, which report an unreachable row as
+  `404` instead.
 - Creating a *new* PV or snapshot follows the same full-containment rule at
   mint time: a facility-restricted key must hold **every** facility it's
   naming, not just one — naming a facility it holds alongside one it doesn't
@@ -281,13 +284,15 @@ write would silently do nothing, which is worse than an error. The rules:
   write.
 - Restoring a snapshot is gated on the snapshot's facility, the same as viewing
   it: a snapshot the key can't see is a `404`, including an unassigned one for
-  a restricted key. Within a visible snapshot, any PV whose facility was
-  changed after capture to one the key doesn't hold — or that has no facility
-  at all — is skipped and reported in the job result's `skippedPvIds`; if every
-  PV is skipped, the restore is a `403`. Update and delete gate the same
-  unassigned-row rule through a different path (the row's own facility check,
-  not the read-masking one), so they report `403` rather than `404` for the
-  same case — both refuse the write; only the status code differs.
+  a restricted key. Within a visible snapshot, a PV is included in the restore
+  if the key holds **any one** of its facilities — the same rule capture and
+  listing use, not the full-containment rule update/delete/create use. Restore
+  only writes the value captured under *this* snapshot's own facility; it
+  never touches the PV's other facilities, so it isn't mutating the shared row
+  the way update/delete do, and doesn't need to require every facility on it.
+  A PV with no facility assignment left, or whose facility was reassigned
+  after capture to one the key holds none of, is skipped and reported in the
+  job result's `skippedPvIds`; if every PV is skipped, the restore is a `403`.
 
 **Where facilities come from.** Both are set by the user. A PV's facilities (it
 can have several) are assigned when it's created or edited, through `facilities`
@@ -301,10 +306,11 @@ an unrestricted key can create one.
 
 **Snapshot reads and restore can disagree on an old snapshot.** A snapshot
 taken before facility scoping existed holds every PV's values as of capture.
-If a PV held then is later reassigned to a different facility a key holds, that
-key can still read the old values in the snapshot (the snapshot's own facility
-gate is what's checked, not each PV's current one) but `restore` skips that PV,
-since restore checks each PV's *current* facility. The read is correct as
+If a PV held then is later reassigned to a facility the key holds none of,
+that key can still read the old values in the snapshot (the snapshot's own
+facility gate is what's checked, not each PV's current one) but `restore`
+skips that PV, since restore checks each PV's *current* facility membership —
+any one shared facility, same as capture and listing. The read is correct as
 history; only a future restore follows today's assignment.
 
 This check and a concurrent mint aren't serialized against each other — each
