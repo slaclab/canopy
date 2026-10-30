@@ -46,22 +46,26 @@ class TestEvaluateScalar:
         ],
     )
     async def test_bitwise_operators_use_integer_operands(self, parser, expression, value, expected):
+        """Evaluate each bitwise operator after truncating operands to integers."""
         parsed = parser.parse(expression, {"a": "PV:A"})
         result = await evaluate_scalar(parsed, {"__v0": value}, timeout_s=1.0)
         assert result == expected
 
     async def test_epics_comparison_precedence(self, parser):
+        """Ensure comparisons bind before bitwise operations as in EPICS Calc."""
         parsed = parser.parse("{a} & 4 == 4", {"a": "PV:A"})
         result = await evaluate_scalar(parsed, {"__v0": 4.0}, timeout_s=1.0)
         assert result == 0.0
 
     async def test_explicit_parentheses_override_epics_precedence(self, parser):
+        """Ensure explicit grouping can put bitwise evaluation before comparison."""
         parsed = parser.parse("({a} & 4) == 4", {"a": "PV:A"})
         result = await evaluate_scalar(parsed, {"__v0": 4.0}, timeout_s=1.0)
         assert result is True
 
     @pytest.mark.parametrize("expression", ["{a} & 1", "~{a}"])
     async def test_bitwise_rejects_nonfinite_operands(self, parser, expression):
+        """Reject NaN operands in binary and unary bitwise expressions."""
         from canopy.fox.errors import FormulaTypeError
 
         parsed = parser.parse(expression, {"a": "PV:A"})
@@ -70,6 +74,7 @@ class TestEvaluateScalar:
 
     @pytest.mark.parametrize("shift", [-1, 64])
     async def test_bitwise_rejects_out_of_range_shift_counts(self, parser, shift):
+        """Reject negative and oversized scalar bit-shift counts."""
         from canopy.fox.errors import FormulaTypeError
 
         parsed = parser.parse(f"{{a}} << {shift}", {"a": "PV:A"})
@@ -87,6 +92,7 @@ class TestEvaluateScalar:
         ],
     )
     async def test_conversion_and_nan_functions(self, parser, expression, value, expected):
+        """Evaluate scalar conversion functions and both supported isnan spellings."""
         parsed = parser.parse(expression, {"a": "PV:A"})
         result = await evaluate_scalar(parsed, {"__v0": value}, timeout_s=1.0)
         assert result == expected
@@ -141,11 +147,13 @@ class TestEvaluateArray:
         ],
     )
     async def test_bitwise_and_conversion_functions_on_arrays(self, parser, expression, expected):
+        """Apply bitwise operators and numeric conversions element-wise to arrays."""
         parsed = parser.parse(expression, {"a": "PV:A"})
         result = await evaluate_array(parsed, {"__v0": np.array([0.5, 1.5, 2.5])}, timeout_s=1.0)
         np.testing.assert_array_equal(result, expected)
 
     async def test_int_array_rejects_nonfinite_values(self, parser):
+        """Reject non-finite elements when converting an array to integers."""
         from canopy.fox.errors import FormulaTypeError
 
         parsed = parser.parse("int({a})", {"a": "PV:A"})
@@ -160,6 +168,7 @@ class TestEvaluateArray:
         ],
     )
     async def test_bitwise_array_rejects_invalid_integer_operands(self, parser, values, message):
+        """Reject non-finite and out-of-range values in bitwise array operands."""
         from canopy.fox.errors import FormulaTypeError
 
         parsed = parser.parse("{a} & 1", {"a": "PV:A"})
@@ -167,6 +176,7 @@ class TestEvaluateArray:
             await evaluate_array(parsed, {"__v0": np.array(values)}, timeout_s=1.0)
 
     async def test_int_array_rejects_values_outside_int64(self, parser):
+        """Reject array integer conversions that exceed the signed 64-bit range."""
         from canopy.fox.errors import FormulaTypeError
 
         parsed = parser.parse("int({a})", {"a": "PV:A"})
@@ -174,6 +184,7 @@ class TestEvaluateArray:
             await evaluate_array(parsed, {"__v0": np.array([float(2**63)])}, timeout_s=1.0)
 
     async def test_str_array_is_rejected(self, parser):
+        """Reject string conversion on arrays because string results are scalar-only."""
         from canopy.fox.errors import FormulaTypeError
 
         parsed = parser.parse("str({a})", {"a": "PV:A"})
