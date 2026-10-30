@@ -10,11 +10,13 @@ from canopy.core.config import get_settings
 from canopy.core.errors import (
     ErrorCode,
     InvalidAPIKey,
+    ReadOnlyInstance,
     KeyStoreUnavailable,
     InsufficientReadAccess,
     InsufficientAdminAccess,
     InsufficientWriteAccess,
     InsufficientModuleAccess,
+    InsufficientFacilityAccess,
 )
 from canopy.core.modules import JOBS, WILDCARD, split_modules, module_for_app
 
@@ -42,9 +44,22 @@ class APIKey:
     name: str = "unknown"
     id: str | None = None
     token: str = field(default="", repr=False)
+    facilities: frozenset[str] = frozenset()
 
     def allows_module(self, module: str) -> bool:
         return module == JOBS or WILDCARD in self.modules or module in self.modules
+
+    @property
+    def unrestricted_facilities(self) -> bool:
+        """Whether this key may reach every facility's data.
+
+        There is no ``allows_facility(id)`` counterpart to ``allows_module``:
+        ``facilities`` holds slugs, rows carry ids, and a grant on a parent covers its
+        descendants, so the check needs hierarchy expansion against the database.
+        That resolution lives in ``core.facilities.gateway``; the per-row check lives
+        in the module owning the row.
+        """
+        return WILDCARD in self.facilities
 
 
 class KeyRegistry(Protocol):
@@ -77,6 +92,11 @@ class EnvKeyRegistry:
         CANOPY_API_KEYS="ops:admin@*"                   # key management only
         CANOPY_API_KEYS="ops:admin@core"                # admin, core routes only
         CANOPY_API_KEYS="fox:read+write@squirrel+fox"   # scoped to two modules
+
+    There is no facility syntax here, by decision rather than omission: every env key
+    grants every facility. Resolving a grant requires reading the hierarchy from the
+    database, which is exactly what this tier has to survive without. Restrict by
+    facility with a database-backed key.
 
     Env keys are no longer a stop-gap: they are the statically stable layer in
     front of the Postgres-backed registry. Keys defined here keep working when the
@@ -151,6 +171,8 @@ class EnvKeyRegistry:
                 # logs without ever revealing the token.
                 name=f"env:{position}",
                 modules=known_modules,
+                # Every facility, unconditionally — see the class docstring.
+                facilities=frozenset({WILDCARD}),
             )
         if self._keys:
             logger.info(
@@ -248,14 +270,32 @@ def require_read_access(key: APIKeyDep) -> APIKey:
     return key
 
 
+READ_ONLY_DETAIL = "This Canopy instance is a read-only mirror; send writes and admin actions to the primary"
+
+
+def is_read_only_instance() -> bool:
+    return get_settings().role == "mirror"
+
+
 def require_write_access(key: APIKeyDep) -> APIKey:
+    """Gate for data-plane writes. Refused outright on a mirror, whatever the key.
+
+    The mirror check runs after the key resolves (so a bad token is still a 401)
+    but before the scope check, so a caller learns that no key would succeed here.
+    """
+    if is_read_only_instance():
+        raise ReadOnlyInstance(READ_ONLY_DETAIL)
     if not key.write:
         raise InsufficientWriteAccess("API key does not have write access")
     return key
 
 
-def require_admin_access(key: APIKeyDep) -> APIKey:
-    """Gate for key management and other operational (not data-plane) actions.
+def require_local_admin_access(key: APIKeyDep) -> APIKey:
+    """Admin gate for state that is local to each instance, so allowed on a mirror too.
+
+    Today that is key management only: ``core.api_key`` is never replicated, so a
+    mirror mints and revokes its own keys. Every other admin route goes through
+    ``require_admin_access``.
 
     Orthogonal to ``read``/``write``, not a level above them — an admin key that
     cannot itself read a PV is the better credential for a provisioning tool.
@@ -265,9 +305,57 @@ def require_admin_access(key: APIKeyDep) -> APIKey:
     return key
 
 
-AdminKeyDep = Annotated[APIKey, Security(require_admin_access)]
+def require_admin_access(key: APIKeyDep) -> APIKey:
+    """Gate for operational (not data-plane) actions on replicated or machine state.
 
-# No WebSocket variant of require_admin_access: nothing about key management streams.
+    Refused on a mirror like ``require_write_access``; key management, which is
+    instance-local, uses ``require_local_admin_access`` instead.
+    """
+    if is_read_only_instance():
+        raise ReadOnlyInstance(READ_ONLY_DETAIL)
+    return require_local_admin_access(key)
+
+
+AdminKeyDep = Annotated[APIKey, Security(require_admin_access)]
+LocalAdminKeyDep = Annotated[APIKey, Security(require_local_admin_access)]
+
+
+def require_read_or_admin_access(key: APIKeyDep) -> APIKey:
+    """Gate for a read endpoint that an admin-only provisioning key also needs.
+
+    An admin key minting facility-scoped grants has no reason to also hold
+    ``read`` — it never touches data — but it still needs to see what it just
+    created. Using this instead of ``require_read_access`` on such a route avoids
+    forcing every provisioning key to carry an unrelated data-plane scope.
+    """
+    if not (key.read or key.admin):
+        raise InsufficientReadAccess("API key does not have read or admin access")
+    return key
+
+
+def require_wildcard_facility_access(key: AdminKeyDep) -> APIKey:
+    """Gate for editing the facility hierarchy itself, not just a key's grant.
+
+    There is no facility equivalent to ``_require_module_containment`` *at this
+    layer* — a facility-scoped admin delegating a narrower grant is handled in
+    ``core.keys.service``. This is a stricter, separate gate: reparenting or
+    deleting a facility can widen what every existing grant resolves to (a grant
+    on a parent silently covers a newly attached child), so only a key with
+    unrestricted facility access may touch the hierarchy at all, regardless of
+    what it's otherwise an admin for.
+    """
+    if not key.unrestricted_facilities:
+        raise InsufficientFacilityAccess("API key must hold the facility wildcard to manage the facility hierarchy")
+    return key
+
+
+# For handlers and service factories that need the key *object*, not just the gate.
+# FastAPI caches a dependency per request, so taking one of these alongside an existing
+# `dependencies=[Security(require_*_access)]` reuses that resolution.
+ReadKeyDep = Annotated[APIKey, Security(require_read_access)]
+WriteKeyDep = Annotated[APIKey, Security(require_write_access)]
+
+# No WebSocket variant of the admin gates: nothing operational streams.
 
 # WebSocket variants raise WebSocketException because handshake errors must close the connection, not return JSON.
 
@@ -312,6 +400,11 @@ def ws_require_read_access(key: Annotated[APIKey, Security(ws_get_api_key)]) -> 
 
 
 def ws_require_write_access(key: Annotated[APIKey, Security(ws_get_api_key)]) -> APIKey:
+    if is_read_only_instance():
+        raise WebSocketException(
+            code=status.WS_1008_POLICY_VIOLATION,
+            reason=f"{ErrorCode.READ_ONLY_INSTANCE.value}: read-only mirror",
+        )
     if not key.write:
         raise WebSocketException(
             code=status.WS_1008_POLICY_VIOLATION,

@@ -5,21 +5,24 @@ Cross-module (owned by no sub-app), so it lives on the parent app at
 never ``write``: ``write`` is held by every client that can set a live
 setpoint — the largest, least-controlled population of keys — and letting one
 mint credentials that outlive its own rotation is the wrong default.
+
+The gate is ``require_local_admin_access``, which a read-only mirror still
+honors: ``core.api_key`` is never replicated, so each instance manages its own.
 """
 
 from fastapi import Query, Security, APIRouter
 
-from canopy.core.security import AdminKeyDep, require_admin_access
+from canopy.core.security import LocalAdminKeyDep, require_local_admin_access
 from canopy.core.keys.schemas import ApiKeyDTO, NewApiKeyDTO, ApiKeyCreateResultDTO
 from canopy.core.keys.dependencies import ApiKeyServiceDep
 
-router = APIRouter(prefix="/v1/api-keys", tags=["API Keys"], dependencies=[Security(require_admin_access)])
+router = APIRouter(prefix="/v1/api-keys", tags=["API Keys"], dependencies=[Security(require_local_admin_access)])
 
 
 @router.post("")
 async def create_key(
     data: NewApiKeyDTO,
-    key: AdminKeyDep,  # reuses the router-level Security() call, doesn't re-resolve the token
+    key: LocalAdminKeyDep,  # reuses the router-level Security() call, doesn't re-resolve the token
     service: ApiKeyServiceDep,
 ) -> ApiKeyCreateResultDTO:
     """Mint a key. The plaintext token is returned here, once, and never again."""
@@ -30,6 +33,8 @@ async def create_key(
         admin=data.admin,
         modules=data.modules,
         acting_key_modules=list(key.modules),
+        facilities=data.facilities,
+        acting_key_facilities=list(key.facilities),
     )
 
 
@@ -50,8 +55,14 @@ async def count_keys(service: ApiKeyServiceDep, activeOnly: bool = Query(False))
 @router.delete("/{key_id}")
 async def deactivate_key(
     key_id: str,
-    key: AdminKeyDep,  # reuses the router-level Security() call, doesn't re-resolve the token
+    key: LocalAdminKeyDep,  # reuses the router-level Security() call, doesn't re-resolve the token
     service: ApiKeyServiceDep,
     force: bool = Query(False, description="Deactivate even if this is the key authenticating the request"),
 ) -> ApiKeyDTO:
-    return await service.deactivate_key(key_id, acting_key_id=key.id, acting_key_modules=list(key.modules), force=force)
+    return await service.deactivate_key(
+        key_id,
+        acting_key_id=key.id,
+        acting_key_modules=list(key.modules),
+        force=force,
+        acting_key_facilities=list(key.facilities),
+    )

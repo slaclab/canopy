@@ -11,8 +11,10 @@ from typing import Annotated
 from fastapi import Query, Security, APIRouter
 
 from canopy.jobs import gateway as jobs_gateway
-from canopy.core.security import require_read_access, require_write_access
+from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
+from canopy.core.security import WriteKeyDep, require_read_access, require_write_access
 from canopy.contracts.jobs import JobCreatedDTO
+from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.time_parse import DateTimeBound
 from canopy.squirrel.errors import SnapshotNotFound
 from canopy.contracts.pagination import PagedResult
@@ -55,8 +57,9 @@ async def list_snapshots(
     ] = None,
     pageSize: int = Query(100, ge=1, le=1000),
     continuationToken: str | None = Query(None, description="Token from the previous page; omit for the first"),
+    facility: str | None = Query(None, description="Facility slug — includes descendants"),
 ) -> PagedResult[SnapshotSummaryDTO]:
-    """List snapshots newest first, optionally filtered by title, tag IDs and/or creation time.
+    """List snapshots newest first, optionally filtered by title, tag IDs, creation time, and/or facility.
 
     Paged by keyset: each page continues from the sort position the previous one ended on
     rather than skipping a count of rows, so snapshots created or deleted while a client
@@ -81,6 +84,8 @@ async def list_snapshots(
         Page size, 1–1000 (default 100).
     continuationToken : str | None
         The previous page's ``continuationToken``; omit it for the first page.
+    facility : str | None
+        A facility slug to filter by — includes descendants.
 
     Returns
     -------
@@ -101,16 +106,36 @@ async def list_snapshots(
         end=end,
         page_size=pageSize,
         continuation_token=continuationToken,
+        facility=facility,
     )
 
 
-@router.post("", dependencies=[Security(require_write_access)])
-async def create_snapshot(data: NewSnapshotDTO) -> JobCreatedDTO:
-    """Enqueue a snapshot of every registered PV. The worker reads EPICS and persists it."""
-    # No SnapshotServiceDep / pre-check here (unlike restore's snapshot_exists guard): create
-    # targets *all* registered PVs, so there is no caller-supplied id that could make the job
-    # doomed up front — nothing to validate before enqueueing.
-    job_id = await jobs_gateway.enqueue("create_snapshot_task", title=data.title, description=data.description)
+@router.post("")
+async def create_snapshot(data: NewSnapshotDTO, key: WriteKeyDep) -> JobCreatedDTO:
+    """Enqueue a snapshot of the facility's PVs (every PV if no facility is given). The
+    worker reads EPICS and persists it."""
+    # The facility gate has to run *here*, not in the service: nothing of the caller's
+    # identity crosses the Arq boundary, and a refused write must not become a queued job.
+    facility_id = None
+    if data.facility is not None:
+        facility = await facilities_gateway.get_by_slug(data.facility)
+        if facility is None:
+            raise FacilityNotFound(f"Facility '{data.facility}' not found")
+        facility_id = facility.id
+
+    key_scope = await facilities_gateway.resolve_key_facility_scope(key.facilities)
+    if key_scope is not None:
+        # A facility-restricted key must name a facility it holds. Unlike mutating an
+        # existing unassigned row, minting a *new* unscoped snapshot is refused — it
+        # would create data the key could not otherwise have reached.
+        if facility_id is None:
+            raise InsufficientFacilityAccess("API key is scoped to specific facilities; 'facility' is required")
+        if facility_id not in key_scope:
+            raise InsufficientFacilityAccess(f"API key is not scoped to facility: {data.facility}")
+
+    job_id = await jobs_gateway.enqueue(
+        "create_snapshot_task", title=data.title, description=data.description, facility_id=facility_id
+    )
     return JobCreatedDTO(job_id=job_id, status_url=f"/jobs/v1/{job_id}")
 
 
@@ -164,8 +189,17 @@ async def restore_snapshot(
     """Enqueue a restore of a snapshot's setpoints to EPICS (``pv_ids=None`` restores all)."""
     if not is_uuid(snapshot_id) or not await service.snapshot_exists(snapshot_id):
         raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
-    pv_ids = request.pv_ids if request else None
-    job_id = await jobs_gateway.enqueue("restore_snapshot_task", snapshot_id=snapshot_id, pv_ids=pv_ids)
+    # Narrow the write set to the key's facilities here, pre-enqueue — the worker has no
+    # caller identity to check against.
+    pv_ids, skipped = await service.plan_restore(snapshot_id, request.pv_ids if request else None)
+    # `None` restores everything; `[]` restores nothing and is refused, never enqueued.
+    if pv_ids is not None and not pv_ids:
+        if skipped:
+            raise InsufficientFacilityAccess("API key is not scoped to any facility in this snapshot")
+        raise BadRequest("Nothing to restore: none of the requested PVs are in this snapshot")
+    job_id = await jobs_gateway.enqueue(
+        "restore_snapshot_task", snapshot_id=snapshot_id, pv_ids=pv_ids, skipped_pv_ids=skipped
+    )
     return JobCreatedDTO(job_id=job_id, status_url=f"/jobs/v1/{job_id}")
 
 

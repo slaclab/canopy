@@ -14,6 +14,7 @@ from datetime import datetime
 from collections.abc import Callable, Awaitable
 
 from sqlalchemy import (
+    ARRAY,
     Select,
     or_,
     any_,
@@ -27,6 +28,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import noload, selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.dialects.postgresql import UUID
 
 from canopy.core.db import BaseRepository
 from canopy.squirrel.data.models import (
@@ -37,6 +39,7 @@ from canopy.squirrel.data.models import (
     TagGroup,
     SnapshotValue,
     pv_tag,
+    pv_facility,
 )
 
 # Chunk size for ORM bulk inserts — keeps a large insert from monopolizing the
@@ -46,6 +49,12 @@ BULK_INSERT_CHUNK_SIZE = 5000
 # Postgres caps a statement at 32767 bind parameters; stay well under it when
 # expanding an ``IN (...)`` / address list.
 PARAM_BATCH_SIZE = 30000
+
+
+def _uuid_array(ids: list[str]):
+    """``ids`` as one ``uuid[]`` bind parameter, for ``col == any_(...)`` — avoids a huge
+    ``IN (...)`` expansion."""
+    return literal(ids, ARRAY(UUID(as_uuid=False)))
 
 
 class SnapshotRepository(BaseRepository[Snapshot]):
@@ -112,6 +121,7 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         tag_ids: list[str] | None,
         start: datetime | None,
         end: datetime | None,
+        facility_ids: set[str] | None,
     ) -> Select:
         """Apply the snapshot listing filters to ``query``; shared by the page and count queries."""
         if title:
@@ -132,6 +142,12 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         if end is not None:
             query = query.where(Snapshot.created_at <= end)
 
+        # Filters directly on ``Snapshot.facility_id`` — a single FK, no subquery needed
+        # (the payoff of keeping snapshot-facility linkage singular rather than
+        # many-to-many like PVs).
+        if facility_ids is not None:
+            query = query.where(Snapshot.facility_id.in_(facility_ids))
+
         return query
 
     async def search(
@@ -142,8 +158,9 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         end: datetime | None = None,
         limit: int = 100,
         after: tuple[datetime, str] | None = None,
+        facility_ids: set[str] | None = None,
     ) -> tuple[list[Snapshot], tuple[datetime, str] | None, int]:
-        """Keyset-paginated search by title, tags and/or creation time.
+        """Keyset-paginated search by title, tags, creation time, and/or facility.
 
         Returns ``(results, next_cursor, total_count)``, newest first. A page starts after
         a ``(created_at, id)`` cursor rather than an offset, so snapshots created or deleted
@@ -166,6 +183,8 @@ class SnapshotRepository(BaseRepository[Snapshot]):
             Maximum number of rows returned.
         after : tuple[datetime, str] | None
             ``(created_at, id)`` of the last row of the previous page; ``None`` for the first.
+        facility_ids : set[str] | None
+            Facility IDs a snapshot's ``facility_id`` must be in; ``None`` for no restriction.
 
         Returns
         -------
@@ -173,11 +192,12 @@ class SnapshotRepository(BaseRepository[Snapshot]):
             The page ordered by ``created_at`` then ``id``, both descending; the cursor for
             the next page, or ``None`` on the last page; and the count of all matching rows.
         """
+        filters = (title, tag_ids, start, end, facility_ids)
         # ``noload`` skips the relationship's selectin default: listing needs only snapshot
         # rows, and loading every value for every listed snapshot (~16k each for a full
         # machine save) dominated the response time.
-        query = self._filtered(select(Snapshot).options(noload(Snapshot.values)), title, tag_ids, start, end)
-        count_query = self._filtered(select(func.count()).select_from(Snapshot), title, tag_ids, start, end)
+        query = self._filtered(select(Snapshot).options(noload(Snapshot.values)), *filters)
+        count_query = self._filtered(select(func.count()).select_from(Snapshot), *filters)
 
         if after is not None:
             query = query.where(
@@ -271,6 +291,19 @@ class SnapshotValueRepository(BaseRepository[SnapshotValue]):
         result = await self.session.execute(select(SnapshotValue).where(SnapshotValue.snapshot_id == snapshot_id))
         return list(result.scalars().all())
 
+    async def get_pv_ids_by_snapshot(self, snapshot_id: str, pv_ids: list[str] | None = None) -> list[str]:
+        """Just the ``pv_id`` column, for callers that need the write set (or its size)
+        rather than the payload — skips loading every ``setpoint_value``/``readback_value``
+        JSONB blob, which can be a sizeable synchronous read for a large snapshot.
+
+        ``pv_ids`` limits it to those of the given PVs that are in the snapshot.
+        """
+        query = select(SnapshotValue.pv_id).where(SnapshotValue.snapshot_id == snapshot_id)
+        if pv_ids is not None:
+            query = query.where(SnapshotValue.pv_id == any_(_uuid_array(pv_ids)))
+        result = await self.session.execute(query)
+        return list(result.scalars().all())
+
     async def count_by_snapshot(self, snapshot_id: str) -> int:
         result = await self.session.execute(
             select(func.count()).select_from(SnapshotValue).where(SnapshotValue.snapshot_id == snapshot_id)
@@ -280,7 +313,9 @@ class SnapshotValueRepository(BaseRepository[SnapshotValue]):
     async def get_by_snapshot_and_pvs(self, snapshot_id: str, pv_ids: list[str]) -> list[SnapshotValue]:
         """Get specific PV values from a snapshot (``= ANY(array)`` avoids huge IN expansion)."""
         result = await self.session.execute(
-            select(SnapshotValue).where(SnapshotValue.snapshot_id == snapshot_id, SnapshotValue.pv_id == any_(pv_ids))
+            select(SnapshotValue).where(
+                SnapshotValue.snapshot_id == snapshot_id, SnapshotValue.pv_id == any_(_uuid_array(pv_ids))
+            )
         )
         return list(result.scalars().all())
 
@@ -437,10 +472,12 @@ class PvRepository(BaseRepository[Pv]):
         limit: int = 100,
         continuation_token: str | None = None,
         tag_filters: dict[str, list[str]] | None = None,
+        facility_ids: set[str] | None = None,
     ) -> tuple[list[Pv], str | None, int]:
         """Keyset-paginated PV search. Returns ``(results, next_token, total_count)``.
 
-        ``tag_filters`` is OR within a group, AND across groups.
+        ``tag_filters`` is OR within a group, AND across groups. ``facility_ids``
+        (already descendant-expanded by the caller) filters via ``pv_facility``.
         """
         query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group))
         count_query = select(func.count()).select_from(Pv)
@@ -463,6 +500,11 @@ class PvRepository(BaseRepository[Pv]):
                     query = query.where(Pv.id.in_(subquery))
                     count_query = count_query.where(Pv.id.in_(subquery))
 
+        if facility_ids is not None:
+            pvs_in_facility = select(pv_facility.c.pv_id).where(pv_facility.c.facility_id.in_(facility_ids)).distinct()
+            query = query.where(Pv.id.in_(pvs_in_facility))
+            count_query = count_query.where(Pv.id.in_(pvs_in_facility))
+
         if continuation_token:
             query = query.where(Pv.id > continuation_token)
 
@@ -481,10 +523,20 @@ class PvRepository(BaseRepository[Pv]):
 
         return pvs, next_token, total_count
 
-    async def get_all_addresses(self) -> list[tuple[str, str | None, str | None, str | None]]:
-        """All ``(id, setpoint, readback, config)`` tuples — the snapshot-capture input."""
-        result = await self.session.execute(select(Pv.id, Pv.setpoint_address, Pv.readback_address, Pv.config_address))
-        return list(result.all())
+    async def get_all_addresses(
+        self, facility_ids: set[str] | None = None
+    ) -> list[tuple[str, str | None, str | None, str | None]]:
+        """All ``(id, setpoint, readback, config)`` tuples — the snapshot-capture input.
+
+        ``facility_ids`` limits it to PVs assigned to any of them; unassigned PVs are
+        excluded. ``None`` returns every PV.
+        """
+        query = select(Pv.id, Pv.setpoint_address, Pv.readback_address, Pv.config_address)
+        if facility_ids is not None:
+            pvs_in_facility = select(pv_facility.c.pv_id).where(pv_facility.c.facility_id.in_(facility_ids)).distinct()
+            query = query.where(Pv.id.in_(pvs_in_facility))
+        result = await self.session.execute(query)
+        return list(result.tuples().all())
 
     async def bulk_create(self, pvs: list[Pv]) -> list[Pv]:
         self.session.add_all(pvs)
@@ -492,6 +544,45 @@ class PvRepository(BaseRepository[Pv]):
         for pv in pvs:
             await self.session.refresh(pv)
         return pvs
+
+    async def facility_ids_for(self, pv_id: str) -> set[str]:
+        """The facility ids a PV is assigned to — empty if it's unassigned.
+
+        ``Pv`` has no ``facilities`` relationship on purpose (see ``models.py``), so
+        this reads the association table directly.
+        """
+        result = await self.session.execute(select(pv_facility.c.facility_id).where(pv_facility.c.pv_id == pv_id))
+        return {row[0] for row in result.all()}
+
+    async def facility_ids_for_many(self, pv_ids: list[str]) -> dict[str, set[str]]:
+        """``{pv_id: {facility_id, ...}}`` for the given PVs. PVs with no assignment are
+        absent from the mapping rather than present with an empty set — callers treating
+        "unassigned" as a distinct case should use ``.get(pv_id, set())``."""
+        if not pv_ids:
+            return {}
+        mapping: dict[str, set[str]] = {}
+        for i in range(0, len(pv_ids), PARAM_BATCH_SIZE):
+            batch = pv_ids[i : i + PARAM_BATCH_SIZE]
+            result = await self.session.execute(
+                select(pv_facility.c.pv_id, pv_facility.c.facility_id).where(pv_facility.c.pv_id.in_(batch))
+            )
+            for pv_id, facility_id in result.all():
+                mapping.setdefault(pv_id, set()).add(facility_id)
+        return mapping
+
+    async def set_facilities(self, pv_id: str, facility_ids: set[str]) -> None:
+        """Replace a PV's facility assignments wholesale. Empty set clears them."""
+        await self.session.execute(delete(pv_facility).where(pv_facility.c.pv_id == pv_id))
+        if facility_ids:
+            await self.session.execute(
+                insert(pv_facility), [{"pv_id": pv_id, "facility_id": fid} for fid in sorted(facility_ids)]
+            )
+
+    async def add_facilities_many(self, assignments: list[tuple[str, set[str]]]) -> None:
+        """Bulk-insert ``(pv_id, facility_ids)`` assignments for freshly created PVs."""
+        rows = [{"pv_id": pv_id, "facility_id": fid} for pv_id, fids in assignments for fid in sorted(fids)]
+        if rows:
+            await self.session.execute(insert(pv_facility), rows)
 
     async def get_by_ids(self, ids: list[str]) -> list[Pv]:
         """Get many PVs by id, batched under the Postgres parameter limit."""
@@ -513,6 +604,7 @@ class PvRepository(BaseRepository[Pv]):
         tag_ids: list[str] | None = None,
         limit: int = 100,
         offset: int = 0,
+        facility_ids: set[str] | None = None,
     ) -> tuple[list[Pv], int]:
         """Offset-paginated, server-side filtered search. Returns ``(results, total_count)``."""
         query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group))
@@ -540,6 +632,11 @@ class PvRepository(BaseRepository[Pv]):
             pvs_with_tags = select(pv_tag.c.pv_id).where(pv_tag.c.tag_id.in_(tag_ids)).distinct()
             query = query.where(Pv.id.in_(pvs_with_tags))
             count_query = count_query.where(Pv.id.in_(pvs_with_tags))
+
+        if facility_ids is not None:
+            pvs_in_facility = select(pv_facility.c.pv_id).where(pv_facility.c.facility_id.in_(facility_ids)).distinct()
+            query = query.where(Pv.id.in_(pvs_in_facility))
+            count_query = count_query.where(Pv.id.in_(pvs_in_facility))
 
         total_result = await self.session.execute(count_query)
         total = total_result.scalar() or 0
@@ -658,3 +755,21 @@ class MetaPvRepository(BaseRepository[MetaPv]):
         result = await self.session.execute(delete(MetaPv).where(MetaPv.pv_id == id))
         await self.session.flush()
         return result.rowcount
+
+
+async def facility_in_use(session: AsyncSession, facility_id: str) -> bool:
+    """Whether any PV or snapshot still references ``facility_id``.
+
+    Registered with ``core.facilities.gateway.register_in_use_checker`` at startup (see
+    ``squirrel/app.py``) so core's ``FacilityService.delete`` can enforce its guard
+    without a cross-schema query.
+    """
+    snapshot_count = await session.execute(
+        select(func.count()).select_from(Snapshot).where(Snapshot.facility_id == facility_id)
+    )
+    if (snapshot_count.scalar() or 0) > 0:
+        return True
+    pv_count = await session.execute(
+        select(func.count()).select_from(pv_facility).where(pv_facility.c.facility_id == facility_id)
+    )
+    return (pv_count.scalar() or 0) > 0
