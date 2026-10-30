@@ -32,10 +32,15 @@ PV names in bindings may optionally include `ca://` or `pva://` protocol prefixe
 | Arithmetic | `+`, `-`, `*`, `/`, `//` (floor div), `%` (modulo), `**` (power) |
 | Comparison | `==`, `!=`, `<`, `<=`, `>`, `>=` |
 | Boolean | `and`, `or`, `not` (also C-style: `&&`, `||`, `!`) |
+| Bitwise | `&`, `|`, `^`, `~`, `<<`, `>>` |
 | Unary | `+`, `-`, `not` / `!` |
 | Ternary | `x if condition else y` |
 
 C-style boolean operators (`&&`, `||`, `!`) are normalized to Python equivalents before evaluation.
+Following EPICS Calc precedence, comparisons bind more tightly than bitwise operators; use parentheses to make
+the grouping explicit. Bitwise operands are truncated toward zero before conversion to integers, and each
+operation's result is a floating-point value. Array operands use signed 64-bit integers; non-finite/out-of-range
+values and shift counts outside 0-63 are rejected.
 
 ## Available functions
 
@@ -49,8 +54,12 @@ All functions operate element-wise on arrays (timeseries data) and accept scalar
 | Angle conversion | `radians`, `degrees` |
 | Reductions | `mean`, `sum`, `min`, `max`, `std`, `var`, `ptp`, `count_nonzero` |
 | Element-wise | `where(condition, x, y)`, `clip(value, low, high)` |
+| Conversion / classification | `float`, `int`, `str` (scalar only), `isnan` |
 
-Functions use NumPy implementations internally. You can access `np.*` and `math.*` constants directly (e.g., `np.pi`), but only the allowlisted functions above are callable — other attributes like `math.factorial` are **not** exposed.
+Functions use NumPy implementations internally. `float` and `int` convert array elements individually; array `int`
+conversion truncates toward zero and requires finite values in the signed 64-bit range. `str` accepts scalar values
+only. `isnan` and `np.isnan` test for NaN (not infinity). You can access `np.*` and `math.*` constants directly
+(e.g., `np.pi`), but only the allowlisted functions above are callable — other attributes like `math.factorial` are **not** exposed.
 
 ## Constants
 

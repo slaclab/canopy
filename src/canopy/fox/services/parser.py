@@ -9,8 +9,10 @@ Steps:
 6. Return ParsedFormula
 """
 
+import io
 import re
 import ast
+import tokenize
 from functools import lru_cache
 from dataclasses import dataclass
 
@@ -97,6 +99,8 @@ def _cached_parse(expression: str, binding_keys: frozenset[str]) -> ParsedFormul
 
     for pattern, replacement in _BOOL_REPLACEMENTS:
         placeholder_expr = pattern.sub(replacement, placeholder_expr)
+
+    placeholder_expr = _normalize_bitwise_precedence(placeholder_expr)
 
     try:
         tree = ast.parse(placeholder_expr, mode="eval")
@@ -213,4 +217,106 @@ def _check_numexpr_compatible(tree: ast.AST) -> bool:
             return False
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.FloorDiv):
             return False
+        if isinstance(node, ast.BinOp) and isinstance(
+            node.op, ast.BitAnd | ast.BitOr | ast.BitXor | ast.LShift | ast.RShift
+        ):
+            return False
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
+            return False
     return True
+
+
+def _normalize_bitwise_precedence(expression: str) -> str:
+    """Make comparisons bind more tightly than bitwise operators, as in EPICS Calc."""
+    try:
+        tokens = [
+            token
+            for token in tokenize.generate_tokens(io.StringIO(expression).readline)
+            if token.type != tokenize.ENDMARKER
+        ]
+    except (tokenize.TokenError, IndentationError):
+        return expression
+
+    insertions: dict[int, list[str]] = {}
+    boundaries = {",", "and", "or", "if", "else", ":"}
+    bitwise = {"&", "|", "^"}
+    comparisons = {"==", "!=", "<", "<=", ">", ">="}
+
+    def process_region(start: int, end: int) -> None:
+        segment_start = start
+        comparison_in_segment = False
+        pending_segments: list[tuple[int, int, bool]] = []
+        has_bitwise = False
+        index = start
+        while index < end:
+            token = tokens[index]
+            if token.type == tokenize.OP and token.string == "(":
+                depth = 1
+                close = index + 1
+                while close < end and depth:
+                    if tokens[close].type == tokenize.OP:
+                        if tokens[close].string == "(":
+                            depth += 1
+                        elif tokens[close].string == ")":
+                            depth -= 1
+                    close += 1
+                if depth == 0:
+                    process_region(index + 1, close - 1)
+                    index = close
+                    continue
+            is_bitwise = token.type == tokenize.OP and token.string in bitwise
+            is_boundary = (token.type == tokenize.OP and token.string in boundaries) or (
+                token.type == tokenize.NAME and token.string in boundaries
+            )
+            if is_bitwise or is_boundary:
+                has_bitwise = has_bitwise or is_bitwise
+                pending_segments.append((segment_start, index, comparison_in_segment))
+                segment_start = index + 1
+                comparison_in_segment = False
+            elif token.type == tokenize.OP and token.string in comparisons:
+                comparison_in_segment = True
+            index += 1
+        pending_segments.append((segment_start, end, comparison_in_segment))
+
+        if not has_bitwise:
+            return
+        for first, last, has_comparison in pending_segments:
+            if not has_comparison:
+                continue
+            while first < last and tokens[first].type in (
+                tokenize.NL,
+                tokenize.NEWLINE,
+                tokenize.INDENT,
+                tokenize.DEDENT,
+            ):
+                first += 1
+            while last > first and tokens[last - 1].type in (
+                tokenize.NL,
+                tokenize.NEWLINE,
+                tokenize.INDENT,
+                tokenize.DEDENT,
+            ):
+                last -= 1
+            if first < last:
+                start_offset = _token_offset(expression, tokens[first].start)
+                end_offset = _token_offset(expression, tokens[last - 1].end)
+                insertions.setdefault(start_offset, []).append("(")
+                insertions.setdefault(end_offset, []).append(")")
+
+    process_region(0, len(tokens))
+    if not insertions:
+        return expression
+
+    edits: list[tuple[int, str]] = []
+    for token_offset, additions in insertions.items():
+        edits.extend((token_offset, addition) for addition in additions)
+    for offset, addition in sorted(edits, reverse=True):
+        expression = expression[:offset] + addition + expression[offset:]
+    return expression
+
+
+def _token_offset(expression: str, position: tuple[int, int]) -> int:
+    """Convert a tokenize (row, column) position to a string offset."""
+    row, column = position
+    lines = expression.splitlines(keepends=True)
+    return sum(len(line) for line in lines[: row - 1]) + column
