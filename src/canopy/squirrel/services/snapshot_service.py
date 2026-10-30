@@ -414,9 +414,10 @@ class SnapshotService:
         )
 
     async def snapshot_exists(self, snapshot_id: str) -> bool:
-        """Existence check used before enqueueing a restore. Gated on the snapshot's own
-        facility, the same rule as ``get_by_id``: a snapshot the key can't view doesn't
-        exist for it, so it can't be restored either."""
+        """Lightweight check (no value load) used before enqueueing a restore: the snapshot
+        exists, isn't deleted, and is in the key's facility scope, the same rule as
+        ``get_by_id``. A snapshot the key can't view doesn't exist for it, so it can't be
+        restored either."""
         snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
         return snapshot is not None and self._in_facility_scope(snapshot.facility_id)
 
@@ -432,7 +433,8 @@ class SnapshotService:
         total_count = await self.value_repo.count_by_snapshot(snapshot_id)
 
         pv_ids = [v.pv_id for v in values]
-        pvs_with_tags = await self.pv_repo.get_by_ids(pv_ids)
+        # A PV deleted since the capture still names and tags its value here.
+        pvs_with_tags = await self.pv_repo.get_by_ids(pv_ids, include_deleted=True)
         pv_tag_map: dict[str, list[TagInfoDTO]] = {}
         pv_address_map: dict[str, tuple[str | None, str | None]] = {}  # pv_id -> (setpoint, readback)
         pv_device_map: dict[str, str | None] = {}
@@ -723,6 +725,11 @@ class SnapshotService:
         logger.info("Restoring snapshot: %s", snapshot_id)
         start_time = datetime.now(UTC)
 
+        # A deleted snapshot keeps its values, so check first: one deleted after its restore
+        # was queued restores nothing, the same as a snapshot that doesn't exist.
+        if not await self.snapshot_repo.is_live(snapshot_id):
+            return RestoreResultDTO(total_pvs=0, success_count=0, failure_count=0, failures=[])
+
         if request is not None and request.pv_ids is not None:
             values = await self.value_repo.get_by_snapshot_and_pvs(snapshot_id, request.pv_ids)
         else:
@@ -732,6 +739,7 @@ class SnapshotService:
             return RestoreResultDTO(total_pvs=0, success_count=0, failure_count=0, failures=[])
 
         pv_ids = [v.pv_id for v in values]
+        # Live PVs only: a PV deleted since the capture is never written, even when named.
         pvs = await self.pv_repo.get_by_ids(pv_ids)
         pv_map = {pv.id: pv for pv in pvs}
 
@@ -914,7 +922,7 @@ class SnapshotService:
         values2 = {v.pv_id: v for v in values2_list}
 
         all_pv_ids = set(values1.keys()) | set(values2.keys())
-        pvs = await self.pv_repo.get_by_ids(list(all_pv_ids))
+        pvs = await self.pv_repo.get_by_ids(list(all_pv_ids), include_deleted=True)
         pv_map = {pv.id: pv for pv in pvs}
 
         differences = []
@@ -1004,9 +1012,10 @@ class SnapshotService:
             return v1 == v2
 
     async def delete_snapshot(self, snapshot_id: str) -> bool:
-        """Delete a snapshot and all its values (DB cascade)."""
+        """Delete a snapshot by setting ``deleted_at``; its values stay. ``False`` when there
+        is no live snapshot to delete."""
         snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
         if not snapshot:
             return False
         await self._require_facility_write(snapshot.facility_id, "this snapshot")
-        return await self.snapshot_repo.delete_with_values(snapshot_id)
+        return await self.snapshot_repo.soft_delete(snapshot_id)

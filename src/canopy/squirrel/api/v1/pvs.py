@@ -118,7 +118,7 @@ async def update_pv(pv_id: str, data: UpdatePVElementDTO, service: PvServiceDep)
 
 @router.delete("/{pv_id}", dependencies=[Security(require_write_access)])
 async def delete_pv(pv_id: str, service: PvServiceDep) -> bool:
-    """Delete a PV."""
+    """Delete a PV: its values in past snapshots are kept, and registering its address again restores it."""
     if not is_uuid(pv_id):
         raise PvNotFound(f"PV {pv_id} not found")
     if not await service.delete(pv_id):
