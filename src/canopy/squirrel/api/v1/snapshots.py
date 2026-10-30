@@ -6,19 +6,20 @@ connector. Everything else (list / get / update / delete / compare, and export /
 snapshot bundle) runs inline against the request session.
 """
 
+import logging
 from typing import Annotated
 
 from fastapi import Query, Security, APIRouter
 
 from canopy.jobs import gateway as jobs_gateway
 from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
-from canopy.core.security import WriteKeyDep, require_read_access, require_write_access
+from canopy.core.security import ActorDep, require_read_access, require_write_access
 from canopy.contracts.jobs import JobCreatedDTO
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.time_parse import DateTimeBound
 from canopy.squirrel.errors import SnapshotNotFound
 from canopy.contracts.pagination import PagedResult
-from canopy.squirrel.dependencies import SnapshotServiceDep
+from canopy.squirrel.dependencies import FacilityScopeDep, SnapshotServiceDep
 from canopy.squirrel.schemas.snapshot import (
     SnapshotDTO,
     NewSnapshotDTO,
@@ -30,6 +31,8 @@ from canopy.squirrel.schemas.snapshot import (
     SnapshotImportResultDTO,
 )
 from canopy.squirrel.api.v1._validation import is_uuid
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/snapshots", tags=["Snapshots"])
 
@@ -112,10 +115,14 @@ async def list_snapshots(
     )
 
 
-@router.post("")
-async def create_snapshot(data: NewSnapshotDTO, key: WriteKeyDep) -> JobCreatedDTO:
+@router.post("", dependencies=[Security(require_write_access)])
+async def create_snapshot(data: NewSnapshotDTO, actor: ActorDep, key_scope: FacilityScopeDep) -> JobCreatedDTO:
     """Enqueue a snapshot of the facility's PVs (every PV if no facility is given). The
-    worker reads EPICS and persists it."""
+    worker reads EPICS and persists it.
+
+    ``createdBy`` records the key's name, or the user a forward instance sent the
+    request for.
+    """
     # The facility gate has to run *here*, not in the service: nothing of the caller's
     # identity crosses the Arq boundary, and a refused write must not become a queued job.
     facility_id = None
@@ -125,7 +132,6 @@ async def create_snapshot(data: NewSnapshotDTO, key: WriteKeyDep) -> JobCreatedD
             raise FacilityNotFound(f"Facility '{data.facility}' not found")
         facility_id = facility.id
 
-    key_scope = await facilities_gateway.resolve_key_facility_scope(key.facilities)
     if key_scope is not None:
         # A facility-restricted key must name a facility it holds. Unlike mutating an
         # existing unassigned row, minting a *new* unscoped snapshot is refused — it
@@ -136,21 +142,32 @@ async def create_snapshot(data: NewSnapshotDTO, key: WriteKeyDep) -> JobCreatedD
             raise InsufficientFacilityAccess(f"API key is not scoped to facility: {data.facility}")
 
     job_id = await jobs_gateway.enqueue(
-        "create_snapshot_task", title=data.title, description=data.description, facility_id=facility_id
+        "create_snapshot_task",
+        title=data.title,
+        description=data.description,
+        facility_id=facility_id,
+        created_by=actor,
     )
     return JobCreatedDTO(job_id=job_id, status_url=f"/jobs/v1/{job_id}")
 
 
 @router.post("/import", dependencies=[Security(require_write_access)])
-async def import_snapshot(bundle: SnapshotBundleDTO, service: SnapshotServiceDep) -> SnapshotImportResultDTO:
+async def import_snapshot(
+    bundle: SnapshotBundleDTO, service: SnapshotServiceDep, actor: ActorDep
+) -> SnapshotImportResultDTO:
     """Create a new snapshot from a bundle exported by ``GET /snapshots/{id}/export``.
 
     Meant for bringing a snapshot back from a history mirror so it can be restored here.
     The new snapshot has a new id, today's creation time, a "Restored from history" title
     and ``importedFrom`` set to the bundle's id. Values whose PV id doesn't exist here are
     left out and listed in ``skipped``; nothing is read from or written to EPICS.
+
+    ``createdBy`` stays the original snapshot's; who imported it (the key's name, or the
+    user a forward instance sent it for) is logged.
     """
-    return await service.import_bundle(bundle)
+    result = await service.import_bundle(bundle)
+    logger.info("Snapshot %s imported as %s for %s", bundle.id, result.snapshot.id, actor)
+    return result
 
 
 @router.get("/{snapshot_id}", dependencies=[Security(require_read_access)])

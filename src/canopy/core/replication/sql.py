@@ -17,6 +17,8 @@ from collections.abc import Iterable
 import asyncpg
 from sqlalchemy.engine import make_url
 
+from canopy.core.replication.migration import side_for_role
+
 _REDACTED = "***"
 
 
@@ -28,15 +30,23 @@ class Refused(ReplicationError):
     """The command won't run here (wrong role, or a failed precondition). Nothing was changed."""
 
 
+# The side a command names, in ``side_for_role``'s terms.
+_SIDES = {"primary": "publisher", "mirror": "subscriber"}
+
+
 def require_role(command: str, required: str, role: str) -> None:
-    """Refuse ``command`` unless this instance's ``CANOPY_ROLE`` is ``required``.
+    """Refuse ``command`` unless this instance is on the ``required`` side.
+
+    ``required`` is ``"primary"`` or ``"mirror"``. The side comes from
+    ``migration.side_for_role``: every role but ``primary``, ``forward`` included,
+    serves a mirror's database.
 
     Raises
     ------
     Refused
-        When ``role`` differs from ``required``.
+        When ``role`` is on the other side.
     """
-    if role != required:
+    if side_for_role(role) != _SIDES[required]:
         raise Refused(f"`{command}` runs on a {required} (CANOPY_ROLE={required}); this instance is a {role}")
 
 

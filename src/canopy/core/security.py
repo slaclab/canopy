@@ -1,17 +1,20 @@
+import json
 import logging
 from typing import Protocol, Annotated
 from dataclasses import field, dataclass
 
-from fastapi import Request, Security, WebSocket, status
+from fastapi import Depends, Request, Security, WebSocket, status
 from fastapi.security import APIKeyHeader
 from fastapi.exceptions import WebSocketException
 
 from canopy.core.config import get_settings
 from canopy.core.errors import (
     ErrorCode,
+    BadRequest,
     InvalidAPIKey,
     ReadOnlyInstance,
     KeyStoreUnavailable,
+    ForwardedWriteRefused,
     InsufficientReadAccess,
     InsufficientAdminAccess,
     InsufficientWriteAccess,
@@ -19,6 +22,12 @@ from canopy.core.errors import (
     InsufficientFacilityAccess,
 )
 from canopy.core.modules import JOBS, WILDCARD, split_modules, module_for_app
+from canopy.core.forwarding.context import (
+    ON_BEHALF_OF_HEADER,
+    ON_BEHALF_OF_FACILITIES_HEADER,
+    ForwardedWrite,
+    forwarded_write,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +44,17 @@ class APIKey:
     `modules` has no default: every real registry (``EnvKeyRegistry``,
     ``DbKeyRegistry``) already passes it explicitly, so a future one that
     forgets to must fail loudly rather than silently granting every module.
+
+    `is_service` marks a key held by another Canopy instance (a forward
+    instance's key on its primary): only such a key may name the caller it acts
+    for in ``X-Canopy-On-Behalf-Of``. Only database keys can be service keys.
     """
 
     read: bool
     write: bool
     modules: frozenset[str]
     admin: bool = False
+    is_service: bool = False
     name: str = "unknown"
     id: str | None = None
     token: str = field(default="", repr=False)
@@ -238,10 +252,86 @@ async def get_api_key(request: Request, token: Annotated[str | None, Security(ap
     module = module_for_app(request.app)
     if not key.allows_module(module):
         raise InsufficientModuleAccess(f"API key is not scoped to '{module}'")
+    if (on_behalf_of := request.headers.get(ON_BEHALF_OF_HEADER)) is not None:
+        _accept_on_behalf_of(on_behalf_of, request.headers.get(ON_BEHALF_OF_FACILITIES_HEADER), key)
     return key
 
 
 APIKeyDep = Annotated[APIKey, Security(get_api_key)]
+
+MAX_ON_BEHALF_OF_LEN = 255  # the width of the created_by columns it is recorded in
+
+
+def _accept_on_behalf_of(value: str, facilities: str | None, key: APIKey) -> None:
+    """Trust ``X-Canopy-On-Behalf-Of`` from ``key``, or refuse the request.
+
+    Only a primary with ``CANOPY_ACCEPT_FORWARDED_WRITES`` trusts it, and only from
+    a service key: anything else could write under a name of its choosing. The
+    accepted value is recorded for this request (see ``request_actor``).
+
+    ``X-Canopy-On-Behalf-Of-Facilities`` must come with it: the caller's facility grant,
+    a JSON list of slugs. The request then reaches only the facilities both the service
+    key and the caller reach (see ``forwarded_facilities``). Without it a forward
+    instance would widen every caller to the service key's grant, so it is required.
+    """
+    settings = get_settings()
+    if settings.role != "primary" or not settings.accept_forwarded_writes:
+        raise ForwardedWriteRefused(f"This instance doesn't accept {ON_BEHALF_OF_HEADER}")
+    if not key.is_service:
+        raise ForwardedWriteRefused(f"Only a service key may send {ON_BEHALF_OF_HEADER}")
+    value = value.strip()
+    if not value or len(value) > MAX_ON_BEHALF_OF_LEN or not value.isprintable():
+        raise BadRequest(f"{ON_BEHALF_OF_HEADER} must be 1-{MAX_ON_BEHALF_OF_LEN} printable characters")
+    grant = _parse_facilities(facilities)
+    if (write := forwarded_write.get()) is None:
+        write = ForwardedWrite()
+        forwarded_write.set(write)
+    write.on_behalf_of = value
+    write.facilities = grant
+
+
+def _parse_facilities(value: str | None) -> frozenset[str]:
+    """The caller's facility grant from ``X-Canopy-On-Behalf-Of-Facilities``."""
+    if value is None:
+        raise BadRequest(f"{ON_BEHALF_OF_FACILITIES_HEADER} is required with {ON_BEHALF_OF_HEADER}")
+    try:
+        slugs = json.loads(value)
+    except ValueError:
+        slugs = None
+    if not isinstance(slugs, list) or not all(isinstance(slug, str) for slug in slugs):
+        raise BadRequest(f"{ON_BEHALF_OF_FACILITIES_HEADER} must be a JSON list of facility slugs")
+    return frozenset(slugs)
+
+
+def forwarded_for() -> str | None:
+    """The caller a trusted forward instance named for this request, or ``None``.
+
+    Set by ``get_api_key``, so only meaningful once the request's key has resolved.
+    """
+    write = forwarded_write.get()
+    return write.on_behalf_of if write is not None else None
+
+
+def forwarded_facilities() -> frozenset[str] | None:
+    """The facility grant of the caller a trusted forward instance named, or ``None``.
+
+    Set by ``get_api_key`` alongside ``forwarded_for``. Facility gates intersect it
+    with the service key's own grant.
+    """
+    write = forwarded_write.get()
+    return write.facilities if write is not None else None
+
+
+def request_actor(key: APIKeyDep) -> str:
+    """Who this request's writes are recorded under (``created_by``).
+
+    The caller a trusted forward instance named in ``X-Canopy-On-Behalf-Of``,
+    else the key's own name. Never a token.
+    """
+    return forwarded_for() or key.name
+
+
+ActorDep = Annotated[str, Depends(request_actor)]
 
 
 async def get_optional_api_key(token: Annotated[str | None, Security(api_key_header)]) -> APIKey | None:
@@ -271,10 +361,16 @@ def require_read_access(key: APIKeyDep) -> APIKey:
 
 
 READ_ONLY_DETAIL = "This Canopy instance is a read-only mirror; send writes and admin actions to the primary"
+NOT_FORWARDED_DETAIL = "This Canopy instance forwards only selected writes to its primary, and not this one"
 
 
 def is_read_only_instance() -> bool:
-    return get_settings().role == "mirror"
+    """A mirror or a forward instance: its database is a copy, written only by replication."""
+    return get_settings().is_replica
+
+
+def _read_only_detail() -> str:
+    return NOT_FORWARDED_DETAIL if get_settings().role == "forward" else READ_ONLY_DETAIL
 
 
 def require_write_access(key: APIKeyDep) -> APIKey:
@@ -284,7 +380,7 @@ def require_write_access(key: APIKeyDep) -> APIKey:
     but before the scope check, so a caller learns that no key would succeed here.
     """
     if is_read_only_instance():
-        raise ReadOnlyInstance(READ_ONLY_DETAIL)
+        raise ReadOnlyInstance(_read_only_detail())
     if not key.write:
         raise InsufficientWriteAccess("API key does not have write access")
     return key
@@ -312,7 +408,7 @@ def require_admin_access(key: APIKeyDep) -> APIKey:
     instance-local, uses ``require_local_admin_access`` instead.
     """
     if is_read_only_instance():
-        raise ReadOnlyInstance(READ_ONLY_DETAIL)
+        raise ReadOnlyInstance(_read_only_detail())
     return require_local_admin_access(key)
 
 

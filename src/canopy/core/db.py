@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
 
 from fastapi import Depends
-from sqlalchemy import DateTime, func, select
+from sqlalchemy import DateTime, func, text, select
 from sqlalchemy.orm import Mapped, DeclarativeBase, mapped_column
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.dialects.postgresql import UUID
 
 from canopy.core.config import get_settings
+from canopy.core.forwarding.context import ForwardedWrite, forwarded_write
 
 
 class Base(DeclarativeBase):
@@ -164,10 +165,32 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
     Every dependency in a request that takes ``SessionDep`` shares one session and one
     transaction, because FastAPI only reuses a dependency declared the same way, scope
     included. A module that needs a different policy can still declare its own.
+
+    For a write a forward instance sent on someone's behalf, the commit's WAL position
+    is recorded for ``X-Canopy-Commit-LSN`` (see ``_commit_forwarded``).
     """
     async with session_scope() as session:
         yield session
-        await session.commit()
+        if (write := forwarded_write.get()) is not None and write.on_behalf_of is not None:
+            await _commit_forwarded(session, write)
+        else:
+            await session.commit()
+
+
+async def _commit_forwarded(session: AsyncSession, write: ForwardedWrite) -> None:
+    """Commit, and if the transaction wrote anything, record a WAL position at or past its commit.
+
+    The insert position read straight after the commit is never before the commit
+    record's end, which is what the mirror reports as applied once it has the change
+    (``pg_replication_origin_status.remote_lsn``). Other sessions' WAL can land in
+    between; that only makes the forward instance wait longer, never report a write
+    as applied before it is. A transaction that wrote nothing has no xid and gets no
+    position, so a read or a job enqueue never makes the forward instance wait.
+    """
+    wrote = await session.scalar(text("SELECT pg_current_xact_id_if_assigned() IS NOT NULL"))
+    await session.commit()
+    if wrote:
+        write.commit_lsn = await session.scalar(text("SELECT pg_current_wal_insert_lsn()::text"))
 
 
 SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]

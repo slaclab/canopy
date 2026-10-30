@@ -28,10 +28,12 @@ class Settings(BaseSettings):
         Connections the pool may open beyond ``database_pool_size``.
     redis_url : str
         Redis DSN backing the Arq job queue and per-job progress.
-    role : {"primary", "mirror"}
+    role : {"primary", "mirror", "forward"}
         ``"mirror"`` makes this instance a read-only copy of a primary's data: write
         and admin routes refuse with ``read_only_instance`` (API-key management
-        excepted) and the worker registers only stateless tasks.
+        excepted) and the worker registers only stateless tasks. ``"forward"`` is a
+        mirror that passes an allowlisted set of writes to its primary
+        (``canopy.core.forwarding``) and refuses the rest the same way.
     instance : str | None
         Name of the deployment this process belongs to (e.g. ``"site-a"``), reported
         by ``GET /v1/instance``.
@@ -40,6 +42,10 @@ class Settings(BaseSettings):
         history, reported by ``GET /v1/instance`` so clients can link to it.
     window_days : int | None
         Days of history this instance keeps; ``None`` means it keeps everything.
+    accept_forwarded_writes : bool
+        On a primary, trust ``X-Canopy-On-Behalf-Of`` from service keys, so a forward
+        instance's writes are recorded under the user it sent them for. Off by
+        default: the header is then refused from every key.
     """
 
     model_config = SettingsConfigDict(
@@ -77,11 +83,21 @@ class Settings(BaseSettings):
 
     # Instance role. A "mirror" serves a read-only copy of a primary's database
     # (fed by Postgres logical replication), so nothing here may write the
-    # replicated tables. Reported, with the fields below, by GET /v1/instance.
-    role: Literal["primary", "mirror"] = "primary"
+    # replicated tables; a "forward" instance is a mirror that sends selected
+    # writes on to its primary over HTTPS. Reported, with the fields below, by
+    # GET /v1/instance.
+    role: Literal["primary", "mirror", "forward"] = "primary"
     instance: str | None = None
     history_url: str | None = None
     window_days: int | None = None
+
+    # Primary only: accept writes a forward instance sends on a user's behalf.
+    accept_forwarded_writes: bool = False
+
+    @property
+    def is_replica(self) -> bool:
+        """Whether this instance's database is a subscriber's copy (``mirror`` or ``forward``)."""
+        return self.role != "primary"
 
 
 @lru_cache

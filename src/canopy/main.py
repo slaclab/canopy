@@ -45,6 +45,7 @@ from canopy.core.replication import metrics as replication_metrics
 from canopy.core.keys.registry import build_key_registry
 from canopy.core.facilities.routes import router as facilities_router
 from canopy.core.keys.repositories import ApiKeyRepository
+from canopy.core.forwarding.middleware import ForwardingMiddleware
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -116,6 +117,9 @@ app = FastAPI(
 # registration order): preflight OPTIONS requests that CORS answers itself never
 # reach the router, and counting them would only inflate the "unmatched" series.
 app.add_middleware(HTTPMetricsMiddleware)
+# Between the two: on a forward instance it answers forwarded writes itself (they have
+# their own counter, since no route here matched them), and CORS still wraps them.
+app.add_middleware(ForwardingMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

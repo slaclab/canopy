@@ -26,7 +26,7 @@ router = APIRouter(prefix="/v1/instance", tags=["Instance"])
 
 
 class InstanceDTO(CanopyModel):
-    role: Literal["primary", "mirror"]
+    role: Literal["primary", "mirror", "forward"]
     instance: str | None
     history_url: str | None
     window_days: int | None

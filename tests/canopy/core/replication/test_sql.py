@@ -82,3 +82,9 @@ def test_require_role():
     require_role("publish", "primary", "primary")
     with pytest.raises(Refused, match="runs on a primary"):
         require_role("publish", "primary", "mirror")
+
+
+def test_a_forward_instance_is_on_the_mirror_side():
+    require_role("subscribe", "mirror", "forward")
+    with pytest.raises(Refused, match="runs on a primary"):
+        require_role("publish", "primary", "forward")

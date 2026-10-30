@@ -29,6 +29,10 @@ class ApiKey(UUIDMixin, TimestampMixin, Base):
     ``last_used_at`` is what makes "is it safe to revoke the old key yet?"
     answerable. It is written on a registry cache miss, so it lags real traffic by
     up to the cache TTL — minutes of granularity, which is all that question needs.
+
+    ``is_service`` marks a key held by another Canopy instance rather than a
+    client: a forward instance's key on its primary, the only kind of key whose
+    ``X-Canopy-On-Behalf-Of`` the primary trusts. Minted only from the CLI.
     """
 
     __tablename__ = "api_key"
@@ -40,6 +44,7 @@ class ApiKey(UUIDMixin, TimestampMixin, Base):
     read_access: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     write_access: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     admin_access: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_service: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Which mounted sub-apps (plus "core" for the parent app's own routes) this
     # key may call. {"*"} — the default, matching every key minted before this

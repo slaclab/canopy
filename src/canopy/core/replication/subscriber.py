@@ -346,6 +346,30 @@ async def grants(
     }
 
 
+async def applied_lsn(conn: asyncpg.Connection, subscription: str) -> str | None:
+    """The primary's WAL position of the last transaction ``subscription`` applied here.
+
+    ``pg_replication_origin_status.remote_lsn``, as in ``subscriber_status``: the end of
+    that transaction's commit record. ``None`` when the subscription doesn't exist or
+    hasn't applied anything yet.
+
+    Raises
+    ------
+    asyncpg.InsufficientPrivilegeError
+        When the role can't read ``pg_replication_origin_status`` (superuser only,
+        unless granted).
+    """
+    return await conn.fetchval(
+        """
+        SELECT o.remote_lsn::text
+        FROM pg_replication_origin_status o
+        JOIN pg_subscription s ON o.external_id = 'pg_' || s.oid::text
+        WHERE s.subname = $1 AND s.subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+        """,
+        subscription,
+    )
+
+
 async def subscriber_status(
     conn: asyncpg.Connection, *, instance: str | None, registry: ReplicationRegistry = REGISTRY
 ) -> dict:

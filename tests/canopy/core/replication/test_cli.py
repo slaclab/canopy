@@ -51,6 +51,7 @@ def test_a_command_is_required():
     ("command", "role"),
     [
         ("publish", "mirror"),
+        ("publish", "forward"),
         ("subscribe", "primary"),
         ("grants", "primary"),
         ("switch", "primary"),
@@ -132,7 +133,8 @@ async def test_a_refusal_inside_a_command_exits_2(db, env, caplog):
     assert "unclassified tables: magpie.mystery" in caplog.text
 
 
-async def test_mirror_status_through_the_cli(db, env, capsys):
-    env(CANOPY_DATABASE_URL=_sqlalchemy_url(DB_DSN), CANOPY_ROLE="mirror", CANOPY_INSTANCE="lab")
+@pytest.mark.parametrize("role", ["mirror", "forward"])
+async def test_mirror_status_through_the_cli(db, env, capsys, role):
+    env(CANOPY_DATABASE_URL=_sqlalchemy_url(DB_DSN), CANOPY_ROLE=role, CANOPY_INSTANCE="lab")
     assert await _run("status") == 0
     assert json.loads(capsys.readouterr().out)["subscription"] == {"name": "canopy_history_lab", "exists": False}

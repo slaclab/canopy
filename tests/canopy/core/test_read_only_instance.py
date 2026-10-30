@@ -28,6 +28,7 @@ from canopy.core.security import (
     ws_require_write_access,
     require_local_admin_access,
 )
+from canopy.core.forwarding import routes as forwarding_routes
 
 MIRROR_REFUSED_GATES = {require_write_access, require_admin_access}
 
@@ -109,6 +110,38 @@ def test_write_and_admin_routes_are_refused_on_a_mirror(method, path, mirror_rol
 
     assert resp.status_code == 403, resp.text
     assert resp.json()["code"] == "read_only_instance"
+
+
+# On a forward instance the middleware answers forwardable routes before any gate
+# runs (tests/canopy/core/forwarding); every other write or admin route is refused
+# there exactly as on a mirror. Shared-table writes count as refused: they are
+# forwarded only with CANOPY_FORWARD__ALLOW_SHARED.
+FORWARD_REFUSED = [
+    (method, path)
+    for method, path in REFUSED
+    if forwarding_routes.match(method, _concrete(path), allow_shared=False) is None
+]
+
+
+@pytest.mark.parametrize(("method", "path"), FORWARD_REFUSED, ids=[f"{m} {p}" for m, p in FORWARD_REFUSED])
+def test_routes_not_forwarded_are_refused_on_a_forward_instance(method, path, forward_role, bind_keys):
+    bind_keys(ALL_SCOPES)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    resp = client.request(method, _concrete(path), headers=HEADERS)
+
+    assert resp.status_code == 403, resp.text
+    assert resp.json() == {"code": "read_only_instance", "detail": security.NOT_FORWARDED_DETAIL}
+
+
+def test_a_forward_instance_still_refuses_restores_hare_puts_and_shared_tables():
+    assert {
+        ("POST", "/squirrel/v1/snapshots/{snapshot_id}/restore"),
+        ("PUT", "/hare/v1/pvs/{pv:path}"),
+        ("POST", "/squirrel/v1/tags"),
+        ("POST", "/magpie/v1/configs/{app}"),
+    } <= set(FORWARD_REFUSED)
+    assert ("POST", "/squirrel/v1/snapshots") not in FORWARD_REFUSED
 
 
 def test_the_refused_set_covers_the_machine_and_data_writes():

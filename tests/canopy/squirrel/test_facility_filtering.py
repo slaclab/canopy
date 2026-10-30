@@ -110,4 +110,9 @@ async def test_create_snapshot_enqueues_with_facility(client: AsyncClient, enque
     assert r.status_code == 200
     # The slug is resolved in the route (it has to be, to gate the write) and the *id*
     # crosses the queue, so a rename between enqueue and execution can't redirect it.
-    assert enqueued[-1][2] == {"title": "T", "description": None, "facility_id": facility.id}
+    sent = enqueued[-1][2]
+    assert {name: sent[name] for name in ("title", "description", "facility_id")} == {
+        "title": "T",
+        "description": None,
+        "facility_id": facility.id,
+    }

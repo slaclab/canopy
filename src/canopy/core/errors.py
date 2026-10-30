@@ -31,6 +31,9 @@ class ErrorCode(StrEnum):
     API_KEY_SELF_DEACTIVATION = auto()
     KEY_STORE_UNAVAILABLE = auto()
     READ_ONLY_INSTANCE = auto()
+    FORWARDED_WRITE_REFUSED = auto()
+    ARCHIVED_IMMUTABLE = auto()
+    PRIMARY_UNAVAILABLE = auto()
 
     # Mole
     ARCHIVER_NOT_CONFIGURED = auto()
@@ -254,6 +257,45 @@ class ReadOnlyInstance(CanopyError):
 
     status_code = 403
     error_code = ErrorCode.READ_ONLY_INSTANCE
+
+
+class ForwardedWriteRefused(CanopyError):
+    """Refused a request carrying ``X-Canopy-On-Behalf-Of`` that this instance won't trust.
+
+    Only a service key may name another caller, and only on a primary that
+    accepts forwarded writes. Refused rather than ignored, so a misconfigured
+    forward instance fails loudly instead of recording writes under its own key.
+    """
+
+    status_code = 403
+    error_code = ErrorCode.FORWARDED_WRITE_REFUSED
+
+
+class ArchivedImmutable(CanopyError):
+    """A forward instance refused to send a change to an entity older than the primary's window.
+
+    The primary may no longer hold it, and the history copy can't be edited, so
+    the request is answered here without reaching the primary.
+    """
+
+    status_code = 409
+    error_code = ErrorCode.ARCHIVED_IMMUTABLE
+
+
+class PrimaryUnavailable(CanopyError):
+    """A forward instance couldn't get an answer from its primary.
+
+    502 when the primary couldn't be reached (nothing was sent); a subclass with
+    504 when it stopped answering after the request went out, so the write may
+    or may not have been applied.
+    """
+
+    status_code = 502
+    error_code = ErrorCode.PRIMARY_UNAVAILABLE
+
+
+class PrimaryTimeout(PrimaryUnavailable):
+    status_code = 504
 
 
 def register_canopy_error_handler(app: FastAPI) -> None:

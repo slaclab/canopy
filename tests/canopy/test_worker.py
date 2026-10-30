@@ -21,6 +21,11 @@ def test_mirror_registers_only_ping_and_convert_batch():
     assert MIRROR_FUNCTIONS == [ping, convert_batch]
 
 
+def test_forward_registers_what_a_mirror_does():
+    # A forward instance sends writes to its primary; its own worker never captures or restores.
+    assert worker_functions("forward") == MIRROR_FUNCTIONS
+
+
 def test_primary_registers_every_task():
     assert worker_functions("primary") == FUNCTIONS
     assert {f.__name__ for f in FUNCTIONS} >= {"create_snapshot_task", "restore_snapshot_task"}
