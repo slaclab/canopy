@@ -1,6 +1,7 @@
 """Snapshot DTOs."""
 
-from typing import Any
+from uuid import UUID
+from typing import Any, Literal
 from datetime import datetime
 
 from pydantic import Field, ConfigDict
@@ -71,13 +72,19 @@ class NewSnapshotDTO(SnapshotBase):
 
 
 class SnapshotSummaryDTO(SnapshotBase):
-    """Summary DTO for listing snapshots."""
+    """Summary DTO for listing snapshots.
+
+    ``retain`` exempts the snapshot from pruning of old snapshots. ``imported_from`` is
+    the id of the snapshot it was imported from (``POST /snapshots/import``), else ``None``.
+    """
 
     id: str
     created_date: datetime
     created_by: str | None = None
     pv_count: int = 0
     facility: str | None = None  # slug
+    retain: bool = False
+    imported_from: str | None = None
     meta_pvs: list[MetaPVValueDTO] = Field(default_factory=list)
 
 
@@ -88,8 +95,68 @@ class SnapshotDTO(SnapshotSummaryDTO):
 
 
 class UpdateSnapshotDTO(CanopyModel):
+    """Partial update: fields left out (or ``null``) keep their value."""
+
     title: str | None = Field(None, min_length=1, max_length=255)
     description: str | None = None
+    retain: bool | None = None
+
+
+BUNDLE_FORMAT = "canopy.squirrel.snapshot-bundle"
+
+
+class BundleValueDTO(CanopyModel):
+    """One value in a snapshot bundle, with the addresses its PV had when exported.
+
+    ``setpoint_value`` and ``readback_value`` are the stored JSONB blobs, unchanged.
+    """
+
+    pv_id: UUID
+    pv_name: str = Field(..., max_length=255)
+    setpoint_address: str | None = Field(None, max_length=255)
+    readback_address: str | None = Field(None, max_length=255)
+    config_address: str | None = Field(None, max_length=255)
+    setpoint_value: dict[str, Any] | None = None
+    readback_value: dict[str, Any] | None = None
+    status: int | None = None
+    severity: int | None = None
+    timestamp: datetime | None = None
+
+
+class SnapshotBundleDTO(CanopyModel):
+    """A snapshot with all its values, as one instance exports it for another to import.
+
+    ``GET /snapshots/{id}/export`` writes it, typically on a history mirror;
+    ``POST /snapshots/import`` reads it on the primary. ``source_instance`` is the
+    exporter's ``CANOPY_INSTANCE``. ``facility`` is the snapshot's facility slug: slugs
+    don't change and ``core.facility`` replicates, so it names the same facility on the
+    mirror and its primary.
+    """
+
+    format: Literal["canopy.squirrel.snapshot-bundle"]
+    version: Literal[1]
+    source_instance: str | None = None
+    id: UUID
+    title: str = Field(..., min_length=1, max_length=255)
+    description: str | None = None
+    created_date: datetime
+    created_by: str | None = Field(None, max_length=255)
+    facility: str | None = Field(None, max_length=64)
+    values: list[BundleValueDTO] = []
+
+
+class SkippedValueDTO(CanopyModel):
+    """A bundle value that wasn't imported, because no PV here has its ``pv_id``."""
+
+    pv_id: str
+    pv_name: str
+
+
+class SnapshotImportResultDTO(CanopyModel):
+    """The snapshot an import created, and the bundle values it left out."""
+
+    snapshot: SnapshotSummaryDTO
+    skipped: list[SkippedValueDTO] = []
 
 
 class RestoreRequestDTO(CanopyModel):
