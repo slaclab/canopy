@@ -1,0 +1,142 @@
+"""``python -m canopy.core.replication`` — set up and inspect replication to a history mirror.
+
+Run::
+
+    python -m canopy.core.replication publish     # primary: after `alembic upgrade head`, every deploy
+    python -m canopy.core.replication grants      # mirror: after `alembic upgrade head`, every deploy
+    python -m canopy.core.replication refresh     # mirror: after `grants`, and hourly
+    python -m canopy.core.replication subscribe   # mirror: once, after its first migration
+    python -m canopy.core.replication status      # either side: JSON on stdout
+
+The database is ``CANOPY_DATABASE_URL`` and the side is ``CANOPY_ROLE`` (each
+command refuses on the wrong one). ``subscribe`` and ``refresh`` name the
+subscription after ``CANOPY_INSTANCE``; ``subscribe`` reads the primary's
+connection string from ``CANOPY_REPLICATION__PUBLISHER_DSN``, never from the
+command line, and nothing the CLI prints contains it.
+
+Logs go to stderr (JSON with ``CANOPY_LOG_FORMAT=json``), so stdout carries only
+``status`` output. Exit status: 0 done (including "nothing to do"), 1 a database
+step failed, 2 refused (wrong role or a failed precondition; nothing changed).
+"""
+
+from __future__ import annotations
+
+import sys
+import json
+import asyncio
+import logging
+import argparse
+
+import asyncpg
+
+from canopy.core.config import get_settings
+from canopy.core.logging import JsonFormatter
+from canopy.core.replication.sql import (
+    Refused,
+    ReplicationError,
+    redact,
+    asyncpg_dsn,
+    require_role,
+)
+from canopy.core.replication.config import get_replication_config
+from canopy.core.replication.publisher import publish, publisher_status
+from canopy.core.replication.subscriber import (
+    grants,
+    refresh,
+    subscribe,
+    subscriber_status,
+)
+
+logger = logging.getLogger("canopy.core.replication")
+
+# Which CANOPY_ROLE each command needs; checked before connecting so a command run
+# on the wrong side fails without touching the database.
+_COMMAND_ROLES = {"publish": "primary", "subscribe": "mirror", "refresh": "mirror", "grants": "mirror", "status": None}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m canopy.core.replication",
+        description="Set up and inspect Postgres logical replication from a primary to its history mirror.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True, metavar="command")
+    commands.add_parser("publish", help="primary: create or update the publications and the replication grants")
+    commands.add_parser("subscribe", help="mirror: create the subscription to the primary (once)")
+    commands.add_parser("refresh", help="mirror: copy tables the primary has started publishing")
+    commands.add_parser("grants", help="mirror: read access for the app role, read-write on local tables")
+    commands.add_parser("status", help="either side: replication state as JSON on stdout")
+    return parser
+
+
+def _configure_logging(log_format: str) -> None:
+    """Send this package's records to stderr, once."""
+    if any(getattr(handler, "_canopy_replication", False) for handler in logger.handlers):
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(JsonFormatter() if log_format == "json" else logging.Formatter("%(levelname)s %(message)s"))
+    handler._canopy_replication = True  # type: ignore[attr-defined]
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+
+async def run(command: str) -> int:
+    """Run one command against ``CANOPY_DATABASE_URL`` and return the exit status."""
+    settings = get_settings()
+    config = get_replication_config()
+    publisher_dsn = config.publisher_dsn.get_secret_value() if config.publisher_dsn else None
+    local_dsn = asyncpg_dsn(settings.database_url)
+    # Only the publisher DSN enters SQL text. Redacting the local one too would mask its
+    # password wherever it appears ("canopy" in dev); password-shaped text is masked regardless.
+    secrets = [publisher_dsn]
+
+    def relay_server_message(_conn: asyncpg.Connection, message: asyncpg.PostgresLogMessage) -> None:
+        level = logging.WARNING if message.severity in ("WARNING", "ERROR") else logging.INFO
+        logger.log(level, "server: %s", redact(message.message, secrets))
+
+    try:
+        if (required := _COMMAND_ROLES[command]) is not None:
+            require_role(command, required, settings.role)
+        conn = await asyncpg.connect(local_dsn, server_settings={"application_name": "canopy-replication"})
+    except Refused as exc:
+        logger.error("refused: %s", exc)
+        return 2
+    except (OSError, asyncpg.PostgresError) as exc:
+        logger.error("cannot connect to the database: %s", redact(str(exc), secrets))
+        return 1
+
+    conn.add_log_listener(relay_server_message)
+    try:
+        if command == "publish":
+            await publish(conn, role=settings.role, config=config)
+        elif command == "subscribe":
+            await subscribe(conn, role=settings.role, instance=settings.instance, config=config)
+        elif command == "refresh":
+            await refresh(conn, role=settings.role, instance=settings.instance)
+        elif command == "grants":
+            await grants(conn, role=settings.role, config=config)
+        elif settings.role == "mirror":
+            print(json.dumps(await subscriber_status(conn, instance=settings.instance), indent=2))
+        else:
+            print(json.dumps(await publisher_status(conn, config=config), indent=2))
+    except Refused as exc:
+        logger.error("refused: %s", exc)
+        return 2
+    except ReplicationError as exc:
+        logger.error("%s", exc)
+        return 1
+    except (OSError, asyncpg.PostgresError) as exc:
+        logger.error("%s failed: %s", command, redact(str(exc), secrets))
+        return 1
+    finally:
+        await conn.close()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    _configure_logging(get_settings().log_format)
+    return asyncio.run(run(args.command))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

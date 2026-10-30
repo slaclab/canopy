@@ -37,6 +37,8 @@ essentials:
 | `CANOPY_SQUIRREL__RESTORE_HOOKS` | Comma-separated restore hooks, applied in order; empty means none run. Once a hook's write fails for a PV, later hooks skip it, so list `write_to_con` before `magnet_trim` to trim a magnet only after its BCON is updated. Must reach the **worker**, which performs restores. Verify with `GET /squirrel/v1/health/restore-hooks`: `worker` is what the worker reported loading at startup, `api` is the API's view, and `matchesApi: false` flags a mismatch |
 | `CANOPY_ROLE` | `primary` (default) or `mirror`. A mirror is a read-only copy of a primary's database: write and admin routes return 403 `read_only_instance` (API-key management still works, since keys are local to each instance), and the worker runs only `ping` and batch conversion. Set it on both the API and the worker |
 | `CANOPY_INSTANCE`, `CANOPY_HISTORY_URL`, `CANOPY_WINDOW_DAYS` | Optional. Reported by `GET /v1/instance` with the role and the Alembic head shipped in the image: the instance name, the URL of its read-only history copy, and how many days of history it keeps (unset means all) |
+| `CANOPY_REPLICATION__PUBLISHER_DSN` | Mirror only, for `python -m canopy.core.replication subscribe`: the libpq connection string the subscription uses to reach the primary as the replication role. Supply it from a secret; the CLI never prints it |
+| `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_ROLE`, `__APP_ROLE` | Role names for the replication CLI: on a primary, `publish` grants the replication role (default `replicator`) and the reader role (default `canopy_reader`) SELECT on the published tables; on a mirror, `grants` gives the app role (default `canopy_app`) read access to replicated tables and read-write on API keys |
 | `CANOPY_<MODULE>__<FIELD>` | Per-module tuning (e.g. `CANOPY_VOLE__GLOBAL_BYTES_MAX`) |
 
 The annotated template
@@ -76,6 +78,12 @@ The production image carries the migration tree, so run
 `alembic upgrade head` from the new image before restarting services on it
 (see [Upgrade](production.md#upgrade)). A fresh database serves nothing until
 its first migration.
+
+On a primary with a read-only history mirror, follow the upgrade with
+`python -m canopy.core.replication publish`, which keeps the replication
+publication in step with the tables. The mirror runs `alembic upgrade head`,
+then `grants` and `refresh`, before its primary deploys; `subscribe` runs once.
+`status` reports either side as JSON.
 
 ## Health checks
 
