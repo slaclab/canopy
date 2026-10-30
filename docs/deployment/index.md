@@ -18,6 +18,8 @@ Two deployment paths are documented here:
   production compose file.
 - [Deploy at your facility](production.md) — image tags, required
   configuration, migrations, and health checks for a production instance.
+- [History mirror](history.md) — a read-only copy of an instance fed by
+  Postgres logical replication: topology, roles, release order, and runbooks.
 
 ## Configuration
 
@@ -84,7 +86,7 @@ On a primary with a read-only history mirror, follow the upgrade with
 `python -m canopy.core.replication publish`, which keeps the replication
 publication in step with the tables. The mirror runs `alembic upgrade head`,
 then `grants` and `refresh`, before its primary deploys; `subscribe` runs once.
-`status` reports either side as JSON, and `drift-check`, run on the mirror after
+`status` reports either side as JSON (see [History mirror](history.md)), and `drift-check`, run on the mirror after
 the hourly `refresh`, compares each table with the primary: it exits 1 when the
 copy has drifted (a change replication skipped) and 2 when it can't check. Run each side's migrations with its own
 `CANOPY_ROLE`: a few migration steps run on the primary or on the mirror only (see

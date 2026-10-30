@@ -114,7 +114,8 @@ class Check:
     parent_id: str = "id"  # time series with a parent: the parent's primary key column
 
 
-async def _columns(conn: asyncpg.Connection, table: str) -> list[str]:
+async def table_columns(conn: asyncpg.Connection, table: str) -> list[str]:
+    """``table``'s columns, in order."""
     rows = await conn.fetch(
         "SELECT attname FROM pg_attribute WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped "
         "ORDER BY attnum",
@@ -123,7 +124,8 @@ async def _columns(conn: asyncpg.Connection, table: str) -> list[str]:
     return [row["attname"] for row in rows]
 
 
-async def _primary_key(conn: asyncpg.Connection, table: str) -> list[str]:
+async def primary_key(conn: asyncpg.Connection, table: str) -> list[str]:
+    """``table``'s primary-key columns, in key order."""
     rows = await conn.fetch(
         """
         SELECT a.attname
@@ -170,13 +172,13 @@ async def plan(
             elif bucketing.parent not in ready:
                 skipped[table] = f"parent {bucketing.parent} not ready"
             else:
-                (parent_id,) = await _primary_key(mirror, bucketing.parent)
+                (parent_id,) = await primary_key(mirror, bucketing.parent)
                 checks.append(Check(table, kind, bucketing=bucketing, parent_id=parent_id))
         else:
-            on_primary = set(await _columns(primary, table))
+            on_primary = set(await table_columns(primary, table))
             # One column list, in one order, for both sides' row hashes.
-            columns = tuple(c for c in await _columns(mirror, table) if c in on_primary)
-            checks.append(Check(table, kind, columns=columns, key=tuple(await _primary_key(mirror, table))))
+            columns = tuple(c for c in await table_columns(mirror, table) if c in on_primary)
+            checks.append(Check(table, kind, columns=columns, key=tuple(await primary_key(mirror, table))))
     return checks, skipped
 
 

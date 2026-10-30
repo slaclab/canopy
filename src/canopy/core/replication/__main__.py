@@ -8,6 +8,7 @@ Run::
     python -m canopy.core.replication subscribe   # mirror: once, after its first migration
     python -m canopy.core.replication status      # either side: JSON on stdout
     python -m canopy.core.replication drift-check # mirror: compare with the primary, hourly after `refresh`
+    python -m canopy.core.replication reseed --since <time>  # mirror: refill a gap, then resume replication
 
 The database is ``CANOPY_DATABASE_URL`` and the side is ``CANOPY_ROLE`` (each
 command refuses on the wrong one). ``subscribe`` and ``refresh`` name the
@@ -34,7 +35,7 @@ import asyncpg
 
 from canopy.core.config import get_settings
 from canopy.core.logging import JsonFormatter
-from canopy.core.replication import drift
+from canopy.core.replication import drift, reseed
 from canopy.core.replication.sql import (
     Refused,
     ReplicationError,
@@ -77,6 +78,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=30.0,
         metavar="SECONDS",
         help="pause before re-reading tables that differ, to let apply catch up (default 30; 0 skips the re-check)",
+    )
+    fill = commands.add_parser(
+        "reseed", help="mirror: copy what the primary changed since a time, then resume replication from now"
+    )
+    fill.add_argument(
+        "--since",
+        required=True,
+        type=reseed.parse_since,
+        metavar="TIME",
+        help="ISO 8601 time (UTC if no zone), no later than the newest snapshot the mirror holds",
     )
     return parser
 
@@ -157,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
     _configure_logging(get_settings().log_format)
     if args.command == "drift-check":
         return asyncio.run(drift.run(args))
+    if args.command == "reseed":
+        return asyncio.run(reseed.run(args))
     return asyncio.run(run(args.command))
 
 

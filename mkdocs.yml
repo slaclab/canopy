@@ -106,6 +106,7 @@ nav:
     - Docker Compose: deployment/docker.md
     - Deploy at Your Facility: deployment/production.md
     - API Keys: deployment/api-keys.md
+    - History Mirror: deployment/history.md
   - How To:
     - Custom archiver adapter: how_to/custom_archiver_adapter.md
     - Custom directory adapter: how_to/custom_directory_adapter.md
