@@ -92,7 +92,8 @@ then `grants` and `refresh`, before its primary deploys; `subscribe` runs once.
 | Endpoint | Use |
 |----------|-----|
 | `GET /health` | Process liveness — used by the container healthchecks and post-deploy checks |
+| `GET /health/ready` | Readiness: 200 `{"status": "ready"}` once the database answers `SELECT 1` within two seconds, 503 while it doesn't. Use it for a Kubernetes readiness probe; keep `/health` as the liveness probe, so a database outage takes the API out of rotation instead of restarting it |
 | `GET /<module>/v1/health/watchdog` | Per-module liveness heartbeat (version, uptime) |
 | `GET /<module>/v1/health/summary` | Per-module status rollup (requires read access) — e.g. Hare's reports backend, client and monitor counts |
 | `GET /v1/instance` | `{role, instance, historyUrl, windowDays, alembicHead}` (requires read access on `core`). `alembicHead` is the migrations head shipped in the image, not the database's |
-| `GET /metrics` | Prometheus exposition (unauthenticated, like `/health`): request counts and latency per module route, plus module gauges — see [Metrics](../observability/metrics.md) |
+| `GET /metrics` | Prometheus exposition (unauthenticated, like `/health`): request counts and latency per module route, module gauges, and replication slot or subscription state — see [Metrics](../observability/metrics.md) |

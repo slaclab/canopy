@@ -6,7 +6,7 @@ from html import escape
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from canopy import __version__
@@ -25,6 +25,7 @@ from canopy.magpie.app import app as magpie_app
 from canopy.magpie.app import magpie_lifespan
 from canopy.core.config import get_settings
 from canopy.core.errors import register_canopy_error_handler
+from canopy.core.health import database_ready
 from canopy.raccoon.app import app as raccoon_app
 from canopy.raccoon.app import raccoon_lifespan
 from canopy.core.logging import configure_logging
@@ -40,6 +41,7 @@ from canopy.core.instance import router as instance_router
 from canopy.core.security import bind_key_registry
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.keys.routes import router as api_keys_router
+from canopy.core.replication import metrics as replication_metrics
 from canopy.core.keys.registry import build_key_registry
 from canopy.core.facilities.routes import router as facilities_router
 from canopy.core.keys.repositories import ApiKeyRepository
@@ -151,15 +153,26 @@ tag_module(jobs_app, "jobs")
 tag_module(converter_app, "converter")
 tag_module(analytics_app, "analytics")
 
+replication_metrics.register()
+
 
 @app.get("/health", tags=["meta"])
 async def health() -> dict[str, str]:
     return {"status": "healthy"}
 
 
+@app.get("/health/ready", tags=["meta"])
+async def ready() -> JSONResponse:
+    """Readiness: 200 once the database answers, 503 while it doesn't. ``/health`` stays the liveness probe."""
+    if await database_ready():
+        return JSONResponse({"status": "ready"})
+    return JSONResponse({"status": "unavailable", "database": "unreachable"}, status_code=503)
+
+
 @app.get("/metrics", tags=["meta"], response_class=PlainTextResponse)
 async def metrics() -> Response:
     """Prometheus exposition for this process."""
+    await replication_metrics.refresh()
     payload, content_type = render_latest()
     return Response(content=payload, media_type=content_type)
 
