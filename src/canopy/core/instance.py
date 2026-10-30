@@ -1,6 +1,7 @@
 """``GET /v1/instance`` — what this deployment is, for clients and deploy checks.
 
-Clients read ``role`` to hide write controls on a read-only mirror and
+Clients read ``role`` to hide write controls on a read-only mirror,
+``machineAccess`` to hide PV writes and restores where they would be refused, and
 ``historyUrl`` to link to the full history; the deploy pipeline compares
 ``alembicHead`` between a mirror and its primary to stop a release that would
 migrate the primary ahead of the copy subscribed to it.
@@ -31,6 +32,7 @@ class InstanceDTO(CanopyModel):
     history_url: str | None
     window_days: int | None
     alembic_head: str | None
+    machine_access: Literal["read", "write"]
 
 
 @lru_cache
@@ -64,4 +66,5 @@ async def get_instance() -> InstanceDTO:
         history_url=settings.history_url,
         window_days=settings.window_days,
         alembic_head=shipped_alembic_head(),
+        machine_access="write" if settings.machine_writes else "read",
     )

@@ -12,6 +12,7 @@ from starlette.routing import compile_path
 from canopy.core.security import require_write_access
 from canopy.core.forwarding.routes import (
     SHARED,
+    MACHINE,
     FACILITY,
     FORWARDABLE,
     NOT_FORWARDED,
@@ -60,9 +61,14 @@ def test_snapshot_changes_carry_the_age_check():
     assert match("POST", "/squirrel/v1/snapshots", allow_shared=False)[0].snapshot_param is None
 
 
+def test_machine_routes_always_match_for_the_middleware_to_judge():
+    route, params = match("POST", "/squirrel/v1/snapshots/abc/restore", allow_shared=False)
+    assert route.route_class is MACHINE
+    assert params == {"snapshot_id": "abc"}
+
+
 def test_reads_and_unknown_paths_are_never_forwarded():
     assert match("GET", "/squirrel/v1/snapshots", allow_shared=True) is None
-    assert match("POST", "/squirrel/v1/snapshots/abc/restore", allow_shared=True) is None
     assert match("PUT", "/hare/v1/pvs/SOME:PV", allow_shared=True) is None
 
 

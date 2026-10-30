@@ -51,6 +51,7 @@ def test_primary_defaults(client):
         "historyUrl": None,
         "windowDays": None,
         "alembicHead": _repo_head(),
+        "machineAccess": "write",
     }
 
 
@@ -64,11 +65,14 @@ def test_mirror_reports_its_role_and_history_fields(client, history_settings):
         "historyUrl": "https://history.example.org",
         "windowDays": None,
         "alembicHead": _repo_head(),
+        "machineAccess": "read",
     }
 
 
-def test_forward_reports_its_role(client, forward_role):
-    assert client.get("/v1/instance", headers={"X-API-Key": "ro"}).json()["role"] == "forward"
+def test_forward_reports_its_role_and_machine_access(client, forward_role):
+    body = client.get("/v1/instance", headers={"X-API-Key": "ro"}).json()
+
+    assert (body["role"], body["machineAccess"]) == ("forward", "read")
 
 
 def test_requires_a_key(client):

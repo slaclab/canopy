@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import Path, Security, APIRouter
 
 from canopy.contracts.pv import PVMeta, PVValue
-from canopy.core.security import require_read_access, require_write_access
+from canopy.core.security import require_read_access, require_machine_write_access
 from canopy.hare.schemas.pv import PVWriteDTO, PVWriteResultDTO
 from canopy.hare.dependencies import PVBrokerDep
 
@@ -38,7 +38,7 @@ async def get_pv(
     return await broker.get_value(pv)
 
 
-@router.put("/{pv:path}", dependencies=[Security(require_write_access)])
+@router.put("/{pv:path}", dependencies=[Security(require_machine_write_access)])
 async def put_pv(
     pv: Annotated[str, Path(description="PV name; may carry a ca:// or pva:// prefix")],
     body: PVWriteDTO,
@@ -49,6 +49,8 @@ async def put_pv(
     With ``wait`` true (the default) the call
     blocks until the IOC processes the write, so a 200 means it landed; a failure
     or timeout raises `PVWriteFailed` (-> 502).
+
+    On a forward instance this runs only with ``CANOPY_MACHINE_ACCESS=write``.
     """
     await broker.put(pv, body.value, wait=body.wait, timeout=body.timeout)
     return PVWriteResultDTO(pv=pv)

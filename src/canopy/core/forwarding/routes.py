@@ -27,6 +27,9 @@ class RouteClass(StrEnum):
     """Rows that belong to one facility (snapshots, PVs): forwarded by default."""
     SHARED = "shared"
     """Tables every facility shares (tag groups and tags, meta-PVs, Magpie configs)."""
+    MACHINE = "machine"
+    """Operations that change the machine, run by the primary: forwarded only with
+    ``CANOPY_MACHINE_ACCESS=write``, otherwise refused with ``machine_read_only``."""
 
 
 @dataclass(frozen=True)
@@ -52,7 +55,7 @@ class ForwardRoute:
         return self.path.split("/", 2)[1]
 
 
-FACILITY, SHARED = RouteClass.FACILITY, RouteClass.SHARED
+FACILITY, SHARED, MACHINE = RouteClass.FACILITY, RouteClass.SHARED, RouteClass.MACHINE
 
 FORWARDABLE: tuple[ForwardRoute, ...] = (
     # Snapshot capture is a machine read by the primary's worker; the response is a
@@ -83,11 +86,12 @@ FORWARDABLE: tuple[ForwardRoute, ...] = (
     ForwardRoute("POST", "/magpie/v1/configs/{app}", SHARED),
     ForwardRoute("PUT", "/magpie/v1/configs/{app}/{slug}", SHARED),
     ForwardRoute("DELETE", "/magpie/v1/configs/{app}/{slug}", SHARED),
+    # The primary's worker restores; the job is polled like a capture's.
+    ForwardRoute("POST", "/squirrel/v1/snapshots/{snapshot_id}/restore", MACHINE, snapshot_param="snapshot_id"),
 )
 
 NOT_FORWARDED: dict[tuple[str, str], str] = {
-    ("PUT", "/hare/v1/pvs/{pv:path}"): "writes the machine; machine access decides where it runs",
-    ("POST", "/squirrel/v1/snapshots/{snapshot_id}/restore"): "writes the machine; only the primary restores",
+    ("PUT", "/hare/v1/pvs/{pv:path}"): "one PV write; runs here through this instance's gateway with machine access",
     ("POST", "/vole/v1/_debug/evict/{pv:path}"): "drops this process's own buffer; nothing to forward",
     ("POST", "/v1/facilities"): "edits the facility hierarchy; done on the primary",
     ("PUT", "/v1/facilities/{facility_slug}"): "edits the facility hierarchy; done on the primary",
@@ -100,6 +104,7 @@ def match(method: str, path: str, *, allow_shared: bool) -> tuple[ForwardRoute, 
 
     ``path`` is the route path (any ``root_path`` already removed). ``None`` when the
     request isn't forwarded, including shared-table writes without ``allow_shared``.
+    Machine routes always match; the caller refuses them without machine access.
     """
     for route in FORWARDABLE:
         if route.method != method or (route.route_class is SHARED and not allow_shared):

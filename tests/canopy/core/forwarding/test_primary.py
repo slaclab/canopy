@@ -9,6 +9,7 @@ import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from fastapi import FastAPI
+from sqlalchemy import text
 from fastapi.testclient import TestClient
 
 from canopy.core import db, security
@@ -262,6 +263,27 @@ async def test_a_caller_with_no_facilities_reaches_none(http, sites, captures):
 
     assert resp.status_code == 403
     assert captures == []
+
+
+async def test_a_forwarded_restore_logs_the_caller(http, monkeypatch, caplog):
+    async def fake_enqueue(function, *args, **kwargs):
+        return "job-r"
+
+    monkeypatch.setattr("canopy.jobs.gateway.enqueue", fake_enqueue)
+    snapshot_id = "6f1c2c1e-0d4b-4c43-9a55-2f0d7a3c9b10"
+    async with db.get_session_maker()() as session:
+        await session.execute(
+            text("INSERT INTO squirrel.snapshot (id, title) VALUES (:id, 'Before')"), {"id": snapshot_id}
+        )
+        await session.commit()
+
+    with caplog.at_level("INFO", logger="canopy.squirrel.api.v1.snapshots"):
+        resp = await http.post(
+            f"/squirrel/v1/snapshots/{snapshot_id}/restore", headers={"X-API-Key": "svc", **ON_BEHALF}
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert f"Restore of snapshot {snapshot_id} queued as job job-r for operator@site_a" in caplog.text
 
 
 async def test_a_forwarded_config_records_the_caller_not_the_body(http):

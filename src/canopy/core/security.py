@@ -12,6 +12,7 @@ from canopy.core.errors import (
     ErrorCode,
     BadRequest,
     InvalidAPIKey,
+    MachineReadOnly,
     ReadOnlyInstance,
     KeyStoreUnavailable,
     ForwardedWriteRefused,
@@ -381,6 +382,29 @@ def require_write_access(key: APIKeyDep) -> APIKey:
     """
     if is_read_only_instance():
         raise ReadOnlyInstance(_read_only_detail())
+    if not key.write:
+        raise InsufficientWriteAccess("API key does not have write access")
+    return key
+
+
+MACHINE_READ_ONLY_DETAIL = (
+    "This Canopy instance has no machine access (CANOPY_MACHINE_ACCESS=read); make machine changes on the primary"
+)
+
+
+def require_machine_write_access(key: APIKeyDep) -> APIKey:
+    """Gate for a write to the machine made by this process (a Hare PV write).
+
+    A primary checks write scope as ``require_write_access`` does, and a mirror
+    refuses as it does. A forward instance runs the write here, through its own
+    gateway, only with ``CANOPY_MACHINE_ACCESS=write``; otherwise
+    ``machine_read_only``. Never forwarded: the primary's own users write there.
+    """
+    settings = get_settings()
+    if settings.role == "forward" and not settings.machine_writes:
+        raise MachineReadOnly(MACHINE_READ_ONLY_DETAIL)
+    if settings.role == "mirror":
+        raise ReadOnlyInstance(READ_ONLY_DETAIL)
     if not key.write:
         raise InsufficientWriteAccess("API key does not have write access")
     return key
