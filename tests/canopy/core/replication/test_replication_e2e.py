@@ -9,8 +9,6 @@ while the mirror's tables belong to an ordinary owner role granted
 Each test gets its own databases and roles on both servers.
 """
 
-import os
-import asyncio
 from uuid import uuid4
 from dataclasses import dataclass
 
@@ -18,7 +16,6 @@ import pytest
 import asyncpg
 import pytest_asyncio
 from pydantic import SecretStr
-from sqlalchemy.engine import make_url
 
 from canopy.core.replication.sql import Refused, ReplicationError
 from canopy.core.replication.config import ReplicationConfig
@@ -31,26 +28,20 @@ from canopy.core.replication.subscriber import (
     subscriber_status,
 )
 
-from .conftest import drop_roles, build_schema
-
-PUBLISHER_ADMIN = os.environ.get("CANOPY_TEST_REPLICATION_PUBLISHER_DSN")
-SUBSCRIBER_ADMIN = os.environ.get("CANOPY_TEST_REPLICATION_SUBSCRIBER_DSN")
-# How the mirror's server reaches the primary's: libpq key=value, without dbname/user/password.
-PUBLISHER_CONNINFO = os.environ.get("CANOPY_TEST_REPLICATION_PUBLISHER_CONNINFO")
-
-pytestmark = pytest.mark.skipif(
-    not (PUBLISHER_ADMIN and SUBSCRIBER_ADMIN and PUBLISHER_CONNINFO),
-    reason="set CANOPY_TEST_REPLICATION_{PUBLISHER_DSN,SUBSCRIBER_DSN,PUBLISHER_CONNINFO}; see docker-compose.yml here",
+from .conftest import (
+    PUBLISHER_ADMIN,
+    SUBSCRIBER_ADMIN,
+    PUBLISHER_CONNINFO,
+    drop_roles,
+    eventually,
+    server_dsn,
+    build_schema,
+    requires_pair,
 )
 
+pytestmark = requires_pair
+
 PRESENT = sorted(REGISTRY.replicated)
-
-
-def _dsn(admin: str, *, database: str, user: str | None = None, password: str | None = None) -> str:
-    url = make_url(admin).set(database=database)
-    if user is not None:
-        url = url.set(username=user, password=password)
-    return url.render_as_string(hide_password=False)
 
 
 @dataclass
@@ -79,8 +70,8 @@ async def pair():
     await sub_server.execute(f'GRANT pg_create_subscription TO "{owner}"')
     await sub_server.execute(f'CREATE ROLE "{app}" LOGIN')
     await sub_server.execute(f'CREATE DATABASE "{sub_db}" OWNER "{owner}"')
-    await build_schema(_dsn(PUBLISHER_ADMIN, database=pub_db))
-    await build_schema(_dsn(SUBSCRIBER_ADMIN, database=sub_db, user=owner, password=owner_pw))
+    await build_schema(server_dsn(PUBLISHER_ADMIN, database=pub_db))
+    await build_schema(server_dsn(SUBSCRIBER_ADMIN, database=sub_db, user=owner, password=owner_pw))
 
     config = ReplicationConfig(
         replicator_role=replicator,
@@ -92,9 +83,9 @@ async def pair():
         instance=f"e2e_{suffix}",
         owner=owner,
         config=config,
-        pub=await asyncpg.connect(_dsn(PUBLISHER_ADMIN, database=pub_db)),
-        sub=await asyncpg.connect(_dsn(SUBSCRIBER_ADMIN, database=sub_db, user=owner, password=owner_pw)),
-        sub_admin=await asyncpg.connect(_dsn(SUBSCRIBER_ADMIN, database=sub_db)),
+        pub=await asyncpg.connect(server_dsn(PUBLISHER_ADMIN, database=pub_db)),
+        sub=await asyncpg.connect(server_dsn(SUBSCRIBER_ADMIN, database=sub_db, user=owner, password=owner_pw)),
+        sub_admin=await asyncpg.connect(server_dsn(SUBSCRIBER_ADMIN, database=sub_db)),
     )
     try:
         yield pair
@@ -112,17 +103,6 @@ async def pair():
         await drop_roles(sub_server, [owner, app])
         await pub_server.close()
         await sub_server.close()
-
-
-async def eventually(check, timeout: float = 60.0):
-    """Await ``check()`` until it returns something truthy; fail after ``timeout`` seconds."""
-    deadline = asyncio.get_running_loop().time() + timeout
-    while True:
-        if result := await check():
-            return result
-        if asyncio.get_running_loop().time() > deadline:
-            pytest.fail(f"condition not met within {timeout}s")
-        await asyncio.sleep(0.2)
 
 
 async def _copied(p: Pair) -> bool:

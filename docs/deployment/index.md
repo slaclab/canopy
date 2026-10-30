@@ -83,7 +83,9 @@ On a primary with a read-only history mirror, follow the upgrade with
 `python -m canopy.core.replication publish`, which keeps the replication
 publication in step with the tables. The mirror runs `alembic upgrade head`,
 then `grants` and `refresh`, before its primary deploys; `subscribe` runs once.
-`status` reports either side as JSON.
+`status` reports either side as JSON. Run each side's migrations with its own
+`CANOPY_ROLE`: a few migration steps run on the primary or on the mirror only (see
+"Database Migrations" in `CONTRIBUTING.md`).
 
 ## Health checks
 

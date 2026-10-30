@@ -7,10 +7,12 @@ cluster-wide, so each test gets uniquely named ones and drops them afterwards.
 Skips rather than fails when Postgres is unreachable, like the other database tests.
 
 None of these need ``wal_level = logical``: Postgres creates a publication without
-it (with a warning). Subscribing needs a second server; see ``test_replication_e2e.py``.
+it (with a warning). Subscribing needs a second server: the tests marked
+``requires_pair`` run against two (``docker-compose.yml`` here starts them).
 """
 
 import os
+import asyncio
 from uuid import uuid4
 
 import pytest
@@ -32,6 +34,36 @@ from canopy.core.replication.registry import REGISTRY
 _ADMIN_DSN = os.environ.get("CANOPY_TEST_ADMIN_DSN", "postgresql://canopy:canopy@localhost:5432/postgres")
 _DB_NAME = "canopy_replication_test"
 DB_DSN = make_url(_ADMIN_DSN).set(database=_DB_NAME).render_as_string(hide_password=False)
+
+# A primary (wal_level=logical) and a mirror on two servers, for the end-to-end tests.
+PUBLISHER_ADMIN = os.environ.get("CANOPY_TEST_REPLICATION_PUBLISHER_DSN")
+SUBSCRIBER_ADMIN = os.environ.get("CANOPY_TEST_REPLICATION_SUBSCRIBER_DSN")
+# How the mirror's server reaches the primary's: libpq key=value, without dbname/user/password.
+PUBLISHER_CONNINFO = os.environ.get("CANOPY_TEST_REPLICATION_PUBLISHER_CONNINFO")
+
+requires_pair = pytest.mark.skipif(
+    not (PUBLISHER_ADMIN and SUBSCRIBER_ADMIN and PUBLISHER_CONNINFO),
+    reason="set CANOPY_TEST_REPLICATION_{PUBLISHER_DSN,SUBSCRIBER_DSN,PUBLISHER_CONNINFO}; see docker-compose.yml here",
+)
+
+
+def server_dsn(admin: str, *, database: str, user: str | None = None, password: str | None = None) -> str:
+    """``admin`` pointed at ``database``, optionally as another user."""
+    url = make_url(admin).set(database=database)
+    if user is not None:
+        url = url.set(username=user, password=password)
+    return url.render_as_string(hide_password=False)
+
+
+async def eventually(check, timeout: float = 60.0):
+    """Await ``check()`` until it returns something truthy; fail after ``timeout`` seconds."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        if result := await check():
+            return result
+        if asyncio.get_running_loop().time() > deadline:
+            pytest.fail(f"condition not met within {timeout}s")
+        await asyncio.sleep(0.2)
 
 
 async def build_schema(dsn: str) -> None:
