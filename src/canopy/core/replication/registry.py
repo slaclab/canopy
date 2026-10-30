@@ -11,11 +11,16 @@ whether the mirror gets it:
     applied on the mirror too.
 ``time_series``
     Rows that only accumulate (snapshots and their values). Replicated with every
-    operation for now; a later phase moves them to a publication without
-    deletes, so pruning the primary never removes history.
+    operation in the single layout; in the split layout their publication carries
+    no deletes, so pruning the primary never removes history.
 ``local``
     Rows that belong to one database and never replicate. API keys are local: a
     mirror mints and checks its own.
+
+Two publication layouts carry the same tables. ``publications`` is the single
+``canopy_history`` every primary starts with; ``split_publications`` is the pair a
+primary that prunes old rows switches to (``publish --split``): ``canopy_ref`` with
+every operation and ``canopy_ts`` with inserts and updates only.
 
 Keys are ``"schema.table"`` strings rather than model classes, so ``canopy.core``
 imports no module's models.
@@ -66,6 +71,16 @@ class ReplicationRegistry:
 
     tables: Mapping[str, TableClass]
     publications: tuple[Publication, ...]
+    split_publications: tuple[Publication, ...] = ()
+
+    def layout(self, split: bool) -> tuple[Publication, ...]:
+        """The publications of one layout: the split pair when ``split``, else the single one."""
+        return self.split_publications if split else self.publications
+
+    @property
+    def all_publications(self) -> tuple[Publication, ...]:
+        """Every publication either layout uses."""
+        return self.publications + self.split_publications
 
     def published(self, publication: Publication) -> list[str]:
         """Tables ``publication`` carries, sorted."""
@@ -98,6 +113,7 @@ def split_name(qualified: str) -> tuple[str, str]:
 EXCLUDED = frozenset({"public.alembic_version"})
 
 _ALL_OPERATIONS = ("insert", "update", "delete")
+_NO_DELETES = ("insert", "update")
 
 REGISTRY = ReplicationRegistry(
     tables=MappingProxyType(
@@ -113,6 +129,7 @@ REGISTRY = ReplicationRegistry(
             "squirrel.snapshot": TableClass.TIME_SERIES,
             "squirrel.snapshot_value": TableClass.TIME_SERIES,
             "core.api_key": TableClass.LOCAL,
+            "core.history_heartbeat": TableClass.LOCAL,
         }
     ),
     # One publication until the primary prunes old rows. TRUNCATE is left out on
@@ -124,5 +141,13 @@ REGISTRY = ReplicationRegistry(
             classes=frozenset({TableClass.REFERENCE, TableClass.TIME_SERIES}),
             operations=_ALL_OPERATIONS,
         ),
+    ),
+    # Reference tables keep their deletes: replacing a PV's tags deletes and re-inserts
+    # link rows, and without the delete the re-insert would collide on the mirror and
+    # stop replication. Time-series deletes come only from pruning (user deletes are
+    # soft), and those must never reach history.
+    split_publications=(
+        Publication(name="canopy_ref", classes=frozenset({TableClass.REFERENCE}), operations=_ALL_OPERATIONS),
+        Publication(name="canopy_ts", classes=frozenset({TableClass.TIME_SERIES}), operations=_NO_DELETES),
     ),
 )

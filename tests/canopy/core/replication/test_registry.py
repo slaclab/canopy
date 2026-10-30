@@ -79,6 +79,29 @@ def test_publications_are_well_formed():
 
 
 def test_derived_views():
-    assert REGISTRY.local == ["core.api_key"]
+    assert REGISTRY.local == ["core.api_key", "core.history_heartbeat"]
     assert REGISTRY.schemas == ["core", "magpie", "squirrel"]
     assert set(REGISTRY.replicated) == {name for name, cls in REGISTRY.tables.items() if cls is not TableClass.LOCAL}
+
+
+def test_each_layout_publishes_every_non_local_table_exactly_once():
+    for layout in (REGISTRY.publications, REGISTRY.split_publications):
+        for name, cls in REGISTRY.tables.items():
+            carriers = [p.name for p in layout if name in REGISTRY.published(p)]
+            assert len(carriers) == (0 if cls is TableClass.LOCAL else 1), f"{name} is published by {carriers}"
+
+
+def test_the_split_layout_never_publishes_time_series_deletes():
+    by_name = {p.name: p for p in REGISTRY.split_publications}
+    assert set(by_name) == {"canopy_ref", "canopy_ts"}
+    assert by_name["canopy_ts"].classes == {TableClass.TIME_SERIES}
+    assert not {"delete", "truncate"} & set(by_name["canopy_ts"].operations)
+    # Reference tables keep deletes: replacing a PV's tags deletes and re-inserts link rows.
+    assert by_name["canopy_ref"].classes == {TableClass.REFERENCE}
+    assert "delete" in by_name["canopy_ref"].operations
+
+
+def test_layouts():
+    assert REGISTRY.layout(False) == REGISTRY.publications
+    assert REGISTRY.layout(True) == REGISTRY.split_publications
+    assert REGISTRY.all_publications == REGISTRY.publications + REGISTRY.split_publications

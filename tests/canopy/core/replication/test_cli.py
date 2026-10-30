@@ -47,7 +47,16 @@ def test_a_command_is_required():
     assert caught.value.code == 2
 
 
-@pytest.mark.parametrize(("command", "role"), [("publish", "mirror"), ("subscribe", "primary"), ("grants", "primary")])
+@pytest.mark.parametrize(
+    ("command", "role"),
+    [
+        ("publish", "mirror"),
+        ("subscribe", "primary"),
+        ("grants", "primary"),
+        ("switch", "primary"),
+        ("heartbeat", "primary"),
+    ],
+)
 def test_wrong_side_is_refused_without_connecting(env, no_connect, caplog, command, role):
     env(CANOPY_ROLE=role)
     assert cli.main([command]) == 2
@@ -59,6 +68,30 @@ def test_connection_failure_exits_1_without_the_password(env, caplog):
     assert cli.main(["status"]) == 1
     assert "cannot connect" in caplog.text
     assert "s3cret-local" not in caplog.text
+
+
+def test_split_switch_and_heartbeat_options():
+    parser = cli.build_parser()
+
+    assert parser.parse_args(["publish", "--split"]).split is True
+    assert parser.parse_args(["publish"]).split is False
+    assert parser.parse_args(["subscribe", "--split"]).split is True
+    assert parser.parse_args(["switch"]).timeout == 120.0
+    checks = parser.parse_args(["heartbeat", "--backup-ok", "--drift-ok"])
+    assert (checks.backup_ok, checks.wal_archive_ok, checks.drift_ok) == (True, False, True)
+
+
+async def test_an_unreachable_primary_is_reported_without_the_heartbeat_password():
+    from pydantic import SecretStr
+
+    from canopy.core.replication.config import ReplicationConfig
+    from canopy.core.replication.subscriber import ReplicationError, _connect_primary
+
+    config = ReplicationConfig(heartbeat_dsn=SecretStr("postgresql://beat:s3cret-beat@127.0.0.1:1/canopy"))
+    with pytest.raises(ReplicationError) as caught:
+        await _connect_primary(config, "heartbeat")
+    assert "cannot connect to the primary" in str(caught.value)
+    assert "s3cret-beat" not in str(caught.value)
 
 
 def test_logging_is_configured_once():

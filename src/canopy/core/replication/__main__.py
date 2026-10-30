@@ -9,12 +9,19 @@ Run::
     python -m canopy.core.replication status      # either side: JSON on stdout
     python -m canopy.core.replication drift-check # mirror: compare with the primary, hourly after `refresh`
     python -m canopy.core.replication reseed --since <time>  # mirror: refill a gap, then resume replication
+    python -m canopy.core.replication heartbeat --backup-ok --wal-archive-ok --drift-ok
+                                                  # mirror: hourly, after its checks; writes to the primary
+
+A primary that prunes old rows moves to the split publication layout once:
+``publish --split`` on the primary, ``switch`` on the mirror, then ``publish --split``
+on the primary again (see ``canopy.core.replication.publisher``).
 
 The database is ``CANOPY_DATABASE_URL`` and the side is ``CANOPY_ROLE`` (each
 command refuses on the wrong one). ``subscribe`` and ``refresh`` name the
 subscription after ``CANOPY_INSTANCE``; ``subscribe`` reads the primary's
 connection string from ``CANOPY_REPLICATION__PUBLISHER_DSN``, never from the
-command line, and nothing the CLI prints contains it.
+command line, and nothing the CLI prints contains it. ``heartbeat`` and ``switch``
+reach the primary through ``CANOPY_REPLICATION__HEARTBEAT_DSN``, handled the same way.
 
 Logs go to stderr (JSON with ``CANOPY_LOG_FORMAT=json``), so stdout carries only
 ``status`` output. Exit status: 0 done (including "nothing to do"), 1 a database
@@ -47,7 +54,9 @@ from canopy.core.replication.config import get_replication_config
 from canopy.core.replication.publisher import publish, publisher_status
 from canopy.core.replication.subscriber import (
     grants,
+    switch,
     refresh,
+    heartbeat,
     subscribe,
     subscriber_status,
 )
@@ -56,7 +65,15 @@ logger = logging.getLogger("canopy.core.replication")
 
 # Which CANOPY_ROLE each command needs; checked before connecting so a command run
 # on the wrong side fails without touching the database.
-_COMMAND_ROLES = {"publish": "primary", "subscribe": "mirror", "refresh": "mirror", "grants": "mirror", "status": None}
+_COMMAND_ROLES = {
+    "publish": "primary",
+    "subscribe": "mirror",
+    "refresh": "mirror",
+    "grants": "mirror",
+    "status": None,
+    "switch": "mirror",
+    "heartbeat": "mirror",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -65,11 +82,34 @@ def build_parser() -> argparse.ArgumentParser:
         description="Set up and inspect Postgres logical replication from a primary to its history mirror.",
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="command")
-    commands.add_parser("publish", help="primary: create or update the publications and the replication grants")
-    commands.add_parser("subscribe", help="mirror: create the subscription to the primary (once)")
+    publish_parser = commands.add_parser(
+        "publish", help="primary: create or update the publications and the replication grants"
+    )
+    subscribe_parser = commands.add_parser("subscribe", help="mirror: create the subscription to the primary (once)")
     commands.add_parser("refresh", help="mirror: copy tables the primary has started publishing")
     commands.add_parser("grants", help="mirror: read access for the app role, read-write on local tables")
     commands.add_parser("status", help="either side: replication state as JSON on stdout")
+    publish_parser.add_argument(
+        "--split",
+        action="store_true",
+        help="move to canopy_ref + canopy_ts: create them, or, once the mirror has switched, drop canopy_history",
+    )
+    subscribe_parser.add_argument(
+        "--split", action="store_true", help="subscribe to canopy_ref + canopy_ts (a primary already split)"
+    )
+    switch_parser = commands.add_parser(
+        "switch", help="mirror: move the subscription to canopy_ref + canopy_ts (once, after `publish --split`)"
+    )
+    switch_parser.add_argument(
+        "--timeout", type=float, default=120.0, help="seconds to wait for the slot to catch up (default 120)"
+    )
+    heartbeat_parser = commands.add_parser(
+        "heartbeat", help="mirror: record this mirror's check results on the primary (hourly)"
+    )
+    for check in ("backup", "wal-archive", "drift"):
+        heartbeat_parser.add_argument(
+            f"--{check}-ok", action="store_true", help=f"the {check.replace('-', ' ')} check passed; omit if it failed"
+        )
     check = commands.add_parser("drift-check", help="mirror: compare each table with the primary; exit 1 on drift")
     check.add_argument("--days", type=_positive_int, help="compare time-series rows from the last DAYS days only")
     check.add_argument(
@@ -110,15 +150,21 @@ def _configure_logging(log_format: str) -> None:
     logger.setLevel(logging.INFO)
 
 
-async def run(command: str) -> int:
-    """Run one command against ``CANOPY_DATABASE_URL`` and return the exit status."""
+async def run(command: str, options: argparse.Namespace | None = None) -> int:
+    """Run one command against ``CANOPY_DATABASE_URL`` and return the exit status.
+
+    ``options`` are the parsed command-line flags; ``None`` runs the command with its defaults.
+    """
+    options = options or build_parser().parse_args([command])
     settings = get_settings()
     config = get_replication_config()
     publisher_dsn = config.publisher_dsn.get_secret_value() if config.publisher_dsn else None
+    heartbeat_dsn = config.heartbeat_dsn.get_secret_value() if config.heartbeat_dsn else None
     local_dsn = asyncpg_dsn(settings.database_url)
-    # Only the publisher DSN enters SQL text. Redacting the local one too would mask its
-    # password wherever it appears ("canopy" in dev); password-shaped text is masked regardless.
-    secrets = [publisher_dsn]
+    # Only the publisher DSN enters SQL text, and the heartbeat DSN is a second
+    # connection. Redacting the local one too would mask its password wherever it
+    # appears ("canopy" in dev); password-shaped text is masked regardless.
+    secrets = [publisher_dsn, heartbeat_dsn]
 
     def relay_server_message(_conn: asyncpg.Connection, message: asyncpg.PostgresLogMessage) -> None:
         level = logging.WARNING if message.severity in ("WARNING", "ERROR") else logging.INFO
@@ -138,13 +184,25 @@ async def run(command: str) -> int:
     conn.add_log_listener(relay_server_message)
     try:
         if command == "publish":
-            await publish(conn, role=settings.role, config=config)
+            await publish(conn, role=settings.role, config=config, split=options.split)
         elif command == "subscribe":
-            await subscribe(conn, role=settings.role, instance=settings.instance, config=config)
+            await subscribe(conn, role=settings.role, instance=settings.instance, config=config, split=options.split)
         elif command == "refresh":
             await refresh(conn, role=settings.role, instance=settings.instance)
         elif command == "grants":
             await grants(conn, role=settings.role, config=config)
+        elif command == "switch":
+            await switch(conn, role=settings.role, instance=settings.instance, config=config, timeout=options.timeout)
+        elif command == "heartbeat":
+            await heartbeat(
+                conn,
+                role=settings.role,
+                instance=settings.instance,
+                config=config,
+                backup_ok=options.backup_ok,
+                wal_archive_ok=options.wal_archive_ok,
+                drift_ok=options.drift_ok,
+            )
         elif settings.role == "mirror":
             print(json.dumps(await subscriber_status(conn, instance=settings.instance), indent=2))
         else:
@@ -170,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(drift.run(args))
     if args.command == "reseed":
         return asyncio.run(reseed.run(args))
-    return asyncio.run(run(args.command))
+    return asyncio.run(run(args.command, args))
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ import canopy.core.keys.models  # noqa: F401 — register every persistent modul
 import canopy.magpie.data.models  # noqa: F401
 import canopy.squirrel.data.models  # noqa: F401
 import canopy.core.facilities.models  # noqa: F401
+import canopy.core.replication.models  # noqa: F401
 from canopy.core.db import Base
 from canopy.core.replication.config import ReplicationConfig
 from canopy.core.replication.metrics import ReplicationCollector
@@ -111,6 +112,7 @@ def config() -> ReplicationConfig:
         replicator_role=f"rt_replicator_{suffix}",
         reader_role=f"rt_reader_{suffix}",
         app_role=f"rt_app_{suffix}",
+        heartbeat_role=f"rt_heartbeat_{suffix}",
         publisher_dsn=None,
     )
 
@@ -123,11 +125,11 @@ async def db(ensure_replication_db, config):
     try:
         yield conn
     finally:
-        for publication in REGISTRY.publications:
+        for publication in REGISTRY.all_publications:
             await conn.execute(f'DROP PUBLICATION IF EXISTS "{publication.name}"')
         for schema in REGISTRY.schemas:
             await conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-        await drop_roles(conn, [config.replicator_role, config.reader_role, config.app_role])
+        await drop_roles(conn, [config.replicator_role, config.reader_role, config.app_role, config.heartbeat_role])
         await conn.close()
 
 

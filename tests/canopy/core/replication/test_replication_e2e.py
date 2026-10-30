@@ -169,7 +169,11 @@ async def _seed(conn: asyncpg.Connection) -> dict[str, str]:
 async def test_copy_then_stream_changes(pair: Pair):
     p = pair
     published = await publish(p.pub, role="primary", config=p.config)
-    assert published["roles"] == {p.config.replicator_role: "granted", p.config.reader_role: "granted"}
+    assert published["roles"] == {
+        p.config.replicator_role: "granted",
+        p.config.reader_role: "granted",
+        p.config.heartbeat_role: "absent",
+    }
     ids = await _seed(p.pub)
     await grants(p.sub, role="mirror", config=p.config)
 

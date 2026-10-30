@@ -12,7 +12,9 @@ time, the changes the mirror is missing are no longer in any slot. ``reseed --si
   history is the only copy.
 
 It runs with the subscription disabled, creating it disabled and without the initial
-copy when there is none. The hand-over works like this:
+copy when there is none. A subscription it creates reads the primary's split pair
+(``canopy_ref``, ``canopy_ts``) once the primary has it, else ``canopy_history``. The
+hand-over works like this:
 
 1. ``x0 = pg_current_wal_insert_lsn()`` on the primary, then wait for every
    transaction in progress after that to finish, then open a repeatable-read
@@ -76,6 +78,7 @@ from canopy.core.replication.drift import (
 )
 from canopy.core.replication.config import ReplicationConfig, get_replication_config
 from canopy.core.replication.registry import REGISTRY, TableClass, ReplicationRegistry
+from canopy.core.replication.publisher import publication_layout
 from canopy.core.replication.subscriber import (
     subscribe,
     _subscription,
@@ -355,7 +358,12 @@ async def reseed(
     sub = await _subscription(mirror, name)
     created = sub is None
     if created:
-        await subscribe(mirror, role=role, instance=instance, config=config, registry=registry, copy_data=False)
+        # pg_publication is readable by the reader. A primary that has created the split
+        # pair is moving to it, or has moved, so a new subscription starts on the pair.
+        split = await publication_layout(primary, registry) in ("switching", "split")
+        await subscribe(
+            mirror, role=role, instance=instance, config=config, registry=registry, copy_data=False, split=split
+        )
         sub = await _subscription(mirror, name)
     elif sub["subenabled"]:
         raise Refused(f"subscription {name} is enabled; disable it first (ALTER SUBSCRIPTION {name} DISABLE)")
@@ -404,6 +412,7 @@ async def reseed(
     return {
         "subscription": name,
         "created": created,
+        "publications": list(sub["subpublications"]),
         "since": since.isoformat(),
         "cut_lsn": x0,
         "open_at_cut": open_at_cut,

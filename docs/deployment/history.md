@@ -56,10 +56,12 @@ Alembic head shipped in the image, which the deploy check below compares.
 | table owner (e.g. `canopy_owner`) | mirror | Migrations, `grants`, `refresh`, `subscribe` | Owns the tables; member of `pg_create_subscription` |
 | `canopy_app` | mirror | The mirror's API and worker | `grants` gives `SELECT` on replicated tables and read-write on API keys |
 | superuser | mirror | `reseed` | Or the table owner with `EXECUTE` on `pg_replication_origin_advance(text, pg_lsn)` |
+| `canopy_heartbeat` | primary | The mirror's `heartbeat` and `switch` | `LOGIN`; `publish` lets it read and write `core.history_heartbeat` and nothing else. Only needed for [pruning](#prune) |
 
-The names are the defaults of `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_ROLE`
-and `__APP_ROLE`. The primary's `pg_hba.conf` admits `replicator` and
-`canopy_reader` over `hostssl` with SCRAM from the mirror's network only.
+The names are the defaults of `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_ROLE`,
+`__APP_ROLE` and `__HEARTBEAT_ROLE`. The primary's `pg_hba.conf` admits `replicator`,
+`canopy_reader` and `canopy_heartbeat` over `hostssl` with SCRAM from the mirror's
+network only.
 
 The primary's Postgres needs `wal_level = logical`, enough `max_replication_slots`
 and `max_wal_senders`, and `max_slot_wal_keep_size` set **before the first slot
@@ -91,7 +93,8 @@ progress on either side.
 
 On the mirror, hourly: `refresh`, then `drift-check` (with
 `CANOPY_REPLICATION__READER_DSN`). `drift-check` exits 1 when the copy has drifted
-and 2 when it couldn't check, so either fails the Job.
+and 2 when it couldn't check, so either fails the Job. Where the primary prunes, the
+Job also runs `heartbeat` last, as described under [Prune](#prune).
 
 ### Metrics and alerts
 
@@ -115,6 +118,84 @@ Tables that differ are read again after `--settle` seconds (30 by default), so l
 isn't reported as drift. The JSON report names each drifting table and day. To repair
 drift, find its cause, then run `reseed` with `--since` no later than the oldest
 drifting day (reference tables are always reconciled in full).
+
+## Prune
+
+A primary whose disk can't hold all of its history keeps the last `CANOPY_WINDOW_DAYS`
+days of snapshots and leaves older ones to its mirror. Turn this on only where the
+sizing forecast says it's needed. It takes the three steps below, once, then a worker
+setting. Prune deletes must never reach the mirror, so the primary first moves to a
+second publication layout: `canopy_ref` carries the reference tables with every
+operation, and `canopy_ts` carries the time-series tables with inserts and updates
+only. User deletes still reach the mirror, because deleting a snapshot or a PV only
+marks it deleted.
+
+### Switch to the split layout
+
+1. On the primary: `publish --split`. It creates `canopy_ref` and `canopy_ts` beside
+   `canopy_history`. Deploys keep running plain `publish`, which keeps all three in
+   step and never switches layouts.
+2. On the mirror: `switch`, with `CANOPY_REPLICATION__HEARTBEAT_DSN` set to a URI to the
+   primary as `canopy_heartbeat`. It waits (up to `--timeout`, 120 s) until the slot
+   has confirmed a position taken after the pair existed, then moves the subscription
+   to the pair without copying. A subscription moved while its slot is still behind
+   the pair's creation can't find the publications and retries forever. `switch`
+   refuses if the subscription is disabled or the primary has no pair yet.
+3. On the primary: `publish --split` again. It drops `canopy_history` once every
+   mirror's walsender is seen streaming the pair, and exits 2 with the reason until
+   then. Retry after a few seconds: the walsender restarts after the switch. Reading
+   what a walsender streams needs a superuser or `pg_read_all_stats`.
+
+A mirror of a split primary gets the pair from then on. `reseed` creates its
+subscription on the pair whenever the primary has it. To copy everything again
+instead, run `subscribe --split`.
+
+### Heartbeat
+
+The mirror reports its checks to the primary hourly, last in the CronJob:
+
+```text
+refresh
+drift-check --days <CANOPY_WINDOW_DAYS>
+heartbeat [--backup-ok] [--wal-archive-ok] [--drift-ok]
+```
+
+Pass each flag only when that check passed: `--drift-ok` when `drift-check` exited 0
+(1, drift, and 2, couldn't check, both leave it out), and `--backup-ok` and
+`--wal-archive-ok` from the backup system's own status. Once the primary prunes,
+`drift-check` needs `--days`: days the primary has pruned would otherwise count as
+drift. `heartbeat` writes `core.history_heartbeat` on the primary through
+`CANOPY_REPLICATION__HEARTBEAT_DSN`, timed by the primary's clock.
+
+### Turn pruning on
+
+On the primary's worker, set `CANOPY_INSTANCE`, `CANOPY_WINDOW_DAYS` and
+`CANOPY_PRUNE__ENABLED=true`. The job runs nightly at `CANOPY_PRUNE__HOUR` (UTC). Until
+`CANOPY_PRUNE__DRY_RUN=false` it only counts what it would remove. Run it dry for a
+month while `drift-check` stays clean, then turn the dry run off.
+
+Each run removes snapshots older than the window that aren't retained, deleted or
+not, up to `CANOPY_PRUNE__MAX_SNAPSHOTS_PER_RUN`, one per transaction. Before every
+snapshot it checks a gate, and it stops at the first failure, logging each failed
+check by name:
+
+| Check | Fails when |
+|---|---|
+| `instance_set`, `window_set` | `CANOPY_INSTANCE` or `CANOPY_WINDOW_DAYS` is unset |
+| `no_delete_publication` | Any publication carrying a snapshot table publishes deletes (`canopy_history` still exists) |
+| `slot_active` | The mirror's slot is missing or no walsender holds it |
+| `streams_split` | The walsender isn't streaming publications that carry the snapshot tables, or its command can't be read |
+| `wal_status_reserved` | The slot's WAL is at risk |
+| `lag` | Flush lag or the mirror's last reply is older than `CANOPY_PRUNE__MAX_LAG_S` (60 s) |
+| `heartbeat_fresh`, `heartbeat_ok` | No heartbeat within `CANOPY_PRUNE__HEARTBEAT_MAX_AGE_H` (3 h), or one reporting a failed check |
+
+A snapshot older than the window can still be restored on the primary: export it from
+the mirror (`GET /squirrel/v1/snapshots/{id}/export`) and import the bundle on the
+primary (`POST /squirrel/v1/snapshots/import`), which creates a new, recent copy. The
+copy keeps the snapshot's facility, so the import needs a key that can write there. A
+snapshot with `retain` set is never pruned. Prune can't see references held outside
+Canopy, so a service that refers to snapshots, such as an optimization service's runs,
+sets `retain` on the ones it needs.
 
 ## Runbooks
 
@@ -141,7 +222,8 @@ needed, so this subscription can't continue.
    `CANOPY_REPLICATION__PUBLISHER_DSN` and `CANOPY_REPLICATION__READER_DSN` set. It
    creates the subscription disabled and without a copy, copies what changed since
    that time, and enables it from the cut. An earlier time is safe, only slower; a
-   later one is refused, because its changes would be lost.
+   later one is refused, because its changes would be lost. On a split primary the new
+   subscription reads `canopy_ref` and `canopy_ts`.
 5. Run `drift-check`.
 
 If a write transaction was open on the primary when the re-seed began (the report's
