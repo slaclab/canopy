@@ -9,7 +9,12 @@ while the mirror's tables belong to an ordinary owner role granted
 Each test gets its own databases and roles on both servers.
 """
 
+import os
+import sys
+import json
+import subprocess
 from uuid import uuid4
+from datetime import UTC, datetime
 from dataclasses import dataclass
 
 import pytest
@@ -18,6 +23,7 @@ import pytest_asyncio
 from pydantic import SecretStr
 
 from canopy.core.replication.sql import Refused, ReplicationError
+from canopy.core.replication.drift import SESSION, drift_check
 from canopy.core.replication.config import ReplicationConfig
 from canopy.core.replication.metrics import read_status
 from canopy.core.replication.registry import REGISTRY, TableClass, ReplicationRegistry
@@ -311,3 +317,137 @@ async def test_gauges_on_both_sides(pair: Pair):
         return samples[("canopy_replication_subscription_worker_up", subscription)] == 0
 
     await eventually(worker_stopped)
+
+
+async def _subscribed(p: Pair) -> dict[str, str]:
+    """Publish, seed, grant, subscribe, and wait for the copy; returns the seeded ids."""
+    await publish(p.pub, role="primary", config=p.config)
+    ids = await _seed(p.pub)
+    await grants(p.sub, role="mirror", config=p.config)
+    await subscribe(p.sub, role="mirror", instance=p.instance, config=p.config)
+    await eventually(lambda: _copied(p))
+    return ids
+
+
+async def _reader_dsn(p: Pair) -> str:
+    """The primary as its read-only reader role, which ``publish`` granted SELECT on the published tables."""
+    password = uuid4().hex
+    await p.pub.execute(f"ALTER ROLE \"{p.config.reader_role}\" PASSWORD '{password}'")
+    database = await p.pub.fetchval("SELECT current_database()")
+    return server_dsn(PUBLISHER_ADMIN, database=database, user=p.config.reader_role, password=password)
+
+
+async def _drift_connections(p: Pair) -> tuple[asyncpg.Connection, asyncpg.Connection]:
+    database = await p.sub.fetchval("SELECT current_database()")
+    primary = await asyncpg.connect(await _reader_dsn(p), server_settings=SESSION)
+    mirror = await asyncpg.connect(server_dsn(SUBSCRIBER_ADMIN, database=database), server_settings=SESSION)
+    return primary, mirror
+
+
+async def test_drift_check_finds_what_the_mirror_lost(pair: Pair):
+    p = pair
+    ids = await _subscribed(p)
+    old = str(uuid4())
+    await p.pub.execute(
+        "INSERT INTO squirrel.snapshot (id, title, created_at) VALUES ($1, 'Old', now() - interval '10 days')", old
+    )
+    await eventually(lambda: _in_step(p))
+    old_day = await p.pub.fetchval(
+        "SELECT (created_at AT TIME ZONE 'UTC')::date::text FROM squirrel.snapshot WHERE id = $1", old
+    )
+    today = datetime.now(UTC).date().isoformat()
+    primary, mirror = await _drift_connections(p)
+    try:
+        report = await drift_check(primary, mirror, instance=p.instance)
+        assert report["in_step"] and report["compared"] == PRESENT and report["skipped"] == {}
+
+        # A column only the mirror has yet (it migrates first) isn't drift.
+        await p.sub_admin.execute("ALTER TABLE squirrel.pv ADD COLUMN zz_history_only text DEFAULT 'x'")
+        # What replication never does: an edit made on the mirror, and deletes there that
+        # skip the foreign keys, as apply does, leaving a snapshot value without its snapshot.
+        await p.sub_admin.execute("UPDATE squirrel.tag SET name = 'Edited on the mirror' WHERE id = $1", ids["tag_a"])
+        await p.sub_admin.execute("SET session_replication_role = replica")
+        await p.sub_admin.execute("DELETE FROM squirrel.snapshot WHERE id = ANY($1::uuid[])", [ids["snapshot"], old])
+        await p.sub_admin.execute("RESET session_replication_role")
+
+        report = await drift_check(primary, mirror, instance=p.instance)
+        assert not report["in_step"]
+        assert sorted(report["drift"]) == ["squirrel.snapshot", "squirrel.snapshot_value", "squirrel.tag"]
+        tag = report["drift"]["squirrel.tag"]
+        assert tag["primary"]["rows"] == tag["mirror"]["rows"] and tag["primary"]["md5"] != tag["mirror"]["md5"]
+        snapshot = report["drift"]["squirrel.snapshot"]
+        assert [d["day"] for d in snapshot["days"]] == [old_day, today] and snapshot["missing_rows"] == 2
+        values = report["drift"]["squirrel.snapshot_value"]
+        assert values["days"] == [{"day": today, "primary": 1, "mirror": 0}]
+        assert values["orphans"] == {"primary": 0, "mirror": 1}
+
+        recent = await drift_check(primary, mirror, instance=p.instance, days=3)
+        assert [d["day"] for d in recent["drift"]["squirrel.snapshot"]["days"]] == [today]
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+async def test_drift_check_rereads_what_differed_after_settling(pair: Pair):
+    """The re-check runs in new transactions, so a mirror that was only behind comes out in step."""
+    p = pair
+    await _subscribed(p)
+    name = f"canopy_history_{p.instance}"
+    primary, mirror = await _drift_connections(p)
+    try:
+        await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
+        await p.pub.execute("INSERT INTO squirrel.snapshot (id, title) VALUES (gen_random_uuid(), 'Not applied yet')")
+        behind = await drift_check(primary, mirror, instance=p.instance)
+        assert list(behind["drift"]) == ["squirrel.snapshot"]
+
+        async def catch_up():
+            await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" ENABLE')
+            await eventually(lambda: _in_step(p))
+
+        settled = await drift_check(primary, mirror, instance=p.instance, settle=catch_up)
+        assert settled["in_step"] and settled["rechecked"] == ["squirrel.snapshot"]
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+async def test_drift_check_command_exit_status(pair: Pair):
+    p = pair
+    await _subscribed(p)
+    database = await p.sub.fetchval("SELECT current_database()")
+    reader_dsn = await _reader_dsn(p)
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "CANOPY_ROLE": "mirror",
+        "CANOPY_INSTANCE": p.instance,
+        "CANOPY_DATABASE_URL": server_dsn(SUBSCRIBER_ADMIN, database=database).replace(
+            "postgresql://", "postgresql+asyncpg://", 1
+        ),
+        "CANOPY_REPLICATION__READER_DSN": reader_dsn,
+    }
+
+    def drift_check_command(**overrides: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "canopy.core.replication", "drift-check", "--settle", "0"],
+            env=env | overrides,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    in_step = drift_check_command()
+    assert in_step.returncode == 0, in_step.stderr
+    assert json.loads(in_step.stdout)["in_step"] is True
+
+    await p.sub_admin.execute("DELETE FROM squirrel.pv_tag")
+    drifted = drift_check_command()
+    assert drifted.returncode == 1
+    assert "squirrel.pv_tag" in json.loads(drifted.stdout)["drift"]
+    assert "Drift in squirrel.pv_tag" in drifted.stderr
+
+    wrong = "wrong-" + uuid4().hex
+    password = reader_dsn.split(":")[2].split("@")[0]
+    failed = drift_check_command(CANOPY_REPLICATION__READER_DSN=reader_dsn.replace(password, wrong))
+    assert failed.returncode == 2
+    assert "password authentication failed" in failed.stderr
+    assert wrong not in failed.stderr + failed.stdout

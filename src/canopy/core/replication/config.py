@@ -30,6 +30,13 @@ class ReplicationConfig(BaseSettings):
             "never goes on the command line or into the CLI's output."
         ),
     )
+    reader_dsn: SecretStr | None = Field(
+        default=None,
+        description=(
+            "postgresql:// URI the mirror's `drift-check` uses to read the primary, as the read-only "
+            "reader role. Supply it from a secret, like the publisher DSN."
+        ),
+    )
     replicator_role: str = Field(
         default="replicator",
         description="Role the subscription connects as; `publish` grants it SELECT on the published tables.",
