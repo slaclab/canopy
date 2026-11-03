@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-    <title>Coverage for src/canopy/fox/services/subscription_manager.py: 91%</title>
+    <title>Coverage for src/canopy/formula_engine/services/subscription_manager.py: 91%</title>
     <link rel="icon" sizes="32x32" href="favicon_32_cb_c827f16f.png">
     <link rel="stylesheet" href="style_cb_4667309f.css" type="text/css">
     <script src="coverage_html_cb_54cfdca1.js" defer></script>
@@ -11,7 +11,7 @@
 <header>
     <div class="content">
         <h1>
-            <span class="text">Coverage for </span><b>src<span class="sep">/</span>canopy<span class="sep">/</span>fox<span class="sep">/</span>services<span class="sep">/</span>subscription_manager.py</b>:
+            <span class="text">Coverage for </span><b>src<span class="sep">/</span>canopy<span class="sep">/</span>formula_engine<span class="sep">/</span>services<span class="sep">/</span>subscription_manager.py</b>:
             <span class="pc_cov">91%</span>
         </h1>
         <aside id="help_panel_wrapper">
@@ -60,12 +60,12 @@
             <button type="button" class="exc show_exc button_toggle_exc" value="exc" data-shortcut="x" title="Toggle lines excluded">0<span class="text"> excluded</span></button>
         </h2>
         <p class="text">
-            <a id="prevFileLink" class="nav" href="z_a87a225078f50b78_scalar_evaluator_py.html">&#xab; prev</a> &nbsp; &nbsp;
+            <a id="prevFileLink" class="nav" href="z_6c3ac46f67fbbd41_scalar_evaluator_py.html">&#xab; prev</a> &nbsp; &nbsp;
             <a id="indexLink" class="nav" href="index.html">&Hat; index</a> &nbsp; &nbsp;
-            <a id="nextFileLink" class="nav" href="z_a87a225078f50b78_timeseries_evaluator_py.html">&#xbb; next</a>
+            <a id="nextFileLink" class="nav" href="z_6c3ac46f67fbbd41_timeseries_evaluator_py.html">&#xbb; next</a>
             &nbsp; &nbsp; &nbsp;
             <a class="nav" href="https://coverage.readthedocs.io/en/7.17.0">coverage.py v7.17.0</a>,
-            created at 2026-11-03 15:07 +0000
+            created at 2026-11-03 15:15 +0000
         </p>
         <aside class="hidden">
             <button type="button" class="button_next_chunk" data-shortcut="j"></button>
@@ -95,11 +95,11 @@
     <p class="run"><span class="n"><a id="t13" href="#t13">13</a></span><span class="t"><span class="key">from</span> <span class="nam">dataclasses</span> <span class="key">import</span> <span class="nam">field</span><span class="op">,</span> <span class="nam">dataclass</span>&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t14" href="#t14">14</a></span><span class="t"><span class="key">from</span> <span class="nam">collections</span><span class="op">.</span><span class="nam">abc</span> <span class="key">import</span> <span class="nam">Callable</span><span class="op">,</span> <span class="nam">Awaitable</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t15" href="#t15">15</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t16" href="#t16">16</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">fox</span><span class="op">.</span><span class="nam">errors</span> <span class="key">import</span> <span class="nam">SubscriptionLimitExceeded</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t17" href="#t17">17</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">core</span><span class="op">.</span><span class="nam">errors</span> <span class="key">import</span> <span class="nam">ErrorCode</span><span class="op">,</span> <span class="nam">CanopyError</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t18" href="#t18">18</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">contracts</span><span class="op">.</span><span class="nam">formula</span> <span class="key">import</span> <span class="nam">FormulaSpec</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t19" href="#t19">19</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">epics</span><span class="op">.</span><span class="nam">pv_protocol</span> <span class="key">import</span> <span class="nam">strip_protocol_prefix</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t20" href="#t20">20</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">fox</span><span class="op">.</span><span class="nam">services</span><span class="op">.</span><span class="nam">formula_service</span> <span class="key">import</span> <span class="nam">FormulaService</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t16" href="#t16">16</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">core</span><span class="op">.</span><span class="nam">errors</span> <span class="key">import</span> <span class="nam">ErrorCode</span><span class="op">,</span> <span class="nam">CanopyError</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t17" href="#t17">17</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">contracts</span><span class="op">.</span><span class="nam">formula</span> <span class="key">import</span> <span class="nam">FormulaSpec</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t18" href="#t18">18</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">epics</span><span class="op">.</span><span class="nam">pv_protocol</span> <span class="key">import</span> <span class="nam">strip_protocol_prefix</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t19" href="#t19">19</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">formula_engine</span><span class="op">.</span><span class="nam">errors</span> <span class="key">import</span> <span class="nam">SubscriptionLimitExceeded</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t20" href="#t20">20</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">formula_engine</span><span class="op">.</span><span class="nam">services</span><span class="op">.</span><span class="nam">formula_service</span> <span class="key">import</span> <span class="nam">FormulaService</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t21" href="#t21">21</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t22" href="#t22">22</a></span><span class="t"><span class="nam">_RETRIABLE_CODES</span> <span class="op">=</span> <span class="nam">frozenset</span><span class="op">(</span><span class="op">{</span><span class="nam">ErrorCode</span><span class="op">.</span><span class="nam">FORMULA_INPUT_MISSING</span><span class="op">,</span> <span class="nam">ErrorCode</span><span class="op">.</span><span class="nam">PV_NOT_BUFFERED</span><span class="op">}</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t23" href="#t23">23</a></span><span class="t"><span class="nam">_INPUT_RETRY_DELAY_S</span> <span class="op">=</span> <span class="num">0.25</span>&nbsp;</span><span class="r"></span></p>
@@ -699,12 +699,12 @@
 <footer>
     <div class="content">
         <p>
-            <a class="nav" href="z_a87a225078f50b78_scalar_evaluator_py.html">&#xab; prev</a> &nbsp; &nbsp;
+            <a class="nav" href="z_6c3ac46f67fbbd41_scalar_evaluator_py.html">&#xab; prev</a> &nbsp; &nbsp;
             <a class="nav" href="index.html">&Hat; index</a> &nbsp; &nbsp;
-            <a class="nav" href="z_a87a225078f50b78_timeseries_evaluator_py.html">&#xbb; next</a>
+            <a class="nav" href="z_6c3ac46f67fbbd41_timeseries_evaluator_py.html">&#xbb; next</a>
             &nbsp; &nbsp; &nbsp;
             <a class="nav" href="https://coverage.readthedocs.io/en/7.17.0">coverage.py v7.17.0</a>,
-            created at 2026-11-03 15:07 +0000
+            created at 2026-11-03 15:15 +0000
         </p>
     </div>
 </footer>

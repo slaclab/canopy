@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-    <title>Coverage for src/canopy/fox/api/v1/validate.py: 100%</title>
+    <title>Coverage for src/canopy/formula_engine/api/v1/validate.py: 100%</title>
     <link rel="icon" sizes="32x32" href="favicon_32_cb_c827f16f.png">
     <link rel="stylesheet" href="style_cb_4667309f.css" type="text/css">
     <script src="coverage_html_cb_54cfdca1.js" defer></script>
@@ -11,7 +11,7 @@
 <header>
     <div class="content">
         <h1>
-            <span class="text">Coverage for </span><b>src<span class="sep">/</span>canopy<span class="sep">/</span>fox<span class="sep">/</span>api<span class="sep">/</span>v1<span class="sep">/</span>validate.py</b>:
+            <span class="text">Coverage for </span><b>src<span class="sep">/</span>canopy<span class="sep">/</span>formula_engine<span class="sep">/</span>api<span class="sep">/</span>v1<span class="sep">/</span>validate.py</b>:
             <span class="pc_cov">100%</span>
         </h1>
         <aside id="help_panel_wrapper">
@@ -60,12 +60,12 @@
             <button type="button" class="exc show_exc button_toggle_exc" value="exc" data-shortcut="x" title="Toggle lines excluded">0<span class="text"> excluded</span></button>
         </h2>
         <p class="text">
-            <a id="prevFileLink" class="nav" href="z_76d2521724e6a59f_router_py.html">&#xab; prev</a> &nbsp; &nbsp;
+            <a id="prevFileLink" class="nav" href="z_33e009d0a83f0f29_router_py.html">&#xab; prev</a> &nbsp; &nbsp;
             <a id="indexLink" class="nav" href="index.html">&Hat; index</a> &nbsp; &nbsp;
-            <a id="nextFileLink" class="nav" href="z_76d2521724e6a59f_ws_py.html">&#xbb; next</a>
+            <a id="nextFileLink" class="nav" href="z_33e009d0a83f0f29_ws_py.html">&#xbb; next</a>
             &nbsp; &nbsp; &nbsp;
             <a class="nav" href="https://coverage.readthedocs.io/en/7.17.0">coverage.py v7.17.0</a>,
-            created at 2026-11-03 15:07 +0000
+            created at 2026-11-03 15:15 +0000
         </p>
         <aside class="hidden">
             <button type="button" class="button_next_chunk" data-shortcut="j"></button>
@@ -83,11 +83,11 @@
     <p class="run"><span class="n"><a id="t1" href="#t1">1</a></span><span class="t"><span class="key">from</span> <span class="nam">fastapi</span> <span class="key">import</span> <span class="nam">Security</span><span class="op">,</span> <span class="nam">APIRouter</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t2" href="#t2">2</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t3" href="#t3">3</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">core</span><span class="op">.</span><span class="nam">security</span> <span class="key">import</span> <span class="nam">require_read_access</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t4" href="#t4">4</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">fox</span><span class="op">.</span><span class="nam">dependencies</span> <span class="key">import</span> <span class="nam">FormulaServiceDep</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t5" href="#t5">5</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">contracts</span><span class="op">.</span><span class="nam">formula</span> <span class="key">import</span> <span class="nam">FormulaSpec</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t6" href="#t6">6</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">fox</span><span class="op">.</span><span class="nam">schemas</span><span class="op">.</span><span class="nam">formula</span> <span class="key">import</span> <span class="nam">FormulaValidationDTO</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t4" href="#t4">4</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">contracts</span><span class="op">.</span><span class="nam">formula</span> <span class="key">import</span> <span class="nam">FormulaSpec</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t5" href="#t5">5</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">formula_engine</span><span class="op">.</span><span class="nam">dependencies</span> <span class="key">import</span> <span class="nam">FormulaServiceDep</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t6" href="#t6">6</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">formula_engine</span><span class="op">.</span><span class="nam">schemas</span><span class="op">.</span><span class="nam">formula</span> <span class="key">import</span> <span class="nam">FormulaValidationDTO</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t7" href="#t7">7</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t8" href="#t8">8</a></span><span class="t"><span class="nam">router</span> <span class="op">=</span> <span class="nam">APIRouter</span><span class="op">(</span><span class="nam">tags</span><span class="op">=</span><span class="op">[</span><span class="str">&quot;Fox / Validate&quot;</span><span class="op">]</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t8" href="#t8">8</a></span><span class="t"><span class="nam">router</span> <span class="op">=</span> <span class="nam">APIRouter</span><span class="op">(</span><span class="nam">tags</span><span class="op">=</span><span class="op">[</span><span class="str">&quot;Formula Engine / Validate&quot;</span><span class="op">]</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t9" href="#t9">9</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t10" href="#t10">10</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t11" href="#t11">11</a></span><span class="t"><span class="op">@</span><span class="nam">router</span><span class="op">.</span><span class="nam">post</span><span class="op">(</span><span class="str">&quot;/validate&quot;</span><span class="op">,</span> <span class="nam">dependencies</span><span class="op">=</span><span class="op">[</span><span class="nam">Security</span><span class="op">(</span><span class="nam">require_read_access</span><span class="op">)</span><span class="op">]</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
@@ -102,12 +102,12 @@
 <footer>
     <div class="content">
         <p>
-            <a class="nav" href="z_76d2521724e6a59f_router_py.html">&#xab; prev</a> &nbsp; &nbsp;
+            <a class="nav" href="z_33e009d0a83f0f29_router_py.html">&#xab; prev</a> &nbsp; &nbsp;
             <a class="nav" href="index.html">&Hat; index</a> &nbsp; &nbsp;
-            <a class="nav" href="z_76d2521724e6a59f_ws_py.html">&#xbb; next</a>
+            <a class="nav" href="z_33e009d0a83f0f29_ws_py.html">&#xbb; next</a>
             &nbsp; &nbsp; &nbsp;
             <a class="nav" href="https://coverage.readthedocs.io/en/7.17.0">coverage.py v7.17.0</a>,
-            created at 2026-11-03 15:07 +0000
+            created at 2026-11-03 15:15 +0000
         </p>
     </div>
 </footer>

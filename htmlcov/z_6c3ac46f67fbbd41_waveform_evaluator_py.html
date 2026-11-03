@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-    <title>Coverage for src/canopy/fox/services/waveform_evaluator.py: 62%</title>
+    <title>Coverage for src/canopy/formula_engine/services/waveform_evaluator.py: 62%</title>
     <link rel="icon" sizes="32x32" href="favicon_32_cb_c827f16f.png">
     <link rel="stylesheet" href="style_cb_4667309f.css" type="text/css">
     <script src="coverage_html_cb_54cfdca1.js" defer></script>
@@ -11,7 +11,7 @@
 <header>
     <div class="content">
         <h1>
-            <span class="text">Coverage for </span><b>src<span class="sep">/</span>canopy<span class="sep">/</span>fox<span class="sep">/</span>services<span class="sep">/</span>waveform_evaluator.py</b>:
+            <span class="text">Coverage for </span><b>src<span class="sep">/</span>canopy<span class="sep">/</span>formula_engine<span class="sep">/</span>services<span class="sep">/</span>waveform_evaluator.py</b>:
             <span class="pc_cov">62%</span>
         </h1>
         <aside id="help_panel_wrapper">
@@ -60,12 +60,12 @@
             <button type="button" class="exc show_exc button_toggle_exc" value="exc" data-shortcut="x" title="Toggle lines excluded">0<span class="text"> excluded</span></button>
         </h2>
         <p class="text">
-            <a id="prevFileLink" class="nav" href="z_a87a225078f50b78_timeseries_evaluator_py.html">&#xab; prev</a> &nbsp; &nbsp;
+            <a id="prevFileLink" class="nav" href="z_6c3ac46f67fbbd41_timeseries_evaluator_py.html">&#xab; prev</a> &nbsp; &nbsp;
             <a id="indexLink" class="nav" href="index.html">&Hat; index</a> &nbsp; &nbsp;
             <a id="nextFileLink" class="nav" href="z_75e9e8830fd80f82_health_py.html">&#xbb; next</a>
             &nbsp; &nbsp; &nbsp;
             <a class="nav" href="https://coverage.readthedocs.io/en/7.17.0">coverage.py v7.17.0</a>,
-            created at 2026-11-03 15:07 +0000
+            created at 2026-11-03 15:15 +0000
         </p>
         <aside class="hidden">
             <button type="button" class="button_next_chunk" data-shortcut="j"></button>
@@ -88,24 +88,24 @@
     <p class="pln"><span class="n"><a id="t6" href="#t6">6</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t7" href="#t7">7</a></span><span class="t"><span class="key">import</span> <span class="nam">numpy</span> <span class="key">as</span> <span class="nam">np</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t8" href="#t8">8</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t9" href="#t9">9</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">fox</span><span class="op">.</span><span class="nam">ports</span> <span class="key">import</span> <span class="nam">DataSource</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t10" href="#t10">10</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">fox</span><span class="op">.</span><span class="nam">config</span> <span class="key">import</span> <span class="nam">FoxConfig</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t11" href="#t11">11</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">fox</span><span class="op">.</span><span class="nam">errors</span> <span class="key">import</span> <span class="op">(</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run run2"><span class="n"><a id="t12" href="#t12">12</a></span><span class="t">    <span class="nam">FormulaTypeError</span><span class="op">,</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run run2"><span class="n"><a id="t13" href="#t13">13</a></span><span class="t">    <span class="nam">FormulaInputMissing</span><span class="op">,</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run run2"><span class="n"><a id="t14" href="#t14">14</a></span><span class="t">    <span class="nam">FormulaDimensionMismatch</span><span class="op">,</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run run2"><span class="n"><a id="t15" href="#t15">15</a></span><span class="t"><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t16" href="#t16">16</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">contracts</span><span class="op">.</span><span class="nam">sample</span> <span class="key">import</span> <span class="nam">AlarmSeverity</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t17" href="#t17">17</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">contracts</span><span class="op">.</span><span class="nam">formula</span> <span class="key">import</span> <span class="nam">FormulaSpec</span><span class="op">,</span> <span class="nam">WaveformResult</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t18" href="#t18">18</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">fox</span><span class="op">.</span><span class="nam">services</span><span class="op">.</span><span class="nam">parser</span> <span class="key">import</span> <span class="nam">ParsedFormula</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t19" href="#t19">19</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">fox</span><span class="op">.</span><span class="nam">services</span><span class="op">.</span><span class="nam">evaluator</span> <span class="key">import</span> <span class="nam">evaluate_array</span><span class="op">,</span> <span class="nam">worst_severity</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t9" href="#t9">9</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">contracts</span><span class="op">.</span><span class="nam">sample</span> <span class="key">import</span> <span class="nam">AlarmSeverity</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t10" href="#t10">10</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">contracts</span><span class="op">.</span><span class="nam">formula</span> <span class="key">import</span> <span class="nam">FormulaSpec</span><span class="op">,</span> <span class="nam">WaveformResult</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t11" href="#t11">11</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">formula_engine</span><span class="op">.</span><span class="nam">ports</span> <span class="key">import</span> <span class="nam">DataSource</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t12" href="#t12">12</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">formula_engine</span><span class="op">.</span><span class="nam">config</span> <span class="key">import</span> <span class="nam">FormulaEngineConfig</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t13" href="#t13">13</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">formula_engine</span><span class="op">.</span><span class="nam">errors</span> <span class="key">import</span> <span class="op">(</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run run2"><span class="n"><a id="t14" href="#t14">14</a></span><span class="t">    <span class="nam">FormulaTypeError</span><span class="op">,</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run run2"><span class="n"><a id="t15" href="#t15">15</a></span><span class="t">    <span class="nam">FormulaInputMissing</span><span class="op">,</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run run2"><span class="n"><a id="t16" href="#t16">16</a></span><span class="t">    <span class="nam">FormulaDimensionMismatch</span><span class="op">,</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run run2"><span class="n"><a id="t17" href="#t17">17</a></span><span class="t"><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t18" href="#t18">18</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">formula_engine</span><span class="op">.</span><span class="nam">services</span><span class="op">.</span><span class="nam">parser</span> <span class="key">import</span> <span class="nam">ParsedFormula</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t19" href="#t19">19</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">formula_engine</span><span class="op">.</span><span class="nam">services</span><span class="op">.</span><span class="nam">evaluator</span> <span class="key">import</span> <span class="nam">evaluate_array</span><span class="op">,</span> <span class="nam">worst_severity</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t20" href="#t20">20</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t21" href="#t21">21</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t22" href="#t22">22</a></span><span class="t"><span class="key">async</span> <span class="key">def</span> <span class="nam">evaluate_waveform_formula</span><span class="op">(</span>&nbsp;</span><span class="r"></span></p>
     <p class="run run2"><span class="n"><a id="t23" href="#t23">23</a></span><span class="t">    <span class="nam">spec</span><span class="op">:</span> <span class="nam">FormulaSpec</span><span class="op">,</span>&nbsp;</span><span class="r"></span></p>
     <p class="run run2"><span class="n"><a id="t24" href="#t24">24</a></span><span class="t">    <span class="nam">parsed</span><span class="op">:</span> <span class="nam">ParsedFormula</span><span class="op">,</span>&nbsp;</span><span class="r"></span></p>
     <p class="run run2"><span class="n"><a id="t25" href="#t25">25</a></span><span class="t">    <span class="nam">data_source</span><span class="op">:</span> <span class="nam">DataSource</span><span class="op">,</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run run2"><span class="n"><a id="t26" href="#t26">26</a></span><span class="t">    <span class="nam">config</span><span class="op">:</span> <span class="nam">FoxConfig</span><span class="op">,</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run run2"><span class="n"><a id="t26" href="#t26">26</a></span><span class="t">    <span class="nam">config</span><span class="op">:</span> <span class="nam">FormulaEngineConfig</span><span class="op">,</span>&nbsp;</span><span class="r"></span></p>
     <p class="run run2"><span class="n"><a id="t27" href="#t27">27</a></span><span class="t"><span class="op">)</span> <span class="op">-&gt;</span> <span class="nam">WaveformResult</span><span class="op">:</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t28" href="#t28">28</a></span><span class="t">    <span class="str">&quot;&quot;&quot;Evaluate a waveform formula against latest array-valued samples.&quot;&quot;&quot;</span>&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t29" href="#t29">29</a></span><span class="t">    <span class="nam">variables</span><span class="op">:</span> <span class="nam">dict</span><span class="op">[</span><span class="nam">str</span><span class="op">,</span> <span class="nam">np</span><span class="op">.</span><span class="nam">ndarray</span><span class="op">]</span> <span class="op">=</span> <span class="op">{</span><span class="op">}</span>&nbsp;</span><span class="r"></span></p>
@@ -156,12 +156,12 @@
 <footer>
     <div class="content">
         <p>
-            <a class="nav" href="z_a87a225078f50b78_timeseries_evaluator_py.html">&#xab; prev</a> &nbsp; &nbsp;
+            <a class="nav" href="z_6c3ac46f67fbbd41_timeseries_evaluator_py.html">&#xab; prev</a> &nbsp; &nbsp;
             <a class="nav" href="index.html">&Hat; index</a> &nbsp; &nbsp;
             <a class="nav" href="z_75e9e8830fd80f82_health_py.html">&#xbb; next</a>
             &nbsp; &nbsp; &nbsp;
             <a class="nav" href="https://coverage.readthedocs.io/en/7.17.0">coverage.py v7.17.0</a>,
-            created at 2026-11-03 15:07 +0000
+            created at 2026-11-03 15:15 +0000
         </p>
     </div>
 </footer>

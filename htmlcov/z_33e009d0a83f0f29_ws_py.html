@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-    <title>Coverage for src/canopy/fox/api/v1/ws.py: 80%</title>
+    <title>Coverage for src/canopy/formula_engine/api/v1/ws.py: 80%</title>
     <link rel="icon" sizes="32x32" href="favicon_32_cb_c827f16f.png">
     <link rel="stylesheet" href="style_cb_4667309f.css" type="text/css">
     <script src="coverage_html_cb_54cfdca1.js" defer></script>
@@ -11,7 +11,7 @@
 <header>
     <div class="content">
         <h1>
-            <span class="text">Coverage for </span><b>src<span class="sep">/</span>canopy<span class="sep">/</span>fox<span class="sep">/</span>api<span class="sep">/</span>v1<span class="sep">/</span>ws.py</b>:
+            <span class="text">Coverage for </span><b>src<span class="sep">/</span>canopy<span class="sep">/</span>formula_engine<span class="sep">/</span>api<span class="sep">/</span>v1<span class="sep">/</span>ws.py</b>:
             <span class="pc_cov">80%</span>
         </h1>
         <aside id="help_panel_wrapper">
@@ -60,12 +60,12 @@
             <button type="button" class="exc show_exc button_toggle_exc" value="exc" data-shortcut="x" title="Toggle lines excluded">0<span class="text"> excluded</span></button>
         </h2>
         <p class="text">
-            <a id="prevFileLink" class="nav" href="z_76d2521724e6a59f_validate_py.html">&#xab; prev</a> &nbsp; &nbsp;
+            <a id="prevFileLink" class="nav" href="z_33e009d0a83f0f29_validate_py.html">&#xab; prev</a> &nbsp; &nbsp;
             <a id="indexLink" class="nav" href="index.html">&Hat; index</a> &nbsp; &nbsp;
-            <a id="nextFileLink" class="nav" href="z_b66ec4bf076ab976_app_py.html">&#xbb; next</a>
+            <a id="nextFileLink" class="nav" href="z_6b82154be11c10ef_app_py.html">&#xbb; next</a>
             &nbsp; &nbsp; &nbsp;
             <a class="nav" href="https://coverage.readthedocs.io/en/7.17.0">coverage.py v7.17.0</a>,
-            created at 2026-11-03 15:07 +0000
+            created at 2026-11-03 15:15 +0000
         </p>
         <aside class="hidden">
             <button type="button" class="button_next_chunk" data-shortcut="j"></button>
@@ -95,12 +95,12 @@
     <p class="pln"><span class="n"><a id="t13" href="#t13">13</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t14" href="#t14">14</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">core</span><span class="op">.</span><span class="nam">errors</span> <span class="key">import</span> <span class="nam">ErrorCode</span><span class="op">,</span> <span class="nam">CanopyError</span>&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t15" href="#t15">15</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">core</span><span class="op">.</span><span class="nam">security</span> <span class="key">import</span> <span class="nam">ws_require_read_access</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t16" href="#t16">16</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">fox</span><span class="op">.</span><span class="nam">dependencies</span> <span class="key">import</span> <span class="nam">SubscriptionManagerDep</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t17" href="#t17">17</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">contracts</span><span class="op">.</span><span class="nam">formula</span> <span class="key">import</span> <span class="nam">FormulaSpec</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t16" href="#t16">16</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">contracts</span><span class="op">.</span><span class="nam">formula</span> <span class="key">import</span> <span class="nam">FormulaSpec</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t17" href="#t17">17</a></span><span class="t"><span class="key">from</span> <span class="nam">canopy</span><span class="op">.</span><span class="nam">formula_engine</span><span class="op">.</span><span class="nam">dependencies</span> <span class="key">import</span> <span class="nam">SubscriptionManagerDep</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t18" href="#t18">18</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t19" href="#t19">19</a></span><span class="t"><span class="nam">logger</span> <span class="op">=</span> <span class="nam">logging</span><span class="op">.</span><span class="nam">getLogger</span><span class="op">(</span><span class="nam">__name__</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t20" href="#t20">20</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t21" href="#t21">21</a></span><span class="t"><span class="nam">router</span> <span class="op">=</span> <span class="nam">APIRouter</span><span class="op">(</span><span class="nam">prefix</span><span class="op">=</span><span class="str">&quot;/ws&quot;</span><span class="op">,</span> <span class="nam">tags</span><span class="op">=</span><span class="op">[</span><span class="str">&quot;Fox / WebSocket&quot;</span><span class="op">]</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t21" href="#t21">21</a></span><span class="t"><span class="nam">router</span> <span class="op">=</span> <span class="nam">APIRouter</span><span class="op">(</span><span class="nam">prefix</span><span class="op">=</span><span class="str">&quot;/ws&quot;</span><span class="op">,</span> <span class="nam">tags</span><span class="op">=</span><span class="op">[</span><span class="str">&quot;Formula Engine / WebSocket&quot;</span><span class="op">]</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t22" href="#t22">22</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t23" href="#t23">23</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t24" href="#t24">24</a></span><span class="t"><span class="key">class</span> <span class="nam">_WSValidationError</span><span class="op">(</span><span class="nam">ValueError</span><span class="op">)</span><span class="op">:</span>&nbsp;</span><span class="r"></span></p>
@@ -202,7 +202,7 @@
     <p class="mis show_mis"><span class="n"><a id="t120" href="#t120">120</a></span><span class="t">                <span class="key">except</span> <span class="nam">CanopyError</span> <span class="key">as</span> <span class="nam">exc</span><span class="op">:</span>&nbsp;</span><span class="r"></span></p>
     <p class="mis show_mis"><span class="n"><a id="t121" href="#t121">121</a></span><span class="t">                    <span class="key">await</span> <span class="nam">_send_error</span><span class="op">(</span><span class="nam">send_fn</span><span class="op">,</span> <span class="nam">exc</span><span class="op">.</span><span class="nam">error_code</span><span class="op">.</span><span class="nam">value</span><span class="op">,</span> <span class="nam">exc</span><span class="op">.</span><span class="nam">detail</span><span class="op">,</span> <span class="nam">sub_id</span><span class="op">=</span><span class="nam">sub_id</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
     <p class="mis show_mis"><span class="n"><a id="t122" href="#t122">122</a></span><span class="t">                <span class="key">except</span> <span class="nam">Exception</span> <span class="key">as</span> <span class="nam">exc</span><span class="op">:</span>&nbsp;</span><span class="r"></span></p>
-    <p class="mis show_mis"><span class="n"><a id="t123" href="#t123">123</a></span><span class="t">                    <span class="nam">logger</span><span class="op">.</span><span class="nam">warning</span><span class="op">(</span><span class="str">&quot;Fox subscribe failed for %s: %s&quot;</span><span class="op">,</span> <span class="nam">sub_id</span><span class="op">,</span> <span class="nam">exc</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
+    <p class="mis show_mis"><span class="n"><a id="t123" href="#t123">123</a></span><span class="t">                    <span class="nam">logger</span><span class="op">.</span><span class="nam">warning</span><span class="op">(</span><span class="str">&quot;Formula Engine subscribe failed for %s: %s&quot;</span><span class="op">,</span> <span class="nam">sub_id</span><span class="op">,</span> <span class="nam">exc</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
     <p class="mis show_mis"><span class="n"><a id="t124" href="#t124">124</a></span><span class="t">                    <span class="key">await</span> <span class="nam">_send_error</span><span class="op">(</span><span class="nam">send_fn</span><span class="op">,</span> <span class="nam">ErrorCode</span><span class="op">.</span><span class="nam">UNHANDLED_EXCEPTION</span><span class="op">.</span><span class="nam">value</span><span class="op">,</span> <span class="nam">str</span><span class="op">(</span><span class="nam">exc</span><span class="op">)</span><span class="op">,</span> <span class="nam">sub_id</span><span class="op">=</span><span class="nam">sub_id</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t125" href="#t125">125</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t126" href="#t126">126</a></span><span class="t">            <span class="key">elif</span> <span class="nam">mtype</span> <span class="op">==</span> <span class="str">&quot;update&quot;</span><span class="op">:</span>&nbsp;</span><span class="r"></span></p>
@@ -238,7 +238,7 @@
     <p class="mis show_mis"><span class="n"><a id="t156" href="#t156">156</a></span><span class="t">                    <span class="key">await</span> <span class="nam">_send_error</span><span class="op">(</span><span class="nam">send_fn</span><span class="op">,</span> <span class="nam">exc</span><span class="op">.</span><span class="nam">error_code</span><span class="op">.</span><span class="nam">value</span><span class="op">,</span> <span class="nam">exc</span><span class="op">.</span><span class="nam">detail</span><span class="op">,</span> <span class="nam">sub_id</span><span class="op">=</span><span class="nam">sub_id</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
     <p class="mis show_mis"><span class="n"><a id="t157" href="#t157">157</a></span><span class="t">                    <span class="key">continue</span>&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t158" href="#t158">158</a></span><span class="t">                <span class="key">except</span> <span class="nam">Exception</span> <span class="key">as</span> <span class="nam">exc</span><span class="op">:</span>&nbsp;</span><span class="r"></span></p>
-    <p class="run"><span class="n"><a id="t159" href="#t159">159</a></span><span class="t">                    <span class="nam">logger</span><span class="op">.</span><span class="nam">warning</span><span class="op">(</span><span class="str">&quot;Fox update failed for %s: %s&quot;</span><span class="op">,</span> <span class="nam">sub_id</span><span class="op">,</span> <span class="nam">exc</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t159" href="#t159">159</a></span><span class="t">                    <span class="nam">logger</span><span class="op">.</span><span class="nam">warning</span><span class="op">(</span><span class="str">&quot;Formula Engine update failed for %s: %s&quot;</span><span class="op">,</span> <span class="nam">sub_id</span><span class="op">,</span> <span class="nam">exc</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t160" href="#t160">160</a></span><span class="t">                    <span class="key">await</span> <span class="nam">_send_error</span><span class="op">(</span><span class="nam">send_fn</span><span class="op">,</span> <span class="nam">ErrorCode</span><span class="op">.</span><span class="nam">UNHANDLED_EXCEPTION</span><span class="op">.</span><span class="nam">value</span><span class="op">,</span> <span class="nam">str</span><span class="op">(</span><span class="nam">exc</span><span class="op">)</span><span class="op">,</span> <span class="nam">sub_id</span><span class="op">=</span><span class="nam">sub_id</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t161" href="#t161">161</a></span><span class="t">                    <span class="key">continue</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t162" href="#t162">162</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
@@ -259,18 +259,18 @@
     <p class="run"><span class="n"><a id="t177" href="#t177">177</a></span><span class="t">    <span class="key">except</span> <span class="nam">WebSocketDisconnect</span><span class="op">:</span>&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t178" href="#t178">178</a></span><span class="t">        <span class="key">await</span> <span class="nam">manager</span><span class="op">.</span><span class="nam">remove_client</span><span class="op">(</span><span class="nam">client_id</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
     <p class="mis show_mis"><span class="n"><a id="t179" href="#t179">179</a></span><span class="t">    <span class="key">except</span> <span class="nam">Exception</span> <span class="key">as</span> <span class="nam">exc</span><span class="op">:</span>&nbsp;</span><span class="r"></span></p>
-    <p class="mis show_mis"><span class="n"><a id="t180" href="#t180">180</a></span><span class="t">        <span class="nam">logger</span><span class="op">.</span><span class="nam">warning</span><span class="op">(</span><span class="str">&quot;Fox WS error for client %s: %s&quot;</span><span class="op">,</span> <span class="nam">client_id</span><span class="op">,</span> <span class="nam">exc</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
+    <p class="mis show_mis"><span class="n"><a id="t180" href="#t180">180</a></span><span class="t">        <span class="nam">logger</span><span class="op">.</span><span class="nam">warning</span><span class="op">(</span><span class="str">&quot;Formula Engine WS error for client %s: %s&quot;</span><span class="op">,</span> <span class="nam">client_id</span><span class="op">,</span> <span class="nam">exc</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
     <p class="mis show_mis"><span class="n"><a id="t181" href="#t181">181</a></span><span class="t">        <span class="key">await</span> <span class="nam">manager</span><span class="op">.</span><span class="nam">remove_client</span><span class="op">(</span><span class="nam">client_id</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
 </main>
 <footer>
     <div class="content">
         <p>
-            <a class="nav" href="z_76d2521724e6a59f_validate_py.html">&#xab; prev</a> &nbsp; &nbsp;
+            <a class="nav" href="z_33e009d0a83f0f29_validate_py.html">&#xab; prev</a> &nbsp; &nbsp;
             <a class="nav" href="index.html">&Hat; index</a> &nbsp; &nbsp;
-            <a class="nav" href="z_b66ec4bf076ab976_app_py.html">&#xbb; next</a>
+            <a class="nav" href="z_6b82154be11c10ef_app_py.html">&#xbb; next</a>
             &nbsp; &nbsp; &nbsp;
             <a class="nav" href="https://coverage.readthedocs.io/en/7.17.0">coverage.py v7.17.0</a>,
-            created at 2026-11-03 15:07 +0000
+            created at 2026-11-03 15:15 +0000
         </p>
     </div>
 </footer>
