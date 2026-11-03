@@ -53,24 +53,32 @@
 | src/canopy/core/\_\_init\_\_.py                      |        0 |        0 |    100% |           |
 | src/canopy/core/clock.py                             |       16 |        3 |     81% |13, 26, 29 |
 | src/canopy/core/config.py                            |       20 |        0 |    100% |           |
-| src/canopy/core/db.py                                |       73 |       17 |     77% |71-72, 90-91, 107-116, 120-123, 168-171 |
+| src/canopy/core/db.py                                |       73 |       15 |     79% |90-91, 107-116, 120-123, 168-171 |
 | src/canopy/core/decimation.py                        |       35 |        1 |     97% |        53 |
-| src/canopy/core/errors.py                            |      112 |        0 |    100% |           |
+| src/canopy/core/errors.py                            |      136 |        0 |    100% |           |
+| src/canopy/core/facilities/\_\_init\_\_.py           |        0 |        0 |    100% |           |
+| src/canopy/core/facilities/dependencies.py           |        9 |        0 |    100% |           |
+| src/canopy/core/facilities/gateway.py                |       25 |        8 |     68% |22-23, 45-48, 53-54 |
+| src/canopy/core/facilities/models.py                 |       17 |        0 |    100% |           |
+| src/canopy/core/facilities/repositories.py           |       36 |        1 |     97% |        34 |
+| src/canopy/core/facilities/routes.py                 |       25 |        0 |    100% |           |
+| src/canopy/core/facilities/schemas.py                |       22 |        0 |    100% |           |
+| src/canopy/core/facilities/service.py                |       83 |        8 |     90% |63-64, 89-90, 96, 108, 115, 153 |
 | src/canopy/core/health.py                            |       11 |        0 |    100% |           |
 | src/canopy/core/keys/\_\_init\_\_.py                 |        0 |        0 |    100% |           |
 | src/canopy/core/keys/dependencies.py                 |        9 |        0 |    100% |           |
-| src/canopy/core/keys/models.py                       |       18 |        0 |    100% |           |
+| src/canopy/core/keys/models.py                       |       19 |        0 |    100% |           |
 | src/canopy/core/keys/registry.py                     |      121 |        0 |    100% |           |
-| src/canopy/core/keys/repositories.py                 |       36 |        0 |    100% |           |
+| src/canopy/core/keys/repositories.py                 |       39 |        0 |    100% |           |
 | src/canopy/core/keys/routes.py                       |       17 |        0 |    100% |           |
-| src/canopy/core/keys/schemas.py                      |       13 |        0 |    100% |           |
-| src/canopy/core/keys/service.py                      |       71 |        0 |    100% |           |
+| src/canopy/core/keys/schemas.py                      |       14 |        0 |    100% |           |
+| src/canopy/core/keys/service.py                      |       97 |        0 |    100% |           |
 | src/canopy/core/keys/tokens.py                       |        8 |        0 |    100% |           |
 | src/canopy/core/logging.py                           |       62 |        0 |    100% |           |
 | src/canopy/core/metrics.py                           |       54 |        2 |     96% |   121-122 |
 | src/canopy/core/modules.py                           |       14 |        0 |    100% |           |
 | src/canopy/core/runtime.py                           |        8 |        0 |    100% |           |
-| src/canopy/core/security.py                          |      128 |        7 |     95% |238-239, 247, 307, 315-320 |
+| src/canopy/core/security.py                          |      142 |        8 |     94% |259-260, 268, 298, 364, 372-377 |
 | src/canopy/core/time\_parse.py                       |       52 |        1 |     98% |       131 |
 | src/canopy/epics/\_\_init\_\_.py                     |        0 |        0 |    100% |           |
 | src/canopy/epics/backends/\_\_init\_\_.py            |        0 |        0 |    100% |           |
@@ -163,7 +171,7 @@
 | src/canopy/magpie/schemas/health.py                  |        2 |        0 |    100% |           |
 | src/canopy/magpie/services/\_\_init\_\_.py           |        0 |        0 |    100% |           |
 | src/canopy/magpie/services/config\_service.py        |       97 |        8 |     92% |49, 118-121, 124, 201-202 |
-| src/canopy/main.py                                   |       89 |        0 |    100% |           |
+| src/canopy/main.py                                   |       98 |        0 |    100% |           |
 | src/canopy/mole/\_\_init\_\_.py                      |        0 |        0 |    100% |           |
 | src/canopy/mole/adapters/\_\_init\_\_.py             |        1 |        0 |    100% |           |
 | src/canopy/mole/adapters/appliance.py                |      166 |       13 |     92% |55, 171, 215-218, 259, 266-267, 281-282, 293-294 |
@@ -280,7 +288,7 @@
 | src/canopy/vole/services/hare\_ingest.py             |       92 |       11 |     88% |47-48, 55, 77, 103, 121, 131-132, 152-155 |
 | src/canopy/vole/services/notifier.py                 |       35 |        2 |     94% |     33-34 |
 | src/canopy/worker.py                                 |       37 |        6 |     84% | 32, 61-65 |
-| **TOTAL**                                            | **8213** |  **719** | **91%** |           |
+| **TOTAL**                                            | **8508** |  **735** | **91%** |           |
 
 
 ## Setup coverage badge
