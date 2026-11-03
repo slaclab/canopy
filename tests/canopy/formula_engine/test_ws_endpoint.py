@@ -66,6 +66,19 @@ _SCALAR_SPEC = {
 }
 
 
+def _bad_spec(b: str = "PV:B", expression: str = "{a} + {b}") -> dict:
+    return {"kind": "scalar", "expression": expression, "bindings": {"a": "PV:A", "b": b}}
+
+
+# Specs that FormulaService.check_spec rejects, with the error code each gets.
+_BAD_SPECS = [
+    pytest.param(_bad_spec("formula:x"), "formula_circular_reference", id="formula-ref"),
+    pytest.param(_bad_spec("fox:x"), "formula_circular_reference", id="fox-ref"),
+    pytest.param(_bad_spec(""), "invalid_pv_name", id="empty-pv"),
+    pytest.param(_bad_spec(expression="{a} +"), "formula_parse_error", id="syntax-error"),
+]
+
+
 class TestFormulaEngineWebSocket:
     def test_ws_subscribe_receives_result(self, ws_client):
         client, notifier, _ = ws_client
@@ -198,35 +211,33 @@ class TestFormulaEngineWebSocket:
             msg = ws.receive_json()
             assert msg["type"] == "pong"
 
-    @pytest.mark.parametrize("binding", ["formula:x", "fox:x"])
-    def test_ws_subscribe_rejects_a_formula_binding_before_subscribing(self, ws_client, binding):
-        # The bindings are checked before any PV is subscribed, so a bad one
-        # opens no channel subscription and starts no eval loop.
+    @pytest.mark.parametrize(("spec", "code"), _BAD_SPECS)
+    @pytest.mark.parametrize("t1_ns", [0, 10_000_000_000])
+    def test_ws_subscribe_rejects_a_bad_spec_before_subscribing(self, ws_client, spec, code, t1_ns):
+        # The spec is checked before the ack, so a bad one gets an id-less
+        # error (as a malformed spec does), no `subscribed` frame, and opens
+        # no channel subscription or eval loop. One-shots are checked too.
         client, notifier, sub_manager = ws_client
-        spec = {**_SCALAR_SPEC, "bindings": {"a": "PV:A", "b": binding}}
         with client.websocket_connect("/formula-engine/v1/ws/formulas?api_key=test-read") as ws:
-            ws.send_json({"type": "subscribe", "spec": spec})
-
-            msg = ws.receive_json()
-            assert msg["type"] == "subscribed"
-            sub_id = msg["id"]
+            ws.send_json({"type": "subscribe", "spec": spec, "t0Ns": 1_000_000_000 if t1_ns else 0, "t1Ns": t1_ns})
 
             msg = ws.receive_json()
             assert msg["type"] == "error"
-            assert msg["code"] == "formula_circular_reference"
-            assert msg["id"] == sub_id
+            assert msg["code"] == code
+            assert "id" not in msg
 
+            # The next frame is the pong: no `subscribed` or `completed` followed.
             ws.send_json({"type": "ping"})
             assert ws.receive_json()["type"] == "pong"
 
             assert sub_manager._subscribed_pvs == []
             assert not notifier._listeners
             assert sub_manager._shared_evals == {}
+            assert sub_manager._client_subs == {}
 
-    @pytest.mark.parametrize("binding", ["formula:x", "fox:x"])
-    def test_ws_update_rejects_a_formula_binding_before_subscribing(self, ws_client, binding):
+    @pytest.mark.parametrize(("spec", "code"), _BAD_SPECS)
+    def test_ws_update_rejects_a_bad_spec_before_subscribing(self, ws_client, spec, code):
         client, notifier, sub_manager = ws_client
-        spec = {**_SCALAR_SPEC, "bindings": {"a": "PV:A", "b": binding}}
         with client.websocket_connect("/formula-engine/v1/ws/formulas?api_key=test-read") as ws:
             ws.send_json({"type": "subscribe", "spec": _SCALAR_SPEC})
             sub_id = ws.receive_json()["id"]
@@ -238,7 +249,7 @@ class TestFormulaEngineWebSocket:
             ws.send_json({"type": "update", "id": sub_id, "spec": spec})
             msg = ws.receive_json()
             assert msg["type"] == "error"
-            assert msg["code"] == "formula_circular_reference"
+            assert msg["code"] == code
             assert msg["id"] == sub_id
 
             ws.send_json({"type": "ping"})
@@ -247,6 +258,16 @@ class TestFormulaEngineWebSocket:
             assert sub_manager._subscribed_pvs == subscribed_pvs
             assert {pv: len(cbs) for pv, cbs in notifier._listeners.items()} == listeners
             assert list(sub_manager._shared_evals) == shared_keys
+
+    def test_ws_update_of_an_unknown_id_with_a_bad_spec_is_not_found(self, ws_client):
+        client, _, _ = ws_client
+        spec = {**_SCALAR_SPEC, "bindings": {"a": "PV:A", "b": "formula:x"}}
+        with client.websocket_connect("/formula-engine/v1/ws/formulas?api_key=test-read") as ws:
+            ws.send_json({"type": "update", "id": "missing", "spec": spec})
+            msg = ws.receive_json()
+            assert msg["type"] == "error"
+            assert msg["code"] == "not_found"
+            assert msg["id"] == "missing"
 
     def test_ws_update_failure_errors_without_dropping(self, ws_client):
         # A raising update_subscription must send an error frame and keep the

@@ -154,10 +154,12 @@ class SubscriptionManager:
         subscription that joins an already-running push-mode loop is caught up
         on the current value by `_join_shared`.
 
-        A live subscription's bindings are checked before anything else, so a
-        bad binding subscribes to no PV and leaves a live ``sub_id`` it would
-        replace untouched. A one-shot evaluation reports a bad binding as an
-        error frame instead, like any other evaluation error.
+        A live subscription's spec goes through `FormulaService.check_spec`
+        before anything else, so a bad binding or expression subscribes to no
+        PV. Re-using a live ``sub_id`` attaches the replacement before
+        detaching the listener it replaces, so a failure at any step leaves
+        the old subscription running. A one-shot evaluation reports a bad spec
+        as an error frame instead, like any other evaluation error.
 
         Parameters
         ----------
@@ -180,10 +182,9 @@ class SubscriptionManager:
 
         Raises
         ------
-        FormulaCircularReference
-            If a binding uses the ``formula:`` or retired ``fox:`` prefix.
-        InvalidPVName
-            If a binding is not a well-formed PV name.
+        CanopyError
+            If ``spec`` fails `FormulaService.check_spec` (a bad binding or
+            expression); nothing is subscribed.
         SubscriptionLimitExceeded
             If the client already holds ``max_subscriptions_per_client`` live
             subscriptions and ``sub_id`` is new.
@@ -195,7 +196,7 @@ class SubscriptionManager:
             await self._one_shot(sub_id, spec, t0_ns, t1_ns, send_fn)
             return
 
-        self._formula_service.check_bindings(spec)
+        self._formula_service.check_spec(spec)
 
         # Floor the poll interval so a client can't request a CPU-pinning loop.
         if 0 < interval_ms < self._min_interval_ms:
@@ -207,30 +208,84 @@ class SubscriptionManager:
                 f"client has reached the maximum of {self._max_subscriptions_per_client} live subscriptions"
             )
 
-        if client_id not in self._client_subs:
-            self._client_subs[client_id] = {}
-        elif sub_id in self._client_subs[client_id]:
-            await self.remove_subscription(client_id, sub_id)
-            if client_id not in self._client_subs:
-                self._client_subs[client_id] = {}
-
-        key = _compute_key(spec, t0_ns, interval_ms)
+        # Find the listener a re-subscribe replaces before anything awaits, and
+        # drop it by identity only once the replacement is attached: with
+        # identical parameters both share one eval and carry the same ids.
+        replaced = self._find_listener(client_id, sub_id)
         listener = _Listener(client_id=client_id, sub_id=sub_id, send_fn=send_fn)
+        key = await self._attach(listener, spec, t0_ns, interval_ms)
+        if replaced is not None:
+            self._drop_listener(*replaced)
 
+        # Written after the drop, which clears the mapping when it still
+        # points at the replaced listener's eval.
+        self._client_subs.setdefault(client_id, {})[sub_id] = key
+        logger.debug("Client %s subscribed %s → shared eval %s", client_id, sub_id, key[:8])
+
+    def _find_listener(self, client_id: str, sub_id: str) -> tuple[_SharedEval, _Listener] | None:
+        """Return the shared evaluation and listener serving a live subscription.
+
+        Parameters
+        ----------
+        client_id : str
+            WebSocket client that owns the subscription.
+        sub_id : str
+            Subscription id to look up.
+
+        Returns
+        -------
+        tuple of (_SharedEval, _Listener) or None
+            ``None`` if the client holds no live subscription ``sub_id``.
+        """
+        key = self._client_subs.get(client_id, {}).get(sub_id)
+        shared = self._shared_evals.get(key) if key is not None else None
+        if shared is None:
+            return None
+        for listener in shared.listeners:
+            if listener.client_id == client_id and listener.sub_id == sub_id:
+                return shared, listener
+        return None
+
+    async def _attach(self, listener: _Listener, spec: FormulaSpec, t0_ns: int, interval_ms: int) -> str:
+        """Attach a listener to the shared evaluation for these parameters, starting one if none is running.
+
+        Parameters
+        ----------
+        listener : _Listener
+            Listener to attach.
+        spec : FormulaSpec
+            Formula to evaluate.
+        t0_ns : int
+            Window start passed to the formula service.
+        interval_ms : int
+            Poll interval in milliseconds, already floored; ``0`` selects push
+            mode.
+
+        Returns
+        -------
+        str
+            Key of the shared evaluation the listener is attached to.
+
+        Raises
+        ------
+        Exception
+            Any error raised while starting a new shared eval, after the
+            partially started eval is torn down.
+        """
+        key = _compute_key(spec, t0_ns, interval_ms)
         if key in self._shared_evals:
             self._join_shared(self._shared_evals[key], listener)
-        else:
-            shared = _SharedEval(key=key, spec=spec, t0_ns=t0_ns, interval_ms=interval_ms)
-            shared.listeners.append(listener)
-            try:
-                await self._start_shared_eval(shared)
-            except Exception:
-                self._teardown_shared(shared)
-                raise
-            self._shared_evals[key] = shared
+            return key
 
-        self._client_subs[client_id][sub_id] = key
-        logger.debug("Client %s subscribed %s → shared eval %s", client_id, sub_id, key[:8])
+        shared = _SharedEval(key=key, spec=spec, t0_ns=t0_ns, interval_ms=interval_ms)
+        shared.listeners.append(listener)
+        try:
+            await self._start_shared_eval(shared)
+        except Exception:
+            self._teardown_shared(shared)
+            raise
+        self._shared_evals[key] = shared
+        return key
 
     def _join_shared(self, shared: _SharedEval, listener: _Listener) -> None:
         """Attach a listener to an already-running shared evaluation.
@@ -329,19 +384,15 @@ class SubscriptionManager:
 
         Raises
         ------
-        FormulaCircularReference
-            If a binding of ``spec`` uses the ``formula:`` or retired ``fox:``
-            prefix; nothing is subscribed and the subscription is unchanged.
-        InvalidPVName
-            If a binding of ``spec`` is not a well-formed PV name; nothing is
-            subscribed and the subscription is unchanged.
+        CanopyError
+            If ``spec`` fails `FormulaService.check_spec` (a bad binding or
+            expression); nothing is subscribed and the subscription is
+            unchanged. The check runs once the subscription is found, so an
+            unknown ``sub_id`` still returns ``False``.
         Exception
             Any error raised while starting a new shared eval; the old eval
             and the subscription's mapping are left intact.
         """
-        if spec is not None:
-            self._formula_service.check_bindings(spec)
-
         subs = self._client_subs.get(client_id)
         if not subs or sub_id not in subs:
             return False
@@ -350,6 +401,9 @@ class SubscriptionManager:
         shared = self._shared_evals.get(key)
         if shared is None:
             return False
+
+        if spec is not None:
+            self._formula_service.check_spec(spec)
 
         new_spec = spec if spec is not None else shared.spec
         new_t0 = t0_ns if t0_ns is not None else shared.t0_ns
@@ -363,17 +417,7 @@ class SubscriptionManager:
             return True
 
         listener = _Listener(client_id=client_id, sub_id=sub_id, send_fn=send_fn)
-        if new_key in self._shared_evals:
-            self._join_shared(self._shared_evals[new_key], listener)
-        else:
-            new_shared = _SharedEval(key=new_key, spec=new_spec, t0_ns=new_t0, interval_ms=new_interval)
-            new_shared.listeners.append(listener)
-            try:
-                await self._start_shared_eval(new_shared)
-            except Exception:
-                self._teardown_shared(new_shared)
-                raise
-            self._shared_evals[new_key] = new_shared
+        await self._attach(listener, new_spec, new_t0, new_interval)
 
         shared.listeners = [ls for ls in shared.listeners if not (ls.client_id == client_id and ls.sub_id == sub_id)]
         if not shared.listeners:

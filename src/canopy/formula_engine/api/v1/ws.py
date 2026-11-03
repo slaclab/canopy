@@ -14,7 +14,7 @@ from fastapi import Security, APIRouter, WebSocket, WebSocketDisconnect
 from canopy.core.errors import ErrorCode, CanopyError
 from canopy.core.security import ws_require_read_access
 from canopy.contracts.formula import FormulaSpec
-from canopy.formula_engine.dependencies import SubscriptionManagerDep
+from canopy.formula_engine.dependencies import FormulaServiceDep, SubscriptionManagerDep
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,9 @@ async def _send_error(send_fn, code: str, message: str, *, sub_id: str | None = 
 
 
 @router.websocket("/formulas", dependencies=[Security(ws_require_read_access)])
-async def ws_formulas(websocket: WebSocket, manager: SubscriptionManagerDep) -> None:
+async def ws_formulas(
+    websocket: WebSocket, manager: SubscriptionManagerDep, formula_service: FormulaServiceDep
+) -> None:
     """Live formula evaluation stream.
 
     Client -> server:
@@ -65,6 +67,10 @@ async def ws_formulas(websocket: WebSocket, manager: SubscriptionManagerDep) -> 
     - ``{"type": "result", "id": "...", "data": {...}}``
     - ``{"type": "error", "code": "...", "message": "..."}``
     - ``{"type": "pong", "timestamp": T}``
+
+    Each subscribe gets either ``subscribed`` or an error without an ``id``.
+    A spec that can't be evaluated (a bad binding or expression) gets the
+    error, before anything subscribes and before any id is assigned.
     """
     await websocket.accept()
     client_id = uuid.uuid4().hex
@@ -109,6 +115,16 @@ async def ws_formulas(websocket: WebSocket, manager: SubscriptionManagerDep) -> 
                     spec = FormulaSpec(**spec_raw)
                 except Exception as exc:
                     await _send_error(send_fn, ErrorCode.INVALID_SPEC.value, f"invalid spec: {exc}")
+                    continue
+
+                try:
+                    formula_service.check_spec(spec)
+                except CanopyError as exc:
+                    await _send_error(send_fn, exc.error_code.value, exc.detail)
+                    continue
+                except Exception as exc:
+                    logger.warning("Formula Engine spec check failed: %s", exc)
+                    await _send_error(send_fn, ErrorCode.UNHANDLED_EXCEPTION.value, str(exc))
                     continue
 
                 sub_id = uuid.uuid4().hex

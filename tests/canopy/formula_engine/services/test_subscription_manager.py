@@ -7,9 +7,11 @@ import pytest
 from tests.conftest import wait_for
 from canopy.core.errors import ErrorCode
 from canopy.contracts.formula import FormulaSpec
+from canopy.epics.pv_protocol import InvalidPVName
 from canopy.formula_engine.config import FormulaEngineConfig
 from canopy.formula_engine.errors import (
     FormulaTypeError,
+    FormulaParseError,
     FormulaInputMissing,
     FormulaCircularReference,
     SubscriptionLimitExceeded,
@@ -151,39 +153,49 @@ def _recording_manager(formula_service: FormulaService) -> tuple[SubscriptionMan
     return mgr, calls
 
 
-def _spec_binding(pv: str) -> FormulaSpec:
-    return FormulaSpec(kind="scalar", expression="{a} + {b}", bindings={"a": "PV:A", "b": pv})
+def _bad_spec(b: str = "PV:B", expression: str = "{a} + {b}") -> FormulaSpec:
+    return FormulaSpec(kind="scalar", expression=expression, bindings={"a": "PV:A", "b": b})
 
 
-@pytest.mark.parametrize("binding", ["formula:x", "fox:x"])
+# Specs that FormulaService.check_spec rejects, with the error each raises.
+_BAD_SPECS = [
+    pytest.param(_bad_spec("formula:x"), FormulaCircularReference, id="formula-ref"),
+    pytest.param(_bad_spec("fox:x"), FormulaCircularReference, id="fox-ref"),
+    pytest.param(_bad_spec(""), InvalidPVName, id="empty-pv"),
+    pytest.param(_bad_spec("A B"), InvalidPVName, id="spaced-pv"),
+    pytest.param(_bad_spec("pva://"), InvalidPVName, id="bare-prefix"),
+    pytest.param(_bad_spec(expression="{a} +"), FormulaParseError, id="syntax-error"),
+    pytest.param(_bad_spec(expression="{a} * 2"), FormulaParseError, id="unused-binding"),
+]
+
+
+@pytest.mark.parametrize(("spec", "error"), _BAD_SPECS)
 @pytest.mark.parametrize("interval_ms", [0, 100])
-async def test_add_subscription_rejects_a_formula_binding_before_subscribing(formula_service, binding, interval_ms):
-    # A bad binding must raise before any PV is subscribed, not open channel
+async def test_add_subscription_rejects_a_bad_spec_before_subscribing(formula_service, spec, error, interval_ms):
+    # A bad spec must raise before any PV is subscribed, not open channel
     # subscriptions (or a poll loop) that only the first evaluation turns into
     # an error frame.
     mgr, calls = _recording_manager(formula_service)
     _messages, send_fn = _make_collector()
 
-    with pytest.raises(FormulaCircularReference):
-        await mgr.add_subscription(
-            "c1", "s1", _spec_binding(binding), t0_ns=0, t1_ns=0, send_fn=send_fn, interval_ms=interval_ms
-        )
+    with pytest.raises(error):
+        await mgr.add_subscription("c1", "s1", spec, t0_ns=0, t1_ns=0, send_fn=send_fn, interval_ms=interval_ms)
 
     assert calls == []
     assert mgr._shared_evals == {}
     assert mgr._client_subs == {}
 
 
-@pytest.mark.parametrize("binding", ["formula:x", "fox:x"])
-async def test_resubscribe_with_a_formula_binding_keeps_the_old_subscription(formula_service, binding):
+@pytest.mark.parametrize(("spec", "error"), _BAD_SPECS)
+async def test_resubscribe_with_a_bad_spec_keeps_the_old_subscription(formula_service, spec, error):
     mgr, calls = _recording_manager(formula_service)
     _messages, send_fn = _make_collector()
     await mgr.add_subscription("c1", "s1", _scalar_spec(), t0_ns=0, t1_ns=0, send_fn=send_fn)
     old_key = mgr._client_subs["c1"]["s1"]
     calls.clear()
 
-    with pytest.raises(FormulaCircularReference):
-        await mgr.add_subscription("c1", "s1", _spec_binding(binding), t0_ns=0, t1_ns=0, send_fn=send_fn)
+    with pytest.raises(error):
+        await mgr.add_subscription("c1", "s1", spec, t0_ns=0, t1_ns=0, send_fn=send_fn)
 
     assert calls == []
     assert mgr._client_subs["c1"]["s1"] == old_key
@@ -191,21 +203,85 @@ async def test_resubscribe_with_a_formula_binding_keeps_the_old_subscription(for
     await mgr.shutdown()
 
 
-@pytest.mark.parametrize("binding", ["formula:x", "fox:x"])
-async def test_update_subscription_rejects_a_formula_binding_before_subscribing(formula_service, binding):
+async def test_resubscribe_keeps_the_old_subscription_when_the_replacement_fails_to_start(formula_service, notifier):
+    # The replacement is started before the old subscription is detached, so a
+    # spec that passes the checks but fails to subscribe leaves the old one
+    # running.
+    calls = {"n": 0}
+
+    async def subscribe_live(pvs: list[str]) -> None:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("subscribe failed")
+
+    mgr = SubscriptionManager(
+        formula_service=formula_service,
+        on_change_fn=notifier.subscribe,
+        subscribe_live_fn=subscribe_live,
+        subscribe_latest_fn=subscribe_live,
+    )
+    messages, send_fn = _make_collector()
+    await mgr.add_subscription("c1", "s1", _scalar_spec(), t0_ns=0, t1_ns=0, send_fn=send_fn)
+    old_key = mgr._client_subs["c1"]["s1"]
+
+    with pytest.raises(RuntimeError):
+        await mgr.add_subscription("c1", "s1", _timeseries_spec(), t0_ns=-5000, t1_ns=0, send_fn=send_fn)
+
+    assert mgr._client_subs["c1"]["s1"] == old_key
+    assert list(mgr._shared_evals) == [old_key]
+    assert [ls.sub_id for ls in mgr._shared_evals[old_key].listeners] == ["s1"]
+    messages.clear()
+    notifier.notify("PV:A")
+    assert await wait_for(lambda: messages)
+    assert messages[0]["type"] == "result"
+    await mgr.shutdown()
+
+
+async def test_resubscribe_with_the_same_params_replaces_the_listener(formula_service):
+    # With identical parameters the replacement joins the old listener's eval,
+    # so the old listener is dropped by identity, not by its (shared) ids.
+    mgr, _calls = _recording_manager(formula_service)
+    first, first_send = _make_collector()
+    await mgr.add_subscription("c1", "s1", _scalar_spec(), t0_ns=0, t1_ns=0, send_fn=first_send)
+    assert await wait_for(lambda: first)
+    key = mgr._client_subs["c1"]["s1"]
+
+    second, second_send = _make_collector()
+    await mgr.add_subscription("c1", "s1", _scalar_spec(), t0_ns=0, t1_ns=0, send_fn=second_send)
+
+    assert mgr._client_subs == {"c1": {"s1": key}}
+    listeners = mgr._shared_evals[key].listeners
+    assert [ls.send_fn for ls in listeners] == [second_send]
+    assert await wait_for(lambda: second)
+    assert _scalar_values(second) == [8.0]
+    await mgr.shutdown()
+
+
+@pytest.mark.parametrize(("spec", "error"), _BAD_SPECS)
+async def test_update_subscription_rejects_a_bad_spec_before_subscribing(formula_service, spec, error):
     mgr, calls = _recording_manager(formula_service)
     _messages, send_fn = _make_collector()
     await mgr.add_subscription("c1", "s1", _scalar_spec(), t0_ns=0, t1_ns=0, send_fn=send_fn)
     old_key = mgr._client_subs["c1"]["s1"]
     calls.clear()
 
-    with pytest.raises(FormulaCircularReference):
-        await mgr.update_subscription("c1", "s1", send_fn, spec=_spec_binding(binding))
+    with pytest.raises(error):
+        await mgr.update_subscription("c1", "s1", send_fn, spec=spec)
 
     assert calls == []
     assert mgr._client_subs["c1"]["s1"] == old_key
     assert list(mgr._shared_evals) == [old_key]
     await mgr.shutdown()
+
+
+async def test_update_of_an_unknown_id_with_a_bad_spec_is_not_found(formula_service):
+    # The subscription lookup comes first, so a client whose subscription is
+    # gone learns that, rather than being told to fix a spec it can't use.
+    mgr, calls = _recording_manager(formula_service)
+    _messages, send_fn = _make_collector()
+
+    assert await mgr.update_subscription("c1", "missing", send_fn, spec=_bad_spec("formula:x")) is False
+    assert calls == []
 
 
 def _timeseries_spec() -> FormulaSpec:
@@ -373,13 +449,14 @@ class TestSubscriptionManager:
     async def test_eval_error_sends_error_frame_loop_continues(self, manager, notifier):
         messages, send_fn = _make_collector()
 
-        spec = FormulaSpec(
-            kind="scalar",
-            expression="{a} +",
-            bindings={"a": "PV:A"},
-        )
+        # A bad expression is now rejected before subscribing, so the eval
+        # error comes from evaluation itself.
+        async def type_error(*args, **kwargs):
+            raise FormulaTypeError("bad operand")
 
-        await manager.add_subscription("client-1", "sub-1", spec, 0, 0, send_fn)
+        manager._formula_service.evaluate = type_error
+
+        await manager.add_subscription("client-1", "sub-1", _scalar_spec(), 0, 0, send_fn)
 
         assert await wait_for(lambda: len(messages) >= 1)
         assert messages[0]["type"] == "error"
@@ -594,12 +671,16 @@ async def test_all_dead_listeners_retire_on_the_error_path_too(manager):
     Such an eval never reaches the result fan-out, so the error fan-out drops
     failed listeners and retires the eval the same way.
     """
-    bad_spec = FormulaSpec(kind="scalar", expression="{a} +", bindings={"a": "PV:A"})
+
+    async def type_error(*args, **kwargs):
+        raise FormulaTypeError("bad operand")
+
+    manager._formula_service.evaluate = type_error
 
     async def dead_send(_msg: dict) -> None:
         raise RuntimeError("socket closed")
 
-    await manager.add_subscription("c1", "s1", bad_spec, t0_ns=0, t1_ns=0, send_fn=dead_send)
+    await manager.add_subscription("c1", "s1", _scalar_spec(), t0_ns=0, t1_ns=0, send_fn=dead_send)
     assert await wait_for(lambda: manager._shared_evals == {})
 
     assert manager._client_subs.get("c1", {}) == {}
