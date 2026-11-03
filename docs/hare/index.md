@@ -42,7 +42,7 @@ interpret it:
 | `scalar` | Number or boolean |
 | `string` | String |
 | `enum` | Integer choice index — labels come from `enumChoices` in the metadata |
-| `waveform` | 1-D array of numbers |
+| `waveform` | 1-D array of numbers, or of strings for a string waveform |
 | `table` | `{labels, columns}` object (PV Access NTTable, column-major) |
 | `image` | Reserved — images will travel as binary frames, not JSON |
 | `unsupported` | A recognized but not-yet-rendered Normative Type |
@@ -63,6 +63,9 @@ The EPICS connector behind Hare has two backends, selected with
 
 - **`simulation`** (default) — every PV name resolves to a synthetic sine
   wave. No IOC or network needed; ideal for frontend development and CI.
+  The name's suffix picks the value kind: `:ENUM`, `:WAVEFORM` / `:WF`,
+  `:STR_WAVEFORM` / `:STR_WF` (string waveform), `:STR`, `:TABLE`; anything
+  else is a scalar.
 - **`epics`** — real Channel Access / PV Access via the facility network.
   Discovery uses the standard EPICS environment variables
   (`EPICS_CA_ADDR_LIST`, `EPICS_PVA_ADDR_LIST`, ...).
