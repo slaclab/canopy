@@ -51,11 +51,12 @@
 | src/canopy/converter/services/conversion\_service.py         |       76 |        1 |     99% |       128 |
 | src/canopy/converter/tasks.py                                |       99 |        5 |     95% |98, 120, 125, 152-153 |
 | src/canopy/core/\_\_init\_\_.py                              |        0 |        0 |    100% |           |
+| src/canopy/core/app\_names.py                                |        5 |        0 |    100% |           |
 | src/canopy/core/clock.py                                     |       16 |        3 |     81% |13, 26, 29 |
 | src/canopy/core/config.py                                    |       20 |        0 |    100% |           |
 | src/canopy/core/db.py                                        |       73 |       15 |     79% |90-91, 107-116, 120-123, 168-171 |
 | src/canopy/core/decimation.py                                |       35 |        1 |     97% |        53 |
-| src/canopy/core/errors.py                                    |      136 |        0 |    100% |           |
+| src/canopy/core/errors.py                                    |      142 |        0 |    100% |           |
 | src/canopy/core/facilities/\_\_init\_\_.py                   |        0 |        0 |    100% |           |
 | src/canopy/core/facilities/dependencies.py                   |        9 |        0 |    100% |           |
 | src/canopy/core/facilities/gateway.py                        |       25 |        8 |     68% |22-23, 45-48, 53-54 |
@@ -78,8 +79,29 @@
 | src/canopy/core/metrics.py                                   |       54 |        2 |     96% |   121-122 |
 | src/canopy/core/modules.py                                   |       14 |        0 |    100% |           |
 | src/canopy/core/runtime.py                                   |        8 |        0 |    100% |           |
-| src/canopy/core/security.py                                  |      142 |        8 |     94% |259-260, 268, 298, 364, 372-377 |
+| src/canopy/core/security.py                                  |      142 |        7 |     95% |259-260, 298, 364, 372-377 |
 | src/canopy/core/time\_parse.py                               |       52 |        1 |     98% |       131 |
+| src/canopy/elog/\_\_init\_\_.py                              |        1 |        0 |    100% |           |
+| src/canopy/elog/adapters/\_\_init\_\_.py                     |        0 |        0 |    100% |           |
+| src/canopy/elog/adapters/base.py                             |       35 |        5 |     86% |52, 62, 68, 74, 78 |
+| src/canopy/elog/adapters/elog\_plus.py                       |      176 |        6 |     97% |112, 115-116, 137, 195, 333 |
+| src/canopy/elog/adapters/registry.py                         |       82 |        5 |     94% |74-75, 88-89, 110 |
+| src/canopy/elog/api/\_\_init\_\_.py                          |        0 |        0 |    100% |           |
+| src/canopy/elog/api/v1/\_\_init\_\_.py                       |        0 |        0 |    100% |           |
+| src/canopy/elog/api/v1/apps.py                               |       33 |        0 |    100% |           |
+| src/canopy/elog/api/v1/health.py                             |       10 |        0 |    100% |           |
+| src/canopy/elog/api/v1/router.py                             |        6 |        0 |    100% |           |
+| src/canopy/elog/app.py                                       |       36 |        0 |    100% |           |
+| src/canopy/elog/config.py                                    |       41 |        1 |     98% |        47 |
+| src/canopy/elog/dependencies.py                              |        7 |        1 |     86% |        15 |
+| src/canopy/elog/errors.py                                    |       23 |        0 |    100% |           |
+| src/canopy/elog/gateway.py                                   |       15 |        0 |    100% |           |
+| src/canopy/elog/runtime.py                                   |        4 |        0 |    100% |           |
+| src/canopy/elog/schemas/\_\_init\_\_.py                      |        0 |        0 |    100% |           |
+| src/canopy/elog/schemas/elog.py                              |       28 |        0 |    100% |           |
+| src/canopy/elog/schemas/health.py                            |        9 |        0 |    100% |           |
+| src/canopy/elog/services/\_\_init\_\_.py                     |        0 |        0 |    100% |           |
+| src/canopy/elog/services/elog\_service.py                    |       79 |        1 |     99% |        56 |
 | src/canopy/epics/\_\_init\_\_.py                             |        0 |        0 |    100% |           |
 | src/canopy/epics/backends/\_\_init\_\_.py                    |        0 |        0 |    100% |           |
 | src/canopy/epics/backends/epics\_backend.py                  |      328 |       79 |     76% |56, 75-76, 84, 88, 118-119, 165-166, 171, 211-212, 227-232, 235-240, 247-248, 286, 289-318, 324-325, 349, 358-360, 370, 373-389, 410, 415-416, 474-475, 517, 535, 556-557, 559, 569, 589-592, 602-603 |
@@ -152,9 +174,9 @@
 | src/canopy/magpie/\_\_init\_\_.py                            |        0 |        0 |    100% |           |
 | src/canopy/magpie/api/\_\_init\_\_.py                        |        0 |        0 |    100% |           |
 | src/canopy/magpie/api/v1/\_\_init\_\_.py                     |        0 |        0 |    100% |           |
-| src/canopy/magpie/api/v1/\_validation.py                     |       15 |        0 |    100% |           |
+| src/canopy/magpie/api/v1/\_validation.py                     |       11 |        0 |    100% |           |
 | src/canopy/magpie/api/v1/apps.py                             |        8 |        0 |    100% |           |
-| src/canopy/magpie/api/v1/configs.py                          |       47 |        2 |     96% |   89, 100 |
+| src/canopy/magpie/api/v1/configs.py                          |       48 |        2 |     96% |   90, 101 |
 | src/canopy/magpie/api/v1/debug.py                            |       22 |        0 |    100% |           |
 | src/canopy/magpie/api/v1/health.py                           |        9 |        1 |     89% |        15 |
 | src/canopy/magpie/api/v1/router.py                           |       10 |        0 |    100% |           |
@@ -171,7 +193,7 @@
 | src/canopy/magpie/schemas/health.py                          |        2 |        0 |    100% |           |
 | src/canopy/magpie/services/\_\_init\_\_.py                   |        0 |        0 |    100% |           |
 | src/canopy/magpie/services/config\_service.py                |       97 |        8 |     92% |49, 118-121, 124, 201-202 |
-| src/canopy/main.py                                           |       98 |        0 |    100% |           |
+| src/canopy/main.py                                           |      102 |        0 |    100% |           |
 | src/canopy/mole/\_\_init\_\_.py                              |        0 |        0 |    100% |           |
 | src/canopy/mole/adapters/\_\_init\_\_.py                     |        1 |        0 |    100% |           |
 | src/canopy/mole/adapters/appliance.py                        |      166 |       13 |     92% |55, 171, 215-218, 259, 266-267, 281-282, 293-294 |
@@ -288,7 +310,7 @@
 | src/canopy/vole/services/hare\_ingest.py                     |       92 |       11 |     88% |47-48, 55, 77, 103, 121, 131-132, 152-155 |
 | src/canopy/vole/services/notifier.py                         |       35 |        2 |     94% |     33-34 |
 | src/canopy/worker.py                                         |       37 |        6 |     84% | 32, 61-65 |
-| **TOTAL**                                                    | **8520** |  **735** | **91%** |           |
+| **TOTAL**                                                    | **9117** |  **753** | **92%** |           |
 
 
 ## Setup coverage badge
