@@ -284,6 +284,67 @@ async def test_update_of_an_unknown_id_with_a_bad_spec_is_not_found(formula_serv
     assert calls == []
 
 
+@pytest.mark.parametrize("other_client", [False, True], ids=["alone", "other-client-reuses-the-key"])
+async def test_update_survives_the_old_listener_being_dropped_while_the_new_eval_starts(formula_service, other_client):
+    # A failed send can drop the old listener, retiring its eval, while the
+    # update awaits the new eval's subscribe. The update must not raise or
+    # untrack an eval another client has since started under the old key, and
+    # it must keep the subscription mapped to the new eval so that
+    # remove_client tears it down.
+    started = asyncio.Event()
+    release = asyncio.Event()
+    open_channels: dict[str, int] = {}
+
+    def on_change(pv: str, callback):
+        open_channels[pv] = open_channels.get(pv, 0) + 1
+
+        def unsubscribe() -> None:
+            open_channels[pv] -= 1
+
+        return unsubscribe
+
+    async def subscribe_latest(pvs: list[str]) -> None:
+        pass
+
+    async def subscribe_live(pvs: list[str]) -> None:
+        started.set()
+        await release.wait()
+
+    mgr = SubscriptionManager(
+        formula_service=formula_service,
+        on_change_fn=on_change,
+        subscribe_live_fn=subscribe_live,
+        subscribe_latest_fn=subscribe_latest,
+    )
+    _messages, send_fn = _make_collector()
+    await mgr.add_subscription("c1", "s1", _scalar_spec(), t0_ns=0, t1_ns=0, send_fn=send_fn)
+    old_key = mgr._client_subs["c1"]["s1"]
+    old_shared = mgr._shared_evals[old_key]
+    [old_listener] = old_shared.listeners
+
+    update = asyncio.create_task(mgr.update_subscription("c1", "s1", send_fn, t0_ns=-5000))
+    await started.wait()
+    mgr._drop_listener(old_shared, old_listener)
+    if other_client:
+        await mgr.add_subscription("c2", "s2", _scalar_spec(), t0_ns=0, t1_ns=0, send_fn=send_fn)
+        other_shared = mgr._shared_evals[old_key]
+    release.set()
+    assert await update is True
+
+    new_key = mgr._client_subs["c1"]["s1"]
+    assert new_key != old_key
+    if other_client:
+        assert mgr._shared_evals[old_key] is other_shared
+        assert set(mgr._shared_evals) == {old_key, new_key}
+    else:
+        assert list(mgr._shared_evals) == [new_key]
+
+    await mgr.remove_client("c1")
+    assert list(mgr._shared_evals) == ([old_key] if other_client else [])
+    assert open_channels == {"PV:A": int(other_client), "PV:B": int(other_client)}
+    await mgr.shutdown()
+
+
 def _timeseries_spec() -> FormulaSpec:
     return FormulaSpec(
         kind="timeseries",

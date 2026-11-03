@@ -1,5 +1,7 @@
 """Formula Engine WebSocket endpoint — end-to-end tests."""
 
+from types import SimpleNamespace
+
 import pytest
 from fastapi import WebSocketDisconnect
 from fastapi.testclient import TestClient
@@ -7,6 +9,7 @@ from fastapi.testclient import TestClient
 from canopy.main import app as parent_app
 from canopy.contracts.sample import Sample, AlarmSeverity
 from canopy.formula_engine.app import app as formula_engine_app
+from canopy.formula_engine.api.v1 import ws as ws_module
 from canopy.formula_engine.config import FormulaEngineConfig
 from canopy.vole.services.notifier import ChangeNotifier
 from canopy.formula_engine.dependencies import (
@@ -293,3 +296,38 @@ class TestFormulaEngineWebSocket:
             # Socket survives: connection was not dropped.
             ws.send_json({"type": "ping"})
             assert ws.receive_json()["type"] == "pong"
+
+    def test_ws_update_with_a_mistyped_field_errors_with_its_id(self, ws_client):
+        # An id-less error is read as the reply to a pending subscribe, so an
+        # update the server can't use still names the subscription it targets.
+        client, _, _ = ws_client
+        with client.websocket_connect("/formula-engine/v1/ws/formulas?api_key=test-read") as ws:
+            ws.send_json({"type": "update", "id": "sub-1", "t0Ns": "soon"})
+            msg = ws.receive_json()
+            assert msg["type"] == "error"
+            assert msg["code"] == "invalid_message"
+            assert msg["id"] == "sub-1"
+
+    @pytest.mark.parametrize("debug", [False, True])
+    def test_ws_unexpected_spec_check_error_is_logged_and_hidden(self, ws_client, monkeypatch, caplog, debug):
+        # Like the REST fallback handler: the traceback goes to the log, and the
+        # client sees the exception text only in debug mode.
+        client, _, sub_manager = ws_client
+
+        def boom(_spec):
+            raise RuntimeError("internal detail")
+
+        sub_manager._formula_service.check_spec = boom
+        monkeypatch.setattr(ws_module, "get_settings", lambda: SimpleNamespace(debug=debug))
+
+        with client.websocket_connect("/formula-engine/v1/ws/formulas?api_key=test-read") as ws:
+            ws.send_json({"type": "subscribe", "spec": _SCALAR_SPEC})
+            msg = ws.receive_json()
+            assert msg["type"] == "error"
+            assert msg["code"] == "unhandled_exception"
+            assert "id" not in msg
+            assert msg["message"] == ("internal detail" if debug else "Internal server error")
+
+        [record] = [r for r in caplog.records if r.name == ws_module.__name__]
+        assert record.exc_info is not None
+        assert sub_manager._shared_evals == {}

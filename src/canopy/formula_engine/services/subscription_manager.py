@@ -158,8 +158,11 @@ class SubscriptionManager:
         before anything else, so a bad binding or expression subscribes to no
         PV. Re-using a live ``sub_id`` attaches the replacement before
         detaching the listener it replaces, so a failure at any step leaves
-        the old subscription running. A one-shot evaluation reports a bad spec
-        as an error frame instead, like any other evaluation error.
+        the old subscription running. A one-shot is not checked here:
+        `FormulaService.evaluate` runs the same check, so a bad spec is sent
+        as an error frame and then ``completed``, like any other evaluation
+        error. The WebSocket endpoint checks every spec, one-shots included,
+        before calling this method.
 
         Parameters
         ----------
@@ -183,8 +186,8 @@ class SubscriptionManager:
         Raises
         ------
         CanopyError
-            If ``spec`` fails `FormulaService.check_spec` (a bad binding or
-            expression); nothing is subscribed.
+            If a live subscription's ``spec`` fails `FormulaService.check_spec`
+            (a bad binding or expression); nothing is subscribed.
         SubscriptionLimitExceeded
             If the client already holds ``max_subscriptions_per_client`` live
             subscriptions and ``sub_id`` is new.
@@ -361,6 +364,12 @@ class SubscriptionManager:
         SharedEval are unaffected. An update that resolves to the current
         SharedEval leaves the subscription as it is.
 
+        The new listener is attached before the old one is detached, which
+        `_drop_listener` does by identity once the attach has finished. So the
+        update stays consistent if the old listener is dropped (a failed send)
+        while the new eval is starting: the old eval is retired only if it is
+        still tracked, and the subscription is mapped to the new one.
+
         Parameters
         ----------
         client_id : str
@@ -393,14 +402,10 @@ class SubscriptionManager:
             Any error raised while starting a new shared eval; the old eval
             and the subscription's mapping are left intact.
         """
-        subs = self._client_subs.get(client_id)
-        if not subs or sub_id not in subs:
+        found = self._find_listener(client_id, sub_id)
+        if found is None:
             return False
-
-        key = subs[sub_id]
-        shared = self._shared_evals.get(key)
-        if shared is None:
-            return False
+        shared, old_listener = found
 
         if spec is not None:
             self._formula_service.check_spec(spec)
@@ -413,18 +418,16 @@ class SubscriptionManager:
             new_interval = self._min_interval_ms
 
         new_key = _compute_key(new_spec, new_t0, new_interval)
-        if new_key == key:
+        if new_key == shared.key:
             return True
 
         listener = _Listener(client_id=client_id, sub_id=sub_id, send_fn=send_fn)
         await self._attach(listener, new_spec, new_t0, new_interval)
+        self._drop_listener(shared, old_listener)
 
-        shared.listeners = [ls for ls in shared.listeners if not (ls.client_id == client_id and ls.sub_id == sub_id)]
-        if not shared.listeners:
-            self._teardown_shared(shared)
-            del self._shared_evals[key]
-
-        subs[sub_id] = new_key
+        # Written after the drop, which clears the mapping when it still
+        # points at the old eval.
+        self._client_subs.setdefault(client_id, {})[sub_id] = new_key
         return True
 
     async def remove_subscription(self, client_id: str, sub_id: str) -> None:
