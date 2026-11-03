@@ -47,6 +47,7 @@ def ws_client(notifier):
         on_change_fn=notifier.subscribe,
         subscribe_live_fn=subscribe_live,
     )
+    sub_manager._subscribed_pvs = subscribed_pvs
 
     formula_engine_app.dependency_overrides[get_formula_service] = lambda: formula_service
     formula_engine_app.dependency_overrides[get_subscription_manager] = lambda: sub_manager
@@ -196,6 +197,56 @@ class TestFormulaEngineWebSocket:
             ws.send_json({"type": "ping"})
             msg = ws.receive_json()
             assert msg["type"] == "pong"
+
+    @pytest.mark.parametrize("binding", ["formula:x", "fox:x"])
+    def test_ws_subscribe_rejects_a_formula_binding_before_subscribing(self, ws_client, binding):
+        # The bindings are checked before any PV is subscribed, so a bad one
+        # opens no channel subscription and starts no eval loop.
+        client, notifier, sub_manager = ws_client
+        spec = {**_SCALAR_SPEC, "bindings": {"a": "PV:A", "b": binding}}
+        with client.websocket_connect("/formula-engine/v1/ws/formulas?api_key=test-read") as ws:
+            ws.send_json({"type": "subscribe", "spec": spec})
+
+            msg = ws.receive_json()
+            assert msg["type"] == "subscribed"
+            sub_id = msg["id"]
+
+            msg = ws.receive_json()
+            assert msg["type"] == "error"
+            assert msg["code"] == "formula_circular_reference"
+            assert msg["id"] == sub_id
+
+            ws.send_json({"type": "ping"})
+            assert ws.receive_json()["type"] == "pong"
+
+            assert sub_manager._subscribed_pvs == []
+            assert not notifier._listeners
+            assert sub_manager._shared_evals == {}
+
+    @pytest.mark.parametrize("binding", ["formula:x", "fox:x"])
+    def test_ws_update_rejects_a_formula_binding_before_subscribing(self, ws_client, binding):
+        client, notifier, sub_manager = ws_client
+        spec = {**_SCALAR_SPEC, "bindings": {"a": "PV:A", "b": binding}}
+        with client.websocket_connect("/formula-engine/v1/ws/formulas?api_key=test-read") as ws:
+            ws.send_json({"type": "subscribe", "spec": _SCALAR_SPEC})
+            sub_id = ws.receive_json()["id"]
+            assert ws.receive_json()["type"] == "result"
+            subscribed_pvs = list(sub_manager._subscribed_pvs)
+            listeners = {pv: len(cbs) for pv, cbs in notifier._listeners.items()}
+            shared_keys = list(sub_manager._shared_evals)
+
+            ws.send_json({"type": "update", "id": sub_id, "spec": spec})
+            msg = ws.receive_json()
+            assert msg["type"] == "error"
+            assert msg["code"] == "formula_circular_reference"
+            assert msg["id"] == sub_id
+
+            ws.send_json({"type": "ping"})
+            assert ws.receive_json()["type"] == "pong"
+
+            assert sub_manager._subscribed_pvs == subscribed_pvs
+            assert {pv: len(cbs) for pv, cbs in notifier._listeners.items()} == listeners
+            assert list(sub_manager._shared_evals) == shared_keys
 
     def test_ws_update_failure_errors_without_dropping(self, ws_client):
         # A raising update_subscription must send an error frame and keep the

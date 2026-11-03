@@ -11,6 +11,7 @@ from canopy.formula_engine.config import FormulaEngineConfig
 from canopy.formula_engine.errors import (
     FormulaTypeError,
     FormulaInputMissing,
+    FormulaCircularReference,
     SubscriptionLimitExceeded,
 )
 from canopy.vole.services.notifier import ChangeNotifier
@@ -124,6 +125,86 @@ async def test_update_subscription_preserves_old_eval_on_start_failure(formula_s
     # Old eval survives; the mapping still points at it (not orphaned).
     assert mgr._client_subs["c1"]["s1"] == old_key
     assert old_key in mgr._shared_evals
+    await mgr.shutdown()
+
+
+def _recording_manager(formula_service: FormulaService) -> tuple[SubscriptionManager, list[tuple[str, object]]]:
+    """Build a manager whose on_change and subscribe callbacks record every call."""
+    calls: list[tuple[str, object]] = []
+
+    def on_change(pv: str, callback):
+        calls.append(("on_change", pv))
+        return lambda: None
+
+    async def subscribe_live(pvs: list[str]) -> None:
+        calls.append(("subscribe_live", pvs))
+
+    async def subscribe_latest(pvs: list[str]) -> None:
+        calls.append(("subscribe_latest", pvs))
+
+    mgr = SubscriptionManager(
+        formula_service=formula_service,
+        on_change_fn=on_change,
+        subscribe_live_fn=subscribe_live,
+        subscribe_latest_fn=subscribe_latest,
+    )
+    return mgr, calls
+
+
+def _spec_binding(pv: str) -> FormulaSpec:
+    return FormulaSpec(kind="scalar", expression="{a} + {b}", bindings={"a": "PV:A", "b": pv})
+
+
+@pytest.mark.parametrize("binding", ["formula:x", "fox:x"])
+@pytest.mark.parametrize("interval_ms", [0, 100])
+async def test_add_subscription_rejects_a_formula_binding_before_subscribing(formula_service, binding, interval_ms):
+    # A bad binding must raise before any PV is subscribed, not open channel
+    # subscriptions (or a poll loop) that only the first evaluation turns into
+    # an error frame.
+    mgr, calls = _recording_manager(formula_service)
+    _messages, send_fn = _make_collector()
+
+    with pytest.raises(FormulaCircularReference):
+        await mgr.add_subscription(
+            "c1", "s1", _spec_binding(binding), t0_ns=0, t1_ns=0, send_fn=send_fn, interval_ms=interval_ms
+        )
+
+    assert calls == []
+    assert mgr._shared_evals == {}
+    assert mgr._client_subs == {}
+
+
+@pytest.mark.parametrize("binding", ["formula:x", "fox:x"])
+async def test_resubscribe_with_a_formula_binding_keeps_the_old_subscription(formula_service, binding):
+    mgr, calls = _recording_manager(formula_service)
+    _messages, send_fn = _make_collector()
+    await mgr.add_subscription("c1", "s1", _scalar_spec(), t0_ns=0, t1_ns=0, send_fn=send_fn)
+    old_key = mgr._client_subs["c1"]["s1"]
+    calls.clear()
+
+    with pytest.raises(FormulaCircularReference):
+        await mgr.add_subscription("c1", "s1", _spec_binding(binding), t0_ns=0, t1_ns=0, send_fn=send_fn)
+
+    assert calls == []
+    assert mgr._client_subs["c1"]["s1"] == old_key
+    assert list(mgr._shared_evals) == [old_key]
+    await mgr.shutdown()
+
+
+@pytest.mark.parametrize("binding", ["formula:x", "fox:x"])
+async def test_update_subscription_rejects_a_formula_binding_before_subscribing(formula_service, binding):
+    mgr, calls = _recording_manager(formula_service)
+    _messages, send_fn = _make_collector()
+    await mgr.add_subscription("c1", "s1", _scalar_spec(), t0_ns=0, t1_ns=0, send_fn=send_fn)
+    old_key = mgr._client_subs["c1"]["s1"]
+    calls.clear()
+
+    with pytest.raises(FormulaCircularReference):
+        await mgr.update_subscription("c1", "s1", send_fn, spec=_spec_binding(binding))
+
+    assert calls == []
+    assert mgr._client_subs["c1"]["s1"] == old_key
+    assert list(mgr._shared_evals) == [old_key]
     await mgr.shutdown()
 
 

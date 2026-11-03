@@ -37,7 +37,7 @@ class FormulaService:
         if t0_ns < 0:
             t0_ns = t1_ns + t0_ns
 
-        self._validate_bindings(spec)
+        self.check_bindings(spec)
         parsed = self._parser.parse(spec.expression, spec.bindings)
 
         match spec.kind:
@@ -54,7 +54,7 @@ class FormulaService:
     async def validate(self, spec: FormulaSpec) -> FormulaValidationResult:
         """Parse + AST-check without touching the data source."""
         try:
-            self._validate_bindings(spec)
+            self.check_bindings(spec)
             parsed = self._parser.parse(spec.expression, spec.bindings)
             return FormulaValidationResult(valid=True, tokens=parsed.tokens)
         except FormulaCircularReference as exc:
@@ -62,8 +62,8 @@ class FormulaService:
         except Exception as exc:
             return FormulaValidationResult(valid=False, errors=[str(exc)])
 
-    def _validate_bindings(self, spec: FormulaSpec) -> None:
-        """Bindings must resolve to well-formed PV names only.
+    def check_bindings(self, spec: FormulaSpec) -> None:
+        """Check that every binding resolves to a well-formed PV name.
 
         Rejects formula-of-formula composition (``formula:`` refs), references
         that still use the retired ``fox:`` prefix, and malformed PV names
@@ -71,6 +71,21 @@ class FormulaService:
         reach the data source / EPICS layer. A ``fox:`` name is otherwise a
         valid PV name, so without its own check a stale reference would fail
         as a timeout or missing input instead of a clear error.
+
+        `evaluate` and `validate` run this check, and the subscription manager
+        calls it before subscribing to any of the spec's PVs.
+
+        Parameters
+        ----------
+        spec : FormulaSpec
+            Formula whose bindings are checked.
+
+        Raises
+        ------
+        FormulaCircularReference
+            If a binding uses the ``formula:`` or retired ``fox:`` prefix.
+        InvalidPVName
+            If a binding is not a well-formed PV name.
         """
         for var, pv in spec.bindings.items():
             if pv.startswith("formula:"):

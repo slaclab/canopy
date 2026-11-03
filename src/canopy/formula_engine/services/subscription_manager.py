@@ -154,6 +154,11 @@ class SubscriptionManager:
         subscription that joins an already-running push-mode loop is caught up
         on the current value by `_join_shared`.
 
+        A live subscription's bindings are checked before anything else, so a
+        bad binding subscribes to no PV and leaves a live ``sub_id`` it would
+        replace untouched. A one-shot evaluation reports a bad binding as an
+        error frame instead, like any other evaluation error.
+
         Parameters
         ----------
         client_id : str
@@ -175,6 +180,10 @@ class SubscriptionManager:
 
         Raises
         ------
+        FormulaCircularReference
+            If a binding uses the ``formula:`` or retired ``fox:`` prefix.
+        InvalidPVName
+            If a binding is not a well-formed PV name.
         SubscriptionLimitExceeded
             If the client already holds ``max_subscriptions_per_client`` live
             subscriptions and ``sub_id`` is new.
@@ -185,6 +194,8 @@ class SubscriptionManager:
         if t1_ns != 0:
             await self._one_shot(sub_id, spec, t0_ns, t1_ns, send_fn)
             return
+
+        self._formula_service.check_bindings(spec)
 
         # Floor the poll interval so a client can't request a CPU-pinning loop.
         if 0 < interval_ms < self._min_interval_ms:
@@ -318,10 +329,19 @@ class SubscriptionManager:
 
         Raises
         ------
+        FormulaCircularReference
+            If a binding of ``spec`` uses the ``formula:`` or retired ``fox:``
+            prefix; nothing is subscribed and the subscription is unchanged.
+        InvalidPVName
+            If a binding of ``spec`` is not a well-formed PV name; nothing is
+            subscribed and the subscription is unchanged.
         Exception
             Any error raised while starting a new shared eval; the old eval
             and the subscription's mapping are left intact.
         """
+        if spec is not None:
+            self._formula_service.check_bindings(spec)
+
         subs = self._client_subs.get(client_id)
         if not subs or sub_id not in subs:
             return False
