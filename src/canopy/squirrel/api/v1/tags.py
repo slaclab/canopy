@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from canopy.core.security import require_read_access, require_write_access
 from canopy.contracts.base import CanopyModel
+from canopy.core.validation import require_uuid
 from canopy.squirrel.errors import (
     TagNotFound,
     SquirrelError,
@@ -21,7 +22,6 @@ from canopy.squirrel.schemas.tag import (
     TagGroupSummaryDTO,
 )
 from canopy.squirrel.dependencies import TagServiceDep
-from canopy.squirrel.api.v1._validation import is_uuid
 
 router = APIRouter(prefix="/tags", tags=["Tags"])
 
@@ -41,8 +41,7 @@ async def create_tag_group(data: TagGroupCreate, service: TagServiceDep) -> TagG
 @router.get("/{group_id}", dependencies=[Security(require_read_access)])
 async def get_tag_group(group_id: str, service: TagServiceDep) -> list[TagGroupDTO]:
     """Get a tag group by id with all its tags (wrapped in a list to match the frontend)."""
-    if not is_uuid(group_id):
-        raise TagGroupNotFound(f"Tag group {group_id} not found")
+    group_id = require_uuid(group_id, TagGroupNotFound, f"Tag group {group_id} not found")
     group = await service.get_group_by_id(group_id)
     if not group:
         raise TagGroupNotFound(f"Tag group {group_id} not found")
@@ -52,8 +51,7 @@ async def get_tag_group(group_id: str, service: TagServiceDep) -> list[TagGroupD
 @router.put("/{group_id}", dependencies=[Security(require_write_access)])
 async def update_tag_group(group_id: str, data: TagGroupUpdate, service: TagServiceDep) -> TagGroupDTO:
     """Update a tag group's name and/or description."""
-    if not is_uuid(group_id):
-        raise TagGroupNotFound(f"Tag group {group_id} not found")
+    group_id = require_uuid(group_id, TagGroupNotFound, f"Tag group {group_id} not found")
     group = await service.update_group(group_id, data)
     if not group:
         raise TagGroupNotFound(f"Tag group {group_id} not found")
@@ -69,8 +67,7 @@ async def delete_tag_group(
     force: bool = Query(False),
 ) -> bool:
     """Delete a tag group (and its tags)."""
-    if not is_uuid(group_id):
-        raise TagGroupNotFound(f"Tag group {group_id} not found")
+    group_id = require_uuid(group_id, TagGroupNotFound, f"Tag group {group_id} not found")
     if not await service.delete_group(group_id, force=force):
         raise TagGroupNotFound(f"Tag group {group_id} not found")
     return True
@@ -84,8 +81,7 @@ async def add_tag_to_group(
     skip_duplicates: bool = Query(False, description="Treat a duplicate tag as a no-op success"),
 ) -> AddTagResponse:
     """Add a tag to a group."""
-    if not is_uuid(group_id):
-        raise TagGroupNotFound(f"Tag group {group_id} not found")
+    group_id = require_uuid(group_id, TagGroupNotFound, f"Tag group {group_id} not found")
     group, was_created = await service.add_tag_to_group(group_id, data, skip_duplicates=skip_duplicates)
     if not group:
         raise TagGroupNotFound(f"Tag group {group_id} not found")
@@ -95,8 +91,8 @@ async def add_tag_to_group(
 @router.put("/{group_id}/tags/{tag_id}", dependencies=[Security(require_write_access)])
 async def update_tag(group_id: str, tag_id: str, data: TagUpdate, service: TagServiceDep) -> TagGroupDTO:
     """Update a tag within a group."""
-    if not is_uuid(group_id) or not is_uuid(tag_id):
-        raise TagNotFound(f"Tag {tag_id} not found in group {group_id}")
+    group_id = require_uuid(group_id, TagNotFound, f"Tag {tag_id} not found in group {group_id}")
+    tag_id = require_uuid(tag_id, TagNotFound, f"Tag {tag_id} not found in group {group_id}")
     group = await service.update_tag(group_id, tag_id, data)
     if not group:
         raise TagNotFound(f"Tag {tag_id} not found in group {group_id}")
@@ -106,8 +102,8 @@ async def update_tag(group_id: str, tag_id: str, data: TagUpdate, service: TagSe
 @router.delete("/{group_id}/tags/{tag_id}", dependencies=[Security(require_write_access)])
 async def remove_tag(group_id: str, tag_id: str, service: TagServiceDep) -> TagGroupDTO:
     """Remove a tag from a group."""
-    if not is_uuid(group_id) or not is_uuid(tag_id):
-        raise TagNotFound(f"Tag {tag_id} not found in group {group_id}")
+    group_id = require_uuid(group_id, TagNotFound, f"Tag {tag_id} not found in group {group_id}")
+    tag_id = require_uuid(tag_id, TagNotFound, f"Tag {tag_id} not found in group {group_id}")
     group = await service.remove_tag(group_id, tag_id)
     if not group:
         raise TagNotFound(f"Tag {tag_id} not found in group {group_id}")

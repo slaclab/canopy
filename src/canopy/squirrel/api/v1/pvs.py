@@ -4,6 +4,7 @@ Hare/Vole own live values and the EPICS module owns connectivity probing. So all
 the PV registry: search (keyset + offset), CRUD, bulk import, device list, and meta-PVs.
 """
 
+import json
 from uuid import UUID
 
 from fastapi import Query, Security, APIRouter
@@ -11,6 +12,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from canopy.core.errors import BadRequest
 from canopy.core.security import require_read_access, require_write_access
+from canopy.core.validation import require_uuid, parse_continuation_token
 from canopy.squirrel.errors import PvNotFound
 from canopy.squirrel.schemas.pv import (
     PVElementDTO,
@@ -26,13 +28,12 @@ from canopy.squirrel.schemas.meta_pv import (
     UpdateMetaPVDTO,
     DisplayMetaPVDTO,
 )
-from canopy.squirrel.api.v1._validation import is_uuid
 
 router = APIRouter(prefix="/pvs", tags=["PVs"])
 
 # ``tagFilters`` is JSON inside a query string, so FastAPI can't validate it for us. One adapter
-# checks JSON syntax, shape and UUID form together: an unparseable tag id must not reach asyncpg.
-_TAG_FILTERS = TypeAdapter(dict[str, list[UUID]])
+# checks the shape and the UUID form of keys and values: an unparseable id must not reach asyncpg.
+_TAG_FILTERS = TypeAdapter(dict[UUID, list[UUID]])
 
 
 def _first_problem(error: ValidationError) -> str:
@@ -64,22 +65,23 @@ async def search_pvs_paged(
 
     ``tagFilters`` is ``{group: [tag, ...]}`` — a PV matches when it has at least one tag
     from every listed group (OR within a group, AND across groups). A ``continuationToken``
-    that is not a PV id, or ``tagFilters`` that is not an object of UUID lists, is a 400.
+    that is not a PV id, or ``tagFilters`` that is not an object of tag-id lists keyed by
+    group id, is a 400. A JSON ``null``, ``[]`` or ``{}`` for ``tagFilters`` means no filter.
     """
-    # Normalise through UUID() rather than just gating on is_uuid: forms it accepts but asyncpg
-    # rejects ("{...}", "urn:uuid:...") would otherwise still reach the database as a 500.
-    try:
-        continuation_token = str(UUID(continuationToken)) if continuationToken else None
-    except ValueError as e:
-        raise BadRequest("Invalid continuationToken") from e
+    continuation_token = parse_continuation_token(continuationToken)
 
     tag_filters = None
     if tagFilters:
         try:
-            parsed = _TAG_FILTERS.validate_json(tagFilters)
-        except ValidationError as e:
-            raise BadRequest(f"Invalid tagFilters: {_first_problem(e)}") from e
-        tag_filters = {group: [str(tag) for tag in tags] for group, tags in parsed.items()} or None
+            raw = json.loads(tagFilters)
+        except json.JSONDecodeError as e:
+            raise BadRequest(f"Invalid tagFilters: not JSON ({e.msg} at position {e.pos})") from e
+        if raw:  # null, [], false and 0 mean "no filter", as an absent parameter does
+            try:
+                parsed = _TAG_FILTERS.validate_python(raw)
+            except ValidationError as e:
+                raise BadRequest(f"Invalid tagFilters: {_first_problem(e)}") from e
+            tag_filters = {str(group): [str(tag) for tag in tags] for group, tags in parsed.items()}
 
     return await service.search_paged(
         search=pvName,
@@ -123,8 +125,7 @@ async def create_multiple_pvs(data: list[NewPVElementDTO], service: PvServiceDep
 @router.put("/{pv_id}", dependencies=[Security(require_write_access)])
 async def update_pv(pv_id: str, data: UpdatePVElementDTO, service: PvServiceDep) -> PVElementDTO:
     """Update a PV's metadata (addresses are immutable here)."""
-    if not is_uuid(pv_id):
-        raise PvNotFound(f"PV {pv_id} not found")
+    pv_id = require_uuid(pv_id, PvNotFound, f"PV {pv_id} not found")
     pv = await service.update(pv_id, data)
     if not pv:
         raise PvNotFound(f"PV {pv_id} not found")
@@ -134,8 +135,7 @@ async def update_pv(pv_id: str, data: UpdatePVElementDTO, service: PvServiceDep)
 @router.delete("/{pv_id}", dependencies=[Security(require_write_access)])
 async def delete_pv(pv_id: str, service: PvServiceDep) -> bool:
     """Delete a PV."""
-    if not is_uuid(pv_id):
-        raise PvNotFound(f"PV {pv_id} not found")
+    pv_id = require_uuid(pv_id, PvNotFound, f"PV {pv_id} not found")
     if not await service.delete(pv_id):
         raise PvNotFound(f"PV {pv_id} not found")
     return True
@@ -159,16 +159,14 @@ async def get_meta_pvs(service: PvServiceDep, isActive: bool | None = None) -> l
 @router.get("/meta/{id}", dependencies=[Security(require_read_access)])
 async def get_meta_pv(id: str, service: PvServiceDep) -> MetaPVDTO:
     """Get one meta-PV by its PV id."""
-    if not is_uuid(id):
-        raise PvNotFound(f"Meta PV {id} not found")
+    id = require_uuid(id, PvNotFound, f"Meta PV {id} not found")
     return await service.get_meta_pv(id)
 
 
 @router.patch("/meta/{id}", dependencies=[Security(require_write_access)])
 async def update_meta_pv(id: str, update: UpdateMetaPVDTO, service: PvServiceDep) -> MetaPVDTO:
     """Update a meta-PV's display name and/or active state."""
-    if not is_uuid(id):
-        raise PvNotFound(f"Meta PV {id} not found")
+    id = require_uuid(id, PvNotFound, f"Meta PV {id} not found")
     result = None
     if update.display_name is not None:
         result = await service.set_meta_display_name(id=id, display_name=update.display_name)
@@ -182,6 +180,5 @@ async def update_meta_pv(id: str, update: UpdateMetaPVDTO, service: PvServiceDep
 @router.delete("/meta/{id}", status_code=204, dependencies=[Security(require_write_access)])
 async def delete_meta_pv(id: str, service: PvServiceDep) -> None:
     """Demote a meta-PV back to an ordinary PV."""
-    if not is_uuid(id):
-        raise PvNotFound(f"Meta PV {id} not found")
+    id = require_uuid(id, PvNotFound, f"Meta PV {id} not found")
     await service.delete_meta_pv(id)
