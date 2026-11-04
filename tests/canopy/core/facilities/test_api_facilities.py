@@ -270,6 +270,18 @@ async def test_access_for_a_key_with_no_grant_is_empty(facilities_client, sessio
     assert r.json() == {"unrestricted": False, "facilities": []}
 
 
+async def test_access_is_reachable_by_a_write_only_key(facilities_client, session, session_maker, fake_keys):
+    """Gated on any authenticated key, not `read` specifically: a write-only,
+    facility-scoped key needs to check its own reach before writing as much as a
+    read key does."""
+    await _seed_access_hierarchy(session)
+
+    r = facilities_client.get("/v1/facilities/access", headers={"X-API-Key": "test-write-only"})
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"unrestricted": False, "facilities": ["lcls"]}
+
+
 async def test_access_requires_auth_and_core_module_access(facilities_client, session, session_maker, fake_keys):
     assert facilities_client.get("/v1/facilities/access").status_code == 401
     r = facilities_client.get("/v1/facilities/access", headers={"X-API-Key": "test-squirrel-only"})

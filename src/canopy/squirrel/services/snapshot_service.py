@@ -298,8 +298,14 @@ class SnapshotService:
         row's facility in its grant, and an *unassigned* row (``facility_id IS NULL``)
         is refused rather than passed, since no grant can cover it. Mirrors
         ``PvService._require_facility_write`` — a snapshot has at most one facility, so
-        "any overlap" degenerates to membership. The refusal names the facility by
-        slug, as the PV gate does; an unassigned row has none to name."""
+        "any overlap" degenerates to membership.
+
+        An *assigned* row outside the grant is a 404, not a 403 naming its facility:
+        ``GET`` already hides such a row behind ``_in_facility_scope``'s not-found
+        masking, and a 403 naming its facility would leak which facility a hidden
+        snapshot is filed under to a caller that merely guessed its id. An unassigned
+        row has no hidden facility to leak, so it stays a 403 — it's known to exist,
+        just not writable by any restricted key."""
         if self.facility_scope is None:
             return
         if facility_id is None:
@@ -307,8 +313,7 @@ class SnapshotService:
                 f"API key is scoped to specific facilities; {what} is unassigned and only an unrestricted key may write it"
             )
         if facility_id not in self.facility_scope:
-            slug = await self._facility_slug(facility_id)
-            raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility: {slug}")
+            raise SnapshotNotFound("Snapshot not found")
 
     async def _facility_slug(self, facility_id: str | None) -> str | None:
         """A stored facility id as the slug reported on the wire."""

@@ -269,7 +269,11 @@ write would silently do nothing, which is worse than an error. The rules:
   scoped to only one facility cannot update or delete a PV also assigned to
   another one; holding one shared facility is **not** enough to reach the rest
   of the row. (A snapshot has at most one facility, so updating or deleting it
-  requires membership in that facility.)
+  requires membership in that facility — but unlike a PV, a snapshot outside
+  the key's grant is a `404`, not a `403` naming its facility: a snapshot's
+  existence is already hidden from a key that can't reach it (see below), so
+  naming the facility on update/delete would leak it to a caller that merely
+  guessed the id.)
 - A row with **no** facility assignment is writable only by an **unrestricted**
   key. No grant can cover a row that names no facility, so a restricted key —
   even one holding every facility that currently exists — is refused, the same

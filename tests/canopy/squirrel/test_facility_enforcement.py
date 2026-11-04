@@ -328,15 +328,29 @@ async def test_a_refused_import_names_every_unreachable_facility_and_row(
     assert r.json() == {
         "code": "insufficient_facility_access",
         "detail": (
-            "API key is not scoped to facility(s) facet, lcls-nc. 2 of 4 rows name no facility it can write: "
+            "API key is not scoped to facility(s): facet, lcls-nc. 2 of 4 rows name no facility it can write: "
             "row 2 (FACET:PV:SP): facet; row 4 (NC:PV:RB): facet, lcls-nc"
         ),
     }
-    [record] = caplog.records
+    [record] = [r for r in caplog.records if r.name == "canopy.squirrel.services.pv_service"]
     assert record.getMessage() == (
         "PV import refused: 2 of 4 rows name only facilities outside the key's grant (facet, lcls-nc)"
     )
     assert record.facilities == ["facet", "lcls-nc"]
+
+
+async def test_a_refused_import_row_lists_a_repeated_facility_slug_once(client: AsyncClient, db_session: AsyncSession):
+    await _seed_hierarchy(db_session)
+
+    r = await client.post(
+        "/v1/pvs/multi",
+        headers=SC_HEADERS,
+        json=[{"setpointAddress": "FACET:PV:SP", "facilities": ["facet", "facet"]}],
+    )
+
+    assert r.status_code == 403
+    assert "row 1 (FACET:PV:SP): facet" in r.json()["detail"]
+    assert "facet, facet" not in r.json()["detail"]
 
 
 async def test_a_refused_import_lists_ten_rows_then_counts_the_rest(client: AsyncClient, db_session: AsyncSession):
@@ -350,7 +364,9 @@ async def test_a_refused_import_lists_ten_rows_then_counts_the_rest(client: Asyn
 
     assert r.status_code == 403
     detail = r.json()["detail"]
-    assert detail.startswith("API key is not scoped to facility(s) facet. 12 of 12 rows name no facility it can write:")
+    assert detail.startswith(
+        "API key is not scoped to facility(s): facet. 12 of 12 rows name no facility it can write:"
+    )
     assert "row 10 (FACET:PV:10): facet" in detail
     assert "row 11" not in detail
     assert detail.endswith("; and 2 more")
@@ -625,11 +641,13 @@ async def test_snapshot_metadata_and_delete_are_facility_gated(client: AsyncClie
     db_session.add(snapshot)
     await db_session.commit()
 
+    # A key outside the snapshot's facility gets the same 404 the read side would —
+    # not a 403 naming the facility, which would leak which one a hidden row is in.
     r = await client.put(f"/v1/snapshots/{snapshot.id}", headers=NC_HEADERS, json={"title": "hijacked"})
-    assert r.status_code == 403
-    assert r.json()["detail"] == "API key is not scoped to this snapshot's facility: lcls-sc"
+    assert r.status_code == 404
+    assert r.json()["code"] == "snapshot_not_found"
     r = await client.delete(f"/v1/snapshots/{snapshot.id}", headers=NC_HEADERS)
-    assert r.status_code == 403
+    assert r.status_code == 404
 
     # And the refused update did not land.
     r = await client.get(f"/v1/snapshots/{snapshot.id}", headers=WILD_HEADERS)
