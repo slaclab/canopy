@@ -54,17 +54,17 @@
 | src/canopy/core/app\_names.py                                |        5 |        0 |    100% |           |
 | src/canopy/core/clock.py                                     |       16 |        3 |     81% |13, 26, 29 |
 | src/canopy/core/config.py                                    |       20 |        0 |    100% |           |
-| src/canopy/core/db.py                                        |       73 |       15 |     79% |90-91, 107-116, 120-123, 168-171 |
+| src/canopy/core/db.py                                        |       73 |        6 |     92% |90-91, 168-171 |
 | src/canopy/core/decimation.py                                |       35 |        1 |     97% |        53 |
 | src/canopy/core/errors.py                                    |      142 |        0 |    100% |           |
 | src/canopy/core/facilities/\_\_init\_\_.py                   |        0 |        0 |    100% |           |
 | src/canopy/core/facilities/dependencies.py                   |        9 |        0 |    100% |           |
-| src/canopy/core/facilities/gateway.py                        |       25 |        8 |     68% |22-23, 45-48, 53-54 |
+| src/canopy/core/facilities/gateway.py                        |       37 |        2 |     95% |     62-63 |
 | src/canopy/core/facilities/models.py                         |       17 |        0 |    100% |           |
-| src/canopy/core/facilities/repositories.py                   |       36 |        1 |     97% |        34 |
-| src/canopy/core/facilities/routes.py                         |       25 |        0 |    100% |           |
-| src/canopy/core/facilities/schemas.py                        |       22 |        0 |    100% |           |
-| src/canopy/core/facilities/service.py                        |       83 |        8 |     90% |63-64, 89-90, 96, 108, 115, 153 |
+| src/canopy/core/facilities/repositories.py                   |       48 |        1 |     98% |        34 |
+| src/canopy/core/facilities/routes.py                         |       28 |        0 |    100% |           |
+| src/canopy/core/facilities/schemas.py                        |       24 |        0 |    100% |           |
+| src/canopy/core/facilities/service.py                        |      103 |       11 |     89% |63-64, 75-76, 79-80, 131-132, 138, 150, 159 |
 | src/canopy/core/health.py                                    |       11 |        0 |    100% |           |
 | src/canopy/core/keys/\_\_init\_\_.py                         |        0 |        0 |    100% |           |
 | src/canopy/core/keys/dependencies.py                         |        9 |        0 |    100% |           |
@@ -252,16 +252,16 @@
 | src/canopy/squirrel/api/v1/\_\_init\_\_.py                   |        0 |        0 |    100% |           |
 | src/canopy/squirrel/api/v1/\_validation.py                   |        7 |        0 |    100% |           |
 | src/canopy/squirrel/api/v1/health.py                         |       28 |        0 |    100% |           |
-| src/canopy/squirrel/api/v1/pvs.py                            |       79 |        6 |     92% |109, 117, 142, 150, 157, 165 |
+| src/canopy/squirrel/api/v1/pvs.py                            |       79 |        6 |     92% |115, 123, 148, 156, 163, 171 |
 | src/canopy/squirrel/api/v1/router.py                         |       10 |        0 |    100% |           |
-| src/canopy/squirrel/api/v1/snapshots.py                      |       55 |        5 |     91% |141, 144, 152, 154, 181 |
+| src/canopy/squirrel/api/v1/snapshots.py                      |       72 |        6 |     92% |125, 167, 170, 178, 180, 216 |
 | src/canopy/squirrel/api/v1/tags.py                           |       93 |       19 |     80% |55-60, 73, 75, 88, 91, 99, 102, 110, 113, 149-151, 163-166 |
-| src/canopy/squirrel/app.py                                   |       17 |        0 |    100% |           |
+| src/canopy/squirrel/app.py                                   |       24 |        0 |    100% |           |
 | src/canopy/squirrel/config.py                                |       15 |        1 |     93% |        60 |
 | src/canopy/squirrel/data/\_\_init\_\_.py                     |        0 |        0 |    100% |           |
-| src/canopy/squirrel/data/models.py                           |       62 |        0 |    100% |           |
-| src/canopy/squirrel/data/repositories.py                     |      270 |       39 |     86% |98, 121-127, 230, 253-268, 421-432, 467, 479-480, 533-534, 540-542, 558-560, 600, 630-634 |
-| src/canopy/squirrel/dependencies.py                          |       15 |        0 |    100% |           |
+| src/canopy/squirrel/data/models.py                           |       64 |        0 |    100% |           |
+| src/canopy/squirrel/data/repositories.py                     |      321 |       42 |     87% |107, 131-137, 250, 273-288, 456-467, 509, 521-522, 625-626, 632-634, 637-639, 655-657, 697, 727-731 |
+| src/canopy/squirrel/dependencies.py                          |       20 |        0 |    100% |           |
 | src/canopy/squirrel/errors.py                                |       26 |        0 |    100% |           |
 | src/canopy/squirrel/gateway.py                               |       12 |        0 |    100% |           |
 | src/canopy/squirrel/restore\_hooks/\_\_init\_\_.py           |        4 |        0 |    100% |           |
@@ -274,15 +274,15 @@
 | src/canopy/squirrel/schemas/\_\_init\_\_.py                  |        0 |        0 |    100% |           |
 | src/canopy/squirrel/schemas/health.py                        |       15 |        0 |    100% |           |
 | src/canopy/squirrel/schemas/meta\_pv.py                      |       10 |        0 |    100% |           |
-| src/canopy/squirrel/schemas/pv.py                            |       30 |        0 |    100% |           |
-| src/canopy/squirrel/schemas/snapshot.py                      |       45 |        0 |    100% |           |
+| src/canopy/squirrel/schemas/pv.py                            |       33 |        0 |    100% |           |
+| src/canopy/squirrel/schemas/snapshot.py                      |       47 |        0 |    100% |           |
 | src/canopy/squirrel/schemas/tag.py                           |       26 |        0 |    100% |           |
 | src/canopy/squirrel/services/\_\_init\_\_.py                 |        0 |        0 |    100% |           |
 | src/canopy/squirrel/services/bulk\_insert.py                 |       36 |        2 |     94% |    88, 99 |
-| src/canopy/squirrel/services/pv\_service.py                  |      173 |       27 |     84% |176, 190-191, 248-249, 269-270, 276, 278, 282, 284, 286-289, 299-303, 309-310, 333-336, 341, 347, 361, 386 |
-| src/canopy/squirrel/services/snapshot\_service.py            |      381 |       29 |     92% |129-134, 146, 148, 151, 155-157, 277-279, 435, 477-478, 483, 490, 547, 614, 626, 643, 832, 878-879, 881-882 |
+| src/canopy/squirrel/services/pv\_service.py                  |      247 |       26 |     89% |299, 313-314, 418-419, 439-440, 457, 482, 484, 486-489, 500-504, 510-511, 544-547, 552, 558, 572, 597 |
+| src/canopy/squirrel/services/snapshot\_service.py            |      426 |       31 |     93% |130-135, 147, 149, 152, 156-158, 284-286, 497, 501, 542, 566-567, 572, 579, 638, 750, 767, 960, 1006-1007, 1009-1010, 1016 |
 | src/canopy/squirrel/services/tag\_service.py                 |       79 |       18 |     77% |59-70, 75, 94, 114, 118, 121, 128 |
-| src/canopy/squirrel/tasks.py                                 |       51 |       29 |     43% |34-35, 55-57, 64-79, 84-102 |
+| src/canopy/squirrel/tasks.py                                 |       51 |       21 |     59% |34-35, 55-57, 74-90, 118-121 |
 | src/canopy/vole/\_\_init\_\_.py                              |        0 |        0 |    100% |           |
 | src/canopy/vole/adapter.py                                   |      131 |       48 |     63% |116-167, 181, 198, 202, 208, 215-216 |
 | src/canopy/vole/api/\_\_init\_\_.py                          |        0 |        0 |    100% |           |
@@ -310,7 +310,7 @@
 | src/canopy/vole/services/hare\_ingest.py                     |       92 |       11 |     88% |47-48, 55, 77, 103, 121, 131-132, 152-155 |
 | src/canopy/vole/services/notifier.py                         |       35 |        2 |     94% |     33-34 |
 | src/canopy/worker.py                                         |       37 |        6 |     84% | 32, 61-65 |
-| **TOTAL**                                                    | **9127** |  **742** | **92%** |           |
+| **TOTAL**                                                    | **9382** |  **727** | **92%** |           |
 
 
 ## Setup coverage badge
