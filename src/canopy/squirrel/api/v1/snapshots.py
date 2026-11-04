@@ -120,10 +120,9 @@ async def create_snapshot(data: NewSnapshotDTO, key: WriteKeyDep) -> JobCreatedD
     # identity crosses the Arq boundary, and a refused write must not become a queued job.
     facility_id = None
     if data.facility is not None:
-        facility = await facilities_gateway.get_by_slug(data.facility)
-        if facility is None:
+        facility_id = await facilities_gateway.id_by_slug(data.facility)
+        if facility_id is None:
             raise FacilityNotFound(f"Facility '{data.facility}' not found")
-        facility_id = facility.id
 
     key_scope = await facilities_gateway.resolve_key_facility_scope(key.facilities)
     if key_scope is not None:

@@ -63,6 +63,13 @@ async def get_by_slug(slug: str) -> FacilityDTO | None:
         return await FacilityService(session).get_by_slug(slug)
 
 
+async def id_by_slug(slug: str) -> str | None:
+    """Facility slug -> id, or ``None`` if unknown. Skips ``get_by_slug``'s parent-slug
+    lookup for a caller that only needs the id, not a ``FacilityDTO``."""
+    async with session_scope() as session:
+        return await FacilityService(session).id_by_slug(slug)
+
+
 async def known_slugs(slugs: list[str]) -> set[str]:
     """The subset of ``slugs`` that exist. Used to reject unknown facilities at the
     point a reference to one is *written* (e.g. minting an API key's grant)."""

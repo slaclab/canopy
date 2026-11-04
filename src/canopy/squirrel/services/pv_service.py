@@ -269,7 +269,9 @@ class PvService:
             raise PvAlreadyExists(f"PV addresses violate uniqueness constraints: {e}") from e
         if facility_ids:
             await self.pv_repo.set_facilities(pv.id, facility_ids)
-        return (await self._to_dtos([pv], {pv.id: facility_ids}))[0]
+        # The request already named these facilities by slug — skip `_to_dtos`'s
+        # id-to-slug round trip and report them straight back.
+        return self._to_dto(pv, sorted(set(data.facilities)))
 
     async def create_many(self, data_list: list[NewPVElementDTO]) -> list[PVElementDTO]:
         """Register many PVs in one import.
@@ -371,7 +373,9 @@ class PvService:
             if data.facilities
         ]
         await self.pv_repo.add_facilities_many(assignments)
-        return await self._to_dtos(pvs, dict(assignments))
+        # Each row's own payload already named its facilities by slug — skip the
+        # id-to-slug round trip `_to_dtos` would otherwise make.
+        return [self._to_dto(pv, sorted(set(data.facilities))) for pv, (_, _, _, data) in zip(pvs, normalized_records)]
 
     async def update(self, pv_id: str, data: UpdatePVElementDTO) -> PVElementDTO | None:
         pv = await self.pv_repo.get_by_id(pv_id)
