@@ -1,6 +1,7 @@
 from typing import Literal
 from functools import lru_cache
 
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,7 +40,9 @@ class Settings(BaseSettings):
         Base URL of the read-only history instance holding this instance's full
         history, reported by ``GET /v1/instance`` so clients can link to it.
     window_days : int | None
-        Days of history this instance keeps; ``None`` means it keeps everything.
+        Days of history this instance keeps, at least 1; ``None`` means it keeps
+        everything. A blank value, as Helm and compose render an unset one, is ``None``
+        here and for ``instance`` and ``history_url``.
     """
 
     model_config = SettingsConfigDict(
@@ -81,7 +84,15 @@ class Settings(BaseSettings):
     role: Literal["primary", "mirror"] = "primary"
     instance: str | None = None
     history_url: str | None = None
-    window_days: int | None = None
+    window_days: int | None = Field(None, ge=1)
+
+    @field_validator("instance", "history_url", "window_days", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        """Read a blank value as unset rather than as ``""`` or an unparseable int."""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
 
 @lru_cache

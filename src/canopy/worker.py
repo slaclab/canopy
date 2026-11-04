@@ -71,7 +71,9 @@ FUNCTIONS = [ping, convert_batch, create_snapshot_task, restore_snapshot_task]
 
 # What a read-only mirror's worker runs: tasks that write no replicated table and
 # touch no machine state. Snapshot create/restore are simply not registered there,
-# so a job that reached a mirror's queue anyway fails instead of running.
+# so a job that reached a mirror's queue anyway fails instead of running. That is
+# also why each instance needs its own Redis (or database number): on a shared
+# queue a mirror's worker would take, and fail, its primary's snapshot jobs.
 MIRROR_FUNCTIONS = [ping, convert_batch]
 
 

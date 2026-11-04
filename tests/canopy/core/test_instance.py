@@ -1,5 +1,7 @@
 """``GET /v1/instance``: the role and history fields from settings, and the shipped Alembic head."""
 
+import sys
+
 import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
@@ -68,7 +70,7 @@ def test_requires_a_key(client):
     assert client.get("/v1/instance").status_code == 401
 
 
-def _write_tree(root, revisions: dict[str, str | None], script_location: str) -> None:
+def _write_tree(root, revisions: dict[str, str | None], script_location: str, ini_extra: str = "") -> None:
     """An ``alembic.ini`` in ``root`` and one empty migration per ``{revision: down_revision}``."""
     versions = root / "migrations" / "versions"
     versions.mkdir(parents=True)
@@ -76,7 +78,7 @@ def _write_tree(root, revisions: dict[str, str | None], script_location: str) ->
         (versions / f"{revision}_step.py").write_text(
             f"revision = {revision!r}\ndown_revision = {down_revision!r}\nbranch_labels = None\ndepends_on = None\n"
         )
-    (root / "alembic.ini").write_text(f"[alembic]\nscript_location = {script_location}\n")
+    (root / "alembic.ini").write_text(f"[alembic]\nscript_location = {script_location}\n{ini_extra}")
 
 
 class TestShippedAlembicHead:
@@ -109,6 +111,23 @@ class TestShippedAlembicHead:
         monkeypatch.setenv("ALEMBIC_CONFIG", str(tmp_path / "alembic.ini"))
 
         assert shipped_alembic_head() is None
+
+    def test_a_broken_revision_file_is_none_not_an_error(self, monkeypatch, tmp_path):
+        # Alembic raises the file's own SyntaxError here, not a CommandError.
+        _write_tree(tmp_path, {"aaaa00000001": None}, str(tmp_path / "migrations"))
+        (tmp_path / "migrations" / "versions" / "broken_step.py").write_text("revision = (\n")
+        monkeypatch.setenv("ALEMBIC_CONFIG", str(tmp_path / "alembic.ini"))
+
+        assert shipped_alembic_head() is None
+
+    def test_leaves_sys_path_as_it_was(self, monkeypatch, tmp_path):
+        # The repo's alembic.ini sets prepend_sys_path, which Alembic applies to sys.path.
+        _write_tree(tmp_path, {"aaaa00000001": None}, "migrations", ini_extra="prepend_sys_path = .\n")
+        monkeypatch.chdir(tmp_path)
+        before = sys.path[:]
+
+        assert shipped_alembic_head() == "aaaa00000001"
+        assert sys.path == before
 
     def test_missing_tree_is_none_not_an_error(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ALEMBIC_CONFIG", str(tmp_path / "absent.ini"))
