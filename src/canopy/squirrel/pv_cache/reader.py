@@ -9,6 +9,7 @@ live exactly as it would without the cache.
 from __future__ import annotations
 
 import time
+import asyncio
 import logging
 from typing import Any
 from dataclasses import field, dataclass
@@ -28,13 +29,16 @@ from canopy.squirrel.adapters.epics_io import EpicsValue, _to_epics_value
 
 logger = logging.getLogger(__name__)
 
+# Longest snapshot create waits on Redis for the cache before reading every PV live.
+LOOKUP_TIMEOUT_S = 10.0
+
 
 @dataclass
 class CacheLookup:
     """``hits`` are trusted cached values; ``misses`` must be read live.
 
     ``skipped`` says why the whole cache was passed over (no monitor report, a stale
-    heartbeat, Redis unreachable), and is ``None`` when it was consulted.
+    heartbeat, Redis unreachable or too slow), and is ``None`` when it was consulted.
     """
 
     hits: dict[str, EpicsValue] = field(default_factory=dict)
@@ -43,9 +47,17 @@ class CacheLookup:
 
 
 class PVCacheReader:
-    def __init__(self, redis: Any, *, heartbeat_max_age_s: float, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self,
+        redis: Any,
+        *,
+        heartbeat_max_age_s: float,
+        timeout_s: float = LOOKUP_TIMEOUT_S,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         self._redis = redis
         self._heartbeat_max_age_s = heartbeat_max_age_s
+        self._timeout_s = timeout_s
         self._clock = clock
 
     async def lookup(self, addresses: list[str]) -> CacheLookup:
@@ -57,12 +69,21 @@ class PVCacheReader:
         since. Generations are compared rather than timestamps, so clock skew between
         workers can't make an old entry look current. The whole cache is skipped when
         no monitor has reported, its report can't be read, or `untrusted_reason` rules
-        it out (for one, a heartbeat older than ``heartbeat_max_age_s``).
+        it out (for one, a heartbeat older than ``heartbeat_max_age_s``), and when
+        Redis fails or doesn't answer within ``timeout_s``: a half-open connection
+        would otherwise hold the snapshot until its job timeout.
         """
         try:
-            status = await read_status(self._redis)
-        except RedisError as exc:
+            async with asyncio.timeout(self._timeout_s):
+                return await self._lookup(addresses)
+        except TimeoutError:  # before OSError, which it subclasses
+            return CacheLookup(misses=list(addresses), skipped=f"Redis didn't answer within {self._timeout_s:g}s")
+        except (RedisError, OSError) as exc:
             return CacheLookup(misses=list(addresses), skipped=f"Redis unreachable: {exc}")
+
+    async def _lookup(self, addresses: list[str]) -> CacheLookup:
+        try:
+            status = await read_status(self._redis)
         except UnreadableStatus as exc:
             return CacheLookup(misses=list(addresses), skipped=str(exc))
         if status is None:
@@ -73,18 +94,15 @@ class PVCacheReader:
         generation = status.generation
 
         result = CacheLookup()
-        try:
-            for start in range(0, len(addresses), BATCH_SIZE):
-                chunk = addresses[start : start + BATCH_SIZE]
-                raws = await self._redis.hmget(VALUES_KEY, chunk)
-                for address, raw in zip(chunk, raws, strict=True):
-                    value = self._trusted(raw, generation)
-                    if value is None:
-                        result.misses.append(address)
-                    else:
-                        result.hits[address] = value
-        except RedisError as exc:
-            return CacheLookup(misses=list(addresses), skipped=f"Redis unreachable: {exc}")
+        for start in range(0, len(addresses), BATCH_SIZE):
+            chunk = addresses[start : start + BATCH_SIZE]
+            raws = await self._redis.hmget(VALUES_KEY, chunk)
+            for address, raw in zip(chunk, raws, strict=True):
+                value = self._trusted(raw, generation)
+                if value is None:
+                    result.misses.append(address)
+                else:
+                    result.hits[address] = value
         return result
 
     @staticmethod

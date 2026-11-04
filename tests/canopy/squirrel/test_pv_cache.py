@@ -358,6 +358,29 @@ async def test_reader_skips_the_cache_a_stepped_down_leader_left():
     assert "stepped down" in lookup.skipped
 
 
+class _HangingRedis:
+    """A Redis behind a half-open connection: the status reads, the values never arrive."""
+
+    def __init__(self, status: bytes) -> None:
+        self._status = status
+
+    async def get(self, _key):
+        return self._status
+
+    async def hmget(self, _key, _fields):
+        await asyncio.Event().wait()
+
+
+async def test_reader_reads_live_when_redis_stops_answering():
+    status = json.dumps({"heartbeatAt": time.time(), "generation": "gen-2"}).encode()
+    reader = PVCacheReader(_HangingRedis(status), heartbeat_max_age_s=30, timeout_s=0.05)
+
+    lookup = await asyncio.wait_for(reader.lookup(["A", "B"]), timeout=5)
+    assert lookup.hits == {}
+    assert lookup.misses == ["A", "B"]
+    assert "didn't answer" in lookup.skipped
+
+
 async def test_reader_serves_only_connected_entries_from_the_current_generation():
     redis = fakeredis.aioredis.FakeRedis()
     now = time.time()
