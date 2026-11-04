@@ -13,7 +13,12 @@ from canopy.core.health import make_health_router
 from canopy.core.security import require_read_access
 from canopy.squirrel.config import get_squirrel_config
 from canopy.squirrel.runtime import uptime_s
-from canopy.squirrel.pv_cache import VALUES_KEY, read_status
+from canopy.squirrel.pv_cache import (
+    VALUES_KEY,
+    UnreadableStatus,
+    read_status,
+    untrusted_reason,
+)
 from canopy.squirrel.restore_hooks import read_worker_status, describe_restore_hooks
 from canopy.squirrel.schemas.health import (
     PVCacheStatusDTO,
@@ -93,7 +98,18 @@ PV_CACHE_STATUS_TIMEOUT_S = 2.0
 
 
 def _from_unix(value: float | None) -> datetime | None:
-    return None if value is None else datetime.fromtimestamp(float(value), tz=UTC)
+    """``value`` as a UTC datetime; ``None`` for no value, 0 (a stepped-down leader) or one out of range."""
+    if not value:
+        return None
+    try:
+        return datetime.fromtimestamp(value, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _sentence(reason: str) -> str:
+    """A reason shared with snapshot create's log line, as an error message."""
+    return reason[:1].upper() + reason[1:]
 
 
 @router.get("/pv-cache", dependencies=[Security(require_read_access)])
@@ -114,8 +130,11 @@ async def pv_cache_status() -> PVCacheStatusDTO:
     try:
         async with asyncio.timeout(PV_CACHE_STATUS_TIMEOUT_S):
             pool = await jobs_gateway.get_pool()
-            report = await read_status(pool)
             cached = await pool.hlen(VALUES_KEY)
+            try:
+                report = await read_status(pool)
+            except UnreadableStatus as exc:
+                return PVCacheStatusDTO(status="down", enabled=cfg.enabled, cached=cached, error=_sentence(str(exc)))
     except (TimeoutError, OSError, RedisError) as exc:
         return PVCacheStatusDTO(
             status="down",
@@ -132,32 +151,29 @@ async def pv_cache_status() -> PVCacheStatusDTO:
             error="No worker has reported a PV cache; is CANOPY_SQUIRREL__PV_CACHE__ENABLED set on canopy-worker?",
         )
 
-    age = time.time() - float(report.get("heartbeatAt") or 0)
-    monitored = report.get("monitored")
-    connected = report.get("connected")
-    error = None
-    if age > cfg.heartbeat_max_age_s:
+    now = time.time()
+    # The same check snapshot create applies, so "ok" here means snapshots use the cache.
+    error = untrusted_reason(report, now, cfg.heartbeat_max_age_s)
+    monitored, connected = report.monitored, report.connected
+    if error is not None:
         status = "down"
-        error = (
-            f"The PV cache heartbeat is {age:.0f}s old (limit {cfg.heartbeat_max_age_s:.0f}s); no worker is leading it"
-        )
-    elif not report.get("warm") or (monitored is not None and connected is not None and connected < monitored):
+    elif not report.warm or (monitored is not None and connected is not None and connected < monitored):
         status = "degraded"
     else:
         status = "ok"
     return PVCacheStatusDTO(
         status=status,
         enabled=cfg.enabled,
-        host=report.get("host"),
-        instance=report.get("instance"),
-        leader_since=_from_unix(report.get("leaderSince")),
-        heartbeat_at=_from_unix(report.get("heartbeatAt")),
-        heartbeat_age_s=round(age, 3),
-        configured=report.get("configured"),
+        host=report.host,
+        instance=report.instance,
+        leader_since=_from_unix(report.leader_since),
+        heartbeat_at=_from_unix(report.heartbeat_at),
+        heartbeat_age_s=round(now - report.heartbeat_at, 3) if report.heartbeat_at else None,
+        configured=report.configured,
         monitored=monitored,
         connected=connected,
-        seen=report.get("seen"),
-        warm=report.get("warm"),
+        seen=report.seen,
+        warm=report.warm,
         cached=cached,
-        error=error,
+        error=None if error is None else _sentence(error),
     )

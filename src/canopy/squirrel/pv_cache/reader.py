@@ -19,8 +19,10 @@ from redis.exceptions import RedisError
 from canopy.squirrel.pv_cache.keys import (
     BATCH_SIZE,
     VALUES_KEY,
+    UnreadableStatus,
     read_status,
     decode_entry,
+    untrusted_reason,
 )
 from canopy.squirrel.adapters.epics_io import EpicsValue, _to_epics_value
 
@@ -54,20 +56,21 @@ class PVCacheReader:
         entry left by an earlier leader may describe a channel nobody was watching
         since. Generations are compared rather than timestamps, so clock skew between
         workers can't make an old entry look current. The whole cache is skipped when
-        no monitor has reported or its heartbeat is older than ``heartbeat_max_age_s``.
+        no monitor has reported, its report can't be read, or `untrusted_reason` rules
+        it out (for one, a heartbeat older than ``heartbeat_max_age_s``).
         """
         try:
             status = await read_status(self._redis)
         except RedisError as exc:
             return CacheLookup(misses=list(addresses), skipped=f"Redis unreachable: {exc}")
+        except UnreadableStatus as exc:
+            return CacheLookup(misses=list(addresses), skipped=str(exc))
         if status is None:
             return CacheLookup(misses=list(addresses), skipped="no worker has reported a PV cache")
-        age = self._clock() - float(status.get("heartbeatAt") or 0)
-        if age > self._heartbeat_max_age_s:
-            return CacheLookup(misses=list(addresses), skipped=f"the PV cache heartbeat is {age:.0f}s old")
-        generation = status.get("generation")
-        if not generation:
-            return CacheLookup(misses=list(addresses), skipped="the PV cache report names no leader generation")
+        reason = untrusted_reason(status, self._clock(), self._heartbeat_max_age_s)
+        if reason is not None:
+            return CacheLookup(misses=list(addresses), skipped=reason)
+        generation = status.generation
 
         result = CacheLookup()
         try:

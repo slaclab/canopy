@@ -57,9 +57,10 @@ class PVCacheStatusDTO(CanopyModel):
     """The worker-side PV cache that cached snapshots (``useCache=true``) read from.
 
     ``status`` is ``"disabled"`` when no worker has ever led the cache and this API
-    process has it disabled too; ``"down"`` when the cache can't be used (no report
-    although the API has it enabled, a heartbeat older than the configured maximum,
-    or Redis unreachable: ``error`` says which); ``"degraded"`` while the leader is
+    process has it disabled too; ``"down"`` when snapshot create won't use the cache
+    (no report although the API has it enabled, an unreadable report, a heartbeat older
+    than the configured maximum, a leader that stepped down, or Redis unreachable:
+    ``error`` says which); ``"degraded"`` while the leader is
     still hearing from its PVs after taking over (``warm`` false) or when some
     monitored PVs are disconnected; ``"ok"`` otherwise. Snapshots still work in every
     state: what the cache can't vouch for is read live.

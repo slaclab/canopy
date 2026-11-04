@@ -145,7 +145,7 @@ async def test_a_graceful_stop_releases_the_lease_and_marks_the_cache_unled():
     await monitor.stop()
 
     assert await redis.get(LEADER_KEY) is None
-    assert (await read_status(redis))["heartbeatAt"] == 0
+    assert (await read_status(redis)).heartbeat_at == 0
 
 
 # --- what the leader writes ---------------------------------------------------- #
@@ -167,13 +167,13 @@ async def test_flush_writes_values_disconnects_and_a_heartbeat():
         assert b["pv"]["connected"] is False
 
         status = await read_status(redis)
-        assert status["monitored"] == 2
-        assert status["connected"] == 1
-        assert status["seen"] == 2
-        assert status["warm"] is True
-        assert status["heartbeatAt"] >= status["leaderSince"]
+        assert status.monitored == 2
+        assert status.connected == 1
+        assert status.seen == 2
+        assert status.warm is True
+        assert status.heartbeat_at >= status.leader_since
         # Entries and report carry the generation the lease was taken with.
-        assert a["gen"] == status["generation"] == (await redis.get(LEADER_KEY)).decode()
+        assert a["gen"] == status.generation == (await redis.get(LEADER_KEY)).decode()
     finally:
         await monitor.stop()
 
@@ -185,7 +185,7 @@ async def test_not_warm_until_every_monitored_address_has_reported():
         connector.emit(_pv("A"))
         await monitor.flush()
         status = await read_status(redis)
-        assert (status["seen"], status["warm"]) == (1, False)
+        assert (status.seen, status.warm) == (1, False)
     finally:
         await monitor.stop()
 
@@ -255,7 +255,7 @@ async def test_the_leaders_own_renewal_does_not_cost_it_a_write():
         await monitor.flush()
 
         assert json.loads(await redis.hget(VALUES_KEY, "A"))["pv"]["value"] == 2.5
-        assert (await read_status(redis))["seen"] == 1
+        assert (await read_status(redis)).seen == 1
     finally:
         await monitor.stop()
 
@@ -325,6 +325,37 @@ async def test_reader_skips_the_cache_when_the_heartbeat_is_stale():
     lookup = await PVCacheReader(redis, heartbeat_max_age_s=30).lookup(["A"])
     assert lookup.misses == ["A"]
     assert "heartbeat" in lookup.skipped
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not json",
+        "[1, 2]",
+        json.dumps({"heartbeatAt": "soon", "generation": "gen-2"}),
+        json.dumps({"generation": "gen-2"}),
+        '{"heartbeatAt": NaN, "generation": "gen-2"}',
+    ],
+)
+async def test_reader_reads_live_when_the_report_is_unreadable(raw):
+    redis = fakeredis.aioredis.FakeRedis()
+    await redis.set(STATUS_KEY, raw)
+    await redis.hset(VALUES_KEY, "A", encode_entry(_pv("A"), time.time(), "gen-2"))
+
+    lookup = await PVCacheReader(redis, heartbeat_max_age_s=30).lookup(["A"])
+    assert lookup.hits == {}
+    assert lookup.misses == ["A"]
+    assert "unreadable" in lookup.skipped
+
+
+async def test_reader_skips_the_cache_a_stepped_down_leader_left():
+    redis = fakeredis.aioredis.FakeRedis()
+    await _write_status(redis, heartbeat_at=0)
+    await redis.hset(VALUES_KEY, "A", encode_entry(_pv("A"), time.time(), "gen-2"))
+
+    lookup = await PVCacheReader(redis, heartbeat_max_age_s=30).lookup(["A"])
+    assert lookup.misses == ["A"]
+    assert "stepped down" in lookup.skipped
 
 
 async def test_reader_serves_only_connected_entries_from_the_current_generation():

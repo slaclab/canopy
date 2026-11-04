@@ -18,7 +18,6 @@ closes its subscriptions and goes back to waiting.
 
 from __future__ import annotations
 
-import json
 import time
 import uuid
 import socket
@@ -38,6 +37,7 @@ from canopy.squirrel.pv_cache.keys import (
     LEADER_KEY,
     STATUS_KEY,
     VALUES_KEY,
+    PVCacheReport,
     encode_entry,
 )
 from canopy.squirrel.data.repositories import PvRepository
@@ -169,7 +169,7 @@ class PVCacheMonitor:
 
     async def _step_down(self) -> None:
         # Readers stop trusting the cache at once, rather than after heartbeat_max_age_s.
-        final_report = {**self.status_report(self._clock()), "heartbeatAt": 0}
+        final_report = self.status_report(self._clock()).model_copy(update={"heartbeat_at": 0})
         subs = list(self._subs.values())
         self._wanted.clear()
         self._subs.clear()
@@ -181,7 +181,10 @@ class PVCacheMonitor:
         await asyncio.gather(*(sub.close() for sub in subs), return_exceptions=True)
         try:
             await self._write_if_leader(
-                lambda pipe: (pipe.delete(LEADER_KEY), pipe.set(STATUS_KEY, json.dumps(final_report)))
+                lambda pipe: (
+                    pipe.delete(LEADER_KEY),
+                    pipe.set(STATUS_KEY, final_report.model_dump_json(by_alias=True)),
+                )
             )
         except RedisError as exc:
             logger.warning("PV cache monitor %s could not release the lease: %s", self._instance, exc)
@@ -345,7 +348,8 @@ class PVCacheMonitor:
                         lambda pipe, mapping=mapping: pipe.hset(VALUES_KEY, mapping=mapping)
                     ):
                         return  # the lease is gone: these values are no longer ours to write
-                await self._write_if_leader(lambda pipe: pipe.set(STATUS_KEY, json.dumps(self.status_report(now))))
+                report = self.status_report(now).model_dump_json(by_alias=True)
+                await self._write_if_leader(lambda pipe: pipe.set(STATUS_KEY, report))
             except RedisError:
                 # Put back whatever newer events haven't superseded, so a dropped
                 # disconnect isn't lost and the cache doesn't keep serving the old value.
@@ -354,18 +358,18 @@ class PVCacheMonitor:
                         self._pending.setdefault(address, value)
                 raise
 
-    def status_report(self, now: float) -> dict[str, Any]:
+    def status_report(self, now: float) -> PVCacheReport:
         monitored = len(self._subs)
         seen = len(self._seen & self._subs.keys())
-        return {
-            "instance": self._instance,
-            "host": self._host,
-            "generation": self._generation,
-            "leaderSince": self._leader_since,
-            "heartbeatAt": now,
-            "configured": self._configured,
-            "monitored": monitored,
-            "connected": sum(1 for address in self._subs if self._connected.get(address)),
-            "seen": seen,
-            "warm": monitored > 0 and seen >= monitored,
-        }
+        return PVCacheReport(
+            instance=self._instance,
+            host=self._host,
+            generation=self._generation,
+            leader_since=self._leader_since,
+            heartbeat_at=now,
+            configured=self._configured,
+            monitored=monitored,
+            connected=sum(1 for address in self._subs if self._connected.get(address)),
+            seen=seen,
+            warm=monitored > 0 and seen >= monitored,
+        )

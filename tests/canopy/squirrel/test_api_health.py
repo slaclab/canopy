@@ -183,6 +183,7 @@ async def _report(redis, **overrides) -> None:
     report = {
         "instance": "abc",
         "host": "worker-1",
+        "generation": "abc-gen",
         "leaderSince": now - 60,
         "heartbeatAt": now,
         "configured": 3,
@@ -235,10 +236,37 @@ async def test_pv_cache_is_degraded_while_warming_or_with_disconnected_pvs(
 
 async def test_pv_cache_is_down_when_the_heartbeat_is_stale(http_client: AsyncClient, redis, monkeypatch):
     _cache_config(monkeypatch, enabled=True)
-    await _report(redis, heartbeatAt=0)
+    await _report(redis, heartbeatAt=time.time() - 120)
     status = await _cache_status(http_client)
     assert status["status"] == "down"
     assert "heartbeat" in status["error"]
+
+
+async def test_pv_cache_is_down_after_its_leader_stepped_down(http_client: AsyncClient, redis, monkeypatch):
+    _cache_config(monkeypatch, enabled=True)
+    await _report(redis, heartbeatAt=0)
+    status = await _cache_status(http_client)
+    assert status["status"] == "down"
+    assert "stepped down" in status["error"]
+    # Not a 1970 heartbeat.
+    assert (status["heartbeatAt"], status["heartbeatAgeS"]) == (None, None)
+
+
+async def test_pv_cache_without_a_generation_is_down_as_snapshots_skip_it(http_client: AsyncClient, redis, monkeypatch):
+    _cache_config(monkeypatch, enabled=True)
+    await _report(redis, generation=None)
+    status = await _cache_status(http_client)
+    assert status["status"] == "down"
+    assert "generation" in status["error"]
+
+
+@pytest.mark.parametrize("raw", ["not json", "[]", json.dumps({"heartbeatAt": "soon"})])
+async def test_an_unreadable_pv_cache_report_is_down_not_an_error(http_client: AsyncClient, redis, monkeypatch, raw):
+    _cache_config(monkeypatch, enabled=True)
+    await redis.set(STATUS_KEY, raw)
+    status = await _cache_status(http_client)
+    assert status["status"] == "down"
+    assert "unreadable" in status["error"]
 
 
 async def test_pv_cache_is_down_when_redis_is_unreachable(http_client: AsyncClient, monkeypatch):
