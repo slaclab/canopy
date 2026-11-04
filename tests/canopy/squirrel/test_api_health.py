@@ -206,6 +206,27 @@ async def test_pv_cache_is_disabled_when_nothing_ran_it(http_client: AsyncClient
     assert (status["status"], status["enabled"]) == ("disabled", False)
 
 
+@pytest.mark.parametrize("heartbeat_age_s", [120, None])
+async def test_pv_cache_switched_off_after_a_worker_led_it_is_disabled(
+    http_client: AsyncClient, redis, monkeypatch, heartbeat_age_s
+):
+    """Not down for good once a worker has ever led it: a stale or stepped-down report counts as off."""
+    _cache_config(monkeypatch, enabled=False)
+    await _report(redis, heartbeatAt=0 if heartbeat_age_s is None else time.time() - heartbeat_age_s)
+    status = await _cache_status(http_client)
+    assert (status["status"], status["enabled"], status["error"]) == ("disabled", False, None)
+    assert status["host"] == "worker-1"  # still says who led it last
+
+
+async def test_pv_cache_led_by_a_worker_is_reported_even_if_this_api_has_it_off(
+    http_client: AsyncClient, redis, monkeypatch
+):
+    _cache_config(monkeypatch, enabled=False)
+    await _report(redis)
+    status = await _cache_status(http_client)
+    assert (status["status"], status["enabled"]) == ("ok", False)
+
+
 async def test_pv_cache_is_down_when_enabled_but_no_worker_reported(http_client: AsyncClient, monkeypatch):
     _cache_config(monkeypatch, enabled=True)
     status = await _cache_status(http_client)

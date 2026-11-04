@@ -37,6 +37,7 @@ from canopy.squirrel.pv_cache.keys import (
     LEADER_KEY,
     STATUS_KEY,
     VALUES_KEY,
+    STATUS_TTL_MS,
     PVCacheReport,
     encode_entry,
 )
@@ -185,7 +186,7 @@ class PVCacheMonitor:
             await self._write_if_leader(
                 lambda pipe: (
                     pipe.delete(LEADER_KEY),
-                    pipe.set(STATUS_KEY, final_report.model_dump_json(by_alias=True)),
+                    pipe.set(STATUS_KEY, final_report.model_dump_json(by_alias=True), px=STATUS_TTL_MS),
                 )
             )
         except RedisError as exc:
@@ -373,7 +374,7 @@ class PVCacheMonitor:
                 def heartbeat(pipe: Any) -> None:
                     for start in range(0, len(prune), BATCH_SIZE):
                         pipe.hdel(VALUES_KEY, *prune[start : start + BATCH_SIZE])
-                    pipe.set(STATUS_KEY, report)
+                    pipe.set(STATUS_KEY, report, px=STATUS_TTL_MS)
 
                 if await self._write_if_leader(heartbeat):
                     self._unpruned -= set(prune)

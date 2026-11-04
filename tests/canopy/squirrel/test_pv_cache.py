@@ -176,6 +176,8 @@ async def test_a_graceful_stop_releases_the_lease_and_marks_the_cache_unled():
 
     assert await redis.get(LEADER_KEY) is None
     assert (await read_status(redis)).heartbeat_at == 0
+    # The last report expires, so a cache that stays switched off doesn't read as down.
+    assert await redis.pttl(STATUS_KEY) > 0
 
 
 # --- what the leader writes ---------------------------------------------------- #
@@ -204,6 +206,7 @@ async def test_flush_writes_values_disconnects_and_a_heartbeat():
         assert status.heartbeat_at >= status.leader_since
         # Entries and report carry the generation the lease was taken with.
         assert a["gen"] == status.generation == (await redis.get(LEADER_KEY)).decode()
+        assert await redis.pttl(STATUS_KEY) > 0
     finally:
         await monitor.stop()
 

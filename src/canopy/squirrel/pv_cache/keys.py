@@ -24,6 +24,9 @@ VALUES_KEY = "canopy:squirrel:pv_cache:values"
 LEADER_KEY = "canopy:squirrel:pv_cache:leader"
 # String: the leader's JSON report, rewritten on every flush (its heartbeat).
 STATUS_KEY = "canopy:squirrel:pv_cache:status"
+# How long a report outlives its last write: long enough for /health/pv-cache to show
+# who led last and when, and short of keeping it forever once the cache is turned off.
+STATUS_TTL_MS = 60 * 60 * 1000
 
 # Entries per HSET / HMGET call, so a full 40k-PV warm-up isn't one multi-MB command.
 BATCH_SIZE = 2000

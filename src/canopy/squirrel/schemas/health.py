@@ -56,7 +56,7 @@ class RestoreHooksStatusDTO(CanopyModel):
 class PVCacheStatusDTO(CanopyModel):
     """The worker-side PV cache that cached snapshots (``useCache=true``) read from.
 
-    ``status`` is ``"disabled"`` when no worker has ever led the cache and this API
+    ``status`` is ``"disabled"`` when no worker is leading the cache and this API
     process has it disabled too; ``"down"`` when snapshot create won't use the cache
     (no report although the API has it enabled, an unreadable report, a heartbeat older
     than the configured maximum, a leader that stepped down, or Redis unreachable:

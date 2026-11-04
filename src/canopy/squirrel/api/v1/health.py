@@ -132,35 +132,39 @@ async def pv_cache_status() -> PVCacheStatusDTO:
             pool = await jobs_gateway.get_pool()
             cached = await pool.hlen(VALUES_KEY)
             try:
-                report = await read_status(pool)
+                report, unreadable = await read_status(pool), None
             except UnreadableStatus as exc:
-                return PVCacheStatusDTO(status="down", enabled=cfg.enabled, cached=cached, error=_sentence(str(exc)))
+                report, unreadable = None, exc
     except (TimeoutError, OSError, RedisError) as exc:
         return PVCacheStatusDTO(
             status="down",
             enabled=cfg.enabled,
             error=f"Could not read the PV cache report from Redis: {str(exc) or type(exc).__name__}",
         )
-    if report is None:
-        if not cfg.enabled:
-            return PVCacheStatusDTO(status="disabled", enabled=False, cached=cached)
-        return PVCacheStatusDTO(
-            status="down",
-            enabled=True,
-            cached=cached,
-            error="No worker has reported a PV cache; is CANOPY_SQUIRREL__PV_CACHE__ENABLED set on canopy-worker?",
-        )
 
     now = time.time()
-    # The same check snapshot create applies, so "ok" here means snapshots use the cache.
-    error = untrusted_reason(report, now, cfg.heartbeat_max_age_s)
-    monitored, connected = report.monitored, report.connected
-    if error is not None:
+    if unreadable is not None:
+        error = _sentence(str(unreadable))
+    elif report is None:
+        error = "No worker has reported a PV cache; is CANOPY_SQUIRREL__PV_CACHE__ENABLED set on canopy-worker?"
+    else:
+        # The same check snapshot create applies, so "ok" here means snapshots use the cache.
+        reason = untrusted_reason(report, now, cfg.heartbeat_max_age_s)
+        error = None if reason is None else _sentence(reason)
+
+    if error is not None and not cfg.enabled:
+        # No worker leads a cache this process has switched off too: off, not broken.
+        status, error = "disabled", None
+    elif error is not None:
         status = "down"
-    elif not report.warm or (monitored is not None and connected is not None and connected < monitored):
+    elif not report.warm or (
+        report.monitored is not None and report.connected is not None and report.connected < report.monitored
+    ):
         status = "degraded"
     else:
         status = "ok"
+    if report is None:
+        return PVCacheStatusDTO(status=status, enabled=cfg.enabled, cached=cached, error=error)
     return PVCacheStatusDTO(
         status=status,
         enabled=cfg.enabled,
@@ -170,10 +174,10 @@ async def pv_cache_status() -> PVCacheStatusDTO:
         heartbeat_at=_from_unix(report.heartbeat_at),
         heartbeat_age_s=round(now - report.heartbeat_at, 3) if report.heartbeat_at else None,
         configured=report.configured,
-        monitored=monitored,
-        connected=connected,
+        monitored=report.monitored,
+        connected=report.connected,
         seen=report.seen,
         warm=report.warm,
         cached=cached,
-        error=None if error is None else _sentence(error),
+        error=error,
     )
