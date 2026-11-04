@@ -7,7 +7,9 @@ call (no caching) so tests can vary the environment freely.
 
 from __future__ import annotations
 
-from pydantic import Field, BaseModel
+from typing import Self
+
+from pydantic import Field, BaseModel, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,15 +25,25 @@ class PVCacheConfig(BaseModel):
     enabled: bool = False
     # How often the leader re-reads the registered PVs from the database and
     # subscribes to new addresses / drops removed ones.
-    reconcile_interval_s: float = 60.0
+    reconcile_interval_s: float = Field(60.0, gt=0)
     # How often buffered monitor updates are written to Redis (and the heartbeat bumped).
-    flush_interval_s: float = 1.0
+    flush_interval_s: float = Field(1.0, gt=0)
     # A cache whose heartbeat is older than this is ignored entirely by snapshot create.
-    heartbeat_max_age_s: float = 30.0
+    heartbeat_max_age_s: float = Field(30.0, gt=0)
     # Leader lease length; the leader renews it every third of this.
-    lease_ttl_s: float = 30.0
+    lease_ttl_s: float = Field(30.0, gt=0)
     # Subscriptions opened concurrently while (re)building the monitor set.
-    subscribe_concurrency: int = 200
+    subscribe_concurrency: int = Field(200, ge=1)
+
+    @model_validator(mode="after")
+    def _heartbeat_outlasts_a_flush(self) -> Self:
+        # Otherwise every heartbeat is stale by the next flush and snapshots never use the cache.
+        if self.heartbeat_max_age_s <= self.flush_interval_s:
+            raise ValueError(
+                f"heartbeat_max_age_s ({self.heartbeat_max_age_s:g}) must be longer than "
+                f"flush_interval_s ({self.flush_interval_s:g})"
+            )
+        return self
 
 
 class SquirrelConfig(BaseSettings):

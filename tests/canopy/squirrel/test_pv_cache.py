@@ -8,6 +8,7 @@ import asyncio
 
 import pytest
 import fakeredis.aioredis
+from pydantic import ValidationError
 from redis.exceptions import RedisError
 from redis.exceptions import ConnectionError as RedisConnectionError
 
@@ -29,7 +30,9 @@ FAST = PVCacheConfig(
     enabled=True, lease_ttl_s=0.3, flush_interval_s=0.02, reconcile_interval_s=0.05, heartbeat_max_age_s=5
 )
 # Background loops that stay quiet for the length of a test, so it controls every write.
-QUIET = PVCacheConfig(enabled=True, lease_ttl_s=30, flush_interval_s=60, reconcile_interval_s=60, heartbeat_max_age_s=5)
+QUIET = PVCacheConfig(
+    enabled=True, lease_ttl_s=30, flush_interval_s=60, reconcile_interval_s=60, heartbeat_max_age_s=120
+)
 
 
 def _pv(address: str, value=1.5, *, connected=True, ts_ns=1_700_000_000_000_000_000) -> PVValue:
@@ -586,6 +589,29 @@ async def test_a_new_leaders_entries_become_hits_as_its_monitors_report():
         assert lookup.misses == ["B"]
     finally:
         await monitor.stop()
+
+
+# --- configuration ------------------------------------------------------------ #
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"lease_ttl_s": 0},
+        {"flush_interval_s": 0},
+        {"reconcile_interval_s": -1},
+        {"heartbeat_max_age_s": 0},
+        {"subscribe_concurrency": 0},
+        {"flush_interval_s": 30, "heartbeat_max_age_s": 30},
+    ],
+)
+def test_settings_that_would_break_the_cache_are_rejected(overrides):
+    with pytest.raises(ValidationError):
+        PVCacheConfig(**overrides)
+
+
+def test_the_defaults_are_valid():
+    PVCacheConfig()
 
 
 # --- worker wiring ------------------------------------------------------------ #
