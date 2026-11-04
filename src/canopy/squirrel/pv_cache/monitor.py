@@ -120,31 +120,52 @@ class PVCacheMonitor:
         """Run the follower/leader loop as a background task until `stop()`."""
         if self._task is None:
             self._task = asyncio.create_task(self.run(), name="squirrel-pv-cache")
+            self._task.add_done_callback(self._log_failure)
+
+    def _log_failure(self, task: asyncio.Task) -> None:
+        # Logged when it happens, not at shutdown: until then only a stale heartbeat shows it.
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            logger.error("PV cache monitor %s stopped on an error", self._instance, exc_info=exc)
 
     async def stop(self) -> None:
         self._stopping.set()
         if self._task is not None:
-            await self._task
-            self._task = None
+            task, self._task = self._task, None
+            try:
+                await task
+            except Exception:
+                pass  # logged by _log_failure; the worker's shutdown must carry on
 
     async def run(self) -> None:
         logger.info("PV cache monitor %s started; waiting for the leader lease", self._instance)
         while not self._stopping.is_set():
-            generation = f"{self._instance}-{uuid.uuid4().hex[:12]}"
             try:
-                acquired = await self._redis.set(LEADER_KEY, generation, nx=True, px=self._lease_ms)
-            except RedisError as exc:
-                logger.warning("PV cache monitor %s could not reach Redis: %s", self._instance, exc)
-                acquired = False
-            if acquired:
-                self._generation = generation
-                try:
-                    await self._lead()
-                finally:
-                    await self._step_down()
-            else:
+                await self._try_to_lead()
+            except Exception:
+                # A bug, but it mustn't end the monitor: keep competing for the lease.
+                logger.exception("PV cache monitor %s failed; retrying", self._instance)
                 await self._wait(self._config.lease_ttl_s / 2)
         logger.info("PV cache monitor %s stopped", self._instance)
+
+    async def _try_to_lead(self) -> None:
+        """Take the lease and lead until it's lost, or wait a while if it's taken."""
+        generation = f"{self._instance}-{uuid.uuid4().hex[:12]}"
+        try:
+            acquired = await self._redis.set(LEADER_KEY, generation, nx=True, px=self._lease_ms)
+        except RedisError as exc:
+            logger.warning("PV cache monitor %s could not reach Redis: %s", self._instance, exc)
+            acquired = False
+        if acquired:
+            self._generation = generation
+            failed = True
+            try:
+                failed = await self._lead()
+            finally:
+                await self._step_down()
+            if failed:  # don't take the lease straight back only to fail again
+                await self._wait(self._config.lease_ttl_s / 2)
+        else:
+            await self._wait(self._config.lease_ttl_s / 2)
 
     async def _wait(self, seconds: float) -> None:
         """Sleep, but wake at once on `stop()`."""
@@ -153,7 +174,8 @@ class PVCacheMonitor:
         except TimeoutError:
             pass
 
-    async def _lead(self) -> None:
+    async def _lead(self) -> bool:
+        """Lead until the lease is lost or `stop()`; ``True`` when a loop failed instead."""
         self._leader_since = self._clock()
         self._lease_lost = False
         logger.info("PV cache monitor %s is the leader (generation %s)", self._instance, self._generation)
@@ -167,7 +189,13 @@ class PVCacheMonitor:
         await asyncio.wait([*loops, stop], return_when=asyncio.FIRST_COMPLETED)
         for task in [*loops, stop]:
             task.cancel()
-        await asyncio.gather(*loops, stop, return_exceptions=True)
+        failed = False
+        for result in await asyncio.gather(*loops, stop, return_exceptions=True):
+            # A loop that failed ends the tenure; say why. (Cancellation isn't an Exception.)
+            if isinstance(result, Exception):
+                logger.error("PV cache monitor %s stepping down after an error", self._instance, exc_info=result)
+                failed = True
+        return failed
 
     async def _step_down(self) -> None:
         # Readers stop trusting the cache at once, rather than after heartbeat_max_age_s.
@@ -191,7 +219,8 @@ class PVCacheMonitor:
             )
         except RedisError as exc:
             logger.warning("PV cache monitor %s could not release the lease: %s", self._instance, exc)
-        self._generation = None
+        finally:
+            self._generation = None
         logger.info("PV cache monitor %s stepped down (closed %d subscriptions)", self._instance, len(subs))
 
     # --- lease ----------------------------------------------------------- #

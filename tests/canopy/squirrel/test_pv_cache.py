@@ -180,6 +180,55 @@ async def test_a_graceful_stop_releases_the_lease_and_marks_the_cache_unled():
     assert await redis.pttl(STATUS_KEY) > 0
 
 
+async def test_an_unexpected_error_is_logged_and_the_monitor_keeps_trying(caplog):
+    redis = fakeredis.aioredis.FakeRedis()
+    real_set = redis.set
+    failures = [RuntimeError("unexpected lease error")]
+
+    async def flaky_set(*args, **kwargs):
+        if failures:
+            raise failures.pop()
+        return await real_set(*args, **kwargs)
+
+    redis.set = flaky_set
+    monitor = PVCacheMonitor(FakeConnector(), redis, FAST, _loader({"A"}))
+    monitor.start()
+    try:
+        assert await wait_for(lambda: monitor.is_leader)
+        assert "unexpected lease error" in caplog.text
+    finally:
+        await monitor.stop()
+
+
+async def test_a_leader_loop_that_fails_is_logged(caplog):
+    monitor = PVCacheMonitor(FakeConnector(), fakeredis.aioredis.FakeRedis(), FAST, _loader({"A"}))
+
+    async def broken_renewal() -> None:
+        raise RuntimeError("renewal bug")
+
+    monitor._renew_loop = broken_renewal
+    monitor.start()
+    try:
+        assert await wait_for(lambda: "renewal bug" in caplog.text)
+        await asyncio.sleep(FAST.lease_ttl_s / 4)
+        # It backs off before taking the lease again, rather than failing in a tight loop.
+        assert caplog.text.count("stepping down after an error") == 1
+    finally:
+        await monitor.stop()
+
+
+async def test_a_monitor_that_died_is_logged_and_its_stop_does_not_raise(caplog):
+    monitor = PVCacheMonitor(FakeConnector(), fakeredis.aioredis.FakeRedis(), FAST, _loader(set()))
+
+    async def broken_run() -> None:
+        raise RuntimeError("monitor bug")
+
+    monitor.run = broken_run
+    monitor.start()
+    assert await wait_for(lambda: "monitor bug" in caplog.text)
+    await monitor.stop()  # the worker's shutdown goes on to close the connector
+
+
 # --- what the leader writes ---------------------------------------------------- #
 
 
