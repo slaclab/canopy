@@ -186,6 +186,11 @@ attribute of the key, independent of module scope. Naming a facility grants
 that facility and everything beneath it in the hierarchy, the same "itself
 plus descendants" rule `?facility=` filtering itself uses.
 
+A `?facility=` naming a facility that doesn't exist is a `404 facility_not_found`
+— for any key, restricted or not. The slug is resolved before it's intersected
+with the key's own grant, so an unrestricted key gets the same 404 a restricted
+one does.
+
 The grant itself is defined and validated here; nothing yet *consults* it. A
 data-serving module (Squirrel) reading and enforcing this scope on its own
 reads and writes is separate, not-yet-merged work — until it lands, a
@@ -250,9 +255,8 @@ makes is filtered; there is no unfiltered read for it to fall back on:
 A request's own `?facility=` filter is intersected with the key's grant, so it
 can narrow results but never widen them. A key with an empty grant gets zero
 rows, and asking for a facility the key isn't granted returns nothing rather
-than everything. A `?facility=` naming a facility that doesn't exist is a
-`404 facility_not_found`. Tags, the device list, and meta-PVs (see below) are
-global and not filtered.
+than everything. Tags, the device list, and meta-PVs (see below) are global
+and not filtered.
 
 **Writes** are refused, with a `403 insufficient_facility_access` — a filtered
 write would silently do nothing, which is worse than an error. The rules:

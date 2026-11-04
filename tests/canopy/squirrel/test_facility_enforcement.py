@@ -344,6 +344,12 @@ async def test_read_is_intersected_with_the_grant_in_both_directions(client: Asy
     r = await client.get("/v1/pvs/paged?facility=lcls-nc", headers=SC_HEADERS)
     assert r.json()["results"] == []
 
+    # An unknown slug is a 404 for a restricted key too, not a 200 with an empty list —
+    # `resolve_effective_scope` resolves the slug before intersecting with the grant.
+    r = await client.get("/v1/pvs/paged?facility=does-not-exist", headers=SC_HEADERS)
+    assert r.status_code == 404
+    assert r.json()["code"] == "facility_not_found"
+
     # No query at all still respects the grant.
     r = await client.get("/v1/pvs/paged", headers=SC_HEADERS)
     assert {p["setpointAddress"] for p in r.json()["results"]} == {"SC:PV:SP"}

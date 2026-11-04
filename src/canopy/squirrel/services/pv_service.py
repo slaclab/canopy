@@ -139,9 +139,9 @@ class PvService:
         """Facility slugs -> ``{slug: id}``, in one round trip regardless of how many
         slugs are named (a CSV import can name dozens).
 
-        An unknown slug is a hard ``FacilityNotFound``: degrading to "matches nothing"
-        is right for a *filter*, wrong when the facility is the field being written.
-        Every unknown slug is named at once, not just the first alphabetically.
+        An unknown slug is a hard ``FacilityNotFound``, same as a read filter naming
+        one now gets. Every unknown slug is named at once, not just the first
+        alphabetically.
         """
         resolved = await facilities_gateway.ids_by_slug(slugs)
         if unknown := set(slugs) - resolved.keys():

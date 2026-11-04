@@ -141,7 +141,7 @@ class FacilityService:
         a typo'd slug. Facility existence isn't a secret (``GET /v1/facilities`` lists
         them all), so the 404 reveals nothing.
         """
-        if slug is None:
+        if not slug:
             return None
         result = await self.facility_repo.resolve_facility_scope(slug)
         if result is None:

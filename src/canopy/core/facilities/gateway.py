@@ -44,10 +44,12 @@ async def resolve_key_facility_scope(slugs: frozenset[str]) -> set[str] | None:
 async def resolve_effective_scope(slug: str | None, key_scope: set[str] | None) -> set[str] | None:
     """Compose a request's ``?facility=`` filter with the calling key's grant.
 
-    Both sides use the same sentinel — ``None`` is "no restriction from this side",
-    ``set()`` is "restricted to nothing" — so composing is a plain intersection with
-    ``None`` as the identity. An empty result means the query asked for a facility the
-    key isn't granted, and the caller returns zero rows rather than everything.
+    Both sides share the ``None`` sentinel for "no restriction from this side", so
+    composing is a plain intersection with ``None`` as the identity. ``key_scope`` can
+    still be ``set()`` — "restricted to nothing" — but the request side can't: an
+    unknown slug raises ``FacilityNotFound`` instead of resolving to ``set()``. An
+    empty result here means the query asked for a facility the key isn't granted, and
+    the caller returns zero rows rather than everything.
     """
     requested = await resolve_facility_scope(slug)
     if requested is None:

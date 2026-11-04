@@ -57,7 +57,7 @@ async def list_snapshots(
     ] = None,
     pageSize: int = Query(100, ge=1, le=1000),
     continuationToken: str | None = Query(None, description="Token from the previous page; omit for the first"),
-    facility: str | None = Query(None, description="Facility slug — includes descendants"),
+    facility: str | None = Query(None, description="Facility slug — includes descendants; 404 if unknown"),
 ) -> PagedResult[SnapshotSummaryDTO]:
     """List snapshots newest first, optionally filtered by title, tag IDs, creation time, and/or facility.
 
@@ -85,7 +85,7 @@ async def list_snapshots(
     continuationToken : str | None
         The previous page's ``continuationToken``; omit it for the first page.
     facility : str | None
-        A facility slug to filter by — includes descendants.
+        A facility slug to filter by — includes descendants; 404 if unknown.
 
     Returns
     -------
@@ -98,6 +98,8 @@ async def list_snapshots(
     BadRequest
         When both bounds are given and ``start`` is after ``end``, or the continuation
         token is malformed.
+    FacilityNotFound
+        When ``facility`` names a slug that doesn't exist.
     """
     return await service.list_snapshots(
         title=title,
