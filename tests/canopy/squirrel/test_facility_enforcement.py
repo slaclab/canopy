@@ -232,7 +232,7 @@ async def test_creating_a_pv_in_several_facilities_needs_one_of_them_held(
     client: AsyncClient, db_session: AsyncSession
 ):
     """A create is allowed when at least one requested facility is in the key's grant."""
-    facilities = await _seed_hierarchy(db_session)
+    await _seed_hierarchy(db_session)
 
     r = await client.post(
         "/v1/pvs",
@@ -240,7 +240,7 @@ async def test_creating_a_pv_in_several_facilities_needs_one_of_them_held(
         json={"setpointAddress": "SHARED:PV:SP", "facilities": ["lcls-sc", "facet"]},
     )
     assert r.status_code == 200, r.text
-    assert set(r.json()["facilityIds"]) == {facilities["lcls-sc"].id, facilities["facet"].id}
+    assert r.json()["facilities"] == ["facet", "lcls-sc"]
 
     r = await client.get("/v1/pvs/paged", headers=WILD_HEADERS)
     assert len(r.json()["results"]) == 1
@@ -675,11 +675,11 @@ async def test_a_restricted_key_cannot_unassign_a_pv_it_fully_holds(client: Asyn
 
     r = await client.get("/v1/pvs/paged", headers=WILD_HEADERS)
     pv = next(p for p in r.json()["results"] if p["id"] == pv_id)
-    assert pv["facilityIds"] != []
+    assert pv["facilities"] != []
 
     r = await client.put(f"/v1/pvs/{pv_id}", headers=WILD_HEADERS, json={"facilities": []})
     assert r.status_code == 200, r.text
-    assert r.json()["facilityIds"] == []
+    assert r.json()["facilities"] == []
 
 
 async def test_a_restricted_key_cannot_create_an_unassigned_pv(client: AsyncClient, db_session: AsyncSession):
