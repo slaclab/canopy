@@ -279,7 +279,7 @@ async def test_access_is_reachable_by_a_write_only_key(facilities_client, sessio
     r = facilities_client.get("/v1/facilities/access", headers={"X-API-Key": "test-write-only"})
 
     assert r.status_code == 200, r.text
-    assert r.json() == {"unrestricted": False, "facilities": ["lcls"]}
+    assert r.json() == {"unrestricted": False, "facilities": ["lcls", "lcls-nc", "lcls-sc"]}
 
 
 async def test_access_requires_auth_and_core_module_access(facilities_client, session, session_maker, fake_keys):
