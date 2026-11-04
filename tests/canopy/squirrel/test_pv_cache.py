@@ -8,6 +8,8 @@ import asyncio
 
 import pytest
 import fakeredis.aioredis
+from redis.exceptions import RedisError
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from canopy import worker
 from tests.conftest import wait_for
@@ -105,6 +107,34 @@ def _before_next_exec(redis, hook) -> None:
         return pipe
 
     redis.pipeline = pipeline
+
+
+def _fail_next_heartbeat(redis) -> None:
+    """Fail the next transaction that writes the status report, as if Redis dropped it."""
+    real_pipeline = redis.pipeline
+    armed = [True]
+
+    def pipeline(*args, **kwargs):
+        pipe = real_pipeline(*args, **kwargs)
+        real_execute = pipe.execute
+
+        async def execute(*a, **kw):
+            writes_status = any(args[:2] == ("SET", STATUS_KEY) for args, _options in pipe.command_stack)
+            if armed[0] and writes_status:
+                armed[0] = False
+                await pipe.reset()
+                raise RedisConnectionError("connection lost")
+            return await real_execute(*a, **kw)
+
+        pipe.execute = execute
+        return pipe
+
+    redis.pipeline = pipeline
+
+
+async def _value(redis, address: str):
+    raw = await redis.hget(VALUES_KEY, address)
+    return None if raw is None else json.loads(raw)["pv"]["value"]
 
 
 # --- leader election -------------------------------------------------------- #
@@ -211,6 +241,7 @@ async def test_reconcile_follows_the_registered_pvs():
         addresses.update({"A", "C"})
         assert await wait_for(lambda: set(connector.callbacks) == {"A", "C"})
         assert "B" in connector.closed
+        await monitor.flush()  # removed entries go with the next heartbeat
         assert not await redis.hexists(VALUES_KEY, "B")
 
         # A late event from the dropped monitor doesn't bring B back.
@@ -282,11 +313,90 @@ async def test_a_flush_in_flight_cannot_bring_back_a_removed_entry():
         await asyncio.wait({removing}, timeout=0.1)  # it mustn't get past the flush
         release.set()
         await asyncio.gather(flushing, removing)
+        await monitor.flush()  # deletes A's entry, which the in-flight flush wrote
+        assert not await redis.hexists(VALUES_KEY, "A")
 
         addresses.add("A")  # re-registered before its new monitor reports
         await monitor.reconcile()
         assert "A" in connector.callbacks
         assert not await redis.hexists(VALUES_KEY, "A")
+    finally:
+        await monitor.stop()
+
+
+async def test_a_failed_delete_holds_back_the_heartbeat():
+    """While a removed address's entry can't be deleted the heartbeat stays put, so readers
+    drop the cache once it's stale; a re-registered address waits for the delete."""
+    redis = fakeredis.aioredis.FakeRedis()
+    now = [1000.0]
+    addresses = {"A", "B"}
+    monitor, connector = await _leader(redis, addresses, config=QUIET, clock=lambda: now[0])
+    try:
+        connector.emit(_pv("A"))
+        connector.emit(_pv("B"))
+        await monitor.flush()
+
+        addresses.discard("A")
+        await monitor.reconcile()
+        _fail_next_heartbeat(redis)
+        now[0] = 1005.0
+        with pytest.raises(RedisError):
+            await monitor.flush()
+        assert (await read_status(redis)).heartbeat_at == 1000.0
+        assert await redis.hexists(VALUES_KEY, "A")
+
+        addresses.add("A")
+        await monitor.reconcile()
+        assert "A" not in connector.callbacks  # not until its old entry is gone
+
+        now[0] = 1010.0
+        await monitor.flush()
+        assert (await read_status(redis)).heartbeat_at == 1010.0
+        assert not await redis.hexists(VALUES_KEY, "A")
+        await monitor.reconcile()
+        assert "A" in connector.callbacks
+    finally:
+        await monitor.stop()
+
+
+async def test_a_late_event_cannot_rewrite_a_re_registered_address_before_its_delete():
+    redis = fakeredis.aioredis.FakeRedis()
+    addresses = {"A"}
+    monitor, connector = await _leader(redis, addresses, config=QUIET)
+    try:
+        connector.emit(_pv("A", 1.5))
+        await monitor.flush()
+        old_monitor = connector.callbacks["A"]
+
+        addresses.discard("A")
+        await monitor.reconcile()
+        addresses.add("A")
+        await monitor.reconcile()  # A is wanted again, its old entry not yet deleted
+
+        old_monitor(_pv("A", 99.0))
+        _fail_next_heartbeat(redis)
+        with pytest.raises(RedisError):
+            await monitor.flush()
+        assert await _value(redis, "A") == 1.5  # the old monitor's late value wasn't written
+
+        await monitor.flush()
+        assert not await redis.hexists(VALUES_KEY, "A")
+    finally:
+        await monitor.stop()
+
+
+async def test_a_new_leader_deletes_entries_of_addresses_no_longer_registered():
+    """Entries an earlier leader left for PVs removed since aren't kept forever."""
+    redis = fakeredis.aioredis.FakeRedis()
+    old = time.time() - 60
+    await redis.hset(
+        VALUES_KEY, mapping={a: encode_entry(_pv(a), old, "previous-generation") for a in ("A", "gone-1", "gone-2")}
+    )
+
+    monitor, _ = await _leader(redis, {"A"}, config=QUIET)
+    try:
+        await monitor.flush()
+        assert sorted(await redis.hkeys(VALUES_KEY)) == [b"A"]
     finally:
         await monitor.stop()
 

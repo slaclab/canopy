@@ -89,7 +89,7 @@ class PVCacheMonitor:
 
         self._stopping = asyncio.Event()
         self._task: asyncio.Task | None = None
-        # Held for a whole flush and while reconcile drops removed addresses.
+        # Held for a whole flush, and while reconcile updates what is wanted and what to delete.
         self._flush_lock = asyncio.Lock()
 
         # Leader-only state, cleared on every step-down.
@@ -98,7 +98,8 @@ class PVCacheMonitor:
         self._lease_lost = False  # a conditional write found the lease gone
         self._wanted: set[str] = set()
         self._subs: dict[str, Subscription] = {}
-        self._unpruned: set[str] = set()  # removed addresses whose hash entries still need deleting
+        self._unpruned: set[str] = set()  # addresses whose hash entries the next flush deletes
+        self._swept = False  # entries of addresses nobody registers any more were queued for deletion
         self._pending: dict[str, PVValue] = {}
         self._connected: dict[str, bool] = {}
         self._seen: set[str] = set()
@@ -174,6 +175,7 @@ class PVCacheMonitor:
         self._wanted.clear()
         self._subs.clear()
         self._unpruned.clear()
+        self._swept = False
         self._pending.clear()
         self._connected.clear()
         self._seen.clear()
@@ -249,10 +251,12 @@ class PVCacheMonitor:
 
         Additions and removals are worked out against the open subscriptions, not
         the last wanted set, so a subscription that failed is retried next time.
+        Removed addresses' entries are deleted by the next flush (see `flush`).
         """
         wanted = await self._load_addresses()
+        stray = await self._stray_entries(wanted)
         # Not while a flush is writing: its buffer may hold values for addresses
-        # removed here, and writing them after the delete below would bring them back.
+        # removed here, and writing them after the delete would bring them back.
         # Once this is done, no later flush has them.
         async with self._flush_lock:
             self._configured = len(wanted)
@@ -262,6 +266,7 @@ class PVCacheMonitor:
             removed = sorted(self._subs.keys() - wanted)
             for address in removed:
                 self._pending.pop(address, None)
+            self._unpruned |= set(removed) | stray
 
         for address in removed:
             sub = self._subs.pop(address)
@@ -271,19 +276,8 @@ class PVCacheMonitor:
                 logger.exception("Closing the PV cache monitor for %s failed", address)
             self._connected.pop(address, None)
             self._seen.discard(address)
-        # Entries go once their monitors are closed. A failed delete is retried next
-        # time, and still happens before a re-added address is monitored again, so it
-        # can't serve a value from before it was dropped.
-        self._unpruned |= set(removed)
-        self._unpruned -= self._subs.keys()  # wanted and still monitored: its entry is current
-        prune = sorted(self._unpruned)
-        try:
-            for start in range(0, len(prune), BATCH_SIZE):
-                batch = prune[start : start + BATCH_SIZE]
-                if await self._write_if_leader(lambda pipe, batch=batch: pipe.hdel(VALUES_KEY, *batch)):
-                    self._unpruned -= set(batch)
-        except RedisError as exc:
-            logger.warning("PV cache could not delete %d removed entries; retrying next reconcile: %s", len(prune), exc)
+        # A re-added address isn't monitored again until its old entry is deleted, so
+        # it can't serve a value from before it was dropped.
         added = [address for address in added if address not in self._unpruned]
 
         sem = asyncio.Semaphore(max(1, self._config.subscribe_concurrency))
@@ -310,9 +304,28 @@ class PVCacheMonitor:
                 len(removed),
             )
 
+    async def _stray_entries(self, wanted: set[str]) -> set[str]:
+        """On a tenure's first reconcile, the entries of addresses that aren't registered.
+
+        Earlier leaders' entries for PVs removed while they led, or while none did,
+        are nobody else's to delete. Readers ignore them (wrong generation), but the
+        hash would keep them for good. Retried next reconcile if Redis fails.
+        """
+        if self._swept:
+            return set()
+        try:
+            fields = await self._redis.hkeys(VALUES_KEY)
+        except RedisError as exc:
+            logger.warning("PV cache could not list its entries; retrying next reconcile: %s", exc)
+            return set()
+        self._swept = True
+        return {_text(field) for field in fields} - wanted
+
     def _on_event(self, address: str, value: PVValue) -> None:
-        # Called on the event loop for every connect, update and disconnect.
-        if address not in self._wanted:
+        # Called on the event loop for every connect, update and disconnect. An event
+        # for an address that's no longer registered, or was re-registered before its
+        # old entry was deleted, can only come from a monitor already closed.
+        if address not in self._wanted or address in self._unpruned:
             return
         self._pending[address] = value
         self._connected[address] = value.connected
@@ -333,7 +346,13 @@ class PVCacheMonitor:
                 logger.exception("PV cache flush failed; retrying next cycle")
 
     async def flush(self) -> None:
-        """Write buffered values, then the status report (the heartbeat), while holding the lease."""
+        """Write buffered values, then the heartbeat, while holding the lease.
+
+        The heartbeat (the status report) goes in one transaction with the deletes of
+        removed addresses' entries, so it only advances once those are gone. If the
+        deletes keep failing, readers drop the whole cache after heartbeat_max_age_s:
+        the same bound as any other write that fails.
+        """
         async with self._flush_lock:
             now = self._clock()
             generation = self._generation
@@ -348,8 +367,16 @@ class PVCacheMonitor:
                         lambda pipe, mapping=mapping: pipe.hset(VALUES_KEY, mapping=mapping)
                     ):
                         return  # the lease is gone: these values are no longer ours to write
+                prune = sorted(self._unpruned)
                 report = self.status_report(now).model_dump_json(by_alias=True)
-                await self._write_if_leader(lambda pipe: pipe.set(STATUS_KEY, report))
+
+                def heartbeat(pipe: Any) -> None:
+                    for start in range(0, len(prune), BATCH_SIZE):
+                        pipe.hdel(VALUES_KEY, *prune[start : start + BATCH_SIZE])
+                    pipe.set(STATUS_KEY, report)
+
+                if await self._write_if_leader(heartbeat):
+                    self._unpruned -= set(prune)
             except RedisError:
                 # Put back whatever newer events haven't superseded, so a dropped
                 # disconnect isn't lost and the cache doesn't keep serving the old value.
