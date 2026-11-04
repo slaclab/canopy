@@ -130,7 +130,9 @@ class PvService:
         list. Mint-time assignment uses the separate create policy in
         ``_require_facility_for_create``.
         """
-        return self.facility_scope is None or bool(row_facility_ids & self.facility_scope)
+        if self.facility_scope is None:
+            return True
+        return bool(row_facility_ids) and row_facility_ids.issubset(self.facility_scope)
 
     async def _require_facility_write(self, row_facility_ids: set[str], what: str) -> None:
         """Gate a write on the calling key's facility grant (see ``_can_write``).
@@ -171,11 +173,12 @@ class PvService:
 
     async def _require_facility_containment(self, facility_ids: set[str], what: str) -> None:
         """Gate a specific set of facilities against the grant, requiring every one of
-        them to be held — stricter than ``_require_facility_write``'s "any overlap"
-        test. Used where ``facility_ids`` describes a delta (facilities being added or
-        removed) rather than "does this row belong to me at all": a key holding only
-        one of several facilities must not be able to add or remove the others just
-        because it can touch the row through one it does hold.
+        them to be held. Used where ``facility_ids`` describes a delta (facilities
+        being added or removed) rather than "does this row belong to me at all" (see
+        ``_require_facility_write``, which applies the same full-containment rule to a
+        row's current facilities): a key holding only one of several facilities must
+        not be able to add or remove the others just because it can touch the row
+        through one it does hold.
         """
         if self.facility_scope is None or not facility_ids:
             return
@@ -446,9 +449,7 @@ class PvService:
         await self.pv_repo.add_facilities_many(assignments)
         # Each row's own payload already named its facilities by slug — skip the
         # id-to-slug round trip `_to_dtos` would otherwise make.
-        return [
-            self._to_dto(pv, sorted(set(data.facilities))) for pv, (_, _, _, data) in zip(pvs, normalized_records)
-        ]
+        return [self._to_dto(pv, sorted(set(data.facilities))) for pv, (_, _, _, data) in zip(pvs, normalized_records)]
 
     async def update(self, pv_id: str, data: UpdatePVElementDTO) -> PVElementDTO | None:
         pv = await self.pv_repo.get_by_id(pv_id)
