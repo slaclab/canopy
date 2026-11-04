@@ -34,8 +34,8 @@ MIRROR_REFUSED_GATES = {require_write_access, require_admin_access}
 # Non-GET routes that a mirror keeps serving. Read-scoped: they compute, validate
 # or subscribe, and write nothing replicated or on the machine.
 READ_SCOPED_NON_GET = {
-    ("POST", "/fox/v1/evaluate"),
-    ("POST", "/fox/v1/validate"),
+    ("POST", "/formula-engine/v1/evaluate"),
+    ("POST", "/formula-engine/v1/validate"),
     ("POST", "/vole/v1/pvs/subscribe"),
     ("POST", "/vole/v1/pvs/subscribe/{pv:path}"),
     ("POST", "/raccoon/v1/pvs/validate"),
@@ -80,6 +80,37 @@ def _calls(dependant) -> set:
     return calls
 
 
+def _is_gate(call) -> bool:
+    """Part of the key and scope chain: the gates themselves and the header they read."""
+    return getattr(call, "__module__", "").startswith(("canopy.core.security", "fastapi.security"))
+
+
+def _runtime_dependencies(dependant) -> set:
+    """Dependencies that lead to no gate, such as a module's service.
+
+    The request test overrides these, so a route that declares its gate after its
+    service (``create_entry(..., service, api_key=Security(require_write_access))``)
+    still reaches the gate without the app's lifespan having bound that service.
+    """
+    found = set()
+    for sub in dependant.dependencies:
+        if _is_gate(sub.call):
+            continue
+        if any(_is_gate(call) for call in _calls(sub)):
+            found |= _runtime_dependencies(sub)
+        else:
+            found.add(sub.call)
+    return found
+
+
+def _owner(route: APIRoute) -> FastAPI:
+    """The app whose ``dependency_overrides`` apply to ``route``: its mount's, or the parent's."""
+    for mount in app.routes:
+        if isinstance(mount, Mount) and route in mount.app.routes:
+            return mount.app
+    return app
+
+
 def _api_routes() -> list[tuple[str, str, APIRoute]]:
     """``(method, full path, route)`` for every API route on the parent app and each mount."""
     routes = []
@@ -92,6 +123,7 @@ def _api_routes() -> list[tuple[str, str, APIRoute]]:
 
 
 ROUTES = _api_routes()
+ROUTE_BY_KEY = {(method, path): route for method, path, route in ROUTES}
 REFUSED = [(method, path) for method, path, route in ROUTES if _calls(route.dependant) & MIRROR_REFUSED_GATES]
 
 
@@ -101,8 +133,11 @@ def _concrete(path: str) -> str:
 
 
 @pytest.mark.parametrize(("method", "path"), REFUSED, ids=[f"{m} {p}" for m, p in REFUSED])
-def test_write_and_admin_routes_are_refused_on_a_mirror(method, path, mirror_role, bind_keys):
+def test_write_and_admin_routes_are_refused_on_a_mirror(method, path, mirror_role, bind_keys, monkeypatch):
     bind_keys(ALL_SCOPES)
+    route = ROUTE_BY_KEY[(method, path)]
+    overrides = {call: lambda: None for call in _runtime_dependencies(route.dependant)}
+    monkeypatch.setattr(_owner(route), "dependency_overrides", overrides)
     client = TestClient(app, raise_server_exceptions=False)
 
     resp = client.request(method, _concrete(path), headers=HEADERS)
