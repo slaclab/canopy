@@ -183,6 +183,8 @@ Confirms a subscription was created and provides the assigned ID.
 }
 ```
 
+Each `subscribe` gets exactly one reply, and replies come in the order the subscribes were sent: `subscribed`, or an `error` without an `id` if the subscribe is rejected (see [Error handling](#error-handling)). A client that sends several subscribes before the replies arrive matches each reply to its oldest subscribe still waiting for one. A rejected subscribe is never assigned an ID and gets no further messages.
+
 ### result
 
 A new evaluation result for a subscription. The `data` field contains the same result shape as the REST evaluate endpoint (discriminated by `kind`).
@@ -227,7 +229,7 @@ Confirms a subscription was updated successfully.
 
 ### completed
 
-Sent after a one-shot evaluation finishes. The subscription is automatically removed — no `unsubscribe` needed.
+Sent after a one-shot evaluation finishes, following its `result` or `error`. The subscription is automatically removed — no `unsubscribe` needed. A one-shot whose subscribe is rejected gets only the `error` without an `id`: no `subscribed`, `result` or `completed`.
 
 ```json
 {
@@ -249,7 +251,7 @@ An error occurred for a specific subscription or for the connection.
 }
 ```
 
-The `id` field is present when the error is specific to a subscription. Connection-level errors (e.g., unknown message type) omit it.
+The `id` field is present when the error is specific to a subscription. An error without an `id` is the reply to a rejected `subscribe`, or reports a message the server couldn't use (e.g., unknown message type).
 
 ### pong
 
@@ -299,7 +301,7 @@ The formula re-evaluates on a fixed timer (every `intervalMs` milliseconds) rega
 }
 ```
 
-When `t1Ns` is non-zero (a fixed historical endpoint), the formula evaluates once over the specified window, sends the result, and then sends a `completed` message. The subscription is automatically cleaned up — no `unsubscribe` needed.
+When `t1Ns` is non-zero (a fixed historical endpoint), the formula evaluates once over the specified window, sends the result, and then sends a `completed` message. The subscription is automatically cleaned up — no `unsubscribe` needed. A one-shot whose spec can't be evaluated is rejected like any other subscribe (see [Error handling](#error-handling)).
 
 This is equivalent to the REST `/evaluate` endpoint but over the WebSocket connection, useful for batch queries without opening separate HTTP requests.
 
@@ -329,7 +331,9 @@ When a subscription is updated, the listener is moved to a new shared eval (or a
 
 ## Error handling
 
-- **Per-subscription errors** include the subscription `id` and describe issues with that specific formula (parse errors, missing PVs, timeouts).
-- **Connection-level errors** omit the `id` field and indicate protocol issues (unknown message type, malformed spec).
+- **Rejected subscribes** get an error without an `id` in place of `subscribed`, before anything subscribes. A subscribe is rejected when its `spec` is missing or malformed, a field has the wrong type, or the spec can't be evaluated: a binding names a formula (`formula:` or the retired `fox:` prefix) or isn't a valid PV name, or the expression doesn't parse, uses a construct that isn't allowed, or doesn't match the bindings. One-shots are checked the same way.
+- **Per-subscription errors** include the subscription `id` and describe issues with that specific formula while it runs (missing PVs, timeouts, evaluation errors). A subscribe can also fail after `subscribed`, for example when the client already holds the maximum number of live subscriptions or a PV subscription fails to start. That error carries the new `id`, and the subscription is not kept.
+- **Update errors** carry the update's `id`. An update whose spec can't be evaluated leaves the subscription as it was, and an update of an unknown `id` gets `not_found`.
+- **Connection-level errors** omit the `id` field and indicate protocol issues (invalid JSON, unknown message type).
 - **Retriable errors** (missing inputs, PV not yet buffered) are automatically retried with a short delay. The client does not need to resubscribe.
 - **On disconnect**, all client subscriptions are automatically cleaned up.
