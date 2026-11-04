@@ -117,7 +117,7 @@
 | src/canopy/formula\_engine/api/v1/health.py                  |        3 |        0 |    100% |           |
 | src/canopy/formula\_engine/api/v1/router.py                  |       10 |        0 |    100% |           |
 | src/canopy/formula\_engine/api/v1/validate.py                |       10 |        0 |    100% |           |
-| src/canopy/formula\_engine/api/v1/ws.py                      |      114 |       23 |     80% |120-124, 131-133, 137-138, 142-146, 156-157, 163-166, 179-181 |
+| src/canopy/formula\_engine/api/v1/ws.py                      |      127 |       14 |     89% |150-154, 159-160, 176-178, 196, 211-213 |
 | src/canopy/formula\_engine/app.py                            |       37 |        0 |    100% |           |
 | src/canopy/formula\_engine/config.py                         |       19 |        0 |    100% |           |
 | src/canopy/formula\_engine/dependencies.py                   |       11 |        2 |     82% |    16, 20 |
@@ -132,10 +132,10 @@
 | src/canopy/formula\_engine/schemas/formula.py                |       17 |        0 |    100% |           |
 | src/canopy/formula\_engine/services/\_\_init\_\_.py          |        0 |        0 |    100% |           |
 | src/canopy/formula\_engine/services/evaluator.py             |       74 |        9 |     88% |46, 74-75, 77, 90-91, 93, 140, 142 |
-| src/canopy/formula\_engine/services/formula\_service.py      |       50 |        3 |     94% |     50-52 |
+| src/canopy/formula\_engine/services/formula\_service.py      |       49 |        3 |     94% |     49-51 |
 | src/canopy/formula\_engine/services/parser.py                |      120 |       16 |     87% |69, 105-109, 142, 157-158, 163, 165, 167, 170, 176, 194-197, 206 |
 | src/canopy/formula\_engine/services/scalar\_evaluator.py     |       33 |        1 |     97% |        37 |
-| src/canopy/formula\_engine/services/subscription\_manager.py |      267 |       24 |     91% |272-275, 332, 343, 369, 372, 378, 391, 528, 573-577, 601-610 |
+| src/canopy/formula\_engine/services/subscription\_manager.py |      265 |       22 |     92% |250, 341-344, 422, 436, 439, 445, 458, 595, 642-644, 668-677 |
 | src/canopy/formula\_engine/services/timeseries\_evaluator.py |       42 |        8 |     81% |58, 67, 80-85 |
 | src/canopy/formula\_engine/services/waveform\_evaluator.py   |       39 |       15 |     62% |39-40, 44, 46, 54-68 |
 | src/canopy/hare/\_\_init\_\_.py                              |        0 |        0 |    100% |           |
@@ -310,7 +310,7 @@
 | src/canopy/vole/services/hare\_ingest.py                     |       92 |       11 |     88% |47-48, 55, 77, 103, 121, 131-132, 152-155 |
 | src/canopy/vole/services/notifier.py                         |       35 |        2 |     94% |     33-34 |
 | src/canopy/worker.py                                         |       37 |        6 |     84% | 32, 61-65 |
-| **TOTAL**                                                    | **9117** |  **753** | **92%** |           |
+| **TOTAL**                                                    | **9127** |  **742** | **92%** |           |
 
 
 ## Setup coverage badge
