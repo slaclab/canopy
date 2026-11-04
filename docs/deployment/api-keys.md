@@ -9,7 +9,7 @@ credential layers behind the scenes fit together.
 Every key carries three independent scopes:
 
 - **`read`** — GET requests and WebSocket connections, plus the handful of
-  POSTs that only read (Converter's conversions, Fox's evaluate/validate).
+  POSTs that only read (Converter's conversions, Formula Engine's evaluate/validate).
 - **`write`** — endpoints that change something: setting a PV, saving a
   snapshot, storing a config.
 - **`admin`** — key management (this page's own HTTP surface) and other
@@ -141,7 +141,7 @@ curl -X POST -H "X-API-Key: <admin-token>" -H "Content-Type: application/json" \
 ### Module scoping
 
 A key can be restricted to one or more mounted sub-apps — `mole`, `hare`,
-`raccoon`, `vole`, `fox`, `squirrel`, `magpie`, `jobs`, `converter`
+`raccoon`, `vole`, `formula-engine`, `squirrel`, `magpie`, `jobs`, `converter`, `elog`
 — or `core`, for the parent app's own routes (`/health`, `/v1/api-keys`).
 Minting a key via the CLI or `POST /v1/api-keys` without naming any modules
 grants every module, an explicit default of `["*"]` at that layer. There is no
@@ -157,12 +157,12 @@ Set it with `-m`/`--module` (repeatable) on `scripts/create_key.py`, or the
 `modules` field on `POST /v1/api-keys`:
 
 ```bash
-uv run python scripts/create_key.py trace -r -m fox -m vole
+uv run python scripts/create_key.py trace -r -m formula-engine -m vole
 ```
 
 ```bash
 curl -X POST -H "X-API-Key: <admin-token>" -H "Content-Type: application/json" \
-  -d '{"appName": "trace", "read": true, "modules": ["fox", "vole"]}' \
+  -d '{"appName": "trace", "read": true, "modules": ["formula-engine", "vole"]}' \
   http://localhost:<API_PORT>/v1/api-keys
 ```
 
@@ -171,7 +171,7 @@ entry with no `@` at all is skipped as malformed, the same as an empty token.
 Use `@*` for every module:
 
 ```bash
-CANOPY_API_KEYS="trace:read@fox+vole,ops:admin@*"
+CANOPY_API_KEYS="trace:read@formula-engine+vole,ops:admin@*"
 ```
 
 A key that resolves but isn't scoped to the module a route belongs to gets
@@ -185,6 +185,11 @@ A key can also be restricted to one or more `core.facility` slugs — a global
 attribute of the key, independent of module scope. Naming a facility grants
 that facility and everything beneath it in the hierarchy, the same "itself
 plus descendants" rule `?facility=` filtering itself uses.
+
+A `?facility=` naming a facility that doesn't exist is a `404 facility_not_found`
+— for any key, restricted or not. The slug is resolved before it's intersected
+with the key's own grant, so an unrestricted key gets the same 404 a restricted
+one does.
 
 The grant itself is defined and validated here; nothing yet *consults* it. A
 data-serving module (Squirrel) reading and enforcing this scope on its own
@@ -250,37 +255,52 @@ makes is filtered; there is no unfiltered read for it to fall back on:
 A request's own `?facility=` filter is intersected with the key's grant, so it
 can narrow results but never widen them. A key with an empty grant gets zero
 rows, and asking for a facility the key isn't granted returns nothing rather
-than everything. A `?facility=` naming a facility that doesn't exist is a
-`404 facility_not_found`. Tags, the device list, and meta-PVs (see below) are
-global and not filtered.
+than everything. Tags, the device list, and meta-PVs (see below) are global
+and not filtered.
 
 **Writes** are refused, with a `403 insufficient_facility_access` — a filtered
 write would silently do nothing, which is worse than an error. The rules:
 
-- Mutating a row assigned to facilities requires the key to hold **any one** of
-  them. Holding one of a PV's facilities is enough.
+- **Updating or deleting a PV requires the key to hold *every* facility
+  affected.** For any PV update, the key must hold all of the PV's current
+  facilities and, when changing its facility list, all of the requested
+  facilities too. This covers both facilities being added and facilities being
+  removed. Deleting a PV requires access to all its current facilities. A key
+  scoped to only one facility cannot update or delete a PV also assigned to
+  another one; holding one shared facility is **not** enough to reach the rest
+  of the row. (A snapshot has at most one facility, so updating or deleting it
+  requires membership in that facility.)
 - A row with **no** facility assignment is writable only by an **unrestricted**
   key. No grant can cover a row that names no facility, so a restricted key —
   even one holding every facility that currently exists — is refused, the same
   way it's refused a row assigned to a facility it doesn't hold. This also
   means a restricted key can't strip a row's last facility and un-assign it:
   that write is refused outright, not silently let through because the key
-  held everything the row used to be assigned to.
-- Creating a *new* PV or snapshot is the parallel rule at mint time: a
-  facility-restricted key must name at least one facility it holds. A
-  restricted key can never mint an unassigned row — if it could, the row would
-  be reachable by every other write-scoped key but not reliably by the one
-  that created it, once "unassigned requires unrestricted" applies on the next
-  write.
+  held everything the row used to be assigned to. Update and delete report
+  this as `403` (the row's own facility check runs, not the read-masking one
+  reads use), unlike restore and read, which report an unreachable row as
+  `404` instead.
+- Creating a *new* PV requires a facility-restricted key to hold **at least
+  one** of the PV's requested facilities. A PV assigned to multiple facilities
+  may therefore include facilities outside the creator's grant, but each row
+  in a bulk create must independently include at least one facility the key
+  holds. A restricted key cannot create an unassigned PV: that row would not
+  be reachable under the "unassigned requires unrestricted" rule for later
+  writes.
+- Creating a snapshot requires a facility-restricted key to hold the snapshot's
+  facility. The facility is singular; a restricted key cannot create an
+  unassigned snapshot that captures every registered PV.
 - Restoring a snapshot is gated on the snapshot's facility, the same as viewing
   it: a snapshot the key can't see is a `404`, including an unassigned one for
-  a restricted key. Within a visible snapshot, any PV whose facility was
-  changed after capture to one the key doesn't hold — or that has no facility
-  at all — is skipped and reported in the job result's `skippedPvIds`; if every
-  PV is skipped, the restore is a `403`. Update and delete gate the same
-  unassigned-row rule through a different path (the row's own facility check,
-  not the read-masking one), so they report `403` rather than `404` for the
-  same case — both refuse the write; only the status code differs.
+  a restricted key. Within a visible snapshot, a PV is included in the restore
+  if the key holds **any one** of its facilities — the same rule capture and
+  listing use, not the full-containment rule update/delete use. Restore
+  only writes the value captured under *this* snapshot's own facility; it
+  never touches the PV's other facilities, so it isn't mutating the shared row
+  the way update/delete do, and doesn't need to require every facility on it.
+  A PV with no facility assignment left, or whose facility was reassigned
+  after capture to one the key holds none of, is skipped and reported in the
+  job result's `skippedPvIds`; if every PV is skipped, the restore is a `403`.
 
 A `403 insufficient_facility_access` names the facilities the key lacks. A refused
 `POST /v1/pvs/multi` names every one the import needs, and lists the refused rows,
@@ -315,10 +335,11 @@ an unrestricted key can create one.
 
 **Snapshot reads and restore can disagree on an old snapshot.** A snapshot
 taken before facility scoping existed holds every PV's values as of capture.
-If a PV held then is later reassigned to a different facility a key holds, that
-key can still read the old values in the snapshot (the snapshot's own facility
-gate is what's checked, not each PV's current one) but `restore` skips that PV,
-since restore checks each PV's *current* facility. The read is correct as
+If a PV held then is later reassigned to a facility the key holds none of,
+that key can still read the old values in the snapshot (the snapshot's own
+facility gate is what's checked, not each PV's current one) but `restore`
+skips that PV, since restore checks each PV's *current* facility membership —
+any one shared facility, same as capture and listing. The read is correct as
 history; only a future restore follows today's assignment.
 
 This check and a concurrent mint aren't serialized against each other — each

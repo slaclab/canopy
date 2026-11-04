@@ -27,6 +27,7 @@ SC_HEADERS = {"X-API-Key": "sc-key"}
 NC_HEADERS = {"X-API-Key": "nc-key"}
 LCLS_HEADERS = {"X-API-Key": "lcls-key"}
 NONE_HEADERS = {"X-API-Key": "none-key"}
+SC_FACET_HEADERS = {"X-API-Key": "sc-facet-key"}
 WILD_HEADERS = {"X-API-Key": "wild-key"}
 ADMIN_HEADERS = {"X-API-Key": "admin-key"}
 
@@ -69,6 +70,13 @@ def scoped_keys():
                     facilities=frozenset({"lcls"}),
                 ),
                 APIKey(token="none-key", read=True, write=True, modules=frozenset({WILDCARD}), facilities=frozenset()),
+                APIKey(
+                    token="sc-facet-key",
+                    read=True,
+                    write=True,
+                    modules=frozenset({WILDCARD}),
+                    facilities=frozenset({"lcls-sc", "facet"}),
+                ),
                 APIKey(
                     token="wild-key",
                     read=True,
@@ -134,11 +142,27 @@ async def test_parent_grant_covers_a_child_facility(client: AsyncClient, db_sess
     assert r.status_code == 200, r.text
 
 
-async def test_holding_one_of_a_pvs_facilities_is_enough(client: AsyncClient, db_session: AsyncSession):
+async def test_holding_only_one_of_a_pvs_several_facilities_is_not_enough(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """Every write to a multi-facility PV — not just a change to its facility list —
+    requires holding *all* of its facilities, not just one. Otherwise a key scoped to
+    `lcls-sc` could edit, or (far worse) delete, a PV also assigned to `facet` on the
+    strength of a single shared facility, reaching data and destroying a row it was
+    never granted any access to via `facet`."""
     await _seed_hierarchy(db_session)
     pv_id = await _create_pv(client, WILD_HEADERS, "SHARED:PV:SP", ["lcls-sc", "facet"])
 
     r = await client.put(f"/v1/pvs/{pv_id}", headers=SC_HEADERS, json={"device": "d"})
+    assert r.status_code == 403, r.text
+    assert r.json()["code"] == "insufficient_facility_access"
+
+    r = await client.delete(f"/v1/pvs/{pv_id}", headers=SC_HEADERS)
+    assert r.status_code == 403, r.text
+
+    # A key holding every one of the PV's facilities — not just the wildcard — can
+    # still write it.
+    r = await client.put(f"/v1/pvs/{pv_id}", headers=SC_FACET_HEADERS, json={"device": "d"})
     assert r.status_code == 200, r.text
     # The write didn't quietly drop the facility the key can't reach.
     assert r.json()["facilities"] == ["facet", "lcls-sc"]
@@ -204,6 +228,31 @@ async def test_assigning_a_pv_outside_the_grant_is_refused(client: AsyncClient, 
     assert r.status_code == 403
 
 
+async def test_creating_a_pv_in_several_facilities_needs_one_of_them_held(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """A create is allowed when at least one requested facility is in the key's grant."""
+    await _seed_hierarchy(db_session)
+
+    r = await client.post(
+        "/v1/pvs",
+        headers=SC_HEADERS,
+        json={"setpointAddress": "SHARED:PV:SP", "facilities": ["lcls-sc", "facet"]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["facilities"] == ["facet", "lcls-sc"]
+
+    r = await client.get("/v1/pvs/paged", headers=WILD_HEADERS)
+    assert len(r.json()["results"]) == 1
+
+    r = await client.post(
+        "/v1/pvs",
+        headers=SC_FACET_HEADERS,
+        json={"setpointAddress": "SHARED-2:PV:SP", "facilities": ["lcls-sc", "facet"]},
+    )
+    assert r.status_code == 200, r.text
+
+
 async def test_create_does_not_leak_an_out_of_scope_pv_s_existence_via_409(
     client: AsyncClient, db_session: AsyncSession
 ):
@@ -227,10 +276,7 @@ async def test_create_does_not_leak_an_out_of_scope_pv_s_existence_via_409(
 
 
 async def test_multi_create_gates_each_row_not_the_import_s_union(client: AsyncClient, db_session: AsyncSession):
-    """A row assigned solely to an out-of-scope facility must not ride in on the back
-    of a sibling row the key can reach — gating the import's union of facilities
-    instead of each row would let it through, making ``/pvs/multi`` a way around the
-    single-create gate."""
+    """Every row must independently overlap the grant; a sibling row cannot authorize it."""
     await _seed_hierarchy(db_session)
 
     r = await client.post(
@@ -247,6 +293,15 @@ async def test_multi_create_gates_each_row_not_the_import_s_union(client: AsyncC
     # And the refused batch did not partially land.
     r = await client.get("/v1/pvs/paged", headers=WILD_HEADERS)
     assert r.json()["results"] == []
+
+    # A row may also name out-of-scope facilities if it names at least one in scope.
+    r = await client.post(
+        "/v1/pvs/multi",
+        headers=SC_HEADERS,
+        json=[{"setpointAddress": "SHARED:PV:SP", "facilities": ["lcls-sc", "facet"]}],
+    )
+    assert r.status_code == 200, r.text
+    assert len(r.json()) == 1
 
 
 async def test_a_refused_import_names_every_unreachable_facility_and_row(
@@ -362,6 +417,12 @@ async def test_read_is_intersected_with_the_grant_in_both_directions(client: Asy
     r = await client.get("/v1/pvs/paged?facility=lcls-nc", headers=SC_HEADERS)
     assert r.json()["results"] == []
 
+    # An unknown slug is a 404 for a restricted key too, not a 200 with an empty list —
+    # `resolve_effective_scope` resolves the slug before intersecting with the grant.
+    r = await client.get("/v1/pvs/paged?facility=does-not-exist", headers=SC_HEADERS)
+    assert r.status_code == 404
+    assert r.json()["code"] == "facility_not_found"
+
     # No query at all still respects the grant.
     r = await client.get("/v1/pvs/paged", headers=SC_HEADERS)
     assert {p["setpointAddress"] for p in r.json()["results"]} == {"SC:PV:SP"}
@@ -460,6 +521,32 @@ async def test_restore_skips_a_pv_reassigned_out_of_scope_after_capture(
     kwargs = enqueued[-1][2]
     assert kwargs["pv_ids"] == [kept_pv]
     assert kwargs["skipped_pv_ids"] == [moved_pv]
+
+
+async def test_restore_includes_a_multi_facility_pv_on_one_shared_facility(
+    client: AsyncClient, db_session: AsyncSession, enqueued: list
+):
+    """One shared facility is enough to restore a multi-facility PV, matching capture
+    and listing (both include a PV assigned to *any* facility in scope). Restore only
+    writes the value captured under this snapshot's own facility — it never touches the
+    PV's other facilities — so it must not apply the full-containment rule that guards
+    update/delete, which do mutate the shared row itself. Requiring every facility here
+    would skip a PV the key can see in this very snapshot and is legitimately restoring
+    a value scoped to the facility it does hold."""
+    facilities = await _seed_hierarchy(db_session)
+    shared_pv = await _create_pv(client, WILD_HEADERS, "SHARED:PV:SP", ["lcls-sc", "facet"])
+    snapshot = Snapshot(title="sc", facility_id=facilities["lcls-sc"].id)
+    db_session.add(snapshot)
+    await db_session.commit()
+    db_session.add(
+        SnapshotValue(snapshot_id=snapshot.id, pv_id=shared_pv, pv_name="SHARED:PV:SP", setpoint_value={"value": 1.0})
+    )
+    await db_session.commit()
+    enqueued.clear()
+
+    r = await client.post(f"/v1/snapshots/{snapshot.id}/restore", headers=SC_HEADERS, json={})
+    assert r.status_code == 200, r.text
+    assert enqueued[-1][2]["pv_ids"] == [shared_pv]
 
 
 async def test_restore_with_every_pv_out_of_scope_is_403(client: AsyncClient, db_session: AsyncSession, enqueued: list):

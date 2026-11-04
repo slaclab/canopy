@@ -57,7 +57,7 @@ async def list_snapshots(
     ] = None,
     pageSize: int = Query(100, ge=1, le=1000),
     continuationToken: str | None = Query(None, description="Token from the previous page; omit for the first"),
-    facility: str | None = Query(None, description="Facility slug — includes descendants"),
+    facility: str | None = Query(None, description="Facility slug — includes descendants; 404 if unknown"),
 ) -> PagedResult[SnapshotSummaryDTO]:
     """List snapshots newest first, optionally filtered by title, tag IDs, creation time, and/or facility.
 
@@ -85,7 +85,7 @@ async def list_snapshots(
     continuationToken : str | None
         The previous page's ``continuationToken``; omit it for the first page.
     facility : str | None
-        A facility slug to filter by — includes descendants.
+        A facility slug to filter by — includes descendants; 404 if unknown.
 
     Returns
     -------
@@ -98,6 +98,8 @@ async def list_snapshots(
     BadRequest
         When both bounds are given and ``start`` is after ``end``, or the continuation
         token is malformed.
+    FacilityNotFound
+        When ``facility`` names a slug that doesn't exist.
     """
     return await service.list_snapshots(
         title=title,
@@ -118,10 +120,9 @@ async def create_snapshot(data: NewSnapshotDTO, key: WriteKeyDep) -> JobCreatedD
     # identity crosses the Arq boundary, and a refused write must not become a queued job.
     facility_id = None
     if data.facility is not None:
-        facility = await facilities_gateway.get_by_slug(data.facility)
-        if facility is None:
+        facility_id = await facilities_gateway.id_by_slug(data.facility)
+        if facility_id is None:
             raise FacilityNotFound(f"Facility '{data.facility}' not found")
-        facility_id = facility.id
 
     key_scope = await facilities_gateway.resolve_key_facility_scope(key.facilities)
     if key_scope is not None:

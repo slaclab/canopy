@@ -62,18 +62,18 @@ async def create_facility(data: FacilityCreate, service: FacilityServiceDep) -> 
 @router.put("/{facility_slug}", dependencies=[Security(require_wildcard_facility_access)])
 async def update_facility(facility_slug: str, data: FacilityUpdate, service: FacilityServiceDep) -> FacilityDTO:
     """Update a facility's name, description, or parent. ``slug`` is not editable."""
-    facility = await service.get_by_slug(facility_slug)
-    if not facility:
+    facility_id = await service.id_by_slug(facility_slug)
+    if not facility_id:
         raise FacilityNotFound(f"Facility '{facility_slug}' not found")
-    return await service.update(facility.id, data)
+    return await service.update(facility_id, data)
 
 
 @router.delete("/{facility_slug}", dependencies=[Security(require_wildcard_facility_access)])
 async def delete_facility(facility_slug: str, service: FacilityServiceDep) -> dict[str, bool]:
     """Delete a facility. Refused while it has children, or while any module's data or
     any active key's grant still references it."""
-    facility = await service.get_by_slug(facility_slug)
-    if not facility:
+    facility_id = await service.id_by_slug(facility_slug)
+    if not facility_id:
         raise FacilityNotFound(f"Facility '{facility_slug}' not found")
-    await service.delete(facility.id)
+    await service.delete(facility_id)
     return {"deleted": True}

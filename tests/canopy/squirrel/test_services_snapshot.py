@@ -155,12 +155,16 @@ async def test_facility_snapshot_captures_only_that_facility_and_its_descendants
 
     lcls_snap = await svc.create_snapshot(NewSnapshotDTO(title="lcls", facility="lcls"))
     assert {v.pv_name for v in (await svc.get_by_id(lcls_snap.id)).pv_values} == {"LCLS:SP", "SC:SP"}
+    # The create result reports the facility back by slug, not the stored id.
+    assert lcls_snap.facility == "lcls"
 
     sc_snap = await svc.create_snapshot(NewSnapshotDTO(title="sc", facility="lcls-sc"))
     assert {v.pv_name for v in (await svc.get_by_id(sc_snap.id)).pv_values} == {"SC:SP"}
+    assert sc_snap.facility == "lcls-sc"
 
     machine = await svc.create_snapshot(NewSnapshotDTO(title="all"))
     assert machine.pv_count == 4
+    assert machine.facility is None
 
 
 async def test_paginated_get_does_not_delete_values(db_session: AsyncSession):

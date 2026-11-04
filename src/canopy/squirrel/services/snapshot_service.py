@@ -371,6 +371,8 @@ class SnapshotService:
             When a bound falls outside ``datetime``'s range once converted to UTC, both
             bounds are given and ``start`` is after ``end``, or the continuation token is
             malformed.
+        FacilityNotFound
+            When ``facility`` names a slug that doesn't exist.
         """
         start = _utc_bound("start", start)
         end = _utc_bound("end", end)
@@ -527,13 +529,12 @@ class SnapshotService:
         start_time = datetime.now(UTC)
 
         # The snapshot's own facility is a specific node, so this goes through
-        # `get_by_slug`. An unknown slug here is a real input error, not the "matches
-        # nothing" a read filter wants.
+        # `id_by_slug`. An unknown slug here is the same hard `FacilityNotFound` a
+        # read filter naming one now gets, too.
         if facility_id is None and data.facility is not None:
-            facility = await facilities_gateway.get_by_slug(data.facility)
-            if facility is None:
+            facility_id = await facilities_gateway.id_by_slug(data.facility)
+            if facility_id is None:
                 raise FacilityNotFound(f"Facility '{data.facility}' not found")
-            facility_id = facility.id
         capture_scope = await facilities_gateway.descendant_ids(facility_id) if facility_id is not None else None
 
         pv_addresses = await self.pv_repo.get_all_addresses(capture_scope)
