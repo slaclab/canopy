@@ -457,7 +457,9 @@ class SnapshotService:
         """Create a snapshot by reading every registered PV from EPICS (the hot read path).
 
         With ``pv_cache``, values the worker's PV cache can vouch for are taken from it
-        and only the rest are read live; the stored snapshot has the same shape either way.
+        and only the rest are read live. The stored snapshot has the same shape either
+        way, but a cached value is the PV's last monitor update, which can trail a live
+        read by up to the record's monitor deadband (MDEL).
         """
         logger.info("Creating snapshot: %s", data.title)
         start_time = datetime.now(UTC)

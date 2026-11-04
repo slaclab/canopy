@@ -20,6 +20,10 @@ class PVCacheConfig(BaseModel):
     registered setpoint and readback address and keeps its latest value in Redis.
     Snapshot create can then read the cache instead of issuing a live read per PV;
     anything the cache can't vouch for is still read live.
+
+    Cached values are monitor-resolution: alarm changes are posted at once, but a
+    value change within the record's monitor deadband (MDEL) isn't, so a cached value
+    can trail a live read by up to that deadband, with its own (older) timestamp.
     """
 
     enabled: bool = False

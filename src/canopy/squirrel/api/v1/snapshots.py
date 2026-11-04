@@ -114,7 +114,10 @@ async def create_snapshot(
             description=(
                 "Take values from the worker's PV cache where it can vouch for them and read only the rest "
                 "live from EPICS. The cache must be enabled on the worker (CANOPY_SQUIRREL__PV_CACHE__ENABLED); "
-                "without a live cache every PV is read live, as with useCache=false."
+                "without a live cache every PV is read live, as with useCache=false. Cached values are what "
+                "each PV's monitor last posted: alarm changes are posted at once, but a value change smaller "
+                "than the record's monitor deadband (MDEL) isn't, so a cached value can trail a live read by "
+                "up to that deadband, with the timestamp of the value it holds."
             ),
         ),
     ] = False,
