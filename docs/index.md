@@ -17,7 +17,7 @@ to live PV data in a few minutes, no EPICS required.
 - **Mole** — archiver-appliance proxy for historical PV data.
 - **Raccoon** — PV name lookup over the lab directory service.
 - **Vole** — time-aligned in-memory buffer merging live and historical data.
-- **Fox** — formula engine over live and historical PV data.
+- **Formula Engine** — formulas over live and historical PV data.
 - **Squirrel** — machine-state snapshot save / restore / compare.
 - **Jobs** — background-job status over the Arq + Redis worker pool.
 - **Converter** — EDM `.edl` / Qt `.ui` to Canopy Screen IR.
@@ -26,12 +26,11 @@ Planned: **Owl** (plot-config persistence + legacy importer) and **Wren**
 (rules engine, hosted in Hare).
 
 See the [modules overview](modules/index.md) for shared conventions
-(authentication, errors, health checks) and the
-[GitHub wiki](https://github.com/slaclab/Canopy/wiki) for module designs.
+(authentication, errors, health checks).
 
 ## Running it
 
 - [Getting started](getting_started.md) — local development, simulation and
   real EPICS backends.
-- [Deployment](deployment/index.md) — Docker Compose and the SLAC facility
-  deployment pipeline.
+- [Deployment](deployment/index.md) — Docker Compose and deploying Canopy at
+  your facility.

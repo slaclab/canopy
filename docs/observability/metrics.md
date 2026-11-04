@@ -23,10 +23,9 @@ naming and label rules. That is a follow-up; nothing here changes for it.
 The endpoint is unauthenticated, like `/health`, `/docs` and every
 module's `/openapi.json`. This follows Prometheus's own security model, which
 assumes exposition endpoints are reachable only from trusted networks and
-leaves access control to the network rather than the application. The
-[facility deployments](../deployment/facilities.md) bind the API directly on
-hosts inside the lab's networks, and nothing documented exposes it beyond
-them, so that assumption holds today. What the payload adds to the already
+leaves access control to the network rather than the application.
+[Production deployments](../deployment/production.md) must restrict access
+to the API's metrics endpoint to trusted networks. What the payload adds to the already
 public route map is operational telemetry — request counts, latencies, status
 codes, connected-client counts, process memory and the Python version — never
 PV names, values or key names.
@@ -62,7 +61,10 @@ need care:
   the same vocabulary API-key scopes use (`hare`, `vole`, …, and `core` for
   the parent app's own routes). It is read from the app instance that handled
   the request, never from the URL, so it is bounded by construction and
-  unaffected by a path-prefixed ingress.
+  unaffected by a path-prefixed ingress. The Formula Engine reports
+  `module="formula-engine"`, as does the `module` field of its
+  `/formula-engine/v1/health/watchdog` heartbeat. Before the rename both were
+  `fox`, so dashboards and alerts that filter on `module="fox"` need updating.
 - `route` — the matched route *template* (`/v1/pvs/{pv}`), never the raw
   path. A request that matches no route collapses into `route="unmatched"`
   while keeping its `module`: a bot scan of `/wp-admin/...` lands in
@@ -128,7 +130,7 @@ speculatively.
 
 Candidates deliberately **not** built yet, each its own follow-up: Hare event
 queue depth and dropped updates, Mole archiver round-trip latency, Vole
-ring-buffer bytes and evictions, Fox evaluation latency, Squirrel restore
+ring-buffer bytes and evictions, Formula Engine evaluation latency, Squirrel restore
 durations (a worker-side metric, so it also waits on the worker exposition
 above).
 
@@ -158,7 +160,6 @@ The `docker/observability/` overlay runs Prometheus (`:9090`) scraping
 `api:8000/metrics` every 15 s, with a provisioned Grafana datasource
 (`canopy-prometheus`). See the [setup guide](setup_guide.md).
 
-That overlay is the only scraper today: the [facility deployments](../deployment/facilities.md)
-run no Prometheus yet. The endpoint costs nothing to serve, and once a
-facility Prometheus exists it only needs a scrape target of
+The [production deployment guide](../deployment/production.md) does not
+include Prometheus. To use a facility's Prometheus, configure a scrape target of
 `<api-host>:<API_PORT>/metrics`.
