@@ -7,12 +7,12 @@ migrate the primary ahead of the copy subscribed to it.
 """
 
 import os
+import sys
 import logging
 from typing import Literal
 from functools import lru_cache
 
 from fastapi import Security, APIRouter
-from alembic.util import CommandError
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 
@@ -40,15 +40,23 @@ def shipped_alembic_head() -> str | None:
     Found the way the ``alembic`` CLI finds it — ``$ALEMBIC_CONFIG``, else
     ``alembic.ini`` in the working directory (``/app`` in the prod image) — so
     it names exactly what ``alembic upgrade head`` would migrate to from here.
-    ``None`` when the tree isn't there or has more than one head. Cached: the
-    tree can't change under a running process.
+    ``None`` when the tree isn't there (the dev image has none), can't be read,
+    or has more than one head; this endpoint must never fail over it.
+
+    Reading the tree imports every version file, so the API calls this once at
+    startup and the cache answers every request: the tree can't change under a
+    running process. ``sys.path`` is restored afterwards, since Alembic prepends
+    the ini's ``prepend_sys_path`` to it.
     """
     config_path = os.environ.get("ALEMBIC_CONFIG", "alembic.ini")
+    saved_path = sys.path[:]
     try:
         heads = ScriptDirectory.from_config(Config(config_path)).get_heads()
-    except CommandError as exc:
-        logger.warning("Cannot read the Alembic head from %s: %s", config_path, exc)
+    except Exception:
+        logger.warning("Cannot read the Alembic head from %s", config_path, exc_info=True)
         return None
+    finally:
+        sys.path[:] = saved_path
     if len(heads) != 1:
         logger.warning("Alembic tree at %s has %d heads; reporting none", config_path, len(heads))
         return None

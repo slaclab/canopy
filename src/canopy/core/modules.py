@@ -23,12 +23,13 @@ MODULES: frozenset[str] = frozenset(
         "hare",
         "raccoon",
         "vole",
-        "fox",
+        "formula-engine",
         "squirrel",
         "magpie",
         "jobs",
         "converter",
         "analytics",
+        "elog",
     }
 )
 
