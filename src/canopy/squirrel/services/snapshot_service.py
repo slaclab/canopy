@@ -27,6 +27,7 @@ from canopy.squirrel.restore_hooks import (
     RestoreHookError,
     get_restore_hooks,
 )
+from canopy.squirrel.pv_cache.reader import PVCacheReader
 from canopy.squirrel.schemas.snapshot import (
     PVValueDTO,
     TagInfoDTO,
@@ -298,8 +299,14 @@ class SnapshotService:
         row's facility in its grant, and an *unassigned* row (``facility_id IS NULL``)
         is refused rather than passed, since no grant can cover it. Mirrors
         ``PvService._require_facility_write`` — a snapshot has at most one facility, so
-        "any overlap" degenerates to membership. The refusal names the facility by
-        slug, as the PV gate does; an unassigned row has none to name."""
+        "any overlap" degenerates to membership.
+
+        An *assigned* row outside the grant is a 404, not a 403 naming its facility:
+        ``GET`` already hides such a row behind ``_in_facility_scope``'s not-found
+        masking, and a 403 naming its facility would leak which facility a hidden
+        snapshot is filed under to a caller that merely guessed its id. An unassigned
+        row has no hidden facility to leak, so it stays a 403 — it's known to exist,
+        just not writable by any restricted key."""
         if self.facility_scope is None:
             return
         if facility_id is None:
@@ -307,8 +314,7 @@ class SnapshotService:
                 f"API key is scoped to specific facilities; {what} is unassigned and only an unrestricted key may write it"
             )
         if facility_id not in self.facility_scope:
-            slug = await self._facility_slug(facility_id)
-            raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility: {slug}")
+            raise SnapshotNotFound("Snapshot not found")
 
     async def _facility_slug(self, facility_id: str | None) -> str | None:
         """A stored facility id as the slug reported on the wire."""
@@ -371,6 +377,8 @@ class SnapshotService:
             When a bound falls outside ``datetime``'s range once converted to UTC, both
             bounds are given and ``start`` is after ``end``, or the continuation token is
             malformed.
+        FacilityNotFound
+            When ``facility`` names a slug that doesn't exist.
         """
         start = _utc_bound("start", start)
         end = _utc_bound("end", end)
@@ -512,6 +520,7 @@ class SnapshotService:
         created_by: str | None = None,
         progress_callback: Callable | None = None,
         facility_id: str | None = None,
+        pv_cache: PVCacheReader | None = None,
     ) -> SnapshotSummaryDTO:
         """Create a snapshot by reading PVs from EPICS (the hot read path).
 
@@ -522,18 +531,22 @@ class SnapshotService:
         ``facility_id`` lets a caller that already resolved ``data.facility`` pass the id
         straight through. The route does that — it has to resolve the slug anyway to gate
         the write, and passing the id over the job queue avoids re-resolving it.
+
+        With ``pv_cache``, values the worker's PV cache can vouch for are taken from it
+        and only the rest are read live. The stored snapshot has the same shape either
+        way, but a cached value is the PV's last monitor update, which can trail a live
+        read by up to the record's monitor deadband (MDEL).
         """
         logger.info("Creating snapshot: %s", data.title)
         start_time = datetime.now(UTC)
 
         # The snapshot's own facility is a specific node, so this goes through
-        # `get_by_slug`. An unknown slug here is a real input error, not the "matches
-        # nothing" a read filter wants.
+        # `id_by_slug`. An unknown slug here is the same hard `FacilityNotFound` a
+        # read filter naming one now gets, too.
         if facility_id is None and data.facility is not None:
-            facility = await facilities_gateway.get_by_slug(data.facility)
-            if facility is None:
+            facility_id = await facilities_gateway.id_by_slug(data.facility)
+            if facility_id is None:
                 raise FacilityNotFound(f"Facility '{data.facility}' not found")
-            facility_id = facility.id
         capture_scope = await facilities_gateway.descendant_ids(facility_id) if facility_id is not None else None
 
         pv_addresses = await self.pv_repo.get_all_addresses(capture_scope)
@@ -555,17 +568,33 @@ class SnapshotService:
         all_addresses = list(set(setpoint_map.keys()) | set(readback_map.keys()))
         logger.info("Reading %d unique EPICS addresses for %d PVs", len(all_addresses), total_pv_count)
 
-        # Rescale address-level progress to PV-level so the user sees "N/total PVs".
-        async def pv_progress_callback(current_addr: int, total_addr: int, _message: str) -> None:
-            pv_progress_count = int((current_addr / total_addr) * total_pv_count) if total_addr > 0 else 0
+        cached: dict[str, Any] = {}
+        to_read = all_addresses
+        if pv_cache is not None:
+            lookup = await pv_cache.lookup(all_addresses)
+            cached, to_read = lookup.hits, lookup.misses
+            if lookup.skipped:
+                logger.warning("PV cache not used, reading every PV live: %s", lookup.skipped)
+            logger.info(
+                "PV cache: %d of %d addresses from cache, %d read live", len(cached), len(all_addresses), len(to_read)
+            )
+        cache_note = f"{len(cached):,} from cache; " if cached else ""
+        total_addresses = len(all_addresses)
+
+        # Rescale address-level progress to PV-level so the user sees "N/total PVs";
+        # cached addresses count as already read.
+        async def pv_progress_callback(current_addr: int, _total_addr: int, _message: str) -> None:
+            done = len(cached) + current_addr
+            pv_progress_count = int((done / total_addresses) * total_pv_count) if total_addresses > 0 else 0
             await progress_callback(
-                pv_progress_count, total_pv_count, f"Read {pv_progress_count:,}/{total_pv_count:,} PVs"
+                pv_progress_count, total_pv_count, f"{cache_note}Read {pv_progress_count:,}/{total_pv_count:,} PVs"
             )
 
-        if progress_callback:
-            epics_values = await self.epics.get_many_with_progress(all_addresses, pv_progress_callback)
+        if progress_callback and to_read:
+            live_values = await self.epics.get_many_with_progress(to_read, pv_progress_callback)
         else:
-            epics_values = await self.epics.get_many(all_addresses)
+            live_values = await self.epics.get_many(to_read) if to_read else {}
+        epics_values = {**cached, **live_values}
 
         logger.info("EPICS read completed in %.2fs", (datetime.now(UTC) - start_time).total_seconds())
 

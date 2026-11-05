@@ -79,6 +79,13 @@ class FacilityService:
         facility = await self.facility_repo.get_by_slug(slug)
         return await self._with_parent(facility) if facility else None
 
+    async def id_by_slug(self, slug: str) -> str | None:
+        """Facility slug -> id, without ``get_by_slug``'s extra query resolving the
+        parent's slug. For a write path that only needs the id, not a ``FacilityDTO``
+        to hand back to the client."""
+        facility = await self.facility_repo.get_by_slug(slug)
+        return facility.id if facility else None
+
     async def _resolve_parent_id(self, parent_slug: str) -> str:
         """Parent *slug* -> its id. Unknown slug is a hard ``FacilityNotFound``."""
         parent = await self.facility_repo.get_by_slug(parent_slug)
@@ -142,7 +149,9 @@ class FacilityService:
         if data.description is not None:
             facility.description = data.description
         facility = await self.facility_repo.update(facility)
-        return await self._with_parent(facility)
+        # A reparent's `data.parent` is already the slug `_resolve_parent_id` just
+        # looked up — skip `_with_parent`'s redundant query for that case.
+        return self._to_dto(facility, data.parent) if data.parent is not None else await self._with_parent(facility)
 
     async def delete(self, facility_id: str) -> bool:
         facility = await self.facility_repo.get_by_id(facility_id)
@@ -169,7 +178,7 @@ class FacilityService:
         a typo'd slug. Facility existence isn't a secret (``GET /v1/facilities`` lists
         them all), so the 404 reveals nothing.
         """
-        if slug is None:
+        if not slug:
             return None
         result = await self.facility_repo.resolve_facility_scope(slug)
         if result is None:
