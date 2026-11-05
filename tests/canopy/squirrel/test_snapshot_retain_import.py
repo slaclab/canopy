@@ -18,6 +18,7 @@ from canopy.squirrel.services.snapshot_service import SnapshotService
 from tests.canopy.squirrel.test_services_snapshot import FakeEpicsIO, _NoHook
 
 CAPTURED = datetime(2026, 3, 1, 8, 30, tzinfo=UTC)
+REPEATED = str(uuid.uuid4())
 
 
 @pytest.fixture
@@ -237,8 +238,11 @@ async def test_import_reads_a_timestamp_without_offset_as_utc(client: AsyncClien
         {"title": "x" * 256},
         {"values": [{"pvId": "not-a-uuid", "pvName": "EXP:SP"}]},
         {"values": [{"pvId": str(uuid.uuid4()), "pvName": "x" * 256}]},
+        {"values": [{"pvId": REPEATED, "pvName": "A"}, {"pvId": REPEATED, "pvName": "B"}]},
+        {"values": [{"pvId": str(uuid.uuid4()), "pvName": "A", "setpointValue": {"value": 1, "precision": "invalid"}}]},
+        {"values": [{"pvId": str(uuid.uuid4()), "pvName": "A", "readbackValue": {"severity": "high"}}]},
     ],
-    ids=["format", "version", "id", "title", "pv-id", "pv-name"],
+    ids=["format", "version", "id", "title", "pv-id", "pv-name", "repeated-pv-id", "bad-precision", "bad-severity"],
 )
 async def test_import_rejects_a_malformed_bundle(client: AsyncClient, db_session: AsyncSession, change: dict):
     sid, _, _ = await _seed(db_session)
@@ -247,3 +251,16 @@ async def test_import_rejects_a_malformed_bundle(client: AsyncClient, db_session
     r = await client.post("/v1/snapshots/import", headers=WRITE_HEADERS, json=bundle)
 
     assert r.status_code == 422, r.text
+
+
+async def test_a_bundle_repeating_a_known_pv_creates_nothing(client: AsyncClient, db_session: AsyncSession):
+    sid, _, _ = await _seed(db_session)
+    bundle = await _export(client, sid)
+    # Two setpoints for one PV: restore would write whichever it met last.
+    bundle["values"].append({**bundle["values"][1], "setpointValue": {"value": 99}})
+
+    r = await client.post("/v1/snapshots/import", headers=WRITE_HEADERS, json=bundle)
+
+    assert r.status_code == 422
+    assert bundle["values"][1]["pvId"] in r.text
+    assert (await client.get("/v1/snapshots", headers=READ_HEADERS)).json()["totalCount"] == 1

@@ -353,6 +353,15 @@ class SnapshotService:
         unrestricted key, matching ``list_snapshots``'s filter."""
         return self.facility_scope is None or (facility_id is not None and facility_id in self.facility_scope)
 
+    def _pv_in_scope(self, pv_facility_ids: set[str]) -> bool:
+        """Whether the key may restore, or import, a value of a PV assigned to ``pv_facility_ids``.
+
+        An unrestricted key may use any PV. A restricted key needs one shared facility; an
+        unassigned PV has none to share, and facility-filtered reads hide it from such a
+        key too.
+        """
+        return self.facility_scope is None or bool(pv_facility_ids & self.facility_scope)
+
     async def list_snapshots(
         self,
         title: str | None = None,
@@ -742,10 +751,9 @@ class SnapshotService:
         allowed, skipped = [], []
         for pv_id in candidate_ids:
             assigned = by_pv.get(pv_id, set())
-            # Same rule as `_require_facility_write`: a restricted key needs one shared
-            # facility; an unassigned PV has none to share, so it is skipped rather than
-            # let through — a restore is a real EPICS setpoint write, not a filtered read.
-            (allowed if assigned & self.facility_scope else skipped).append(pv_id)
+            # An unassigned PV is skipped rather than let through: a restore is a real EPICS
+            # setpoint write, not a filtered read.
+            (allowed if self._pv_in_scope(assigned) else skipped).append(pv_id)
         return allowed, skipped
 
     async def export_bundle(self, snapshot_id: str) -> SnapshotBundleDTO | None:
@@ -796,6 +804,24 @@ class SnapshotService:
             values=values,
         )
 
+    async def _importable_pv_ids(self, pv_ids: list[str]) -> set[str]:
+        """The PV ids of a bundle that an import may keep values for.
+
+        A PV must exist here (deleted PVs included: a mirror replicates its primary's PV
+        rows, ids and all), and the key must be able to restore it (``_pv_in_scope``).
+        The new snapshot's export shows each value's PV addresses, so a value of a PV the
+        key can't see would reveal it. Every rule is a condition in the loop below.
+        """
+        known = await self.pv_repo.get_existing_ids(pv_ids, include_deleted=True)
+        assigned = await self.pv_repo.facility_ids_for_many(sorted(known)) if self.facility_scope is not None else {}
+        importable = set()
+        for pv_id in known:
+            facility_ids = assigned.get(pv_id, set())
+            if not self._pv_in_scope(facility_ids):
+                continue
+            importable.add(pv_id)
+        return importable
+
     async def import_bundle(self, bundle: SnapshotBundleDTO) -> SnapshotImportResultDTO:
         """Create a new snapshot from a bundle exported by another instance.
 
@@ -803,7 +829,9 @@ class SnapshotService:
         recent; ``imported_from`` records the bundle's snapshot id, and each value keeps
         its capture ``timestamp``. Values are matched to PVs here by ``pv_id``, deleted
         PVs included: a history mirror replicates its primary's PV rows, ids and all.
-        Values whose PV isn't here are skipped and listed. Nothing is read from EPICS.
+        Values whose PV isn't here, or that the key couldn't restore, are skipped and
+        listed alike, so the answer doesn't reveal another facility's PV. Nothing is read
+        from EPICS.
         The new snapshot takes the bundle's facility, which the key must be able to
         write, as it would for a capture; a bundle without one imports unassigned.
 
@@ -820,7 +848,7 @@ class SnapshotService:
         Raises
         ------
         BadRequest
-            When the bundle has values and none of their PVs exist here.
+            When the bundle has values and none of their PVs can be imported here.
         FacilityNotFound
             When the bundle names a facility this instance doesn't have.
         InsufficientFacilityAccess
@@ -834,8 +862,7 @@ class SnapshotService:
             facility_id = facility.id
         self._require_facility_for_create(facility_id, bundle.facility)
 
-        pv_ids = sorted({str(value.pv_id) for value in bundle.values})
-        known = await self.pv_repo.get_existing_ids(pv_ids, include_deleted=True)
+        known = await self._importable_pv_ids(sorted({str(value.pv_id) for value in bundle.values}))
         rows: list[dict] = []
         skipped: list[SkippedValueDTO] = []
         for value in bundle.values:

@@ -15,6 +15,7 @@ from canopy.squirrel.prune import prune
 from canopy.squirrel.data.models import Pv, Snapshot, SnapshotValue
 from canopy.core.replication.gate import GateResult
 from canopy.core.replication.config import PruneConfig
+from tests.canopy.squirrel.test_facility_enforcement import _seed_hierarchy
 
 NOW = datetime(2026, 10, 1, tzinfo=UTC)
 PASS = GateResult()
@@ -39,7 +40,7 @@ def _gate(*results: GateResult):
 
 
 async def _seed(maker, **snapshots: dict) -> dict[str, str]:
-    """Commit snapshots named by keyword, each ``{"age_days", "retain"?, "deleted"?, "values"?}``."""
+    """Commit snapshots named by keyword, each ``{"age_days", "retain"?, "deleted"?, "values"?, "facility"?}``."""
     async with maker() as session:
         pv = Pv(setpoint_address="PRUNE:SP")
         session.add(pv)
@@ -51,6 +52,7 @@ async def _seed(maker, **snapshots: dict) -> dict[str, str]:
                 created_at=NOW - timedelta(days=spec["age_days"]),
                 retain=spec.get("retain", False),
                 deleted_at=NOW if spec.get("deleted") else None,
+                facility_id=spec.get("facility"),
             )
             session.add(snap)
             await session.flush()
@@ -147,3 +149,41 @@ async def test_the_cron_task_does_nothing_while_disabled(monkeypatch):
     monkeypatch.setattr(prune_module.asyncpg, "connect", no_connect)
 
     assert await prune_module.prune_snapshots({}) == {"enabled": False}
+
+
+async def test_each_facility_keeps_its_newest_snapshot(maker, db_session):
+    facilities = await _seed_hierarchy(db_session)
+    lone, busy = facilities["lcls-sc"].id, facilities["lcls-nc"].id
+    await _seed(
+        maker,
+        lone_oldest={"age_days": 60, "facility": lone},
+        lone_newest={"age_days": 40, "facility": lone},
+        busy_old={"age_days": 50, "facility": busy},
+        busy_recent={"age_days": 5, "facility": busy},
+        unassigned_old={"age_days": 45},
+    )
+    config = PruneConfig(dry_run=False)
+
+    dry = await prune(maker, window_days=30, config=PruneConfig(), check_gate=_gate(PASS), now=NOW)
+    pruned = await prune(maker, window_days=30, config=config, check_gate=_gate(PASS), now=NOW)
+
+    # Only old snapshots with a newer one in their facility go, so a facility never
+    # loses its last snapshot and stays in use. The dry run counts the same ones.
+    assert (dry["snapshots"], pruned["snapshots"], pruned["complete"]) == (3, 3, True)
+    assert (await _left(maker))[0] == {"lone_newest", "busy_recent"}
+
+
+async def test_a_deleted_or_retained_newer_snapshot_still_counts(maker, db_session):
+    facilities = await _seed_hierarchy(db_session)
+    a, b = facilities["lcls-sc"].id, facilities["lcls-nc"].id
+    await _seed(
+        maker,
+        a_old={"age_days": 60, "facility": a},
+        a_deleted={"age_days": 50, "facility": a, "deleted": True},
+        b_old={"age_days": 60, "facility": b},
+        b_retained={"age_days": 50, "facility": b, "retain": True},
+    )
+
+    await prune(maker, window_days=30, config=PruneConfig(dry_run=False), check_gate=_gate(PASS), now=NOW)
+
+    assert (await _left(maker))[0] == {"a_deleted", "b_retained"}
