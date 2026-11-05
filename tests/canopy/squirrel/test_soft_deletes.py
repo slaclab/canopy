@@ -4,13 +4,18 @@ API tests go through the squirrel sub-app; the restore and capture tests drive
 ``SnapshotService`` with the fake EPICS adapter from ``test_services_snapshot``.
 """
 
+import asyncio
 from datetime import UTC, datetime
+from contextlib import asynccontextmanager
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from canopy.core.errors import BadRequest
+from canopy.squirrel.errors import PvNotFound, PvAlreadyExists
+from canopy.squirrel.schemas.pv import NewPVElementDTO
 from canopy.squirrel.data.models import Pv, Snapshot, SnapshotValue
 from tests.canopy.squirrel.conftest import READ_HEADERS, WRITE_HEADERS
 from canopy.squirrel.schemas.snapshot import NewSnapshotDTO, RestoreRequestDTO
@@ -249,3 +254,97 @@ async def test_capture_skips_deleted_pvs(db_session: AsyncSession):
     )
 
     assert summary.pv_count == 1
+
+
+# --- concurrent requests -------------------------------------------------------- #
+
+
+@asynccontextmanager
+async def _race(test_engine, first_call, second_call):
+    """Run ``first_call`` in one session, then start ``second_call`` in another.
+
+    Yields once the second is shown to be waiting on the first's row lock, with a
+    ``commit`` that finishes the first and returns the second's outcome. Both sessions
+    are rolled back and closed however the test ends, so no lock outlives it.
+    """
+    maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    first, second = maker(), maker()
+    task = None
+    try:
+        await first_call(first)
+        task = asyncio.create_task(second_call(second))
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), 0.5)
+
+        async def commit():
+            await first.commit()
+            return await asyncio.gather(task, return_exceptions=True)
+
+        yield commit
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        for session in (second, first):
+            await session.rollback()
+            await session.close()
+
+
+async def _deleted_readback_pv(db_session: AsyncSession, address: str) -> Pv:
+    pv = Pv(readback_address=address)
+    db_session.add(pv)
+    await db_session.commit()
+    assert await PvService(db_session).delete(pv.id)
+    await db_session.commit()
+    return pv
+
+
+@pytest.mark.parametrize("bulk", [False, True], ids=["single", "bulk"])
+async def test_two_registrations_of_a_deleted_pv_bring_it_back_once(test_engine, db_session, bulk):
+    # A readback-only PV has no unique address, so only the row lock stops a duplicate.
+    pv = await _deleted_readback_pv(db_session, "RACE:RB")
+
+    async def register(session, description):
+        data = NewPVElementDTO(readback_address="RACE:RB", description=description)
+        service = PvService(session)
+        return await (service.create_many([data]) if bulk else service.create(data))
+
+    async with _race(test_engine, lambda s: register(s, "first"), lambda s: register(s, "second")) as commit:
+        [outcome] = await commit()
+
+    assert isinstance(outcome, PvAlreadyExists)
+    rows = await db_session.execute(
+        select(Pv.id, Pv.description, Pv.deleted_at).where(Pv.readback_address == "RACE:RB")
+    )
+    assert [tuple(row) for row in rows] == [(pv.id, "first", None)]
+
+
+async def test_a_delete_in_progress_keeps_a_meta_pv_marker_off_the_pv(test_engine, db_session):
+    pv = Pv(setpoint_address="RACE:META:SP")
+    db_session.add(pv)
+    await db_session.commit()
+
+    async with _race(
+        test_engine,
+        lambda s: PvService(s).delete(pv.id),
+        lambda s: PvService(s).add_meta_pv("RACE:META:SP", "Meta"),
+    ) as commit:
+        [outcome] = await commit()
+
+    assert isinstance(outcome, PvNotFound)
+
+
+async def test_a_meta_pv_marker_in_progress_blocks_the_delete(test_engine, db_session):
+    pv = Pv(setpoint_address="RACE:META2:SP")
+    db_session.add(pv)
+    await db_session.commit()
+
+    async with _race(
+        test_engine,
+        lambda s: PvService(s).add_meta_pv("RACE:META2:SP", "Meta"),
+        lambda s: PvService(s).delete(pv.id),
+    ) as commit:
+        [outcome] = await commit()
+
+    assert isinstance(outcome, BadRequest) and "meta-PV" in outcome.detail
+    assert await db_session.scalar(select(Pv.deleted_at).where(Pv.id == pv.id)) is None
