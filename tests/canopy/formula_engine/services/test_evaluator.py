@@ -66,7 +66,7 @@ class TestEvaluateScalar:
     @pytest.mark.parametrize("expression", ["{a} & 1", "~{a}"])
     async def test_bitwise_rejects_nonfinite_operands(self, parser, expression):
         """Reject NaN operands in binary and unary bitwise expressions."""
-        from canopy.fox.errors import FormulaTypeError
+        from canopy.formula_engine.errors import FormulaTypeError
 
         parsed = parser.parse(expression, {"a": "PV:A"})
         with pytest.raises(FormulaTypeError, match="finite"):
@@ -75,7 +75,7 @@ class TestEvaluateScalar:
     @pytest.mark.parametrize("shift", [-1, 64])
     async def test_bitwise_rejects_out_of_range_shift_counts(self, parser, shift):
         """Reject negative and oversized scalar bit-shift counts."""
-        from canopy.fox.errors import FormulaTypeError
+        from canopy.formula_engine.errors import FormulaTypeError
 
         parsed = parser.parse(f"{{a}} << {shift}", {"a": "PV:A"})
         with pytest.raises(FormulaTypeError, match="shift counts"):
@@ -154,7 +154,7 @@ class TestEvaluateArray:
 
     async def test_int_array_rejects_nonfinite_values(self, parser):
         """Reject non-finite elements when converting an array to integers."""
-        from canopy.fox.errors import FormulaTypeError
+        from canopy.formula_engine.errors import FormulaTypeError
 
         parsed = parser.parse("int({a})", {"a": "PV:A"})
         with pytest.raises(FormulaTypeError, match="NaN or infinity"):
@@ -169,7 +169,7 @@ class TestEvaluateArray:
     )
     async def test_bitwise_array_rejects_invalid_integer_operands(self, parser, values, message):
         """Reject non-finite and out-of-range values in bitwise array operands."""
-        from canopy.fox.errors import FormulaTypeError
+        from canopy.formula_engine.errors import FormulaTypeError
 
         parsed = parser.parse("{a} & 1", {"a": "PV:A"})
         with pytest.raises(FormulaTypeError, match=message):
@@ -177,7 +177,7 @@ class TestEvaluateArray:
 
     async def test_int_array_rejects_values_outside_int64(self, parser):
         """Reject array integer conversions that exceed the signed 64-bit range."""
-        from canopy.fox.errors import FormulaTypeError
+        from canopy.formula_engine.errors import FormulaTypeError
 
         parsed = parser.parse("int({a})", {"a": "PV:A"})
         with pytest.raises(FormulaTypeError, match="signed 64-bit"):
@@ -185,7 +185,7 @@ class TestEvaluateArray:
 
     async def test_str_array_is_rejected(self, parser):
         """Reject string conversion on arrays because string results are scalar-only."""
-        from canopy.fox.errors import FormulaTypeError
+        from canopy.formula_engine.errors import FormulaTypeError
 
         parsed = parser.parse("str({a})", {"a": "PV:A"})
         with pytest.raises(FormulaTypeError, match="scalar"):
