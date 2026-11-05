@@ -391,8 +391,8 @@ async def test_drift_check_finds_what_the_mirror_lost(pair: Pair):
         await mirror.close()
 
 
-async def test_drift_check_rereads_what_differed_after_settling(pair: Pair):
-    """The re-check runs in new transactions, so a mirror that was only behind comes out in step."""
+async def test_drift_check_waits_for_a_mirror_that_is_only_behind(pair: Pair):
+    """Lag is never drift: not checked while the mirror can't confirm, in step once it catches up."""
     p = pair
     await _subscribed(p)
     name = f"canopy_history_{p.instance}"
@@ -400,15 +400,74 @@ async def test_drift_check_rereads_what_differed_after_settling(pair: Pair):
     try:
         await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
         await p.pub.execute("INSERT INTO squirrel.snapshot (id, title) VALUES (gen_random_uuid(), 'Not applied yet')")
-        behind = await drift_check(primary, mirror, instance=p.instance)
-        assert list(behind["drift"]) == ["squirrel.snapshot"]
+        behind = await drift_check(primary, mirror, instance=p.instance, settle_s=1)
+        assert behind["status"] == "not_checked" and not behind["drift"]
+        assert list(behind["inconclusive"]) == ["squirrel.snapshot"]
 
-        async def catch_up():
+        async def enable_soon():
+            await asyncio.sleep(1)
             await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" ENABLE')
-            await eventually(lambda: _in_step(p))
 
-        settled = await drift_check(primary, mirror, instance=p.instance, settle=catch_up)
-        assert settled["in_step"] and settled["rechecked"] == ["squirrel.snapshot"]
+        enabling = asyncio.create_task(enable_soon())
+        caught_up = await drift_check(primary, mirror, instance=p.instance, settle_s=30)
+        await enabling
+        assert caught_up["status"] == "in_step", caught_up
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+async def _new_tag(p: Pair) -> None:
+    await p.pub.execute(
+        "INSERT INTO squirrel.tag (id, name, group_id) SELECT gen_random_uuid(), $1, id FROM squirrel.tag_group LIMIT 1",
+        uuid4().hex,
+    )
+
+
+async def test_drift_check_retries_when_the_primary_changes_mid_comparison(pair: Pair):
+    """A write between the reads makes one comparison inconclusive; real drift still shows on the next."""
+    p = pair
+    ids = await _subscribed(p)
+    await p.sub_admin.execute("DELETE FROM squirrel.tag WHERE id = $1", ids["tag_b"])  # the mirror loses a row
+    primary, mirror = await _drift_connections(p)
+    try:
+        hooked = 0
+
+        async def write_once():
+            nonlocal hooked
+            hooked += 1
+            if hooked == 1:
+                await _new_tag(p)
+
+        report = await drift_check(primary, mirror, instance=p.instance, after_mirror_read=write_once)
+        assert report["status"] == "drift" and report["attempts"] == 2
+        assert list(report["drift"]) == ["squirrel.tag"]
+
+        async def write_every_time():
+            await _new_tag(p)
+
+        churned = await drift_check(primary, mirror, instance=p.instance, after_mirror_read=write_every_time)
+        assert churned["status"] == "not_checked" and not churned["drift"]
+        assert churned["attempts"] == 3 and list(churned["inconclusive"]) == ["squirrel.tag"]
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+async def test_drift_check_reports_a_published_table_not_yet_subscribed(pair: Pair):
+    p = pair
+    await _subscribed(p)
+    for conn in (p.sub, p.pub):
+        await conn.execute("CREATE TABLE squirrel.zz_probe (id int PRIMARY KEY)")
+    probe = ReplicationRegistry(
+        tables={**REGISTRY.tables, "squirrel.zz_probe": TableClass.REFERENCE}, publications=REGISTRY.publications
+    )
+    await publish(p.pub, role="primary", config=p.config, registry=probe)
+    primary, mirror = await _drift_connections(p)
+    try:
+        report = await drift_check(primary, mirror, instance=p.instance, registry=probe)
+        assert report["status"] == "not_checked" and not report["drift"]
+        assert report["skipped"] == {"squirrel.zz_probe": "published but not subscribed yet (run refresh)"}
     finally:
         await primary.close()
         await mirror.close()
@@ -429,16 +488,16 @@ async def test_drift_check_command_exit_status(pair: Pair):
         "CANOPY_REPLICATION__READER_DSN": reader_dsn,
     }
 
-    def drift_check_command(**overrides: str) -> subprocess.CompletedProcess:
+    def drift_check_command(settle: str = "10", **overrides: str) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, "-m", "canopy.core.replication", "drift-check", "--settle", "0"],
+            [sys.executable, "-m", "canopy.core.replication", "drift-check", "--settle", settle],
             env=env | overrides,
             capture_output=True,
             text=True,
             timeout=120,
         )
 
-    in_step = drift_check_command()
+    in_step = drift_check_command(settle="0")
     assert in_step.returncode == 0, in_step.stderr
     assert json.loads(in_step.stdout)["in_step"] is True
 
