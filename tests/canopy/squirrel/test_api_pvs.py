@@ -1,21 +1,40 @@
 """API tests for the PV registry + meta-PV endpoints."""
 
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from canopy.core.facilities.models import Facility
 from tests.canopy.squirrel.conftest import READ_HEADERS, WRITE_HEADERS
 
 
-async def test_create_pv_camelcase_wire(client: AsyncClient):
+async def _seed_facility(session: AsyncSession, slug: str) -> Facility:
+    facility = Facility(slug=slug, name=slug.upper())
+    session.add(facility)
+    await session.commit()
+    return facility
+
+
+async def test_create_pv_camelcase_wire(client: AsyncClient, db_session: AsyncSession):
+    await _seed_facility(db_session, "lcls")
+    await _seed_facility(db_session, "facet")
+
     r = await client.post(
         "/v1/pvs",
         headers=WRITE_HEADERS,
-        json={"setpointAddress": "DEV:SP", "readbackAddress": "DEV:RB", "device": "DEV", "absTolerance": 0.5},
+        json={
+            "setpointAddress": "DEV:SP",
+            "readbackAddress": "DEV:RB",
+            "device": "DEV",
+            "absTolerance": 0.5,
+            "facilities": ["facet", "lcls"],
+        },
     )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["setpointAddress"] == "DEV:SP"
     assert body["absTolerance"] == 0.5
     assert {"id", "createdDate", "lastModifiedDate", "tags"} <= body.keys()
+    assert body["facilities"] == ["facet", "lcls"]  # reported by slug, not id
 
 
 async def test_create_requires_an_address(client: AsyncClient):
@@ -115,10 +134,12 @@ async def test_paged_tag_filter(client: AsyncClient, sample_tag_group: dict):
     assert addrs == {"TAGGED:SP"}
 
 
-async def test_multi_create(client: AsyncClient):
-    data = [{"setpointAddress": f"BULK:{i}:SP", "device": f"D{i}"} for i in range(3)]
+async def test_multi_create(client: AsyncClient, db_session: AsyncSession):
+    await _seed_facility(db_session, "lcls")
+    data = [{"setpointAddress": f"BULK:{i}:SP", "device": f"D{i}", "facilities": ["lcls"]} for i in range(3)]
     r = await client.post("/v1/pvs/multi", headers=WRITE_HEADERS, json=data)
     assert r.status_code == 200 and len(r.json()) == 3
+    assert all(pv["facilities"] == ["lcls"] for pv in r.json())  # reported by slug, not id
 
 
 async def test_update_and_delete_pv(client: AsyncClient, sample_pv: dict):

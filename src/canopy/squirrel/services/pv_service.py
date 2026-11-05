@@ -115,16 +115,24 @@ class PvService:
     def _can_write(self, row_facility_ids: set[str]) -> bool:
         """Whether the calling key may write an *existing* row with these facilities.
 
-        Allowed when the key is unrestricted, or when the row's facilities overlap the
-        grant *at all* — holding one of a PV's facilities is enough. An *unassigned* row
-        (``row_facility_ids`` empty) is refused for a restricted key: no grant can cover
-        a row with no facility, so only an unrestricted key may touch one, mirroring the
-        read side once ``_in_facility_scope``-style filtering excludes it from a
-        restricted key's list. Mint-time assignment is a separate, looser check — see
-        ``_require_facility_for_create`` — since minting new unscoped data is a
-        different act from mutating an existing unassigned row.
+        **Policy: a write requires holding every facility the row is assigned to, not
+        just one.** A PV can belong to several facilities (``pv_facility`` is many-to-
+        many); a key holding only one of them must not be able to mutate or delete the
+        row on behalf of a facility it was never granted — update, delete, and any
+        other write go through this same full-containment check, not a looser
+        "overlap" one. (A snapshot has at most one facility, so this degenerates to
+        plain membership there — see ``SnapshotService._require_facility_write``.)
+
+        Allowed when the key is unrestricted. An *unassigned* row (``row_facility_ids``
+        empty) is refused for a restricted key: no grant can cover a row with no
+        facility, so only an unrestricted key may touch one, mirroring the read side
+        once ``_in_facility_scope``-style filtering excludes it from a restricted key's
+        list. Mint-time assignment uses the separate create policy in
+        ``_require_facility_for_create``.
         """
-        return self.facility_scope is None or bool(row_facility_ids & self.facility_scope)
+        if self.facility_scope is None:
+            return True
+        return bool(row_facility_ids) and row_facility_ids.issubset(self.facility_scope)
 
     async def _require_facility_write(self, row_facility_ids: set[str], what: str) -> None:
         """Gate a write on the calling key's facility grant (see ``_can_write``).
@@ -146,9 +154,8 @@ class PvService:
     async def _require_facility_for_create(self, facility_ids: set[str], what: str) -> None:
         """Gate the facilities a *new* row is being created with.
 
-        A restricted key must name at least one facility it holds — unlike
-        ``_require_facility_write``, an empty ``facility_ids`` is refused outright here
-        rather than treated as "no row to check," since a restricted key minting an
+        A restricted key must hold at least one of the requested facilities. An empty
+        ``facility_ids`` is refused outright, since a restricted key minting an
         unassigned row would then be unable to reach it again under
         ``_require_facility_write``'s unrestricted-only rule for unassigned rows.
         Mirrors the equivalent gate in ``SnapshotService`` routes for snapshot creation.
@@ -166,11 +173,12 @@ class PvService:
 
     async def _require_facility_containment(self, facility_ids: set[str], what: str) -> None:
         """Gate a specific set of facilities against the grant, requiring every one of
-        them to be held — stricter than ``_require_facility_write``'s "any overlap"
-        test. Used where ``facility_ids`` describes a delta (facilities being added or
-        removed) rather than "does this row belong to me at all": a key holding only
-        one of several facilities must not be able to add or remove the others just
-        because it can touch the row through one it does hold.
+        them to be held. Used where ``facility_ids`` describes a delta (facilities
+        being added or removed) rather than "does this row belong to me at all" (see
+        ``_require_facility_write``, which applies the same full-containment rule to a
+        row's current facilities): a key holding only one of several facilities must
+        not be able to add or remove the others just because it can touch the row
+        through one it does hold.
         """
         if self.facility_scope is None or not facility_ids:
             return
@@ -182,9 +190,9 @@ class PvService:
         """Facility slugs -> ``{slug: id}``, in one round trip regardless of how many
         slugs are named (a CSV import can name dozens).
 
-        An unknown slug is a hard ``FacilityNotFound``: degrading to "matches nothing"
-        is right for a *filter*, wrong when the facility is the field being written.
-        Every unknown slug is named at once, not just the first alphabetically.
+        An unknown slug is a hard ``FacilityNotFound``, same as a read filter naming
+        one now gets. Every unknown slug is named at once, not just the first
+        alphabetically.
         """
         resolved = await facilities_gateway.ids_by_slug(slugs)
         if unknown := set(slugs) - resolved.keys():
@@ -338,7 +346,9 @@ class PvService:
         if facility_ids or existing is not None:
             # A PV brought back takes the new registration's facilities, like its tags.
             await self.pv_repo.set_facilities(pv.id, facility_ids)
-        return (await self._to_dtos([pv], {pv.id: facility_ids}))[0]
+        # The request already named these facilities by slug — skip `_to_dtos`'s
+        # id-to-slug round trip and report them straight back.
+        return self._to_dto(pv, sorted(set(data.facilities)))
 
     async def create_many(self, data_list: list[NewPVElementDTO]) -> list[PVElementDTO]:
         """Register many PVs in one import.
@@ -382,11 +392,12 @@ class PvService:
                 raise BadRequest(f"Duplicate {kind} addresses in import: {sorted(duplicates[kind])[:10]}")
 
         # Resolve the whole import's distinct slugs up front — one gateway round trip
-        # each instead of one per (row, slug) pair — but gate per row: collapsing the
-        # import into one set and requiring only that it overlap the grant would let a
-        # row assigned solely to an out-of-scope facility ride in alongside one the key
-        # can reach. Gated before the existence checks below, for the same reason as
-        # `create`: an out-of-scope row's existence must not leak through a
+        # each instead of one per (row, slug) pair — but gate per row, with full
+        # overlap of each row's own facilities (see `_require_facility_for_create`):
+        # collapsing the import into one set and requiring only that it overlap the
+        # grant would let a row with no facility the key can reach ride in alongside
+        # one the key can reach. Gated before the existence checks below, for the same
+        # reason as `create`: an out-of-scope row's existence must not leak through a
         # `PvAlreadyExists` message before the facility refusal.
         #
         # Check every row before refusing, so one 403 names all the facilities the import
@@ -400,7 +411,7 @@ class PvService:
             row_facility_ids = {ids_by_slug[slug] for slug in data.facilities}
             if self.facility_scope is not None and not (row_facility_ids & self.facility_scope):
                 address = setpoint_address or readback_address or config_address
-                refused.append((row, address, sorted(data.facilities)))
+                refused.append((row, address, sorted(set(data.facilities))))
         if refused:
             unreachable = sorted({slug for _, _, slugs in refused for slug in slugs})
             rows = "; ".join(
@@ -417,7 +428,7 @@ class PvService:
                 extra={"refused_rows": len(refused), "total_rows": len(normalized_records), "facilities": unreachable},
             )
             raise InsufficientFacilityAccess(
-                f"API key is not scoped to facility(s) {', '.join(unreachable) or '(none named)'}. "
+                f"API key is not scoped to facility(s): {', '.join(unreachable) or '(none named)'}. "
                 f"{len(refused)} of {len(normalized_records)} rows name no facility it can write: {rows}"
             )
 
@@ -475,7 +486,9 @@ class PvService:
         # A PV brought back takes the new registration's facilities, like its tags.
         await self.pv_repo.clear_facilities_many([pv.id for pv in deleted.values()])
         await self.pv_repo.add_facilities_many(assignments)
-        return await self._to_dtos(pvs, dict(assignments))
+        # Each row's own payload already named its facilities by slug — skip the
+        # id-to-slug round trip `_to_dtos` would otherwise make.
+        return [self._to_dto(pv, sorted(set(data.facilities))) for pv, (_, _, _, data) in zip(pvs, normalized_records)]
 
     async def update(self, pv_id: str, data: UpdatePVElementDTO) -> PVElementDTO | None:
         pv = await self.pv_repo.get_by_id(pv_id)
