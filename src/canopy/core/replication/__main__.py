@@ -93,6 +93,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TIME",
         help="ISO 8601 time (UTC if no zone), no later than the newest snapshot the mirror holds",
     )
+    fill.add_argument(
+        "--cut-wait",
+        type=float,
+        default=reseed.CUT_WAIT_S,
+        metavar="SECONDS",
+        help="how long to keep trying for an exact cut while the primary writes, before refusing (default 60)",
+    )
     return parser
 
 
