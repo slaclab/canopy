@@ -181,8 +181,11 @@ async def import_snapshot(
 
     Meant for bringing a snapshot back from a history mirror so it can be restored here.
     The new snapshot has a new id, today's creation time, a "Restored from history" title
-    and ``importedFrom`` set to the bundle's id. Values whose PV id doesn't exist here are
-    left out and listed in ``skipped``; nothing is read from or written to EPICS.
+    and ``importedFrom`` set to the bundle's id. A value is kept only when its PV exists
+    here, the key could restore it, and, for a bundle with a facility, the PV is assigned
+    to that facility or one below it, as for a capture. A PV moved out of the facility
+    since the export is therefore left out. Values left out are listed in ``skipped``;
+    nothing is read from or written to EPICS.
 
     ``createdBy`` stays the original snapshot's; who imported it (the key's name, or the
     user a forward instance sent it for) is logged.

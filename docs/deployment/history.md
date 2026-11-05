@@ -206,7 +206,10 @@ check by name:
 A snapshot older than the window can still be restored on the primary: export it from
 the mirror (`GET /squirrel/v1/snapshots/{id}/export`) and import the bundle on the
 primary (`POST /squirrel/v1/snapshots/import`), which creates a new, recent copy. The
-copy keeps the snapshot's facility, so the import needs a key that can write there. A
+copy keeps the snapshot's facility, so the import needs a key that can write there. It
+takes only values of PVs the key could restore that are still assigned to that facility
+or one below it, as a capture there would; a PV moved to another facility since the
+snapshot was taken is left out and listed in the response's `skipped`. A
 snapshot with `retain` set is never pruned. Prune can't see references held outside
 Canopy, so a service that refers to snapshots, such as an optimization service's runs,
 sets `retain` on the ones it needs.
