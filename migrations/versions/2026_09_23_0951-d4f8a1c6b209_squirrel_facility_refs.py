@@ -8,7 +8,7 @@ it through ``core.facilities.gateway``, so neither schema's migrations depend on
 the other's.
 
 Revision ID: d4f8a1c6b209
-Revises: aecc42bb60da
+Revises: ca592f659279
 Create Date: 2026-09-23 09:51:00.000000
 
 """
@@ -20,7 +20,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "d4f8a1c6b209"
-down_revision: str | None = "aecc42bb60da"
+down_revision: str | None = "ca592f659279"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

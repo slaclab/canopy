@@ -153,6 +153,13 @@ def fake_keys():
             modules=frozenset({"squirrel"}),
             facilities=frozenset({"lcls"}),
         ),
+        "test-write-only": APIKey(
+            token="test-write-only",
+            read=False,
+            write=True,
+            modules=frozenset({WILDCARD}),
+            facilities=frozenset({"lcls"}),
+        ),
     }
 
     class FakeRegistry:

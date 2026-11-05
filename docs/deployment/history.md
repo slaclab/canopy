@@ -223,6 +223,7 @@ test fails when a new route is in neither list.
 | Snapshot restore, Hare PV write | No: they change the machine |
 | API keys | No: each instance manages its own |
 | Facilities | No: define them on the primary; the mirror copies them |
+| E-log entries and attachments | No: they post to the external e-log |
 
 Anything not forwarded is refused as on a mirror, with 403 `read_only_instance`. A
 change to a snapshot older than `CANOPY_FORWARD__PRIMARY_WINDOW_DAYS` is refused with

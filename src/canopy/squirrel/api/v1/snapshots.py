@@ -62,7 +62,7 @@ async def list_snapshots(
     ] = None,
     pageSize: int = Query(100, ge=1, le=1000),
     continuationToken: str | None = Query(None, description="Token from the previous page; omit for the first"),
-    facility: str | None = Query(None, description="Facility slug — includes descendants"),
+    facility: str | None = Query(None, description="Facility slug — includes descendants; 404 if unknown"),
 ) -> PagedResult[SnapshotSummaryDTO]:
     """List snapshots newest first, optionally filtered by title, tag IDs, creation time, and/or facility.
 
@@ -90,7 +90,7 @@ async def list_snapshots(
     continuationToken : str | None
         The previous page's ``continuationToken``; omit it for the first page.
     facility : str | None
-        A facility slug to filter by — includes descendants.
+        A facility slug to filter by — includes descendants; 404 if unknown.
 
     Returns
     -------
@@ -103,6 +103,8 @@ async def list_snapshots(
     BadRequest
         When both bounds are given and ``start`` is after ``end``, or the continuation
         token is malformed.
+    FacilityNotFound
+        When ``facility`` names a slug that doesn't exist.
     """
     return await service.list_snapshots(
         title=title,
@@ -116,7 +118,25 @@ async def list_snapshots(
 
 
 @router.post("", dependencies=[Security(require_write_access)])
-async def create_snapshot(data: NewSnapshotDTO, actor: ActorDep, key_scope: FacilityScopeDep) -> JobCreatedDTO:
+async def create_snapshot(
+    data: NewSnapshotDTO,
+    actor: ActorDep,
+    key_scope: FacilityScopeDep,
+    use_cache: Annotated[
+        bool,
+        Query(
+            alias="useCache",
+            description=(
+                "Take values from the worker's PV cache where it can vouch for them and read only the rest "
+                "live from EPICS. The cache must be enabled on the worker (CANOPY_SQUIRREL__PV_CACHE__ENABLED); "
+                "without a live cache every PV is read live, as with useCache=false. Cached values are what "
+                "each PV's monitor last posted: alarm changes are posted at once, but a value change smaller "
+                "than the record's monitor deadband (MDEL) isn't, so a cached value can trail a live read by "
+                "up to that deadband, with the timestamp of the value it holds."
+            ),
+        ),
+    ] = False,
+) -> JobCreatedDTO:
     """Enqueue a snapshot of the facility's PVs (every PV if no facility is given). The
     worker reads EPICS and persists it.
 
@@ -127,10 +147,9 @@ async def create_snapshot(data: NewSnapshotDTO, actor: ActorDep, key_scope: Faci
     # identity crosses the Arq boundary, and a refused write must not become a queued job.
     facility_id = None
     if data.facility is not None:
-        facility = await facilities_gateway.get_by_slug(data.facility)
-        if facility is None:
+        facility_id = await facilities_gateway.id_by_slug(data.facility)
+        if facility_id is None:
             raise FacilityNotFound(f"Facility '{data.facility}' not found")
-        facility_id = facility.id
 
     if key_scope is not None:
         # A facility-restricted key must name a facility it holds. Unlike mutating an
@@ -141,12 +160,15 @@ async def create_snapshot(data: NewSnapshotDTO, actor: ActorDep, key_scope: Faci
         if facility_id not in key_scope:
             raise InsufficientFacilityAccess(f"API key is not scoped to facility: {data.facility}")
 
+    # use_cache goes to the job only when set, so a plain snapshot asks nothing new of the worker.
+    extra = {"use_cache": True} if use_cache else {}
     job_id = await jobs_gateway.enqueue(
         "create_snapshot_task",
         title=data.title,
         description=data.description,
         facility_id=facility_id,
         created_by=actor,
+        **extra,
     )
     return JobCreatedDTO(job_id=job_id, status_url=f"/jobs/v1/{job_id}")
 
