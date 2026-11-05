@@ -151,3 +151,16 @@ def metric_samples(status: dict | None) -> dict[tuple[str, frozenset], float]:
         for family in text_string_to_metric_families(generate_latest(registry).decode())
         for sample in family.samples
     }
+
+
+async def direct_grants(conn: asyncpg.Connection, role: str, table: str) -> set[str]:
+    """The privileges granted on ``table`` to ``role`` itself, ignoring inherited ones."""
+    rows = await conn.fetch(
+        """
+        SELECT a.privilege_type FROM pg_class c, aclexplode(c.relacl) a
+        WHERE c.oid = $2::regclass AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = $1)
+        """,
+        role,
+        table,
+    )
+    return {row["privilege_type"] for row in rows}
