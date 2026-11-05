@@ -23,6 +23,13 @@ async def resolve_facility_scope(slug: str | None) -> set[str] | None:
         return await FacilityService(session).resolve_facility_scope(slug)
 
 
+async def descendant_ids(facility_id: str) -> set[str]:
+    """``{facility_id, all descendant facility_ids}`` — ``resolve_facility_scope`` for a
+    caller already holding an id (the snapshot worker, which is handed one)."""
+    async with session_scope() as session:
+        return await FacilityService(session).descendant_ids(facility_id)
+
+
 async def resolve_key_facility_scope(slugs: frozenset[str]) -> set[str] | None:
     """A credential's granted slugs -> union of their descendant id sets, or ``None``
     if unrestricted. See ``FacilityService.resolve_key_facility_scope``.
@@ -37,10 +44,12 @@ async def resolve_key_facility_scope(slugs: frozenset[str]) -> set[str] | None:
 async def resolve_effective_scope(slug: str | None, key_scope: set[str] | None) -> set[str] | None:
     """Compose a request's ``?facility=`` filter with the calling key's grant.
 
-    Both sides use the same sentinel — ``None`` is "no restriction from this side",
-    ``set()`` is "restricted to nothing" — so composing is a plain intersection with
-    ``None`` as the identity. An empty result means the query asked for a facility the
-    key isn't granted, and the caller returns zero rows rather than everything.
+    Both sides share the ``None`` sentinel for "no restriction from this side", so
+    composing is a plain intersection with ``None`` as the identity. ``key_scope`` can
+    still be ``set()`` — "restricted to nothing" — but the request side can't: an
+    unknown slug raises ``FacilityNotFound`` instead of resolving to ``set()``. An
+    empty result here means the query asked for a facility the key isn't granted, and
+    the caller returns zero rows rather than everything.
     """
     requested = await resolve_facility_scope(slug)
     if requested is None:
@@ -54,11 +63,33 @@ async def get_by_slug(slug: str) -> FacilityDTO | None:
         return await FacilityService(session).get_by_slug(slug)
 
 
+async def id_by_slug(slug: str) -> str | None:
+    """Facility slug -> id, or ``None`` if unknown. Skips ``get_by_slug``'s parent-slug
+    lookup for a caller that only needs the id, not a ``FacilityDTO``."""
+    async with session_scope() as session:
+        return await FacilityService(session).id_by_slug(slug)
+
+
 async def known_slugs(slugs: list[str]) -> set[str]:
     """The subset of ``slugs`` that exist. Used to reject unknown facilities at the
     point a reference to one is *written* (e.g. minting an API key's grant)."""
     async with session_scope() as session:
         return await FacilityService(session).known_slugs(slugs)
+
+
+async def ids_by_slug(slugs: list[str] | set[str]) -> dict[str, str]:
+    """``{slug: id}`` for the subset of ``slugs`` that exist, in one round trip. For a
+    caller resolving many slugs at once (a bulk PV import naming several facilities)
+    instead of one ``get_by_slug`` call per slug."""
+    async with session_scope() as session:
+        return await FacilityService(session).ids_by_slug(slugs)
+
+
+async def slugs_by_id(ids: list[str] | set[str]) -> dict[str, str]:
+    """``{id: slug}`` for the subset of ``ids`` that exist, in one round trip. For a
+    module that stores facility ids but reports facilities by slug."""
+    async with session_scope() as session:
+        return await FacilityService(session).slugs_by_id(ids)
 
 
 def register_in_use_checker(checker: Callable[[str, str], Awaitable[bool]], what: str) -> None:

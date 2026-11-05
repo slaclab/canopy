@@ -12,6 +12,7 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.squirrel.data.models import Pv, Snapshot, SnapshotValue
+from canopy.core.facilities.models import Facility
 from tests.canopy.squirrel.conftest import READ_HEADERS, WRITE_HEADERS
 
 
@@ -22,6 +23,7 @@ async def _seed_snapshot(
     pv: Pv | None = None,
     value: float = 42.0,
     created_at: datetime | None = None,
+    facility_id: str | None = None,
 ) -> str:
     """Insert a snapshot, optionally with one PV value, and return its id.
 
@@ -37,13 +39,15 @@ async def _seed_snapshot(
         Setpoint value recorded for ``pv``.
     created_at : datetime | None
         Explicit creation timestamp; the database default is used when omitted.
+    facility_id : str | None
+        The snapshot's facility, by id.
 
     Returns
     -------
     str
         The id of the seeded snapshot.
     """
-    snap = Snapshot(title=title, description="seeded")
+    snap = Snapshot(title=title, description="seeded", facility_id=facility_id)
     if created_at is not None:
         snap.created_at = created_at
     session.add(snap)
@@ -320,10 +324,15 @@ async def test_get_snapshot_bad_and_missing_uuid(client: AsyncClient):
 
 
 async def test_update_metadata(client: AsyncClient, db_session: AsyncSession):
-    sid = await _seed_snapshot(db_session, "orig")
+    facility = Facility(slug="lcls", name="LCLS")
+    db_session.add(facility)
+    await db_session.commit()
+    sid = await _seed_snapshot(db_session, "orig", facility_id=facility.id)
+
     r = await client.put(f"/v1/snapshots/{sid}", headers=WRITE_HEADERS, json={"title": "new", "description": "d"})
     assert r.status_code == 200
     assert r.json()["title"] == "new" and r.json()["description"] == "d"
+    assert r.json()["facility"] == "lcls"  # reported by slug, not id
 
 
 async def test_compare_self_has_no_differences(client: AsyncClient, db_session: AsyncSession):
@@ -356,13 +365,13 @@ async def test_create_enqueues_job(client: AsyncClient, enqueued: list):
     assert r.status_code == 200
     assert r.json() == {"jobId": "test-job-id", "statusUrl": "/jobs/v1/test-job-id"}
     assert enqueued[0][0] == "create_snapshot_task"
-    assert enqueued[0][2] == {"title": "T", "description": "D"}
+    assert enqueued[0][2] == {"title": "T", "description": "D", "facility_id": None}
 
 
 async def test_create_with_use_cache_asks_the_worker_for_a_cached_snapshot(client: AsyncClient, enqueued: list):
     r = await client.post("/v1/snapshots?useCache=true", headers=WRITE_HEADERS, json={"title": "T", "description": "D"})
     assert r.status_code == 200
-    assert enqueued[0][2] == {"title": "T", "description": "D", "use_cache": True}
+    assert enqueued[0][2] == {"title": "T", "description": "D", "facility_id": None, "use_cache": True}
 
 
 async def test_restore_existing_enqueues_with_pv_ids(client: AsyncClient, db_session: AsyncSession, enqueued: list):
@@ -370,7 +379,7 @@ async def test_restore_existing_enqueues_with_pv_ids(client: AsyncClient, db_ses
     r = await client.post(f"/v1/snapshots/{sid}/restore", headers=WRITE_HEADERS, json={"pvIds": ["p1", "p2"]})
     assert r.status_code == 200 and r.json()["jobId"] == "test-job-id"
     assert enqueued[-1][0] == "restore_snapshot_task"
-    assert enqueued[-1][2] == {"snapshot_id": sid, "pv_ids": ["p1", "p2"]}
+    assert enqueued[-1][2] == {"snapshot_id": sid, "pv_ids": ["p1", "p2"], "skipped_pv_ids": []}
 
 
 async def test_restore_missing_is_404_and_does_not_enqueue(client: AsyncClient, enqueued: list):

@@ -20,6 +20,8 @@ from sqlalchemy.pool import NullPool
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import canopy.squirrel.data.models  # noqa: F401 — register squirrel tables on Base.metadata
+import canopy.core.facilities.models  # noqa: F401 — register core.facility on Base.metadata
+from canopy.core import db
 from canopy.core.db import Base, get_session
 from canopy.squirrel.app import app as squirrel_app
 
@@ -34,8 +36,10 @@ READ_HEADERS = {"X-API-Key": "test-read"}
 WRITE_HEADERS = {"X-API-Key": "test-write"}
 
 # Only manage this module's own schema/tables, so a future persistent module's tables
-# on the shared Base.metadata can't get created/dropped out from under it.
-_SQUIRREL_TABLES = [t for t in Base.metadata.sorted_tables if t.schema == _SCHEMA]
+# on the shared Base.metadata can't get created/dropped out from under it. `core.facility`
+# is the one exception — squirrel's own integration tests seed facilities and filter
+# PVs/snapshots by them, so its table has to exist alongside squirrel's own.
+_SQUIRREL_TABLES = [t for t in Base.metadata.sorted_tables if t.schema in (_SCHEMA, "core")]
 
 
 @pytest.fixture(autouse=True)
@@ -69,12 +73,26 @@ async def ensure_test_db():
 
 
 @pytest_asyncio.fixture
-async def test_engine(ensure_test_db):
-    """A fresh engine + squirrel schema/tables per test (NullPool — no cross-test connections)."""
+async def test_engine(ensure_test_db, monkeypatch):
+    """A fresh engine + squirrel schema/tables per test (NullPool — no cross-test connections).
+
+    Also creates ``core.facility`` (but not the rest of ``core``'s tables) since
+    squirrel's own tests seed facilities and filter PVs/snapshots by them — dropped
+    at the end of the test too, so it never collides with core's own test suite,
+    which manages the ``core`` schema in its own, separate test database session.
+
+    ``core.facilities.gateway`` opens its own session via ``core.db.session_scope``
+    rather than taking squirrel's request-scoped one, so it has to be pointed at
+    this same test engine — otherwise it falls through to the real database.
+    """
     engine = create_async_engine(TEST_DATABASE_URL, echo=False, poolclass=NullPool)
     async with engine.begin() as conn:
         await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {_SCHEMA}"))
+        await conn.execute(text("CREATE SCHEMA IF NOT EXISTS core"))
         await conn.run_sync(Base.metadata.create_all, tables=_SQUIRREL_TABLES)
+    monkeypatch.setattr(
+        db, "get_session_maker", lambda: async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    )
     yield engine
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all, tables=_SQUIRREL_TABLES)
