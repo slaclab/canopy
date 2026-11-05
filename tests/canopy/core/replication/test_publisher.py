@@ -8,6 +8,7 @@ from canopy.core.replication.sql import Refused
 from canopy.core.replication.registry import REGISTRY
 from canopy.core.replication.publisher import (
     publish,
+    _not_switched,
     publisher_status,
     publication_layout,
 )
@@ -231,3 +232,20 @@ async def test_publish_lets_the_heartbeat_role_write_its_table_only(db, config):
     assert await privileges(db, config.heartbeat_role, "core.history_heartbeat") == {"SELECT", "INSERT", "UPDATE"}
     for table in PRESENT + ["core.api_key"]:
         assert await privileges(db, config.heartbeat_role, table) == set(), table
+
+
+@pytest.mark.parametrize(
+    ("streams", "switched"),
+    [
+        (["canopy_ref", "canopy_ts"], True),
+        (["canopy_ts"], False),
+        (["canopy_ref"], False),
+        (["canopy_history"], False),
+        (["canopy_history", "canopy_ref", "canopy_ts"], False),
+    ],
+    ids=["pair", "ts-only", "ref-only", "single", "pair-plus-single"],
+)
+def test_a_mirror_has_switched_only_when_it_streams_exactly_the_pair(streams, switched):
+    reasons = _not_switched([{"slot": "canopy_history_site_a", "active": True, "publications": streams}], REGISTRY)
+
+    assert (reasons == []) is switched, reasons

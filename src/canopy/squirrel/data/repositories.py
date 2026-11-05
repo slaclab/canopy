@@ -396,25 +396,35 @@ class PvRepository(BaseRepository[Pv]):
             return and_(Pv.setpoint_address.is_(None), Pv.readback_address.in_(addresses))
         return and_(Pv.setpoint_address.is_(None), Pv.readback_address.is_(None), Pv.config_address.in_(addresses))
 
-    async def get_by_id(self, id: str, *, include_deleted: bool = False) -> Pv | None:
-        """A PV by id; a deleted one only with ``include_deleted``."""
+    @staticmethod
+    def _locked(query: Select) -> Select:
+        """``query`` with its PV rows locked ``FOR UPDATE`` until the transaction ends.
+
+        A second transaction asking for the same row waits, then reads the row as the
+        first one committed it, so a check made on it can't be overtaken.
+        """
+        return query.with_for_update(of=Pv).execution_options(populate_existing=True)
+
+    async def get_by_id(self, id: str, *, include_deleted: bool = False, for_update: bool = False) -> Pv | None:
+        """A PV by id; a deleted one only with ``include_deleted``; locked with ``for_update``."""
         query = select(Pv).where(Pv.id == id)
         if not include_deleted:
             query = query.where(Pv.deleted_at.is_(None))
-        result = await self.session.execute(query)
+        result = await self.session.execute(self._locked(query) if for_update else query)
         return result.scalar_one_or_none()
 
-    async def find_by_address(self, address: str) -> Pv | None:
-        """Find a live PV by any of its addresses (setpoint, readback, or config)."""
-        result = await self.session.execute(
+    async def find_by_address(self, address: str, *, for_update: bool = False) -> Pv | None:
+        """Find a live PV by any of its addresses (setpoint, readback, or config); locked with ``for_update``."""
+        query = (
             select(Pv)
             .options(selectinload(Pv.tags).selectinload(Tag.group))
             .where(Pv.deleted_at.is_(None))
             .where(or_(Pv.setpoint_address == address, Pv.readback_address == address, Pv.config_address == address))
         )
+        result = await self.session.execute(self._locked(query) if for_update else query)
         return result.scalar_one_or_none()
 
-    async def _find_by_identity(self, kind: str, address: str, include_deleted: bool) -> Pv | None:
+    async def _find_by_identity(self, kind: str, address: str, include_deleted: bool, for_update: bool) -> Pv | None:
         query = (
             select(Pv)
             .options(selectinload(Pv.tags).selectinload(Tag.group))
@@ -423,14 +433,17 @@ class PvRepository(BaseRepository[Pv]):
         if not include_deleted:
             query = query.where(Pv.deleted_at.is_(None))
         # One PV at most holds an identity, deleted or not; a live one would come first.
-        result = await self.session.execute(query.order_by(Pv.deleted_at.is_not(None)).limit(1))
+        query = query.order_by(Pv.deleted_at.is_not(None)).limit(1)
+        result = await self.session.execute(self._locked(query) if for_update else query)
         return result.scalars().first()
 
-    async def find_by_setpoint(self, setpoint_address: str, *, include_deleted: bool = False) -> Pv | None:
-        return await self._find_by_identity("setpoint", setpoint_address, include_deleted)
+    async def find_by_setpoint(
+        self, setpoint_address: str, *, include_deleted: bool = False, for_update: bool = False
+    ) -> Pv | None:
+        return await self._find_by_identity("setpoint", setpoint_address, include_deleted, for_update)
 
     async def find_by_readback_without_setpoint(
-        self, readback_address: str, *, include_deleted: bool = False
+        self, readback_address: str, *, include_deleted: bool = False, for_update: bool = False
     ) -> Pv | None:
         """Find a setpoint-less PV by its readback address.
 
@@ -440,6 +453,8 @@ class PvRepository(BaseRepository[Pv]):
             Readback address to match.
         include_deleted : bool
             Also match a deleted PV.
+        for_update : bool
+            Lock the row until the transaction ends.
 
         Returns
         -------
@@ -447,9 +462,11 @@ class PvRepository(BaseRepository[Pv]):
             A PV whose ``setpoint_address`` is NULL and whose ``readback_address`` equals
             ``readback_address``, or ``None`` when no such PV exists.
         """
-        return await self._find_by_identity("readback", readback_address, include_deleted)
+        return await self._find_by_identity("readback", readback_address, include_deleted, for_update)
 
-    async def find_by_config_only(self, config_address: str, *, include_deleted: bool = False) -> Pv | None:
+    async def find_by_config_only(
+        self, config_address: str, *, include_deleted: bool = False, for_update: bool = False
+    ) -> Pv | None:
         """Find a config-only PV by its config address.
 
         Parameters
@@ -458,6 +475,8 @@ class PvRepository(BaseRepository[Pv]):
             Config address to match.
         include_deleted : bool
             Also match a deleted PV.
+        for_update : bool
+            Lock the row until the transaction ends.
 
         Returns
         -------
@@ -465,7 +484,7 @@ class PvRepository(BaseRepository[Pv]):
             A PV whose ``setpoint_address`` and ``readback_address`` are both NULL and whose
             ``config_address`` equals ``config_address``, or ``None`` when no such PV exists.
         """
-        return await self._find_by_identity("config", config_address, include_deleted)
+        return await self._find_by_identity("config", config_address, include_deleted, for_update)
 
     async def _existing_identities(self, kind: str, addresses: list[str]) -> set[str]:
         """The subset of ``addresses`` already identifying a live PV as ``kind``."""
@@ -527,8 +546,13 @@ class PvRepository(BaseRepository[Pv]):
         """
         return await self._existing_identities("config", config_addresses)
 
-    async def get_deleted_by_identity(self, kind: str, addresses: list[str]) -> dict[str, Pv]:
-        """Deleted PVs whose identifying address of ``kind`` is one of ``addresses``.
+    async def lock_by_identity(self, kind: str, addresses: list[str]) -> dict[str, Pv]:
+        """Lock the PVs, live or deleted, whose identifying address of ``kind`` is one of ``addresses``.
+
+        The rows stay locked ``FOR UPDATE`` until the transaction ends, taken in id order
+        so two imports naming the same PVs lock them in the same order and can't deadlock.
+        Locking the live rows too is what lets a caller see that one it found deleted was
+        brought back meanwhile, rather than miss it and register the address twice.
 
         Parameters
         ----------
@@ -540,17 +564,18 @@ class PvRepository(BaseRepository[Pv]):
         Returns
         -------
         dict[str, Pv]
-            Each deleted PV, with its tags loaded, keyed by the address that identifies it.
+            Each PV, with its tags loaded, keyed by the address that identifies it.
         """
         found: dict[str, Pv] = {}
         for i in range(0, len(addresses), PARAM_BATCH_SIZE):
             batch = addresses[i : i + PARAM_BATCH_SIZE]
-            result = await self.session.execute(
+            query = (
                 select(Pv)
                 .options(selectinload(Pv.tags).selectinload(Tag.group))
-                .where(self._identity_filter(kind, batch), Pv.deleted_at.is_not(None))
+                .where(self._identity_filter(kind, batch))
+                .order_by(Pv.id)
             )
-            for pv in result.scalars():
+            for pv in (await self.session.execute(self._locked(query))).scalars():
                 found[getattr(pv, f"{kind}_address")] = pv
         return found
 

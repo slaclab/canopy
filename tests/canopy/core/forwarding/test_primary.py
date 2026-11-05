@@ -5,6 +5,8 @@ The header-trust tests use fake keys. The commit-position tests run the real app
 against Postgres (the ``database`` fixture in this directory's conftest).
 """
 
+from uuid import uuid4
+
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
@@ -18,6 +20,7 @@ from canopy.core.config import get_settings
 from canopy.core.errors import register_canopy_error_handler
 from canopy.core.modules import WILDCARD, tag_module
 from canopy.core.security import APIKey, ActorDep
+from canopy.squirrel.data.models import Pv, pv_facility
 from canopy.core.facilities.models import Facility
 from canopy.core.forwarding.client import lsn_value
 from canopy.core.forwarding.context import forwarded_write
@@ -310,6 +313,73 @@ async def test_a_forwarded_restore_logs_the_caller(http, monkeypatch, caplog):
 
     assert resp.status_code == 200, resp.text
     assert f"Restore of snapshot {snapshot_id} queued as job job-r for operator@site_a" in caplog.text
+
+
+class TestForwardedImport:
+    """#83's import rules hold for a caller a forward instance names, not just the service key.
+
+    The service key reaches every facility, so what's left out comes from the caller's
+    grant and the bundle's facility, never from the service key.
+    """
+
+    @pytest_asyncio.fixture
+    async def site_pvs(self, sites) -> dict[str, str]:
+        """One PV in each site, by slug."""
+        async with db.get_session_maker()() as session:
+            pvs = {slug: Pv(setpoint_address=f"SIM:{slug.upper()}:SP", device="SIM:DEV") for slug in sites}
+            session.add_all(pvs.values())
+            await session.flush()
+            await session.execute(
+                pv_facility.insert(), [{"pv_id": pv.id, "facility_id": sites[slug]} for slug, pv in pvs.items()]
+            )
+            await session.commit()
+            return {slug: pv.id for slug, pv in pvs.items()}
+
+    @staticmethod
+    def _bundle(facility: str, *pv_ids: str) -> dict:
+        return {
+            "format": "canopy.squirrel.snapshot-bundle",
+            "version": 1,
+            "id": str(uuid4()),
+            "title": "Old",
+            "createdDate": "2025-01-01T00:00:00Z",
+            "facility": facility,
+            "values": [{"pvId": pv_id, "pvName": f"PV {pv_id}", "setpointValue": {"value": 1.0}} for pv_id in pv_ids],
+        }
+
+    async def _import(self, http, bundle: dict, grant: str):
+        return await http.post(
+            "/squirrel/v1/snapshots/import", json=bundle, headers={"X-API-Key": "svc", **_for(grant)}
+        )
+
+    async def test_a_pv_outside_the_callers_grant_is_left_out(self, http, site_pvs):
+        resp = await self._import(http, self._bundle("site-a", site_pvs["site-a"], site_pvs["site-b"]), '["site-a"]')
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["snapshot"]["pvCount"] == 1
+        assert [value["pvId"] for value in resp.json()["skipped"]] == [site_pvs["site-b"]]
+
+    async def test_only_pvs_outside_the_callers_grant_is_refused(self, http, site_pvs):
+        resp = await self._import(http, self._bundle("site-a", site_pvs["site-b"]), '["site-a"]')
+
+        assert resp.status_code == 400
+        assert resp.json()["code"] == "bad_request"
+        async with db.get_session_maker()() as session:
+            assert await session.scalar(text("SELECT count(*) FROM squirrel.snapshot")) == 0
+
+    async def test_pvs_in_the_callers_grant_import_whole(self, http, site_pvs):
+        resp = await self._import(http, self._bundle("site-a", site_pvs["site-a"]), '["site-a"]')
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["skipped"] == []
+
+    async def test_a_pv_outside_the_bundles_facility_is_left_out_even_when_the_caller_holds_it(self, http, site_pvs):
+        bundle = self._bundle("site-a", site_pvs["site-a"], site_pvs["site-b"])
+
+        resp = await self._import(http, bundle, '["site-a", "site-b"]')
+
+        assert resp.status_code == 200, resp.text
+        assert [value["pvId"] for value in resp.json()["skipped"]] == [site_pvs["site-b"]]
 
 
 async def test_a_forwarded_config_records_the_caller_not_the_body(http):

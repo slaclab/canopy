@@ -3,6 +3,8 @@
 ``test_split_e2e.py`` reads the same facts from a real primary and mirror.
 """
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from canopy.squirrel.prune import PRUNED_TABLES
@@ -14,6 +16,7 @@ from canopy.core.replication.publisher import walsender_publications
 SLOT = "canopy_history_site_a"
 TABLES = list(PRUNED_TABLES)
 CONFIG = PruneConfig(max_lag_s=60, heartbeat_max_age_h=3)
+STARTED = datetime(2026, 11, 1, 6, 0, tzinfo=UTC)
 
 
 def _status(**slot) -> dict:
@@ -27,24 +30,40 @@ def _status(**slot) -> dict:
         "slots": [
             {
                 "slot_name": SLOT,
+                "kind": "subscription",
                 "active": True,
                 "wal_status": "reserved",
                 "walsender_publications": ["canopy_ref", "canopy_ts"],
                 "walsender_flush_lag_s": None,
                 "walsender_reply_age_s": 4.0,
+                "walsender_started_at": STARTED.isoformat(),
                 **slot,
             }
         ],
     }
 
 
-HEARTBEAT = {"backup_ok": True, "wal_archive_ok": True, "drift_ok": True, "applied_lsn": "0/16B3748", "age_h": 0.5}
+HEARTBEAT = {
+    "backup_ok": True,
+    "wal_archive_ok": True,
+    "drift_ok": True,
+    "applied_lsn": "0/16B3748",
+    "written_at": STARTED + timedelta(minutes=30),
+    "age_h": 0.5,
+}
+
+
+def _with_copy(status: dict) -> dict:
+    """``status`` with a table's initial copy under way: a tablesync slot beside the mirror's."""
+    sync = {"slot_name": "pg_16399_sync_16388_7431", "kind": "tablesync", "active": True, "wal_status": "reserved"}
+    return {**status, "slots": [*status["slots"], sync]}
 
 
 def _judge(*, status=None, delete_publications=None, heartbeat=HEARTBEAT) -> GateResult:
     return evaluate_gate(
         slot_name=SLOT,
         tables=TABLES,
+        split_publications=[p.name for p in REGISTRY.split_publications],
         status=status or _status(),
         delete_publications=delete_publications or {},
         heartbeat=heartbeat,
@@ -72,6 +91,11 @@ def test_a_switched_caught_up_mirror_with_good_checks_passes():
         ({"heartbeat": None}, "heartbeat_fresh"),
         ({"heartbeat": {**HEARTBEAT, "age_h": 3.5}}, "heartbeat_fresh"),
         ({"heartbeat": {**HEARTBEAT, "drift_ok": False}}, "heartbeat_ok"),
+        ({"status": _status(walsender_publications=["canopy_ts"])}, "streams_split"),
+        ({"status": _status(walsender_publications=["canopy_ref"])}, "streams_split"),
+        ({"heartbeat": {**HEARTBEAT, "written_at": STARTED - timedelta(minutes=1)}}, "heartbeat_fresh"),
+        ({"status": _status(walsender_started_at=None)}, "heartbeat_fresh"),
+        ({"status": _with_copy(_status())}, "no_initial_copy"),
     ],
     ids=[
         "deletes-published",
@@ -86,6 +110,11 @@ def test_a_switched_caught_up_mirror_with_good_checks_passes():
         "no-heartbeat",
         "old-heartbeat",
         "drift-failed",
+        "canopy_ts-only",
+        "canopy_ref-only",
+        "heartbeat-before-stream",
+        "stream-start-unknown",
+        "initial-copy",
     ],
 )
 def test_each_failed_check_is_named(change, failed):
@@ -145,3 +174,17 @@ def test_walsender_publications_are_read_from_its_command(command, publications)
 def test_the_pruned_tables_are_time_series():
     # Their split-layout publication carries no deletes; a reference table's deletes would reach history.
     assert all(REGISTRY.tables[table] is TableClass.TIME_SERIES for table in PRUNED_TABLES)
+
+
+def test_the_reasons_name_the_new_checks():
+    failures = _judge(
+        status=_with_copy(_status(walsender_publications=["canopy_ts"])),
+        heartbeat={**HEARTBEAT, "written_at": STARTED - timedelta(hours=1)},
+    ).failures
+
+    assert failures["streams_split"] == "the mirror streams canopy_ts, without canopy_ref"
+    assert failures["no_initial_copy"] == "an initial table copy is running (pg_16399_sync_16388_7431)"
+    assert (
+        failures["heartbeat_fresh"]
+        == f"the last heartbeat is from before the walsender started at {STARTED.isoformat()}"
+    )

@@ -415,6 +415,19 @@ def require_machine_write_access(key: APIKeyDep) -> APIKey:
     return key
 
 
+def require_external_write_access(key: APIKeyDep) -> APIKey:
+    """Gate for a write this process makes to a service outside Canopy (an e-log post).
+
+    It changes nothing replicated and nothing on the machine, so a forward instance
+    makes it itself, as a primary does; a mirror refuses it as it refuses every write.
+    """
+    if get_settings().role == "mirror":
+        raise ReadOnlyInstance(READ_ONLY_DETAIL)
+    if not key.write:
+        raise InsufficientWriteAccess("API key does not have write access")
+    return key
+
+
 def require_local_admin_access(key: APIKeyDep) -> APIKey:
     """Admin gate for state that is local to each instance, so allowed on a mirror too.
 

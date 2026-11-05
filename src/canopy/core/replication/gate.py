@@ -15,22 +15,32 @@ check stops the run, and the job reports every check that failed, by name:
 ``slot_active``
     The mirror's slot exists and a walsender holds it.
 ``streams_split``
-    That walsender streams publications that between them carry every pruned table:
-    the mirror has switched to the split layout and still receives new rows.
+    That walsender streams both split publications, and between them they carry
+    every pruned table: the mirror has switched to the split layout and still
+    receives new rows and reference changes.
+``no_initial_copy``
+    No table's initial copy is running here (no ``pg_<oid>_sync_...`` slot). A copy
+    reads the table as it is when it starts, so rows pruned before then would never
+    reach history.
 ``wal_status_reserved``
     The slot's WAL is within ``max_wal_size``, not at risk of being removed.
 ``lag``
     The mirror's flush lag and the age of its last reply are within ``max_lag_s``.
 ``heartbeat_fresh``, ``heartbeat_ok``
     The mirror reported its checks within ``heartbeat_max_age_h`` (by this
-    database's clock), and its backup, WAL archive and drift check all passed.
+    database's clock), after its current walsender started, and its backup, WAL
+    archive and drift check all passed. A heartbeat from before a rebuilt or
+    reconnected subscription doesn't count, and ``heartbeat`` reports the drift
+    check failed while any of the mirror's tables is still copying.
 
 Slot facts come from ``publisher_status``, so the gate and ``status`` read the same
-numbers. Seeing what a walsender streams needs a superuser or ``pg_read_all_stats``.
+numbers. Seeing what a walsender streams, and when it started, needs a superuser or
+``pg_read_all_stats``.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from dataclasses import field, dataclass
 from collections.abc import Mapping, Sequence
 
@@ -64,6 +74,7 @@ def evaluate_gate(
     *,
     slot_name: str,
     tables: Sequence[str],
+    split_publications: Sequence[str],
     status: Mapping,
     delete_publications: Mapping[str, list[str]],
     heartbeat: Mapping | None,
@@ -77,12 +88,15 @@ def evaluate_gate(
         The mirror's slot (its subscription's name).
     tables : Sequence[str]
         The ``schema.table`` names the caller will delete from.
+    split_publications : Sequence[str]
+        The split layout's publication names, all of which the mirror must stream.
     status : Mapping
         ``publisher_status`` output.
     delete_publications : Mapping[str, list[str]]
         For each pruned table, the publications that carry it and publish deletes or truncates.
     heartbeat : Mapping | None
-        The mirror's ``core.history_heartbeat`` row plus ``age_h``, or ``None`` when it never reported.
+        The mirror's ``core.history_heartbeat`` row (``written_at`` included) plus ``age_h``,
+        or ``None`` when it never reported.
     config : PruneConfig
         Lag and heartbeat limits.
 
@@ -113,6 +127,8 @@ def evaluate_gate(
         }
         if streamed is None:
             failures["streams_split"] = "can't see what the walsender streams; needs a superuser or pg_read_all_stats"
+        elif absent := sorted(set(split_publications) - set(streamed)):
+            failures["streams_split"] = f"the mirror streams {', '.join(streamed)}, without {', '.join(absent)}"
         elif missing := sorted(set(tables) - carried):
             failures["streams_split"] = f"the mirror streams {', '.join(streamed)}, which carry no {', '.join(missing)}"
         flush_lag, reply_age = slot["walsender_flush_lag_s"], slot["walsender_reply_age_s"]
@@ -122,16 +138,28 @@ def evaluate_gate(
             failures["lag"] = f"the mirror last replied {reply_age:.0f} s ago (limit {config.max_lag_s:g} s)"
         elif flush_lag is not None and flush_lag > config.max_lag_s:
             failures["lag"] = f"flush lag is {flush_lag:.0f} s (limit {config.max_lag_s:g} s)"
+    if copying := sorted(s["slot_name"] for s in status["slots"] if s["kind"] == "tablesync"):
+        failures["no_initial_copy"] = f"an initial table copy is running ({', '.join(copying)})"
     if slot is not None and slot["wal_status"] != "reserved":
         failures["wal_status_reserved"] = f"slot {slot_name} has wal_status {slot['wal_status']}"
 
     if heartbeat is None:
         failures["heartbeat_fresh"] = f"no heartbeat from {slot_name}"
     else:
+        started = slot["walsender_started_at"] if slot is not None and slot["active"] else None
         if heartbeat["age_h"] > config.heartbeat_max_age_h:
             failures["heartbeat_fresh"] = (
                 f"the last heartbeat is {heartbeat['age_h']:.1f} h old (limit {config.heartbeat_max_age_h:g} h)"
             )
+        elif slot is not None and slot["active"] and started is None:
+            failures["heartbeat_fresh"] = (
+                "can't see when the walsender started, so can't tell whether the heartbeat is from this stream; "
+                "needs a superuser or pg_read_all_stats"
+            )
+        elif started is not None and heartbeat["written_at"] < datetime.fromisoformat(started):
+            # A rebuilt or reconnected subscription streams anew: what the mirror checked
+            # before doesn't vouch for it, until it reports again.
+            failures["heartbeat_fresh"] = f"the last heartbeat is from before the walsender started at {started}"
         if failed := [check for check in ("backup_ok", "wal_archive_ok", "drift_ok") if not heartbeat[check]]:
             failures["heartbeat_ok"] = f"the mirror reported failed checks: {', '.join(failed)}"
     return GateResult(failures)
@@ -195,7 +223,7 @@ async def check_prune_gate(
     try:
         heartbeat = await conn.fetchrow(
             """
-            SELECT backup_ok, wal_archive_ok, drift_ok, applied_lsn,
+            SELECT backup_ok, wal_archive_ok, drift_ok, applied_lsn, written_at,
                    extract(epoch FROM clock_timestamp() - written_at)::float8 / 3600 AS age_h
             FROM core.history_heartbeat WHERE name = $1
             """,
@@ -206,6 +234,7 @@ async def check_prune_gate(
     return evaluate_gate(
         slot_name=slot_name,
         tables=tables,
+        split_publications=[p.name for p in registry.split_publications],
         status=status,
         delete_publications={row["name"]: list(row["publications"]) for row in rows},
         heartbeat=dict(heartbeat) if heartbeat else None,

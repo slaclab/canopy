@@ -43,7 +43,7 @@ flowchart LR
 |---|---|---|
 | `primary` (default) | Everything, including machine operations | All tasks |
 | `mirror` | Refused with 403 `read_only_instance`, except API-key management | Stateless tasks only |
-| `forward` | An allowlisted set sent to the primary ([Forward mode](#forward-mode)); the rest refused as on a mirror | Stateless tasks only |
+| `forward` | An allowlisted set sent to the primary ([Forward mode](#forward-mode)), e-log posts made here; the rest refused as on a mirror | Stateless tasks only |
 
 `GET /v1/instance` reports the role, so clients can hide write controls, and the
 Alembic head shipped in the image, which the deploy check below compares.
@@ -147,8 +147,8 @@ marks it deleted.
    the pair's creation can't find the publications and retries forever. `switch`
    refuses if the subscription is disabled or the primary has no pair yet.
 3. On the primary: `publish --split` again. It drops `canopy_history` once every
-   mirror's walsender is seen streaming the pair, and exits 2 with the reason until
-   then. Retry after a few seconds: the walsender restarts after the switch. Reading
+   mirror's walsender is seen streaming exactly the pair, and exits 2 with the reason
+   until then. Retry after a few seconds: the walsender restarts after the switch. Reading
    what a walsender streams needs a superuser or `pg_read_all_stats`.
 
 A mirror of a split primary gets the pair from then on. `reseed` creates its
@@ -172,6 +172,12 @@ Pass each flag only when that check passed: `--drift-ok` when `drift-check` exit
 drift. `heartbeat` writes `core.history_heartbeat` on the primary through
 `CANOPY_REPLICATION__HEARTBEAT_DSN`, timed by the primary's clock.
 
+While the subscription is disabled or any of its tables is still copying, `heartbeat`
+records the drift check as failed whatever `--drift-ok` says: those tables weren't
+compared, and rows pruned before a table's copy reads them would never reach history.
+A heartbeat also counts only for the stream it was written in. After the mirror
+reconnects, or its subscription is rebuilt, prune waits for the next heartbeat.
+
 ### Turn pruning on
 
 On the primary's worker, set `CANOPY_INSTANCE`, `CANOPY_WINDOW_DAYS` and
@@ -180,7 +186,9 @@ On the primary's worker, set `CANOPY_INSTANCE`, `CANOPY_WINDOW_DAYS` and
 month while `drift-check` stays clean, then turn the dry run off.
 
 Each run removes snapshots older than the window that aren't retained, deleted or
-not, up to `CANOPY_PRUNE__MAX_SNAPSHOTS_PER_RUN`, one per transaction. Before every
+not, up to `CANOPY_PRUNE__MAX_SNAPSHOTS_PER_RUN`, one per transaction. Each facility
+keeps its newest snapshot however old it is, so a facility history still refers to
+stays in use and can't be deleted. Before every
 snapshot it checks a gate, and it stops at the first failure, logging each failed
 check by name:
 
@@ -189,15 +197,19 @@ check by name:
 | `instance_set`, `window_set` | `CANOPY_INSTANCE` or `CANOPY_WINDOW_DAYS` is unset |
 | `no_delete_publication` | Any publication carrying a snapshot table publishes deletes (`canopy_history` still exists) |
 | `slot_active` | The mirror's slot is missing or no walsender holds it |
-| `streams_split` | The walsender isn't streaming publications that carry the snapshot tables, or its command can't be read |
+| `streams_split` | The walsender doesn't stream both `canopy_ref` and `canopy_ts`, they don't carry the snapshot tables, or its command can't be read |
+| `no_initial_copy` | A table's initial copy is running (a `pg_<oid>_sync_…` slot exists) |
 | `wal_status_reserved` | The slot's WAL is at risk |
 | `lag` | Flush lag or the mirror's last reply is older than `CANOPY_PRUNE__MAX_LAG_S` (60 s) |
-| `heartbeat_fresh`, `heartbeat_ok` | No heartbeat within `CANOPY_PRUNE__HEARTBEAT_MAX_AGE_H` (3 h), or one reporting a failed check |
+| `heartbeat_fresh`, `heartbeat_ok` | No heartbeat within `CANOPY_PRUNE__HEARTBEAT_MAX_AGE_H` (3 h) and since the walsender started, or one reporting a failed check |
 
 A snapshot older than the window can still be restored on the primary: export it from
 the mirror (`GET /squirrel/v1/snapshots/{id}/export`) and import the bundle on the
 primary (`POST /squirrel/v1/snapshots/import`), which creates a new, recent copy. The
-copy keeps the snapshot's facility, so the import needs a key that can write there. A
+copy keeps the snapshot's facility, so the import needs a key that can write there. It
+takes only values of PVs the key could restore that are still assigned to that facility
+or one below it, as a capture there would; a PV moved to another facility since the
+snapshot was taken is left out and listed in the response's `skipped`. A
 snapshot with `retain` set is never pruned. Prune can't see references held outside
 Canopy, so a service that refers to snapshots, such as an optimization service's runs,
 sets `retain` on the ones it needs.
@@ -224,10 +236,10 @@ test fails when a new route is in neither list.
 | Hare PV write | No; with `CANOPY_MACHINE_ACCESS=write` it runs on the forward instance, through its own EPICS gateway, which must allow writes |
 | API keys | No: each instance manages its own |
 | Facilities | No: define them on the primary; the mirror copies them |
-| E-log entries and attachments | No: they post to the external e-log |
+| E-log entries and attachments | No: the forward instance posts them itself, with its own `CANOPY_ELOG__*` app tokens |
 
-Anything not forwarded is refused as on a mirror, with 403 `read_only_instance`, and
-a machine write without machine access with 403 `machine_read_only`. A
+Anything else not forwarded is refused as on a mirror, with 403 `read_only_instance`,
+and a machine write without machine access with 403 `machine_read_only`. A
 change to a snapshot older than `CANOPY_FORWARD__PRIMARY_WINDOW_DAYS` is refused with
 409 `archived_immutable` unless the snapshot is retained, since the primary may have
 pruned it. To bring such a snapshot back, export it here

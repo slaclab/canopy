@@ -4,7 +4,13 @@ from uuid import UUID
 from typing import Any, Literal
 from datetime import datetime
 
-from pydantic import Field, ConfigDict
+from pydantic import (
+    Field,
+    ConfigDict,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from canopy.contracts.base import CanopyModel
 
@@ -108,7 +114,9 @@ BUNDLE_FORMAT = "canopy.squirrel.snapshot-bundle"
 class BundleValueDTO(CanopyModel):
     """One value in a snapshot bundle, with the addresses its PV had when exported.
 
-    ``setpoint_value`` and ``readback_value`` are the stored JSONB blobs, unchanged.
+    ``setpoint_value`` and ``readback_value`` are the stored JSONB blobs, unchanged. The
+    fields ``EpicsValueDTO`` models must parse, so the imported snapshot can be read back;
+    keys it doesn't model are kept as they are.
     """
 
     pv_id: UUID
@@ -121,6 +129,17 @@ class BundleValueDTO(CanopyModel):
     status: int | None = None
     severity: int | None = None
     timestamp: datetime | None = None
+
+    @field_validator("setpoint_value", "readback_value")
+    @classmethod
+    def _readable(cls, blob: dict[str, Any] | None) -> dict[str, Any] | None:
+        if blob is not None:
+            try:
+                EpicsValueDTO.model_validate(blob)
+            except ValidationError as exc:
+                problems = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
+                raise ValueError(problems) from None
+        return blob
 
 
 class SnapshotBundleDTO(CanopyModel):
@@ -143,6 +162,19 @@ class SnapshotBundleDTO(CanopyModel):
     created_by: str | None = Field(None, max_length=255)
     facility: str | None = Field(None, max_length=64)
     values: list[BundleValueDTO] = []
+
+    @model_validator(mode="after")
+    def _one_value_per_pv(self) -> "SnapshotBundleDTO":
+        """Refuse a bundle that gives a PV two values: restore would write whichever came last."""
+        seen: set[UUID] = set()
+        repeated: set[str] = set()
+        for value in self.values:
+            if value.pv_id in seen:
+                repeated.add(str(value.pv_id))
+            seen.add(value.pv_id)
+        if repeated:
+            raise ValueError(f"values repeat pvId {', '.join(sorted(repeated)[:10])}")
+        return self
 
 
 class SkippedValueDTO(CanopyModel):

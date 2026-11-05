@@ -31,10 +31,16 @@ from canopy.core.security import (
     ws_require_write_access,
     require_local_admin_access,
     require_machine_write_access,
+    require_external_write_access,
 )
 from canopy.core.forwarding import routes as forwarding_routes
 
-MIRROR_REFUSED_GATES = {require_write_access, require_admin_access, require_machine_write_access}
+MIRROR_REFUSED_GATES = {
+    require_write_access,
+    require_admin_access,
+    require_machine_write_access,
+    require_external_write_access,
+}
 
 # Non-GET routes that a mirror keeps serving. Read-scoped: they compute, validate
 # or subscribe, and write nothing replicated or on the machine.
@@ -184,16 +190,18 @@ def test_write_and_admin_routes_are_refused_on_a_mirror(method, path, mirror_rol
 
 
 # On a forward instance the middleware answers forwardable routes before any gate
-# runs, and machine writes depend on CANOPY_MACHINE_ACCESS (both in
-# tests/canopy/core/forwarding); every other write or admin route is refused there
-# exactly as on a mirror. Shared-table writes count as refused: they are forwarded
-# only with CANOPY_FORWARD__ALLOW_SHARED.
+# runs, machine writes depend on CANOPY_MACHINE_ACCESS (both in
+# tests/canopy/core/forwarding), and writes to an outside service (the e-log) run there
+# as on a primary (tests/canopy/elog); every other write or admin route is refused there
+# exactly as on a mirror. Shared-table writes count as refused: they are forwarded only
+# with CANOPY_FORWARD__ALLOW_SHARED.
 FORWARD_REFUSED = [
     (method, path)
     for method, path, route in ROUTES
     if (method, path) in REFUSED
     and forwarding_routes.match(method, _concrete(path), allow_shared=False) is None
     and require_machine_write_access not in _calls(route.dependant)
+    and require_external_write_access not in _calls(route.dependant)
 ]
 
 
@@ -219,6 +227,7 @@ def test_a_forward_instance_still_refuses_shared_tables_and_debug_routes():
     } <= set(FORWARD_REFUSED)
     assert ("POST", "/squirrel/v1/snapshots") not in FORWARD_REFUSED
     assert ("PUT", "/hare/v1/pvs/{pv:path}") not in FORWARD_REFUSED
+    assert ("POST", "/elog/v1/apps/{app}/entries") not in FORWARD_REFUSED
 
 
 def test_the_refused_set_covers_the_machine_and_data_writes():
