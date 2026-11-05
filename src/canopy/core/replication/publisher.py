@@ -116,8 +116,13 @@ def _not_switched(walsenders: list[dict], registry: ReplicationRegistry) -> list
             reasons.append(
                 f"can't read what slot {walsender['slot']} streams; publish needs a superuser or pg_read_all_stats"
             )
-        elif not set(walsender["publications"]) <= split:
-            reasons.append(f"slot {walsender['slot']} still streams {', '.join(walsender['publications'])}")
+        elif set(walsender["publications"]) != split:
+            # Exactly the pair: canopy_ts alone would leave history without reference
+            # changes, and canopy_ref alone without new snapshots.
+            reasons.append(
+                f"slot {walsender['slot']} streams {', '.join(walsender['publications'])}, "
+                f"not exactly {', '.join(sorted(split))}"
+            )
     return reasons
 
 
@@ -320,9 +325,9 @@ async def publisher_status(
         logical slot in this database, with the WAL it retains. Slots named
         ``pg_<oid>_sync_...`` belong to an initial table copy and are normally
         short-lived; one that stays inactive is holding WAL for a failed copy. For a
-        slot a walsender holds: the publications it streams (``None`` when this role
-        may not see them), its flush lag (``None`` once caught up and idle) and the
-        age of the mirror's last reply, in seconds.
+        slot a walsender holds: the publications it streams and when the walsender started
+        (both ``None`` when this role may not see them), its flush lag (``None`` once
+        caught up and idle) and the age of the mirror's last reply, in seconds.
     """
     present = await tables_present(conn, registry.schemas)
     layout = await publication_layout(conn, registry)
@@ -361,6 +366,7 @@ async def publisher_status(
                r.state AS walsender_state, r.reply_time AS walsender_reply_time,
                extract(epoch FROM r.flush_lag)::float8 AS walsender_flush_lag_s,
                extract(epoch FROM clock_timestamp() - r.reply_time)::float8 AS walsender_reply_age_s,
+               a.backend_start AS walsender_started_at,
                a.query AS walsender_command
         FROM pg_replication_slots s
         LEFT JOIN pg_stat_replication_slots st ON st.slot_name = s.slot_name

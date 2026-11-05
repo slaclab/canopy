@@ -526,8 +526,11 @@ async def heartbeat(
     """Record this mirror's latest checks in the primary's ``core.history_heartbeat``.
 
     The CronJob runs it after the backup, WAL-archive and drift checks, passing each
-    result; a check not passed as OK is recorded as failed. The primary's prune job
-    deletes nothing while the latest heartbeat is old or reports a failure.
+    result; a check not passed as OK is recorded as failed. The drift check is also
+    recorded as failed while the subscription is disabled or any of its tables is
+    still copying: those tables weren't compared, and rows pruned before their copy
+    would never reach history. The primary's prune job deletes nothing while the
+    latest heartbeat is old, predates the current stream, or reports a failure.
     ``applied_lsn`` comes from ``subscriber_status`` and is ``None`` when this role
     may not read it. The row is keyed by the subscription's name and timed by the
     primary's clock.
@@ -543,6 +546,15 @@ async def heartbeat(
     status = (await subscriber_status(conn, instance=instance, registry=registry))["subscription"]
     if not status["exists"]:
         raise Refused(f"no subscription {status['name']}; a mirror reports checks only once it replicates")
+    if drift_ok and not status["enabled"]:
+        logger.warning("Subscription %s is disabled; recording the drift check as failed", status["name"])
+        drift_ok = False
+    elif drift_ok and status["tables_not_ready"]:
+        logger.warning(
+            "Tables still copying (%s); recording the drift check as failed",
+            ", ".join(f"{table}: {state}" for table, state in status["tables_not_ready"].items()),
+        )
+        drift_ok = False
     row = {
         "name": status["name"],
         "backup_ok": backup_ok,

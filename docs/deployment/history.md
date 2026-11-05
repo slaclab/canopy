@@ -142,8 +142,8 @@ marks it deleted.
    the pair's creation can't find the publications and retries forever. `switch`
    refuses if the subscription is disabled or the primary has no pair yet.
 3. On the primary: `publish --split` again. It drops `canopy_history` once every
-   mirror's walsender is seen streaming the pair, and exits 2 with the reason until
-   then. Retry after a few seconds: the walsender restarts after the switch. Reading
+   mirror's walsender is seen streaming exactly the pair, and exits 2 with the reason
+   until then. Retry after a few seconds: the walsender restarts after the switch. Reading
    what a walsender streams needs a superuser or `pg_read_all_stats`.
 
 A mirror of a split primary gets the pair from then on. `reseed` creates its
@@ -167,6 +167,12 @@ Pass each flag only when that check passed: `--drift-ok` when `drift-check` exit
 drift. `heartbeat` writes `core.history_heartbeat` on the primary through
 `CANOPY_REPLICATION__HEARTBEAT_DSN`, timed by the primary's clock.
 
+While the subscription is disabled or any of its tables is still copying, `heartbeat`
+records the drift check as failed whatever `--drift-ok` says: those tables weren't
+compared, and rows pruned before a table's copy reads them would never reach history.
+A heartbeat also counts only for the stream it was written in. After the mirror
+reconnects, or its subscription is rebuilt, prune waits for the next heartbeat.
+
 ### Turn pruning on
 
 On the primary's worker, set `CANOPY_INSTANCE`, `CANOPY_WINDOW_DAYS` and
@@ -184,10 +190,11 @@ check by name:
 | `instance_set`, `window_set` | `CANOPY_INSTANCE` or `CANOPY_WINDOW_DAYS` is unset |
 | `no_delete_publication` | Any publication carrying a snapshot table publishes deletes (`canopy_history` still exists) |
 | `slot_active` | The mirror's slot is missing or no walsender holds it |
-| `streams_split` | The walsender isn't streaming publications that carry the snapshot tables, or its command can't be read |
+| `streams_split` | The walsender doesn't stream both `canopy_ref` and `canopy_ts`, they don't carry the snapshot tables, or its command can't be read |
+| `no_initial_copy` | A table's initial copy is running (a `pg_<oid>_sync_…` slot exists) |
 | `wal_status_reserved` | The slot's WAL is at risk |
 | `lag` | Flush lag or the mirror's last reply is older than `CANOPY_PRUNE__MAX_LAG_S` (60 s) |
-| `heartbeat_fresh`, `heartbeat_ok` | No heartbeat within `CANOPY_PRUNE__HEARTBEAT_MAX_AGE_H` (3 h), or one reporting a failed check |
+| `heartbeat_fresh`, `heartbeat_ok` | No heartbeat within `CANOPY_PRUNE__HEARTBEAT_MAX_AGE_H` (3 h) and since the walsender started, or one reporting a failed check |
 
 A snapshot older than the window can still be restored on the primary: export it from
 the mirror (`GET /squirrel/v1/snapshots/{id}/export`) and import the bundle on the

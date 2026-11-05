@@ -127,7 +127,7 @@ async def test_split_switch_heartbeat_and_prune(split_pair: Pair):
     # Step 1: the split pair appears beside canopy_history; the mirror hasn't moved yet.
     first = await publish(p.pub, role="primary", config=p.config, split=True)
     assert first["layout"] == "switching"
-    with pytest.raises(Refused, match="still streams canopy_history"):
+    with pytest.raises(Refused, match="streams canopy_history, not exactly canopy_ref, canopy_ts"):
         await publish(p.pub, role="primary", config=p.config, split=True)
     assert "no_delete_publication" in (await _gate(p)).failures
 
@@ -165,6 +165,18 @@ async def test_split_switch_heartbeat_and_prune(split_pair: Pair):
     assert beat["name"] == f"canopy_history_{p.instance}"
     assert await eventually(lambda: _passes(p))
 
+    # A reconnected stream has a new walsender, and the heartbeat from before it no
+    # longer vouches for the mirror until the mirror reports again.
+    name = f"canopy_history_{p.instance}"
+    await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
+    await eventually(lambda: _slot_inactive(p, name))
+    await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" ENABLE')
+    assert await eventually(lambda: _refused_only_for(p, "heartbeat_fresh"))
+    await heartbeat(
+        p.sub, role="mirror", instance=p.instance, config=p.config, backup_ok=True, wal_archive_ok=True, drift_ok=True
+    )
+    assert await eventually(lambda: _passes(p))
+
     # Prune on the primary: a dry run first, then the real thing.
     url = make_url(server_dsn(PUBLISHER_ADMIN, database=await p.pub.fetchval("SELECT current_database()")))
     engine = create_async_engine(url.set(drivername="postgresql+asyncpg"), poolclass=NullPool)
@@ -193,6 +205,14 @@ async def test_split_switch_heartbeat_and_prune(split_pair: Pair):
     assert slot["walsender_publications"] == ["canopy_ref", "canopy_ts"]
     mirror = (await subscriber_status(p.sub_admin, instance=p.instance))["subscription"]
     assert mirror["apply_error_count"] == 0
+
+
+async def _slot_inactive(p: Pair, name: str) -> bool:
+    return not await p.pub.fetchval("SELECT active FROM pg_replication_slots WHERE slot_name = $1", name)
+
+
+async def _refused_only_for(p: Pair, check: str) -> bool:
+    return set((await _gate(p)).failures) == {check}
 
 
 async def _passes(p: Pair) -> bool:
