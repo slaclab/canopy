@@ -224,6 +224,7 @@ test fails when a new route is in neither list.
 | Hare PV write | No; with `CANOPY_MACHINE_ACCESS=write` it runs on the forward instance, through its own EPICS gateway, which must allow writes |
 | API keys | No: each instance manages its own |
 | Facilities | No: define them on the primary; the mirror copies them |
+| E-log entries and attachments | No: they post to the external e-log |
 
 Anything not forwarded is refused as on a mirror, with 403 `read_only_instance`, and
 a machine write without machine access with 403 `machine_read_only`. A
@@ -241,7 +242,8 @@ A forwarded capture or restore runs as a job on the primary. Clients poll it her
 
 The forward instance checks the caller's own key (write scope and module), then calls
 the primary with its service key and names the caller in `X-Canopy-On-Behalf-Of`, as
-`<key name>@<instance>`. The primary trusts that header only from a service key and
+`<key name>@<instance>`, percent-encoded UTF-8 so a non-ASCII key name survives the
+trip. The primary trusts that header only from a service key and
 only with `CANOPY_ACCEPT_FORWARDED_WRITES=true`; otherwise it refuses the request with
 403 `forwarded_write_refused`. It records the name in `createdBy` (snapshot captures,
 Magpie configs) and logs it for restores and imports.
@@ -268,7 +270,10 @@ For a forwarded request that committed a write, the primary returns
 (2 s) for its subscription's applied position (`pg_replication_origin_status`) to
 reach it. If it doesn't, the answer carries `X-Canopy-Replica-Stale: true`: the write
 succeeded, but a read straight after it may not show it yet. Captures and restores
-commit later, in the primary's worker, so they carry no position.
+commit later, in the primary's worker, so they carry no position. Both headers are
+exposed through CORS, so a browser client on another origin can read them. The wait
+includes getting a database connection, so a busy pool marks the answer stale rather
+than delaying it.
 
 The view is readable only by superusers by default. As a superuser on the forward
 instance's database, grant its app role both:

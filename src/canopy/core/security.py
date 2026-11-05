@@ -2,6 +2,7 @@ import json
 import logging
 from typing import Protocol, Annotated
 from dataclasses import field, dataclass
+from urllib.parse import unquote
 
 from fastapi import Depends, Request, Security, WebSocket, status
 from fastapi.security import APIKeyHeader
@@ -106,7 +107,7 @@ class EnvKeyRegistry:
         CANOPY_API_KEYS="ro:read@*,rw:read+write@*"     # two keys
         CANOPY_API_KEYS="ops:admin@*"                   # key management only
         CANOPY_API_KEYS="ops:admin@core"                # admin, core routes only
-        CANOPY_API_KEYS="fox:read+write@squirrel+fox"   # scoped to two modules
+        CANOPY_API_KEYS="ui:read+write@squirrel+formula-engine"    # scoped to two modules
 
     There is no facility syntax here, by decision rather than omission: every env key
     grants every facility. Resolving a grant requires reading the hierarchy from the
@@ -267,8 +268,9 @@ def _accept_on_behalf_of(value: str, facilities: str | None, key: APIKey) -> Non
     """Trust ``X-Canopy-On-Behalf-Of`` from ``key``, or refuse the request.
 
     Only a primary with ``CANOPY_ACCEPT_FORWARDED_WRITES`` trusts it, and only from
-    a service key: anything else could write under a name of its choosing. The
-    accepted value is recorded for this request (see ``request_actor``).
+    a service key: anything else could write under a name of its choosing. The name
+    travels percent-encoded UTF-8, since header values are ASCII and a key's name
+    needn't be; the decoded value is recorded for this request (see ``request_actor``).
 
     ``X-Canopy-On-Behalf-Of-Facilities`` must come with it: the caller's facility grant,
     a JSON list of slugs. The request then reaches only the facilities both the service
@@ -280,7 +282,10 @@ def _accept_on_behalf_of(value: str, facilities: str | None, key: APIKey) -> Non
         raise ForwardedWriteRefused(f"This instance doesn't accept {ON_BEHALF_OF_HEADER}")
     if not key.is_service:
         raise ForwardedWriteRefused(f"Only a service key may send {ON_BEHALF_OF_HEADER}")
-    value = value.strip()
+    try:
+        value = unquote(value, errors="strict").strip()
+    except UnicodeDecodeError:
+        raise BadRequest(f"{ON_BEHALF_OF_HEADER} must be percent-encoded UTF-8") from None
     if not value or len(value) > MAX_ON_BEHALF_OF_LEN or not value.isprintable():
         raise BadRequest(f"{ON_BEHALF_OF_HEADER} must be 1-{MAX_ON_BEHALF_OF_LEN} printable characters")
     grant = _parse_facilities(facilities)

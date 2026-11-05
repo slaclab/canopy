@@ -96,6 +96,10 @@ NOT_FORWARDED: dict[tuple[str, str], str] = {
     ("POST", "/v1/facilities"): "edits the facility hierarchy; done on the primary",
     ("PUT", "/v1/facilities/{facility_slug}"): "edits the facility hierarchy; done on the primary",
     ("DELETE", "/v1/facilities/{facility_slug}"): "edits the facility hierarchy; done on the primary",
+    # Posts go to the external e-log, not Canopy's database. Refused as on a mirror until
+    # someone decides a forward instance should post (here, or through its primary).
+    ("POST", "/elog/v1/apps/{app}/entries"): "posts to the external e-log; not in forward mode's allowlist",
+    ("POST", "/elog/v1/apps/{app}/attachments"): "posts to the external e-log; not in forward mode's allowlist",
 }
 
 

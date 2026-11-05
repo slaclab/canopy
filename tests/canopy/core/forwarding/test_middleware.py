@@ -6,6 +6,7 @@ fakes bound to this instance's registry, and the service key is ``service-token`
 
 import json
 from uuid import uuid4
+from urllib.parse import unquote
 
 import httpx
 import pytest
@@ -29,13 +30,14 @@ PRIMARY = "https://primary.example.org"
 WRITER = APIKey(token="writer", read=True, write=True, modules=frozenset({WILDCARD}), name="console")
 READER = APIKey(token="reader", read=True, write=False, modules=frozenset({WILDCARD}), name="viewer")
 MAGPIE_ONLY = APIKey(token="magpie", read=True, write=True, modules=frozenset({"magpie"}), name="configs")
+OPERATOR = APIKey(token="operator", read=True, write=True, modules=frozenset({WILDCARD}), name="opérateur")
 SNAPSHOT_ID = "6f1c2c1e-0d4b-4c43-9a55-2f0d7a3c9b10"
 
 
 @pytest.fixture
 def client(forward_role):
     previous = security._registry
-    security.bind_key_registry(FakeRegistry(WRITER, READER, MAGPIE_ONLY))
+    security.bind_key_registry(FakeRegistry(WRITER, READER, MAGPIE_ONLY, OPERATOR))
     yield TestClient(app, raise_server_exceptions=False)
     security._registry = previous
 
@@ -96,6 +98,17 @@ def test_only_the_body_query_and_content_headers_go_on(client, httpx_mock: HTTPX
     assert json.loads(sent.headers["X-Canopy-On-Behalf-Of-Facilities"]) == []
     assert "cookie" not in sent.headers
     assert sent.headers["X-API-Key"] == "service-token"
+
+
+def test_a_non_ascii_name_travels_percent_encoded(client, httpx_mock: HTTPXMock):
+    httpx_mock.add_response(method="POST", url=f"{PRIMARY}/squirrel/v1/pvs", json={})
+
+    resp = client.post("/squirrel/v1/pvs", json={}, headers=_as(OPERATOR))
+
+    assert resp.status_code == 200, resp.text
+    sent = httpx_mock.get_request().headers["X-Canopy-On-Behalf-Of"]
+    assert sent == "op%C3%A9rateur@site_a"
+    assert unquote(sent) == "opérateur@site_a"
 
 
 def test_the_primarys_errors_come_back_as_they_are(client, httpx_mock: HTTPXMock):
@@ -234,6 +247,16 @@ class TestReadYourWrites:
         assert resp.status_code == 200
         assert resp.headers["x-canopy-replica-stale"] == "true"
 
+    def test_a_browser_on_another_origin_can_read_both_headers(self, client, httpx_mock: HTTPXMock, waited):
+        waited(False)
+        httpx_mock.add_response(json={}, headers={"X-Canopy-Commit-LSN": "0/16B3748"})
+
+        resp = client.post("/squirrel/v1/pvs", json={}, headers=_as(WRITER, Origin="https://ui.example.org"))
+
+        exposed = {name.strip().lower() for name in resp.headers["access-control-expose-headers"].split(",")}
+        assert {"x-canopy-commit-lsn", "x-canopy-replica-stale"} <= exposed
+        assert resp.headers["x-canopy-replica-stale"] == "true"
+
     def test_no_commit_no_wait(self, client, httpx_mock: HTTPXMock, waited):
         calls = waited(False)
         httpx_mock.add_response(json={"jobId": "j1", "statusUrl": "/jobs/v1/j1"})
@@ -364,6 +387,14 @@ class TestJobStatus:
         sent = httpx_mock.get_request()
         assert sent.headers["X-API-Key"] == "service-token"
         assert sent.headers["X-Canopy-On-Behalf-Of"] == "viewer@site_a"
+
+    def test_a_non_ascii_caller_can_poll(self, client, httpx_mock: HTTPXMock, no_local_job):
+        httpx_mock.add_response(method="GET", url=f"{PRIMARY}/jobs/v1/j1", json={"id": "j1", "status": "running"})
+
+        resp = client.get("/jobs/v1/j1", headers=_as(OPERATOR))
+
+        assert resp.status_code == 200, resp.text
+        assert httpx_mock.get_request().headers["X-Canopy-On-Behalf-Of"] == "op%C3%A9rateur@site_a"
 
     def test_unknown_on_the_primary_too(self, client, httpx_mock: HTTPXMock, no_local_job):
         httpx_mock.add_response(method="GET", url=f"{PRIMARY}/jobs/v1/j2", status_code=404, json={})

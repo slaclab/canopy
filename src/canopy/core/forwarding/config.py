@@ -64,6 +64,14 @@ class ForwardConfig(BaseSettings):
         default=False, description="Allow an http:// primary_url. For local development and tests only."
     )
 
+    @field_validator("primary_url", "service_key", "primary_window_days", "ca_bundle", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        """Read a blank value, as Helm and compose render an unset one, as unset (like ``Settings``)."""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("primary_url")
     @classmethod
     def _strip_trailing_slash(cls, value: str | None) -> str | None:

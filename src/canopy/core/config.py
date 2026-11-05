@@ -2,7 +2,7 @@ import logging
 from typing import Literal
 from functools import lru_cache
 
-from pydantic import model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,9 @@ class Settings(BaseSettings):
         Base URL of the read-only history instance holding this instance's full
         history, reported by ``GET /v1/instance`` so clients can link to it.
     window_days : int | None
-        Days of history this instance keeps; ``None`` means it keeps everything.
+        Days of history this instance keeps, at least 1; ``None`` means it keeps
+        everything. A blank value, as Helm and compose render an unset one, is ``None``
+        here and for ``instance`` and ``history_url``.
     accept_forwarded_writes : bool
         On a primary, trust ``X-Canopy-On-Behalf-Of`` from service keys, so a forward
         instance's writes are recorded under the user it sent them for. Off by
@@ -99,7 +101,15 @@ class Settings(BaseSettings):
     role: Literal["primary", "mirror", "forward"] = "primary"
     instance: str | None = None
     history_url: str | None = None
-    window_days: int | None = None
+    window_days: int | None = Field(None, ge=1)
+
+    @field_validator("instance", "history_url", "window_days", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        """Read a blank value as unset rather than as ``""`` or an unparseable int."""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     # Primary only: accept writes a forward instance sends on a user's behalf.
     accept_forwarded_writes: bool = False

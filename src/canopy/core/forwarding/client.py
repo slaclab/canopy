@@ -7,10 +7,9 @@ forwarded write started on the primary).
 from __future__ import annotations
 
 import json
-import time
 import asyncio
 import logging
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 import asyncpg
@@ -92,7 +91,9 @@ async def send_to_primary(
     outgoing = {name: value for name, value in (headers or {}).items() if name.lower() in PASSED_REQUEST_HEADERS}
     outgoing |= {
         "X-API-Key": service_key,
-        ON_BEHALF_OF_HEADER: on_behalf_of(caller),
+        # Percent-encoded UTF-8: header values are ASCII, a key's name needn't be.
+        # Keeping @ and : readable costs nothing, since % itself is always encoded.
+        ON_BEHALF_OF_HEADER: quote(on_behalf_of(caller), safe="@:"),
         # The primary limits the request to the facilities both keys reach.
         ON_BEHALF_OF_FACILITIES_HEADER: json.dumps(sorted(caller.facilities)),
     }
@@ -125,6 +126,9 @@ async def wait_until_applied(commit_lsn: str, timeout_s: float) -> bool:
     ``CANOPY_INSTANCE``, or no grant on the view): the caller then marks the answer
     stale, which is true as far as this instance can tell. Never raises; the write
     already succeeded on the primary.
+
+    ``timeout_s`` bounds the whole wait, getting a connection from the pool and each
+    query included, so a busy pool or a stalled database can't hold the answer.
     """
     try:
         target = lsn_value(commit_lsn)
@@ -132,17 +136,17 @@ async def wait_until_applied(commit_lsn: str, timeout_s: float) -> bool:
     except (ValueError, Refused) as exc:
         logger.warning("Cannot wait for a forwarded write to replicate: %s", exc)
         return False
-    deadline = time.monotonic() + timeout_s
     try:
-        async with get_engine().connect() as conn:
-            raw = (await conn.get_raw_connection()).driver_connection
-            while True:
-                applied = await applied_lsn(raw, subscription)
-                if applied is not None and lsn_value(applied) >= target:
-                    return True
-                if time.monotonic() >= deadline:
-                    return False
-                await asyncio.sleep(_POLL_S)
+        async with asyncio.timeout(timeout_s):
+            async with get_engine().connect() as conn:
+                raw = (await conn.get_raw_connection()).driver_connection
+                while True:
+                    applied = await applied_lsn(raw, subscription)
+                    if applied is not None and lsn_value(applied) >= target:
+                        return True
+                    await asyncio.sleep(_POLL_S)
+    except TimeoutError:
+        return False
     except asyncpg.InsufficientPrivilegeError:
         logger.warning(
             "Cannot read pg_replication_origin_status, so forwarded writes can't wait for replication. As a "
