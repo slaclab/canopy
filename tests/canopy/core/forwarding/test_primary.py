@@ -110,12 +110,38 @@ class TestTrust:
 
         assert actor_client.post("/actor", headers={"X-API-Key": "svc", **ON_BEHALF}).status_code == 403
 
-    @pytest.mark.parametrize("value", ["   ", "x" * 256, "tab\there"])
-    def test_malformed_names(self, actor_client, accepting, value):
-        resp = actor_client.post("/actor", headers={"X-API-Key": "svc", "X-Canopy-On-Behalf-Of": value})
+    def test_the_name_arrives_percent_encoded(self, actor_client, accepting):
+        resp = actor_client.post(
+            "/actor",
+            headers={"X-API-Key": "svc", **ON_BEHALF, "X-Canopy-On-Behalf-Of": "op%C3%A9rateur@site_a"},
+        )
+
+        assert resp.json() == {"actor": "opérateur@site_a"}
+
+    def test_the_length_limit_is_on_the_decoded_name(self, actor_client, accepting):
+        resp = actor_client.post(
+            "/actor", headers={"X-API-Key": "svc", **ON_BEHALF, "X-Canopy-On-Behalf-Of": "%C3%A9" * 255}
+        )
+
+        assert resp.json() == {"actor": "é" * 255}
+
+    def test_a_name_that_isnt_utf8_is_a_bad_request(self, actor_client, accepting):
+        resp = actor_client.post("/actor", headers={"X-API-Key": "svc", **ON_BEHALF, "X-Canopy-On-Behalf-Of": "%C3"})
 
         assert resp.status_code == 400
-        assert resp.json()["code"] == "bad_request"
+        assert "percent-encoded UTF-8" in resp.json()["detail"]
+
+    def test_a_client_key_is_refused_before_the_name_is_read(self, actor_client, accepting):
+        resp = actor_client.post("/actor", headers={"X-API-Key": "cli", **ON_BEHALF, "X-Canopy-On-Behalf-Of": "%C3"})
+
+        assert resp.json()["code"] == "forwarded_write_refused"
+
+    @pytest.mark.parametrize("value", ["   ", "x" * 256, "tab\there", "tab%09here", "%25" * 256])
+    def test_malformed_names(self, actor_client, accepting, value):
+        resp = actor_client.post("/actor", headers={"X-API-Key": "svc", **ON_BEHALF, "X-Canopy-On-Behalf-Of": value})
+
+        assert resp.status_code == 400
+        assert "printable characters" in resp.json()["detail"]
 
     def test_the_callers_facilities_are_required(self, actor_client, accepting):
         resp = actor_client.post("/actor", headers={"X-API-Key": "svc", "X-Canopy-On-Behalf-Of": "operator@site_a"})
@@ -276,3 +302,14 @@ async def test_a_forwarded_config_records_the_caller_not_the_body(http):
 
     assert forwarded.json()["createdBy"] == "operator@site_a"
     assert direct.json()["createdBy"] == "claimed"
+
+
+async def test_a_non_ascii_caller_is_recorded_as_named(http):
+    resp = await http.post(
+        "/magpie/v1/configs/trace",
+        json={"data": {}},
+        headers={"X-API-Key": "svc", **ON_BEHALF, "X-Canopy-On-Behalf-Of": "op%C3%A9rateur@site_a"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["createdBy"] == "opérateur@site_a"

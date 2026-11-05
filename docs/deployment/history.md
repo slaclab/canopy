@@ -239,7 +239,8 @@ A forwarded capture runs as a job on the primary. Clients poll it here as usual:
 
 The forward instance checks the caller's own key (write scope and module), then calls
 the primary with its service key and names the caller in `X-Canopy-On-Behalf-Of`, as
-`<key name>@<instance>`. The primary trusts that header only from a service key and
+`<key name>@<instance>`, percent-encoded UTF-8 so a non-ASCII key name survives the
+trip. The primary trusts that header only from a service key and
 only with `CANOPY_ACCEPT_FORWARDED_WRITES=true`; otherwise it refuses the request with
 403 `forwarded_write_refused`. It records the name in `createdBy` (snapshot captures,
 Magpie configs) and logs it for imports.
@@ -266,7 +267,9 @@ For a forwarded request that committed a write, the primary returns
 (2 s) for its subscription's applied position (`pg_replication_origin_status`) to
 reach it. If it doesn't, the answer carries `X-Canopy-Replica-Stale: true`: the write
 succeeded, but a read straight after it may not show it yet. A capture commits later,
-in the primary's worker, so it carries no position.
+in the primary's worker, so it carries no position. Both headers are exposed through
+CORS, so a browser client on another origin can read them. The wait includes getting a
+database connection, so a busy pool marks the answer stale rather than delaying it.
 
 The view is readable only by superusers by default. As a superuser on the forward
 instance's database, grant its app role both:

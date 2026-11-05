@@ -45,6 +45,7 @@ from canopy.core.replication import metrics as replication_metrics
 from canopy.core.keys.registry import build_key_registry
 from canopy.core.facilities.routes import router as facilities_router
 from canopy.core.keys.repositories import ApiKeyRepository
+from canopy.core.forwarding.context import COMMIT_LSN_HEADER, REPLICA_STALE_HEADER
 from canopy.core.forwarding.middleware import ForwardingMiddleware
 
 configure_logging()
@@ -126,6 +127,9 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Not CORS-safelisted, so a browser client on another origin couldn't otherwise read
+    # whether its forwarded write is visible here yet.
+    expose_headers=[COMMIT_LSN_HEADER, REPLICA_STALE_HEADER],
 )
 
 register_canopy_error_handler(app)
