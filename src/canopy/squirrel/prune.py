@@ -13,6 +13,11 @@ mirror not at all: both tables are ``time_series`` in the replication registry,
 whose split-layout publication carries no deletes, and the gate refuses to run
 while any publication carrying them does.
 
+Each facility keeps its newest snapshot, however old. Deleting a facility is refused
+while any snapshot refers to it (``facility_in_use``); if prune removed a facility's
+last one, the facility could be deleted here, and that delete would reach history,
+whose copies of the pruned snapshots would then name a missing facility.
+
 Prune can't see references held outside this database: a service that refers to
 snapshots it may need later, such as an optimization service's runs, sets ``retain``
 on them.
@@ -25,7 +30,8 @@ from datetime import UTC, datetime, timedelta
 from collections.abc import Callable, Awaitable
 
 import asyncpg
-from sqlalchemy import func, delete, select
+from sqlalchemy import or_, func, delete, exists, select, tuple_
+from sqlalchemy.orm import aliased
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from canopy.core.db import get_session_maker
@@ -46,10 +52,25 @@ PRUNED_TABLES = ("squirrel.snapshot", "squirrel.snapshot_value")
 
 
 def _candidates(cutoff: datetime):
-    """Snapshots old enough to prune, oldest first (``snapshot (created_at, id)`` serves it)."""
+    """Snapshots old enough to prune, oldest first (``snapshot (created_at, id)`` serves it).
+
+    A snapshot in a facility is a candidate only while a newer snapshot of the same
+    facility exists, deleted or not, so the facility's newest one always stays.
+    """
+    newer = aliased(Snapshot)
     return (
         select(Snapshot.id)
-        .where(Snapshot.created_at < cutoff, Snapshot.retain.is_(False))
+        .where(
+            Snapshot.created_at < cutoff,
+            Snapshot.retain.is_(False),
+            or_(
+                Snapshot.facility_id.is_(None),
+                exists().where(
+                    newer.facility_id == Snapshot.facility_id,
+                    tuple_(newer.created_at, newer.id) > tuple_(Snapshot.created_at, Snapshot.id),
+                ),
+            ),
+        )
         .order_by(Snapshot.created_at, Snapshot.id)
     )
 

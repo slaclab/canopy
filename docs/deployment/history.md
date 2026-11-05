@@ -181,7 +181,9 @@ On the primary's worker, set `CANOPY_INSTANCE`, `CANOPY_WINDOW_DAYS` and
 month while `drift-check` stays clean, then turn the dry run off.
 
 Each run removes snapshots older than the window that aren't retained, deleted or
-not, up to `CANOPY_PRUNE__MAX_SNAPSHOTS_PER_RUN`, one per transaction. Before every
+not, up to `CANOPY_PRUNE__MAX_SNAPSHOTS_PER_RUN`, one per transaction. Each facility
+keeps its newest snapshot however old it is, so a facility history still refers to
+stays in use and can't be deleted. Before every
 snapshot it checks a gate, and it stops at the first failure, logging each failed
 check by name:
 
