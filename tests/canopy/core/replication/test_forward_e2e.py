@@ -99,6 +99,11 @@ async def test_the_mirror_reports_a_forwarded_write_applied(pair: Pair, monkeypa
             f'GRANT EXECUTE ON FUNCTION pg_show_replication_origin_status() TO "{p.config.app_role}"'
         )
         assert await wait_until_applied(commit_lsn, 30.0) is True
+
+        # A wait cut short by its timeout hands its connection back to the pool in working
+        # order: the next wait, on the same pool, still reads the position.
+        assert await wait_until_applied("FFFFFFFF/0", 0.3) is False
+        assert await wait_until_applied(commit_lsn, 5.0) is True
     finally:
         await db.dispose_engine()
         get_settings.cache_clear()
