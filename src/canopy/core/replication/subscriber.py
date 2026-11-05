@@ -32,6 +32,8 @@ from canopy.core.replication.sql import (
     quote_literal,
     tables_present,
     schemas_present,
+    require_confined,
+    owner_memberships,
 )
 from canopy.core.replication.config import ReplicationConfig
 from canopy.core.replication.registry import EXCLUDED, REGISTRY, ReplicationRegistry
@@ -266,11 +268,18 @@ async def grants(
     later migration creates is readable at once. Run it after ``alembic upgrade head``,
     as the tables' owner, so a new local table also gets its write grant.
 
+    Afterwards the app role must be able to write no replicated table, counting what
+    it inherits from other roles or PUBLIC: a write there would diverge from the
+    primary or break replication. ``grants`` refuses rather than change those shared
+    grants, and the refusal rolls back its own.
+
     Raises
     ------
     Refused
-        Wrong role, the app role doesn't exist, or it is a superuser or owns a registered
-        table (grants mean nothing to it, and a revoke would strip an owner's own rights).
+        Wrong role; the app role doesn't exist; it is a superuser, owns a registered
+        table or belongs to a role that does (grants can't limit it, and a revoke would
+        strip an owner's own rights); or, after the grants, it can still do more than
+        read replicated tables and read and write local ones.
     """
     require_role("grants", "mirror", role)
     app = config.app_role
@@ -283,6 +292,11 @@ async def grants(
     owners = await table_owners(conn, registered)
     if owned := sorted(table for table, owner in owners.items() if owner == app):
         raise Refused(f"app role {app} owns {', '.join(owned)}; it must not own the tables it is limited on")
+    if memberships := await owner_memberships(conn, app, registered):
+        raise Refused(
+            f"app role {app} belongs to {', '.join(memberships)}, which owns registered tables, so it can act as "
+            "their owner; remove that membership"
+        )
     if unclassified := sorted(present - set(registry.tables) - EXCLUDED):
         logger.warning("Unclassified tables, left to default privileges: %s", ", ".join(unclassified))
 
@@ -306,6 +320,16 @@ async def grants(
                 f"ALTER DEFAULT PRIVILEGES FOR ROLE {quote_ident(owner)} "
                 f"IN SCHEMA {', '.join(quote_ident(s) for s in schemas)} GRANT SELECT ON TABLES TO {ident}"
             )
+        # Unclassified tables keep the SELECT that default privileges give them.
+        read_write = {"SELECT", "INSERT", "UPDATE", "DELETE"}
+        await require_confined(
+            conn,
+            app,
+            tables=present,
+            allowed={table: (read_write if table in local else {"SELECT"}) for table in present},
+            command="grants",
+            policy="SELECT on replicated tables and read-write on local ones",
+        )
     logger.info(
         "Granted %s: SELECT on %d replicated tables, read-write on %s", app, len(replicated), ", ".join(local) or "none"
     )
