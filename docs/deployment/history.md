@@ -43,7 +43,7 @@ flowchart LR
 |---|---|---|
 | `primary` (default) | Everything, including machine operations | All tasks |
 | `mirror` | Refused with 403 `read_only_instance`, except API-key management | Stateless tasks only |
-| `forward` | An allowlisted set sent to the primary ([Forward mode](#forward-mode)); the rest refused as on a mirror | Stateless tasks only |
+| `forward` | An allowlisted set sent to the primary ([Forward mode](#forward-mode)), e-log posts made here; the rest refused as on a mirror | Stateless tasks only |
 
 `GET /v1/instance` reports the role, so clients can hide write controls, and the
 Alembic head shipped in the image, which the deploy check below compares.
@@ -223,9 +223,9 @@ test fails when a new route is in neither list.
 | Snapshot restore, Hare PV write | No: they change the machine |
 | API keys | No: each instance manages its own |
 | Facilities | No: define them on the primary; the mirror copies them |
-| E-log entries and attachments | No: they post to the external e-log |
+| E-log entries and attachments | No: the forward instance posts them itself, with its own `CANOPY_ELOG__*` app tokens |
 
-Anything not forwarded is refused as on a mirror, with 403 `read_only_instance`. A
+Anything else not forwarded is refused as on a mirror, with 403 `read_only_instance`. A
 change to a snapshot older than `CANOPY_FORWARD__PRIMARY_WINDOW_DAYS` is refused with
 409 `archived_immutable` unless the snapshot is retained, since the primary may have
 pruned it. To bring such a snapshot back, export it here
