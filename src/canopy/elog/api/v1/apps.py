@@ -10,7 +10,11 @@ from typing import Annotated
 from fastapi import File, Query, Security, APIRouter, UploadFile
 
 from canopy.elog.errors import ElogAttachmentTooLarge
-from canopy.core.security import APIKey, require_read_access, require_external_write_access
+from canopy.core.security import (
+    APIKey,
+    require_read_access,
+    require_external_write_access,
+)
 from canopy.elog.dependencies import ElogServiceDep
 from canopy.elog.schemas.elog import (
     ElogTagDTO,
