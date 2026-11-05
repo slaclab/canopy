@@ -47,6 +47,13 @@ flowchart LR
 `GET /v1/instance` reports the role, so clients can hide write controls, and the
 Alembic head shipped in the image, which the deploy check below compares.
 
+**API keys and facilities.** Each side's API keys are its own, and a key's facility
+grants are slugs. The primary refuses to delete a facility one of its keys grants, but
+it can't see a mirror's keys. A facility deleted on the primary is deleted on the
+mirror too, and a mirror key that granted it silently stops reaching that facility's
+data (a slug that no longer exists grants nothing). Check the mirror's keys before
+deleting a facility on the primary, and re-grant them afterwards.
+
 ### Database roles
 
 | Role | Database | Used by | Rights |
@@ -80,6 +87,14 @@ A deploy pipeline can enforce the order: before step 2, compare `alembicHead` fr
 mirror's `GET /v1/instance` with the head in the new image, and stop if the mirror is
 behind.
 
+**A release with `canopy_requires_primary_at`.** A revision that drops a column or
+table on the mirror, or tightens a constraint after a backfill, names the earlier
+revision its primary must already run (see "Database Migrations" in
+`CONTRIBUTING.md`). Before step 1 of such a release, confirm that the primary runs that
+revision or a later one (`alembic current` there), and that the mirror has caught up:
+on the primary, `status` shows the mirror's slot `active` with `lag_bytes` at or near 0.
+Otherwise the mirror could still be applying rows the migration would reject.
+
 **First deployment.** Run `publish` on the primary, migrate the mirror and run
 `grants`, then run `subscribe` once, with `CANOPY_REPLICATION__PUBLISHER_DSN` from a
 secret. It copies every published table, then streams changes. `status` shows the copy's
@@ -90,8 +105,9 @@ progress on either side.
 ### CronJobs
 
 On the mirror, hourly: `refresh`, then `drift-check` (with
-`CANOPY_REPLICATION__READER_DSN`). `drift-check` exits 1 when the copy has drifted
-and 2 when it couldn't check, so either fails the Job.
+`CANOPY_REPLICATION__READER_DSN`). `drift-check` exits 0 only when every published
+table was compared and is in step, 1 when the copy has drifted, and 2 when it couldn't
+check every table, so anything but 0 fails the Job.
 
 ### Metrics and alerts
 
@@ -111,10 +127,20 @@ table the subscription holds:
 - time-series tables: row counts per UTC day (snapshot values by their snapshot's
   day), plus values whose snapshot is missing.
 
-Tables that differ are read again after `--settle` seconds (30 by default), so lag
-isn't reported as drift. The JSON report names each drifting table and day. To repair
-drift, find its cause, then run `reseed` with `--since` no later than the oldest
-drifting day (reference tables are always reconciled in full).
+A table that differs is drift only when the comparison is conclusive: the mirror's slot
+on the primary has confirmed the position the primary was read at, the mirror still
+differs, and a second read of the primary matches the first. Otherwise lag or a write
+landing between the reads may explain it, so the table is tried again within
+`--settle` seconds (30 by default) and then reported as inconclusive (exit 2). Tables
+still copying, or published but not subscribed yet, are reported as not checked (also
+exit 2). The JSON report names each drifting table and day. To repair drift, find its
+cause, then run `reseed` with `--since` no later than the oldest drifting day
+(reference tables and snapshots are always reconciled in full).
+
+If `publish` on the primary ever reported tables it `cleared`, or `status` showed
+`restricted` ones (a row filter or column list on the publication), a mirror that
+subscribed while the restriction was in place holds only part of those tables, and
+`refresh` won't copy them again. Re-seed those tables on each mirror.
 
 ## Runbooks
 
@@ -139,17 +165,22 @@ needed, so this subscription can't continue.
    `SELECT max(created_at) FROM squirrel.snapshot;`
 4. Run `reseed --since <that time>` on the mirror, with both
    `CANOPY_REPLICATION__PUBLISHER_DSN` and `CANOPY_REPLICATION__READER_DSN` set. It
-   creates the subscription disabled and without a copy, copies what changed since
-   that time, and enables it from the cut. An earlier time is safe, only slower; a
-   later one is refused, because its changes would be lost.
+   creates the subscription disabled and without a copy, copies what the mirror is
+   missing, and enables it from an exact cut, so nothing is copied and replayed both.
+   Snapshots the mirror lacks are found by id, whatever their time; `--since` bounds
+   which snapshots both sides hold get their values re-read. An earlier time is safe,
+   only slower; a later one is refused.
 5. Run `drift-check`.
 
-If a write transaction was open on the primary when the re-seed began (the report's
-`open_at_cut` is above zero, and the log warns), it is both copied and replayed. If it
-inserted rows, apply stops right after the re-seed with a duplicate key. The
-transaction is already in place, so skip it with
-`ALTER SUBSCRIPTION canopy_history_<instance> SKIP (lsn = '<lsn>')`, taking the LSN from
-the "finished at" in the mirror's log.
+The cut needs a moment when no transaction on the primary takes a new transaction id.
+`reseed` keeps trying for `--cut-wait` seconds (60 by default), waiting out writes that
+are already open. On a primary that never pauses that long it refuses and changes
+nothing: pause writes on the primary briefly (stop its API and worker), or retry at a
+quieter time.
+
+If `reseed` fails part-way, the subscription stays disabled: run it again. Never enable
+the subscription by hand after a failed run, since replication would resume from where
+the old slot left off, not from the copy.
 
 ### History PITR
 

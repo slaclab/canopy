@@ -12,10 +12,12 @@ from canopy.core.db import Base
 from canopy.core.config import get_settings
 from canopy.core.replication import drift
 from canopy.core.replication.drift import (
+    EXIT,
     ORPHANS,
     TIME_SERIES_BUCKETS,
     Check,
     Bucketing,
+    status,
     compare,
 )
 from canopy.core.replication.__main__ import build_parser
@@ -151,3 +153,23 @@ async def test_a_failed_connection_never_shows_the_password(env, caplog, capsys)
     )
     assert await drift.run(ARGS) == 2
     assert secret not in caplog.text and secret not in capsys.readouterr().out
+
+
+def _report(**fields) -> dict:
+    return {"compared": ["squirrel.pv"], "skipped": {}, "inconclusive": {}, "drift": {}} | fields
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({}, "in_step"),
+        ({"drift": {"squirrel.pv": {}}}, "drift"),
+        ({"drift": {"squirrel.pv": {}}, "skipped": {"squirrel.tag": "copying"}}, "drift"),
+        ({"skipped": {"squirrel.tag": "copying"}}, "not_checked"),
+        ({"inconclusive": {"squirrel.pv": "the primary changed while it was being compared"}}, "not_checked"),
+        ({"compared": []}, "not_checked"),
+    ],
+)
+def test_only_a_complete_comparison_is_in_step(fields, expected):
+    assert status(_report(**fields)) == expected
+    assert EXIT[expected] == {"in_step": 0, "drift": 1, "not_checked": 2}[expected]
