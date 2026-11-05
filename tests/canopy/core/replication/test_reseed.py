@@ -42,6 +42,11 @@ def test_since_without_a_zone_is_utc():
         parse_since("yesterday")
 
 
+def test_cut_wait_defaults_to_a_minute():
+    assert build_parser().parse_args(["reseed", "--since", "2026-10-01"]).cut_wait == 60.0
+    assert build_parser().parse_args(["reseed", "--since", "2026-10-01", "--cut-wait", "5"]).cut_wait == 5.0
+
+
 def test_since_is_required():
     assert build_parser().parse_args(["reseed", "--since", "2026-10-01"]).since == datetime(2026, 10, 1, tzinfo=UTC)
     with pytest.raises(SystemExit):
