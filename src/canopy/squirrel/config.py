@@ -7,8 +7,47 @@ call (no caching) so tests can vary the environment freely.
 
 from __future__ import annotations
 
-from pydantic import Field
+from typing import Self
+
+from pydantic import Field, BaseModel, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class PVCacheConfig(BaseModel):
+    """The worker-side PV cache that ``POST /snapshots?useCache=true`` reads from.
+
+    When enabled, one ``canopy-worker`` (elected through a Redis lease) monitors every
+    registered setpoint and readback address and keeps its latest value in Redis.
+    Snapshot create can then read the cache instead of issuing a live read per PV;
+    anything the cache can't vouch for is still read live.
+
+    Cached values are monitor-resolution: alarm changes are posted at once, but a
+    value change within the record's monitor deadband (MDEL) isn't, so a cached value
+    can trail a live read by up to that deadband, with its own (older) timestamp.
+    """
+
+    enabled: bool = False
+    # How often the leader re-reads the registered PVs from the database and
+    # subscribes to new addresses / drops removed ones.
+    reconcile_interval_s: float = Field(60.0, gt=0)
+    # How often buffered monitor updates are written to Redis (and the heartbeat bumped).
+    flush_interval_s: float = Field(1.0, gt=0)
+    # A cache whose heartbeat is older than this is ignored entirely by snapshot create.
+    heartbeat_max_age_s: float = Field(30.0, gt=0)
+    # Leader lease length; the leader renews it every third of this.
+    lease_ttl_s: float = Field(30.0, gt=0)
+    # Subscriptions opened concurrently while (re)building the monitor set.
+    subscribe_concurrency: int = Field(200, ge=1)
+
+    @model_validator(mode="after")
+    def _heartbeat_outlasts_a_flush(self) -> Self:
+        # Otherwise every heartbeat is stale by the next flush and snapshots never use the cache.
+        if self.heartbeat_max_age_s <= self.flush_interval_s:
+            raise ValueError(
+                f"heartbeat_max_age_s ({self.heartbeat_max_age_s:g}) must be longer than "
+                f"flush_interval_s ({self.flush_interval_s:g})"
+            )
+        return self
 
 
 class SquirrelConfig(BaseSettings):
@@ -42,6 +81,9 @@ class SquirrelConfig(BaseSettings):
     epics_concurrency: int = 64
     epics_chunk_size: int = 500
     epics_timeout_s: float | None = None
+
+    # Worker-side PV cache for cached snapshots (CANOPY_SQUIRREL__PV_CACHE__*).
+    pv_cache: PVCacheConfig = PVCacheConfig()
 
     @property
     def restore_hooks_list(self) -> list[str]:

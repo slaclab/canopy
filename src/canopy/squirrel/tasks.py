@@ -20,6 +20,7 @@ from arq import Retry
 from canopy.core.db import session_scope
 from canopy.jobs.gateway import report_progress
 from canopy.squirrel.config import get_squirrel_config
+from canopy.squirrel.pv_cache.reader import PVCacheReader
 from canopy.squirrel.schemas.snapshot import NewSnapshotDTO, RestoreRequestDTO
 from canopy.squirrel.adapters.epics_io import EpicsIO
 from canopy.squirrel.services.snapshot_service import SnapshotService
@@ -63,6 +64,7 @@ async def create_snapshot_task(
     description: str | None = None,
     created_by: str | None = None,
     facility_id: str | None = None,
+    use_cache: bool = False,
 ) -> dict:
     """Read the facility's PVs (or every PV) from EPICS and persist a snapshot. Returns
     ``{"type":"snapshot","id":...}``.
@@ -70,10 +72,17 @@ async def create_snapshot_task(
     The facility arrives as a resolved **id**, not a slug: the route had to resolve it to
     check the caller's facility grant before enqueueing, and re-resolving here would
     re-read a slug that may have changed in the interim.
+
+    With ``use_cache``, values the PV cache can vouch for come from it and the rest
+    are read live from EPICS.
     """
-    logger.info("create_snapshot_task: job_id=%s title=%r", ctx.get("job_id"), title)
+    logger.info("create_snapshot_task: job_id=%s title=%r use_cache=%s", ctx.get("job_id"), title, use_cache)
     try:
         epics_io = _build_epics_io(ctx)
+        pv_cache = None
+        if use_cache:
+            cache_cfg = get_squirrel_config().pv_cache
+            pv_cache = PVCacheReader(ctx["redis"], heartbeat_max_age_s=cache_cfg.heartbeat_max_age_s)
         async with session_scope() as session:
             service = SnapshotService(session, epics_io)
             summary = await service.create_snapshot(
@@ -81,6 +90,7 @@ async def create_snapshot_task(
                 created_by=created_by,
                 progress_callback=_progress_sink(ctx),
                 facility_id=facility_id,
+                pv_cache=pv_cache,
             )
             await session.commit()
         return {"type": "snapshot", "id": summary.id}
