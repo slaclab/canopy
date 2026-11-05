@@ -239,6 +239,9 @@ def _normalize_bitwise_precedence(expression: str) -> str:
 
     insertions: dict[int, list[str]] = {}
     boundaries = {",", "and", "or", "if", "else", ":"}
+    # Only &, |, ^ need rewriting: in EPICS Calc (C-like) comparisons bind tighter than these,
+    # the reverse of Python. Shifts (<< >>) are deliberately excluded because they bind tighter
+    # than comparisons in both C and Python, so their grouping is already EPICS-correct.
     bitwise = {"&", "|", "^"}
     comparisons = {"==", "!=", "<", "<=", ">", ">="}
 
