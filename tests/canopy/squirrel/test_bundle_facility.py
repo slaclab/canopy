@@ -6,14 +6,16 @@ is gated like a capture. The keys and facilities are ``test_facility_enforcement
 """
 
 from httpx import AsyncClient
-from sqlalchemy import insert
+from sqlalchemy import delete, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.squirrel.data.models import Pv, Snapshot, SnapshotValue, pv_facility
 from tests.canopy.squirrel.test_facility_enforcement import (  # noqa: F401 - scoped_keys is an autouse fixture
     NC_HEADERS,
     SC_HEADERS,
+    LCLS_HEADERS,
     WILD_HEADERS,
+    SC_FACET_HEADERS,
     scoped_keys,
     _seed_hierarchy,
 )
@@ -131,13 +133,64 @@ async def test_import_of_only_another_facilitys_pvs_creates_nothing(client: Asyn
     assert listing.json()["totalCount"] == 1
 
 
-async def test_an_unrestricted_import_keeps_every_known_pv(client: AsyncClient, db_session: AsyncSession):
+async def test_an_unrestricted_import_keeps_the_pvs_a_capture_would(client: AsyncClient, db_session: AsyncSession):
     facilities = await _seed_hierarchy(db_session)
     sc, nc = facilities["lcls-sc"].id, facilities["lcls-nc"].id
     pvs = {"SC:OWN:SP": sc, "NC:OTHER:SP": nc, "UNASSIGNED:SP": None}
-    bundle = await _export(client, WILD_HEADERS, await _seed_snapshot(db_session, sc, pvs))
+    in_sc = await _export(client, WILD_HEADERS, await _seed_snapshot(db_session, sc, pvs))
+    unassigned = in_sc | {"facility": None}
 
-    r = await client.post("/v1/snapshots/import", headers=WILD_HEADERS, json=bundle)
+    scoped = await client.post("/v1/snapshots/import", headers=WILD_HEADERS, json=in_sc)
+    everything = await client.post("/v1/snapshots/import", headers=WILD_HEADERS, json=unassigned)
 
-    assert r.status_code == 200 and r.json()["skipped"] == []
-    assert r.json()["snapshot"]["pvCount"] == 3
+    # A bundle in a facility keeps that facility's PVs, as a capture there would; one
+    # with no facility keeps every PV, as an unassigned capture does.
+    assert sorted(v["pvName"] for v in scoped.json()["skipped"]) == ["NC:OTHER:SP", "UNASSIGNED:SP"]
+    assert everything.json()["skipped"] == [] and everything.json()["snapshot"]["pvCount"] == 3
+
+
+# --- the capture rule: a bundle's PVs come from its facility's subtree -------- #
+
+
+async def test_a_key_holding_two_facilities_cant_mix_them(client: AsyncClient, db_session: AsyncSession):
+    facilities = await _seed_hierarchy(db_session)
+    sc, facet = facilities["lcls-sc"].id, facilities["facet"].id
+    bundle = await _export(
+        client, WILD_HEADERS, await _seed_snapshot(db_session, sc, {"SC:OWN:SP": sc, "FACET:OTHER:SP": facet})
+    )
+
+    # The key could restore both PVs, but a capture into lcls-sc takes only lcls-sc's.
+    r = await client.post("/v1/snapshots/import", headers=SC_FACET_HEADERS, json=bundle)
+
+    assert r.status_code == 200, r.text
+    assert [v["pvName"] for v in r.json()["skipped"]] == ["FACET:OTHER:SP"]
+    assert r.json()["snapshot"]["pvCount"] == 1
+
+
+async def test_a_pv_below_the_bundles_facility_is_kept(client: AsyncClient, db_session: AsyncSession):
+    facilities = await _seed_hierarchy(db_session)
+    lcls, sc = facilities["lcls"].id, facilities["lcls-sc"].id
+    bundle = await _export(client, WILD_HEADERS, await _seed_snapshot(db_session, lcls, {"SC:CHILD:SP": sc}))
+
+    r = await client.post("/v1/snapshots/import", headers=LCLS_HEADERS, json=bundle)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["skipped"] == [] and r.json()["snapshot"]["pvCount"] == 1
+
+
+async def test_a_pv_moved_out_of_the_facility_since_export_is_skipped(client: AsyncClient, db_session: AsyncSession):
+    facilities = await _seed_hierarchy(db_session)
+    sc, nc = facilities["lcls-sc"].id, facilities["lcls-nc"].id
+    sid = await _seed_snapshot(db_session, sc, {"SC:STAYS:SP": sc, "SC:MOVES:SP": sc})
+    bundle = await _export(client, WILD_HEADERS, sid)
+    moved = next(v["pvId"] for v in bundle["values"] if v["pvName"] == "SC:MOVES:SP")
+    await db_session.execute(delete(pv_facility).where(pv_facility.c.pv_id == moved))
+    await db_session.execute(insert(pv_facility).values(pv_id=moved, facility_id=nc))
+    await db_session.commit()
+
+    # The lcls key could restore it in lcls-nc, but it no longer belongs in an lcls-sc snapshot.
+    r = await client.post("/v1/snapshots/import", headers=LCLS_HEADERS, json=bundle)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["skipped"] == [{"pvId": moved, "pvName": "SC:MOVES:SP"}]
+    assert r.json()["snapshot"]["pvCount"] == 1
