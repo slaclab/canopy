@@ -63,7 +63,7 @@ deleting a facility on the primary, and re-grant them afterwards.
 | table owner (e.g. `canopy_owner`) | mirror | Migrations, `grants`, `refresh`, `subscribe` | Owns the tables; member of `pg_create_subscription` |
 | `canopy_app` | mirror | The mirror's API and worker | `grants` gives `SELECT` on replicated tables and read-write on API keys |
 | superuser | mirror | `reseed` | Or the table owner with `EXECUTE` on `pg_replication_origin_advance(text, pg_lsn)` |
-| `canopy_heartbeat` | primary | The mirror's `heartbeat` and `switch` | `LOGIN`; `publish` lets it read and write `core.history_heartbeat` and nothing else. Only needed for [pruning](#prune) |
+| `canopy_heartbeat` | primary | The mirror's `heartbeat` and `switch` | `LOGIN`; `publish` lets it read and write `core.history_heartbeat` and nothing else, and refuses if it can reach more through other roles or PUBLIC. Only needed for [pruning](#prune) |
 
 The names are the defaults of `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_ROLE`,
 `__APP_ROLE` and `__HEARTBEAT_ROLE`. The primary's `pg_hba.conf` admits `replicator`,
@@ -218,7 +218,7 @@ check by name:
 | `instance_set`, `window_set` | `CANOPY_INSTANCE` or `CANOPY_WINDOW_DAYS` is unset |
 | `no_delete_publication` | Any publication carrying a snapshot table publishes deletes (`canopy_history` still exists) |
 | `slot_active` | The mirror's slot is missing or no walsender holds it |
-| `streams_split` | The walsender doesn't stream both `canopy_ref` and `canopy_ts`, they don't carry the snapshot tables, or its command can't be read |
+| `streams_split` | The walsender doesn't stream both `canopy_ref` and `canopy_ts`, they don't carry the snapshot tables whole (no row filter or column list), or its command can't be read |
 | `no_initial_copy` | A table's initial copy is running (a `pg_<oid>_sync_…` slot exists) |
 | `wal_status_reserved` | The slot's WAL is at risk |
 | `lag` | Flush lag or the mirror's last reply is older than `CANOPY_PRUNE__MAX_LAG_S` (60 s) |

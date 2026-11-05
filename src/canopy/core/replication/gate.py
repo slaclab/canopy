@@ -16,8 +16,8 @@ check stops the run, and the job reports every check that failed, by name:
     The mirror's slot exists and a walsender holds it.
 ``streams_split``
     That walsender streams both split publications, and between them they carry
-    every pruned table: the mirror has switched to the split layout and still
-    receives new rows and reference changes.
+    every pruned table whole, with no row filter or column list: the mirror has
+    switched to the split layout and still receives new rows and reference changes.
 ``no_initial_copy``
     No table's initial copy is running here (no ``pg_<oid>_sync_...`` slot). A copy
     reads the table as it is when it starts, so rows pruned before then would never
@@ -119,11 +119,14 @@ def evaluate_gate(
         failures["slot_active"] = f"slot {slot_name} has no walsender; the mirror isn't streaming"
     else:
         streamed = slot["walsender_publications"]
+        # A table published with a row filter or column list reaches history only in
+        # part, so it doesn't count as carried.
         carried = {
             table
             for publication in status["publications"]
             if streamed and publication["name"] in streamed and publication["exists"]
             for table in publication["tables"]
+            if table not in publication.get("restricted", {})
         }
         if streamed is None:
             failures["streams_split"] = "can't see what the walsender streams; needs a superuser or pg_read_all_stats"

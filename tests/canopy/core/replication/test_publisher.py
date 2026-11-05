@@ -251,6 +251,25 @@ async def test_publish_lets_the_heartbeat_role_write_its_table_only(db, config):
         assert await privileges(db, config.heartbeat_role, table) == set(), table
 
 
+async def test_publish_refuses_a_heartbeat_role_that_inherits_more(db, config):
+    extra = f"{config.heartbeat_role}_extra"
+    await db.execute(f'CREATE ROLE "{config.heartbeat_role}"')
+    await db.execute(f'CREATE ROLE "{extra}"')
+    try:
+        await db.execute(f'GRANT SELECT ON squirrel.pv TO "{extra}"')
+        await db.execute(f'GRANT "{extra}" TO "{config.heartbeat_role}"')
+
+        with pytest.raises(Refused, match=f"role {config.heartbeat_role} must have no more than read-write on core"):
+            await publish(db, role="primary", config=config)
+
+        # The whole publish rolled back, grants and publication alike.
+        assert await db.fetchval("SELECT count(*) FROM pg_publication") == 0
+        assert await privileges(db, config.heartbeat_role, "core.history_heartbeat") == set()
+    finally:
+        await db.execute(f'REVOKE ALL ON squirrel.pv FROM "{extra}"')
+        await db.execute(f'DROP ROLE "{extra}"')
+
+
 @pytest.mark.parametrize(
     ("streams", "switched"),
     [
