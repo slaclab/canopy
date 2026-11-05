@@ -27,8 +27,8 @@ handled the same way.
 Logs go to stderr (JSON with ``CANOPY_LOG_FORMAT=json``), so stdout carries only
 ``status`` output. Exit status: 0 done (including "nothing to do"), 1 a database
 step failed, 2 refused (wrong role or a failed precondition; nothing changed).
-``drift-check`` differs: 0 in step, 1 drift found, 2 the check couldn't run (see
-``canopy.core.replication.drift``).
+``drift-check`` differs: 0 every table in step, 1 drift found, 2 the check couldn't
+be completed (see ``canopy.core.replication.drift``).
 """
 
 from __future__ import annotations
@@ -112,14 +112,18 @@ def build_parser() -> argparse.ArgumentParser:
         heartbeat_parser.add_argument(
             f"--{check}-ok", action="store_true", help=f"the {check.replace('-', ' ')} check passed; omit if it failed"
         )
-    check = commands.add_parser("drift-check", help="mirror: compare each table with the primary; exit 1 on drift")
+    check = commands.add_parser(
+        "drift-check",
+        help="mirror: compare each table with the primary; exit 1 on drift, 2 when not every table was checked",
+    )
     check.add_argument("--days", type=_positive_int, help="compare time-series rows from the last DAYS days only")
     check.add_argument(
         "--settle",
         type=float,
         default=30.0,
         metavar="SECONDS",
-        help="pause before re-reading tables that differ, to let apply catch up (default 30; 0 skips the re-check)",
+        help="how long to wait for the mirror to confirm the primary's position and retry tables that "
+        "came out inconclusive (default 30)",
     )
     fill = commands.add_parser(
         "reseed", help="mirror: copy what the primary changed since a time, then resume replication from now"
@@ -130,6 +134,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=reseed.parse_since,
         metavar="TIME",
         help="ISO 8601 time (UTC if no zone), no later than the newest snapshot the mirror holds",
+    )
+    fill.add_argument(
+        "--cut-wait",
+        type=float,
+        default=reseed.CUT_WAIT_S,
+        metavar="SECONDS",
+        help="how long to keep trying for an exact cut while the primary writes, before refusing (default 60)",
     )
     return parser
 

@@ -1,4 +1,4 @@
-"""Shared pieces of the replication commands: errors, quoting, redaction, catalog reads.
+"""Shared pieces of the replication commands: errors, quoting, redaction, catalog reads, privilege checks.
 
 DDL takes no bind parameters, so identifiers and the subscription's connection
 string are spliced into statements here, quoted. The connection string carries a
@@ -12,7 +12,7 @@ import re
 from decimal import Decimal
 from datetime import datetime
 from urllib.parse import unquote
-from collections.abc import Iterable
+from collections.abc import Mapping, Iterable
 
 import asyncpg
 from sqlalchemy.engine import make_url
@@ -183,6 +183,113 @@ async def table_owners(conn: asyncpg.Connection, tables: Iterable[str]) -> dict[
         list(tables),
     )
     return {row["name"]: row["owner"] for row in rows}
+
+
+_TABLE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER")
+# Privileges that can also be granted on single columns; has_table_privilege misses those.
+_COLUMN_PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "REFERENCES")
+
+
+async def access_outside(
+    conn: asyncpg.Connection, role: str, *, tables: Iterable[str], allowed: Mapping[str, set[str]]
+) -> list[str]:
+    """Every privilege ``role`` can use on ``tables`` beyond ``allowed``, however it holds it.
+
+    Counts what Postgres would let the role do, not just its own grants: privileges
+    inherited from roles it belongs to, ones granted to PUBLIC, the
+    ``pg_read_all_data`` and ``pg_write_all_data`` roles, and grants on single columns.
+
+    Parameters
+    ----------
+    conn : asyncpg.Connection
+        Connection to the database holding ``tables``.
+    role : str
+        Role to check.
+    tables : Iterable[str]
+        ``"schema.table"`` names to check, each of which must exist.
+    allowed : Mapping[str, set[str]]
+        Privileges ``role`` may hold, per table; a table not listed allows none.
+
+    Returns
+    -------
+    list[str]
+        One entry per privilege held beyond ``allowed``, such as
+        ``"SELECT on core.api_key (granted to PUBLIC)"``, sorted by table.
+    """
+    names = sorted(tables)
+    rows = await conn.fetch(
+        """
+        SELECT t.name, p.privilege,
+               CASE WHEN p.privilege = ANY($4::text[]) THEN has_any_column_privilege($1, t.ref, p.privilege)
+                    ELSE has_table_privilege($1, t.ref, p.privilege) END AS held,
+               CASE WHEN p.privilege = ANY($4::text[]) THEN has_any_column_privilege('public', t.ref, p.privilege)
+                    ELSE has_table_privilege('public', t.ref, p.privilege) END AS public
+        FROM unnest($2::text[], $3::text[]) AS t(name, ref)
+        CROSS JOIN unnest($5::text[]) WITH ORDINALITY AS p(privilege, position)
+        ORDER BY t.name, p.position
+        """,
+        role,
+        names,
+        [qualified(name) for name in names],
+        list(_COLUMN_PRIVILEGES),
+        list(_TABLE_PRIVILEGES),
+    )
+    return [
+        f"{row['privilege']} on {row['name']}" + (" (granted to PUBLIC)" if row["public"] else "")
+        for row in rows
+        if row["held"] and row["privilege"] not in allowed.get(row["name"], set())
+    ]
+
+
+async def owner_memberships(conn: asyncpg.Connection, role: str, tables: Iterable[str]) -> list[str]:
+    """Owners of ``tables`` that ``role`` belongs to, directly or through other roles.
+
+    Membership is enough to act as the owner (``SET ROLE``), even where the role
+    doesn't inherit the owner's privileges, so it counts whatever its options.
+    """
+    owners = sorted(set((await table_owners(conn, tables)).values()))
+    rows = await conn.fetch(
+        "SELECT owner FROM unnest($2::text[]) AS o(owner) WHERE owner <> $1 AND pg_has_role($1, owner, 'MEMBER')",
+        role,
+        owners,
+    )
+    return [row["owner"] for row in rows]
+
+
+async def require_confined(
+    conn: asyncpg.Connection,
+    role: str,
+    *,
+    tables: Iterable[str],
+    allowed: Mapping[str, set[str]],
+    command: str,
+    policy: str,
+) -> None:
+    """Refuse unless ``role`` can do no more on ``tables`` than ``allowed``.
+
+    Run it after the command's own grants, inside its transaction, so the refusal
+    rolls them back. It changes no grants itself: access that comes from PUBLIC or
+    another role is shared, so the fix belongs where it was granted.
+
+    Raises
+    ------
+    Refused
+        When ``role`` is a superuser, belongs to an owner of ``tables``, or holds a
+        privilege beyond ``allowed``; the message names each one.
+    """
+    tables = sorted(tables)
+    if await is_superuser(conn, role):
+        problems = ["it is a superuser"]
+    else:
+        problems = [
+            f"it belongs to {owner}, which owns Canopy tables" for owner in await owner_memberships(conn, role, tables)
+        ]
+        problems += await access_outside(conn, role, tables=tables, allowed=allowed)
+    if problems:
+        raise Refused(
+            f"role {role} must have no more than {policy}, but {'; '.join(problems)}. Remove that access where it "
+            f"is granted (PUBLIC, or the other role); {command} doesn't change shared grants. Nothing was changed"
+        )
 
 
 async def non_empty(conn: asyncpg.Connection, tables: Iterable[str]) -> list[str]:

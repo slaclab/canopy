@@ -7,12 +7,14 @@ from pathlib import Path
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from alembic.operations import Operations
 from alembic.runtime.migration import MigrationContext
 
 from canopy.core.config import get_settings
 from canopy.core.replication.migration import (
     OPTION,
+    REQUIRES_PRIMARY_AT,
     on_publisher,
     on_subscriber,
     side_for_role,
@@ -87,3 +89,15 @@ def test_env_takes_the_side_from_canopy_role(tmp_path, monkeypatch, role, step):
     finally:
         get_settings.cache_clear()
     assert f"SELECT '{step}'" in sql.getvalue()
+
+
+def test_a_required_primary_revision_comes_earlier_in_the_tree():
+    """``canopy_requires_primary_at`` must name a revision before the one that declares it."""
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "migrations"))
+    ordered = [r.revision for r in reversed(list(ScriptDirectory.from_config(config).walk_revisions()))]
+    script = ScriptDirectory.from_config(config)
+    for revision in ordered:
+        required = getattr(script.get_revision(revision).module, REQUIRES_PRIMARY_AT, None)
+        if required is not None:
+            assert required in ordered[: ordered.index(revision)], f"{revision} requires {required}"

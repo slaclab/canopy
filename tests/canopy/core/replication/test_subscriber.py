@@ -15,7 +15,7 @@ from canopy.core.replication.subscriber import (
     subscriber_status,
 )
 
-from .conftest import privileges
+from .conftest import privileges, direct_grants
 
 PRESENT = sorted(REGISTRY.replicated)
 DSN = "host=primary.example.org dbname=canopy user=replicator password=s3cret-pw"
@@ -69,6 +69,67 @@ async def test_grants_refusals(db, config):
     await db.execute(f'ALTER TABLE squirrel.tag OWNER TO "{config.app_role}"')
     with pytest.raises(Refused, match="owns squirrel.tag"):
         await grants(db, role="mirror", config=config)
+
+
+@pytest.mark.parametrize(
+    ("setup", "refusal"),
+    [
+        pytest.param(
+            ['CREATE ROLE "{helper}"', 'GRANT INSERT ON squirrel.pv TO "{helper}"', 'GRANT "{helper}" TO "{app}"'],
+            r"INSERT on squirrel\.pv(?! \(granted)",
+            id="inherited-from-another-role",
+        ),
+        pytest.param(
+            ["GRANT UPDATE ON squirrel.snapshot TO PUBLIC"],
+            r"UPDATE on squirrel\.snapshot \(granted to PUBLIC\)",
+            id="granted-to-public",
+        ),
+        pytest.param(
+            [
+                'CREATE ROLE "{helper}"',
+                'GRANT UPDATE (title) ON squirrel.snapshot TO "{helper}"',
+                'GRANT "{helper}" TO "{app}"',
+            ],
+            r"UPDATE on squirrel\.snapshot",
+            id="column-grant-through-another-role",
+        ),
+        pytest.param(
+            ['GRANT pg_write_all_data TO "{app}"'],
+            r"INSERT on magpie\.config",
+            id="pg-write-all-data",
+        ),
+        pytest.param(
+            [
+                'CREATE ROLE "{helper}"',
+                'ALTER TABLE squirrel.tag OWNER TO "{helper}"',
+                'GRANT "{helper}" TO "{app}" WITH INHERIT FALSE',
+            ],
+            r"belongs to rt_reader_\w+, which owns registered tables",
+            id="member-of-a-table-owner",
+        ),
+    ],
+)
+async def test_grants_refuses_an_app_role_that_can_still_write(db, config, setup, refusal):
+    # The reader role isn't used on a mirror, so it doubles as the helper role (and is dropped after).
+    await db.execute(f'CREATE ROLE "{config.app_role}"')
+    for statement in setup:
+        await db.execute(statement.format(app=config.app_role, helper=config.reader_role))
+
+    with pytest.raises(Refused, match=refusal):
+        await grants(db, role="mirror", config=config)
+
+    # Rolled back: the app role got none of this run's grants.
+    assert await direct_grants(db, config.app_role, "squirrel.snapshot") == set()
+
+
+async def test_grants_leaves_default_privilege_reads_on_unclassified_tables_alone(db, config):
+    await db.execute(f'CREATE ROLE "{config.app_role}"')
+    await grants(db, role="mirror", config=config)
+    await db.execute("CREATE TABLE squirrel.not_yet_classified (id int PRIMARY KEY)")
+
+    # Its default-privilege SELECT is within policy, so the next run (which warns about it) still passes.
+    await grants(db, role="mirror", config=config)
+    assert await privileges(db, config.app_role, "squirrel.not_yet_classified") == {"SELECT"}
 
 
 async def test_subscribe_refuses_before_touching_anything(db, config):
