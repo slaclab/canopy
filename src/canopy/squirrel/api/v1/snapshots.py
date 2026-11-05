@@ -113,7 +113,24 @@ async def list_snapshots(
 
 
 @router.post("")
-async def create_snapshot(data: NewSnapshotDTO, key: WriteKeyDep) -> JobCreatedDTO:
+async def create_snapshot(
+    data: NewSnapshotDTO,
+    key: WriteKeyDep,
+    use_cache: Annotated[
+        bool,
+        Query(
+            alias="useCache",
+            description=(
+                "Take values from the worker's PV cache where it can vouch for them and read only the rest "
+                "live from EPICS. The cache must be enabled on the worker (CANOPY_SQUIRREL__PV_CACHE__ENABLED); "
+                "without a live cache every PV is read live, as with useCache=false. Cached values are what "
+                "each PV's monitor last posted: alarm changes are posted at once, but a value change smaller "
+                "than the record's monitor deadband (MDEL) isn't, so a cached value can trail a live read by "
+                "up to that deadband, with the timestamp of the value it holds."
+            ),
+        ),
+    ] = False,
+) -> JobCreatedDTO:
     """Enqueue a snapshot of the facility's PVs (every PV if no facility is given). The
     worker reads EPICS and persists it."""
     # The facility gate has to run *here*, not in the service: nothing of the caller's
@@ -134,8 +151,14 @@ async def create_snapshot(data: NewSnapshotDTO, key: WriteKeyDep) -> JobCreatedD
         if facility_id not in key_scope:
             raise InsufficientFacilityAccess(f"API key is not scoped to facility: {data.facility}")
 
+    # use_cache goes to the job only when set, so a plain snapshot asks nothing new of the worker.
+    extra = {"use_cache": True} if use_cache else {}
     job_id = await jobs_gateway.enqueue(
-        "create_snapshot_task", title=data.title, description=data.description, facility_id=facility_id
+        "create_snapshot_task",
+        title=data.title,
+        description=data.description,
+        facility_id=facility_id,
+        **extra,
     )
     return JobCreatedDTO(job_id=job_id, status_url=f"/jobs/v1/{job_id}")
 

@@ -378,7 +378,7 @@ class PvService:
             row_facility_ids = {ids_by_slug[slug] for slug in data.facilities}
             if self.facility_scope is not None and not (row_facility_ids & self.facility_scope):
                 address = setpoint_address or readback_address or config_address
-                refused.append((row, address, sorted(data.facilities)))
+                refused.append((row, address, sorted(set(data.facilities))))
         if refused:
             unreachable = sorted({slug for _, _, slugs in refused for slug in slugs})
             rows = "; ".join(
@@ -395,7 +395,7 @@ class PvService:
                 extra={"refused_rows": len(refused), "total_rows": len(normalized_records), "facilities": unreachable},
             )
             raise InsufficientFacilityAccess(
-                f"API key is not scoped to facility(s) {', '.join(unreachable) or '(none named)'}. "
+                f"API key is not scoped to facility(s): {', '.join(unreachable) or '(none named)'}. "
                 f"{len(refused)} of {len(normalized_records)} rows name no facility it can write: {rows}"
             )
 
