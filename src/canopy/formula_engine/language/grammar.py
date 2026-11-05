@@ -27,10 +27,16 @@ ALLOWED_NODES: set[type] = {
     ast.FloorDiv,
     ast.Mod,
     ast.Pow,
+    ast.BitAnd,
+    ast.BitOr,
+    ast.BitXor,
+    ast.LShift,
+    ast.RShift,
     # Unary operators
     ast.UAdd,
     ast.USub,
     ast.Not,
+    ast.Invert,
     # Comparison operators
     ast.Eq,
     ast.NotEq,
