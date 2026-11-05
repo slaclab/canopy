@@ -8,8 +8,12 @@ so most migrations run on both. A few steps must not:
   stops apply with a duplicate key.
 * Indexes that only history queries need run on the subscriber only, and stay out
   of ``Base.metadata`` so ``alembic check`` on a primary still passes.
-* A dropped column or table leaves the publisher first and the subscriber a release
-  later, once the subscriber has applied every row that still carried it.
+* A dropped column or table leaves the publisher first and the subscriber later, once
+  the primary runs the publisher-side drop and the subscriber has applied every row
+  that still carried it. The subscriber-side revision names the publisher-side one in
+  a module-level ``canopy_requires_primary_at = "<revision>"`` (``REQUIRES_PRIMARY_AT``);
+  the migration-order test honours it, and deploying it needs the check in
+  ``CONTRIBUTING.md``.
 
 ``migrations/env.py`` records the side from ``CANOPY_ROLE``: ``primary`` is the
 publisher, and every other role serves a subscriber's database. Use it as::
@@ -33,6 +37,9 @@ Side = Literal["publisher", "subscriber"]
 
 OPTION = "canopy_replication_side"
 """Key ``migrations/env.py`` stores the side under, in the migration context's options."""
+
+REQUIRES_PRIMARY_AT = "canopy_requires_primary_at"
+"""Module attribute of a subscriber-side drop: the publisher-side revision its primary must already run."""
 
 
 def side_for_role(role: str) -> Side:
