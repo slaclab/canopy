@@ -66,6 +66,17 @@ async def test_publish_converges_a_stale_publication(db, config):
     assert tuple(row.values()) == (True, True, True, False)
 
 
+async def test_a_retired_table_already_dropped_is_not_reported_missing(db, config, caplog, monkeypatch):
+    # Retired tables stay registered for databases that still hold them; one that has
+    # dropped the table shouldn't log it as "not here yet" on every deploy.
+    monkeypatch.setattr("canopy.core.replication.publisher.RETIRED", frozenset({"squirrel.pv_facility"}))
+    await db.execute("DROP TABLE squirrel.pv_facility")
+    caplog.set_level(logging.INFO, logger="canopy.core.replication")
+    result = await publish(db, role="primary", config=config)
+    assert result["missing"] == []
+    assert "Not in this database yet" not in caplog.text
+
+
 async def test_publish_picks_up_a_registered_table_once_it_exists(db, config, caplog):
     # A mirror migrates a release ahead of its primary, so a primary can lack a table
     # the registry already names.
