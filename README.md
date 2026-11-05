@@ -266,7 +266,7 @@
 | src/canopy/squirrel/gateway.py                               |       12 |        0 |    100% |           |
 | src/canopy/squirrel/pv\_cache/\_\_init\_\_.py                |        4 |        0 |    100% |           |
 | src/canopy/squirrel/pv\_cache/keys.py                        |       46 |        0 |    100% |           |
-| src/canopy/squirrel/pv\_cache/monitor.py                     |      260 |       27 |     90% |57-59, 64, 111, 156-157, 220-221, 237, 259-263, 276, 305-306, 325, 349-350, 371-376, 414-415 |
+| src/canopy/squirrel/pv\_cache/monitor.py                     |      260 |       28 |     89% |57-59, 64, 111, 156-157, 220-221, 237, 258-263, 276, 305-306, 325, 349-350, 371-376, 414-415 |
 | src/canopy/squirrel/pv\_cache/reader.py                      |       64 |        2 |     97% |     81-82 |
 | src/canopy/squirrel/restore\_hooks/\_\_init\_\_.py           |        4 |        0 |    100% |           |
 | src/canopy/squirrel/restore\_hooks/base.py                   |        7 |        0 |    100% |           |
@@ -314,7 +314,7 @@
 | src/canopy/vole/services/hare\_ingest.py                     |       92 |       11 |     88% |47-48, 55, 77, 103, 121, 131-132, 152-155 |
 | src/canopy/vole/services/notifier.py                         |       35 |        2 |     94% |     33-34 |
 | src/canopy/worker.py                                         |       47 |        1 |     98% |        34 |
-| **TOTAL**                                                    | **9858** |  **750** | **92%** |           |
+| **TOTAL**                                                    | **9858** |  **751** | **92%** |           |
 
 
 ## Setup coverage badge
