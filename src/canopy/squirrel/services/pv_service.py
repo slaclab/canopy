@@ -488,7 +488,7 @@ class PvService:
         await self.pv_repo.add_facilities_many(assignments)
         # Each row's own payload already named its facilities by slug — skip the
         # id-to-slug round trip `_to_dtos` would otherwise make.
-        return [self._to_dto(pv, sorted(set(data.facilities))) for pv, (_, _, _, data) in zip(pvs, normalized_records)]
+        return [self._to_dto(pv, sorted(set(data.facilities))) for pv, (*_, data) in zip(pvs, normalized_records)]
 
     async def update(self, pv_id: str, data: UpdatePVElementDTO) -> PVElementDTO | None:
         pv = await self.pv_repo.get_by_id(pv_id)
