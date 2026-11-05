@@ -51,13 +51,15 @@ registered through a single variable:
 CANOPY_API_KEYS="<token>:<scope>[+<scope>][@<module>[+<module>]][,<token>:<scope>...]"
 ```
 
-- Scopes are `read` and `write` — e.g. `dev:read+write` or
-  `viewer:read,operator:read+write`.
+- Scopes are `read`, `write`, and `admin` (key management). The
+  `@<module>` suffix limits a key to those modules; `@*` allows every
+  module. For example, `dev:read+write@*` or
+  `viewer:read@*,operator:read+write@squirrel`.
 - Clients send the token in the `X-API-Key` header. WebSocket endpoints also
   accept `?api_key=<token>` for clients that cannot set headers.
 - If `CANOPY_API_KEYS` is unset, no keys exist and every gated endpoint
   returns `401`.
-- `dev:read+write` is fine on a laptop. For deployed instances, see the
+- `dev:read+write@*` is fine on a laptop. For deployed instances, see the
   [API keys runbook](deployment/api-keys.md).
 
 ## Run the API
