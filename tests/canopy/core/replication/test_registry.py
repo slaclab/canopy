@@ -9,7 +9,7 @@ import importlib
 
 import canopy
 from canopy.core.db import Base
-from canopy.core.replication.registry import EXCLUDED, REGISTRY, TableClass
+from canopy.core.replication.registry import RETIRED, EXCLUDED, REGISTRY, TableClass
 
 
 def _raise(name: str) -> None:
@@ -42,7 +42,13 @@ def test_every_table_is_classified():
 
 
 def test_every_registered_table_has_a_model():
-    assert set(REGISTRY.tables) <= set(METADATA_TABLES)
+    assert set(REGISTRY.tables) - RETIRED <= set(METADATA_TABLES)
+
+
+def test_retired_tables_keep_their_class_and_lose_their_model():
+    """A database that hasn't dropped a retired table yet still needs it classified."""
+    assert RETIRED <= set(REGISTRY.tables)
+    assert not RETIRED & set(METADATA_TABLES)
 
 
 def test_excluded_tables_are_not_classified():

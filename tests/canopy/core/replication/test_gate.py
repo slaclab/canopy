@@ -59,6 +59,13 @@ def _with_copy(status: dict) -> dict:
     return {**status, "slots": [*status["slots"], sync]}
 
 
+def _restricted(status: dict) -> dict:
+    """``status`` with ``canopy_ts`` publishing ``squirrel.snapshot`` through a row filter."""
+    ref, ts = status["publications"]
+    ts = {**ts, "restricted": {"squirrel.snapshot": {"row_filter": "(retain = false)", "columns": None}}}
+    return {**status, "publications": [ref, ts]}
+
+
 def _judge(*, status=None, delete_publications=None, heartbeat=HEARTBEAT) -> GateResult:
     return evaluate_gate(
         slot_name=SLOT,
@@ -96,6 +103,7 @@ def test_a_switched_caught_up_mirror_with_good_checks_passes():
         ({"heartbeat": {**HEARTBEAT, "written_at": STARTED - timedelta(minutes=1)}}, "heartbeat_fresh"),
         ({"status": _status(walsender_started_at=None)}, "heartbeat_fresh"),
         ({"status": _with_copy(_status())}, "no_initial_copy"),
+        ({"status": _restricted(_status())}, "streams_split"),
     ],
     ids=[
         "deletes-published",
@@ -115,6 +123,7 @@ def test_a_switched_caught_up_mirror_with_good_checks_passes():
         "heartbeat-before-stream",
         "stream-start-unknown",
         "initial-copy",
+        "row-filtered",
     ],
 )
 def test_each_failed_check_is_named(change, failed):
@@ -188,3 +197,9 @@ def test_the_reasons_name_the_new_checks():
         failures["heartbeat_fresh"]
         == f"the last heartbeat is from before the walsender started at {STARTED.isoformat()}"
     )
+
+
+def test_a_partly_published_table_doesnt_count_as_carried():
+    assert _judge(status=_restricted(_status())).failures == {
+        "streams_split": "the mirror streams canopy_ref, canopy_ts, which carry no squirrel.snapshot"
+    }

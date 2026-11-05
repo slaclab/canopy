@@ -10,10 +10,11 @@ from canopy.core.replication.publisher import (
     publish,
     _not_switched,
     publisher_status,
+    publication_state,
     publication_layout,
 )
 
-from .conftest import privileges
+from .conftest import privileges, direct_grants
 
 PRESENT = sorted(REGISTRY.replicated)
 
@@ -54,6 +55,8 @@ async def test_publish_twice_changes_nothing(db, config, caplog):
         "created": False,
         "added": [],
         "removed": [],
+        "cleared": [],
+        "schemas_removed": [],
         "operations_changed": False,
     }
     assert "Publication canopy_history: no change" in caplog.text
@@ -73,6 +76,17 @@ async def test_publish_converges_a_stale_publication(db, config):
     assert sync["operations_changed"] is True
     row = await db.fetchrow("SELECT pubinsert, pubupdate, pubdelete, pubtruncate FROM pg_publication")
     assert tuple(row.values()) == (True, True, True, False)
+
+
+async def test_a_retired_table_already_dropped_is_not_reported_missing(db, config, caplog, monkeypatch):
+    # Retired tables stay registered for databases that still hold them; one that has
+    # dropped the table shouldn't log it as "not here yet" on every deploy.
+    monkeypatch.setattr("canopy.core.replication.publisher.RETIRED", frozenset({"squirrel.pv_facility"}))
+    await db.execute("DROP TABLE squirrel.pv_facility")
+    caplog.set_level(logging.INFO, logger="canopy.core.replication")
+    result = await publish(db, role="primary", config=config)
+    assert result["missing"] == []
+    assert "Not in this database yet" not in caplog.text
 
 
 async def test_publish_picks_up_a_registered_table_once_it_exists(db, config, caplog):
@@ -145,6 +159,9 @@ async def test_publisher_status(db, config):
             "tables": PRESENT,
             "missing": [],
             "unexpected": [],
+            "restricted": {},
+            "schemas": [],
+            "all_tables": False,
         }
     ]
     assert after["roles"] == {config.replicator_role: True, config.reader_role: False, config.heartbeat_role: False}
@@ -234,6 +251,25 @@ async def test_publish_lets_the_heartbeat_role_write_its_table_only(db, config):
         assert await privileges(db, config.heartbeat_role, table) == set(), table
 
 
+async def test_publish_refuses_a_heartbeat_role_that_inherits_more(db, config):
+    extra = f"{config.heartbeat_role}_extra"
+    await db.execute(f'CREATE ROLE "{config.heartbeat_role}"')
+    await db.execute(f'CREATE ROLE "{extra}"')
+    try:
+        await db.execute(f'GRANT SELECT ON squirrel.pv TO "{extra}"')
+        await db.execute(f'GRANT "{extra}" TO "{config.heartbeat_role}"')
+
+        with pytest.raises(Refused, match=f"role {config.heartbeat_role} must have no more than read-write on core"):
+            await publish(db, role="primary", config=config)
+
+        # The whole publish rolled back, grants and publication alike.
+        assert await db.fetchval("SELECT count(*) FROM pg_publication") == 0
+        assert await privileges(db, config.heartbeat_role, "core.history_heartbeat") == set()
+    finally:
+        await db.execute(f'REVOKE ALL ON squirrel.pv FROM "{extra}"')
+        await db.execute(f'DROP ROLE "{extra}"')
+
+
 @pytest.mark.parametrize(
     ("streams", "switched"),
     [
@@ -249,3 +285,110 @@ def test_a_mirror_has_switched_only_when_it_streams_exactly_the_pair(streams, sw
     reasons = _not_switched([{"slot": "canopy_history_site_a", "active": True, "publications": streams}], REGISTRY)
 
     assert (reasons == []) is switched, reasons
+
+
+async def test_publish_clears_row_filters_and_column_lists(db, config, caplog):
+    await db.execute(
+        "CREATE PUBLICATION canopy_history FOR TABLE squirrel.pv WHERE (id IS NOT NULL), squirrel.snapshot (id, title) "
+        "WITH (publish = 'insert, update, delete')"
+    )
+    before = (await publisher_status(db, config=config))["publications"][0]
+    assert set(before["restricted"]) == {"squirrel.pv", "squirrel.snapshot"}
+    assert "id" in before["restricted"]["squirrel.pv"]["row_filter"]
+    assert before["restricted"]["squirrel.pv"]["columns"] is None
+    assert before["restricted"]["squirrel.snapshot"]["row_filter"] is None
+    assert sorted(before["restricted"]["squirrel.snapshot"]["columns"]) == ["id", "title"]
+    caplog.set_level(logging.INFO, logger="canopy.core.replication")
+
+    result = await publish(db, role="primary", config=config)
+
+    assert result["publications"]["canopy_history"]["cleared"] == ["squirrel.pv", "squirrel.snapshot"]
+    assert "re-seed those tables" in caplog.text
+    assert await _published(db) == PRESENT
+    assert (await publisher_status(db, config=config))["publications"][0]["restricted"] == {}
+    assert (await publish(db, role="primary", config=config))["publications"]["canopy_history"]["cleared"] == []
+
+
+async def test_publish_lists_tables_instead_of_publishing_schemas_whole(db, config):
+    await db.execute("CREATE PUBLICATION canopy_history FOR TABLE squirrel.pv, TABLES IN SCHEMA magpie")
+    assert (await publisher_status(db, config=config))["publications"][0]["schemas"] == ["magpie"]
+
+    result = await publish(db, role="primary", config=config)
+
+    assert result["publications"]["canopy_history"]["schemas_removed"] == ["magpie"]
+    assert (await publication_state(db, "canopy_history")).schemas == frozenset()
+    assert await _published(db) == PRESENT
+
+
+async def test_publish_refuses_a_for_all_tables_publication(db, config):
+    await db.execute("CREATE PUBLICATION canopy_history FOR ALL TABLES")
+
+    with pytest.raises(Refused, match="FOR ALL TABLES"):
+        await publish(db, role="primary", config=config)
+
+    assert (await publication_state(db, "canopy_history")).all_tables
+    assert (await publisher_status(db, config=config))["publications"][0]["all_tables"] is True
+
+
+async def test_publication_state_of_a_missing_publication(db):
+    state = await publication_state(db, "canopy_history")
+    assert not state.exists and not state.all_tables
+    assert state.tables == state.schemas == state.operations == frozenset() and state.restricted == {}
+
+
+@pytest.mark.parametrize(
+    ("setup", "refusal"),
+    [
+        pytest.param(
+            ['CREATE ROLE "{helper}"', 'GRANT SELECT ON core.api_key TO "{helper}"', 'GRANT "{helper}" TO "{reader}"'],
+            r"SELECT on core\.api_key(?! \(granted)",
+            id="inherited-from-another-role",
+        ),
+        pytest.param(
+            ["GRANT SELECT ON core.api_key TO PUBLIC"],
+            r"SELECT on core\.api_key \(granted to PUBLIC\)",
+            id="granted-to-public",
+        ),
+        pytest.param(
+            [
+                'CREATE ROLE "{helper}"',
+                'GRANT SELECT (token_hash) ON core.api_key TO "{helper}"',
+                'GRANT "{helper}" TO "{reader}"',
+            ],
+            r"SELECT on core\.api_key",
+            id="column-grant-through-another-role",
+        ),
+        pytest.param(
+            [
+                'CREATE ROLE "{helper}"',
+                'ALTER TABLE squirrel.tag OWNER TO "{helper}"',
+                'GRANT "{helper}" TO "{reader}" WITH INHERIT FALSE',
+            ],
+            r"belongs to rt_app_\w+, which owns Canopy tables",
+            id="member-of-a-table-owner",
+        ),
+        pytest.param(
+            ['GRANT pg_write_all_data TO "{reader}"'],
+            r"INSERT on magpie\.config",
+            id="writes-on-published-tables",
+        ),
+        pytest.param(
+            ['ALTER ROLE "{reader}" SUPERUSER'],
+            r"it is a superuser",
+            id="superuser",
+        ),
+    ],
+)
+async def test_publish_refuses_a_role_with_access_outside_its_grants(db, config, setup, refusal):
+    # The app role isn't used on a primary, so it doubles as the helper role (and is dropped after).
+    await db.execute(f'CREATE ROLE "{config.reader_role}"')
+    for statement in setup:
+        await db.execute(statement.format(reader=config.reader_role, helper=config.app_role))
+
+    with pytest.raises(Refused, match=refusal) as caught:
+        await publish(db, role="primary", config=config)
+
+    assert "doesn't change shared grants" in str(caught.value)
+    # The whole run rolled back: no publication, and none of the reader's own grants.
+    assert await db.fetchval("SELECT count(*) FROM pg_publication") == 0
+    assert await direct_grants(db, config.reader_role, "squirrel.pv") == set()

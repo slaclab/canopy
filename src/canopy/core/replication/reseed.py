@@ -6,39 +6,41 @@ time, the changes the mirror is missing are no longer in any slot. ``reseed --si
 
 * every reference table, fully reconciled: rows the primary no longer has are
   deleted, the rest are inserted or updated;
-* time-series parents created (or, where the table has ``updated_at``, updated) at or
-  after ``--since``, and all their children, which are reconciled per parent. Parents
-  the primary no longer has are never deleted: once the primary prunes old rows,
-  history is the only copy.
+* every time-series parent the primary has, inserted or updated; parents the primary
+  no longer has are never deleted, since once the primary prunes old rows history is
+  the only copy;
+* the children of each parent the mirror was missing, and of each parent created (or,
+  where the table has ``updated_at``, updated) at or after ``--since``, reconciled per
+  parent.
 
 It runs with the subscription disabled, creating it disabled and without the initial
 copy when there is none. A subscription it creates reads the primary's split pair
 (``canopy_ref``, ``canopy_ts``) once the primary has it, else ``canopy_history``. The
-hand-over works like this:
+hand-over:
 
-1. ``x0 = pg_current_wal_insert_lsn()`` on the primary, then wait for every
-   transaction in progress after that to finish, then open a repeatable-read
-   snapshot. Every transaction that committed before ``x0`` is visible in it.
-2. Copy the rows above from that snapshot into the mirror, in one transaction that
-   also advances the subscription's replication origin to ``x0`` and enables it, so
-   apply resumes with the first transaction that committed after ``x0``.
+1. Take ``B = pg_current_xact_id()`` on the primary and wait until no lower xid is
+   still running. Read ``x0 = pg_current_wal_insert_lsn()``. Open a repeatable-read
+   snapshot whose first statement takes another xid, ``X``.
+2. ``X = B + 1`` means no other transaction got an xid in between. Everything that
+   committed before ``x0`` is then visible in the snapshot, and nothing committed
+   between ``x0`` and the snapshot. Otherwise the attempt is dropped and the cut is
+   tried again, for up to ``--cut-wait`` seconds; a primary that never pauses writing
+   that long is refused, and nothing changes.
+3. Copy from that snapshot into the mirror in one transaction. Inside it, unique
+   values the primary has moved between rows are set aside first, parents are written
+   before children, and rows the primary no longer has are deleted last, children
+   first.
+4. Once the copy has committed, advance the subscription's replication origin to
+   ``x0`` and enable the subscription. Apply resumes with the first transaction that
+   committed after ``x0``: nothing is replayed and nothing is lost.
 
-Nothing committed before ``x0`` is replayed, and nothing after it is lost. The one
-overlap: a write transaction already open on the primary when the cut starts (a
-snapshot being saved, say) commits after ``x0``, so it is streamed, and the cut waits
-for it, so it is copied too. If it inserted a row, apply stops on the duplicate key.
-That transaction is already in place, so skip it with ``ALTER SUBSCRIPTION ... SKIP
-(lsn = ...)``, taking the LSN from the "finished at" in the mirror's log. The report's
-``open_at_cut`` says how many there were; with none, only a transaction committing in
-the few milliseconds before the snapshot opens can be.
-(The other way round, not waiting, would lose a transaction caught mid-commit without
-a trace. Closing the gap exactly takes the snapshot the replication protocol exports
-when it creates a slot, which plain SQL can't reach.)
+The origin's progress isn't transactional, so it moves only after the copy is safely
+in. If a run fails, the subscription stays disabled: run ``reseed`` again, and never
+enable the subscription by hand.
 
-``--since`` must not be later than the newest snapshot the mirror holds: the origin
-advance discards every change between the mirror's last applied transaction and
-``x0``, and only what ``--since`` covers is copied in its place. Earlier is always
-safe, only slower.
+``--since`` must not be later than the newest snapshot the mirror holds. Missing
+parents are found by id whatever their time, but children of a parent both sides hold
+are re-read only from ``--since`` on. Earlier is always safe, only slower.
 
 Run it as a superuser of the mirror's database, or as the tables' and
 subscription's owner with EXECUTE on ``pg_replication_origin_advance(text, pg_lsn)``.
@@ -53,7 +55,7 @@ import logging
 import argparse
 from datetime import UTC, datetime
 from dataclasses import dataclass
-from collections.abc import Callable, Awaitable
+from collections.abc import Mapping, Callable, Awaitable
 
 import asyncpg
 
@@ -89,7 +91,7 @@ from canopy.core.replication.subscriber import (
 logger = logging.getLogger(__name__)
 
 CUT_WAIT_S = 60.0
-"""How long the cut waits for the primary's in-progress transactions before giving up."""
+"""Default for ``--cut-wait``: how long to keep trying for an exact cut before refusing."""
 
 WORKER_WAIT_S = 10.0
 """How long to wait for a just-disabled subscription's apply worker to exit."""
@@ -185,26 +187,27 @@ async def _plan(
     return [copies[table] for table in order]
 
 
-def _select(copy: Copy, copies: dict[str, Copy]) -> str:
-    """The query that reads ``copy``'s rows on the primary; a time-series one takes ``since`` as ``$1``."""
+def _select(copy: Copy) -> str:
+    """The query that reads ``copy``'s rows on the primary; a child's takes its parents' ids as ``$1``."""
     columns = ", ".join(quote_ident(c) for c in copy.columns)
-    if copy.kind is not TableClass.TIME_SERIES:
-        return f"SELECT {columns} FROM {qualified(copy.table)}"
+    query = f"SELECT {columns} FROM {qualified(copy.table)}"
+    if copy.kind is TableClass.TIME_SERIES and copy.bucketing.parent is not None:
+        query += f" WHERE {quote_ident(copy.bucketing.parent_key)} = ANY($1)"
+    return query
 
-    def recent(alias: str, parent: Copy) -> str:
-        condition = f"{alias}{quote_ident(parent.bucketing.time_column)} >= $1"
-        if parent.updated_column:
-            condition += f" OR {alias}{quote_ident(parent.updated_column)} >= $1"
-        return condition
 
-    if copy.bucketing.parent is None:
-        return f"SELECT {columns} FROM {qualified(copy.table)} WHERE {recent('', copy)}"
-    parent = copies[copy.bucketing.parent]
-    child_columns = ", ".join(f"c.{quote_ident(col)}" for col in copy.columns)
-    return (
-        f"SELECT {child_columns} FROM {qualified(copy.table)} c JOIN {qualified(parent.table)} p "
-        f"ON p.{quote_ident(copy.parent_id)} = c.{quote_ident(copy.bucketing.parent_key)} WHERE {recent('p.', parent)}"
+async def _selected_parents(mirror: asyncpg.Connection, copy: Copy, temp: str, since: datetime) -> list:
+    """Ids of the parents whose children get reconciled: those the mirror lacks, and recent ones."""
+    key = quote_ident(copy.key[0])
+    recent = f"x.{quote_ident(copy.bucketing.time_column)} >= $1"
+    if copy.updated_column:
+        recent += f" OR x.{quote_ident(copy.updated_column)} >= $1"
+    rows = await mirror.fetch(
+        f"SELECT x.{key} AS id FROM {quote_ident(temp)} x WHERE {recent} "
+        f"OR NOT EXISTS (SELECT 1 FROM {qualified(copy.table)} t WHERE t.{key} = x.{key})",
+        since,
     )
+    return [row["id"] for row in rows]
 
 
 def _matches(left: str, right: str, key: tuple[str, ...]) -> str:
@@ -232,20 +235,93 @@ async def _load(
     return total
 
 
-async def _delete_missing(mirror: asyncpg.Connection, copy: Copy, temp: str, temps: dict[str, str]) -> int:
+async def _delete_missing(mirror: asyncpg.Connection, copy: Copy, temp: str, parents: list | None) -> int:
     """Delete the mirror rows in ``copy``'s scope that the primary's copy lacks."""
+    args: list = []
     if copy.kind is not TableClass.TIME_SERIES:
         scope = ""
     elif copy.bucketing.parent is None:
         return 0  # parents are never deleted: the primary may have pruned them
     else:
-        parent_temp = quote_ident(temps[copy.bucketing.parent])
-        scope = f"t.{quote_ident(copy.bucketing.parent_key)} IN (SELECT {quote_ident(copy.parent_id)} FROM {parent_temp}) AND "
+        scope, args = f"t.{quote_ident(copy.bucketing.parent_key)} = ANY($1) AND ", [parents]
     status = await mirror.execute(
         f"DELETE FROM {qualified(copy.table)} t "
-        f"WHERE {scope}NOT EXISTS (SELECT 1 FROM {quote_ident(temp)} x WHERE {_matches('x', 't', copy.key)})"
+        f"WHERE {scope}NOT EXISTS (SELECT 1 FROM {quote_ident(temp)} x WHERE {_matches('x', 't', copy.key)})",
+        *args,
     )
     return int(status.split()[-1])
+
+
+async def _unique_indexes(conn: asyncpg.Connection, table: str) -> list[list[str]]:
+    """The columns of each unique index on ``table`` other than its primary key (expression indexes left out)."""
+    rows = await conn.fetch(
+        """
+        SELECT array_agg(a.attname ORDER BY k.n) AS columns, bool_or(a.attname IS NULL) AS expression
+        FROM pg_index i
+        JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, n) ON true
+        LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum AND k.attnum > 0
+        WHERE i.indrelid = $1::regclass AND i.indisunique AND NOT i.indisprimary
+        GROUP BY i.indexrelid
+        """,
+        qualified(table),
+    )
+    return [list(row["columns"]) for row in rows if not row["expression"]]
+
+
+async def _placeholder(conn: asyncpg.Connection, copy: Copy, column: str) -> str:
+    """SQL for a stand-in value of ``column`` that no real row holds, unique per row."""
+    spec = await conn.fetchrow(
+        """
+        SELECT a.attnotnull, t.typcategory::text AS category, a.atttypmod,
+               EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conrelid = a.attrelid AND c.contype = 'c'
+                       AND a.attnum = ANY(c.conkey)) AS checked
+        FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+        WHERE a.attrelid = $1::regclass AND a.attname = $2
+        """,
+        qualified(copy.table),
+        column,
+    )
+    if not spec["attnotnull"]:
+        return "NULL"
+    if spec["category"] != "S" or spec["checked"]:
+        raise Refused(
+            f"{copy.table}.{column} holds a unique value the primary has moved to another row, and reseed can't "
+            "set it aside (it isn't nullable text without a CHECK); reconcile that row by hand"
+        )
+    length = spec["atttypmod"] - 4 if spec["atttypmod"] > 4 else 33
+    key = " || ',' || ".join(f"t.{quote_ident(k)}::text" for k in copy.key)
+    return f"left(chr(1) || md5({key}), {length})"
+
+
+async def _set_aside(mirror: asyncpg.Connection, copy: Copy, temp: str) -> int:
+    """Give a stand-in to each mirror row holding a unique value the primary gives another row.
+
+    Every such row is rewritten or deleted later in the same transaction, so the stand-in
+    never outlives it; a row that would be kept as it is (history the primary no longer
+    has) is refused instead.
+    """
+    parked = 0
+    for columns in await _unique_indexes(mirror, copy.table):
+        if not set(columns) <= set(copy.columns):
+            continue
+        same = " AND ".join(f"x.{quote_ident(c)} = t.{quote_ident(c)}" for c in columns)
+        mine = ", ".join(f"t.{quote_ident(k)}" for k in copy.key)
+        theirs = ", ".join(f"x.{quote_ident(k)}" for k in copy.key)
+        clash = f"EXISTS (SELECT 1 FROM {quote_ident(temp)} x WHERE {same} AND ({theirs}) IS DISTINCT FROM ({mine}))"
+        if not await mirror.fetchval(f"SELECT EXISTS (SELECT 1 FROM {qualified(copy.table)} t WHERE {clash})"):
+            continue
+        kept = f"EXISTS (SELECT 1 FROM {quote_ident(temp)} x WHERE {_matches('x', 't', copy.key)})"
+        if copy.kind is TableClass.TIME_SERIES and await mirror.fetchval(
+            f"SELECT EXISTS (SELECT 1 FROM {qualified(copy.table)} t WHERE {clash} AND NOT {kept})"
+        ):
+            raise Refused(
+                f"{copy.table} keeps a row the primary no longer has whose {', '.join(columns)} the primary now "
+                "gives another row; reconcile it by hand"
+            )
+        assignments = ", ".join([f"{quote_ident(c)} = {await _placeholder(mirror, copy, c)}" for c in columns])
+        status = await mirror.execute(f"UPDATE {qualified(copy.table)} t SET {assignments} WHERE {clash}")
+        parked += int(status.split()[-1])
+    return parked
 
 
 async def _upsert(mirror: asyncpg.Connection, copy: Copy, temp: str) -> int:
@@ -267,25 +343,51 @@ async def _upsert(mirror: asyncpg.Connection, copy: Copy, temp: str) -> int:
     return int(status.split()[-1])
 
 
-async def _cut(primary: asyncpg.Connection) -> tuple[str, int]:
-    """``x0``, once every transaction that might have committed before it is visible, and how many were open."""
-    x0 = await primary.fetchval("SELECT pg_current_wal_insert_lsn()::text")
-    # Every transaction that held an xid when x0 was read has a lower one than this.
-    # A snapshot's in-progress list stops below its xmax (the newest finished xid + 1),
-    # which can leave out the newest open transactions, so ask by xid instead: once
-    # none below this one is running, every commit before x0 is visible.
-    bound = await primary.fetchval("SELECT pg_current_xact_id()::text")
+async def _xid(conn: asyncpg.Connection) -> int:
+    return int(await conn.fetchval("SELECT pg_current_xact_id()::text"))
+
+
+async def _exact_cut(
+    primary: asyncpg.Connection,
+    deadline: float,
+    before_snapshot: Callable[[], Awaitable[object]] | None = None,
+) -> tuple[str, asyncpg.transaction.Transaction, int]:
+    """``x0``, an open repeatable-read transaction on ``primary`` that is exact for it, and the attempts made.
+
+    Raises
+    ------
+    Refused
+        The primary never paused long enough before ``deadline``. Nothing was changed.
+    """
     running = "SELECT count(*) FROM pg_snapshot_xip(pg_current_snapshot()) x WHERE x < $1::text::xid8"
-    open_at_cut = await primary.fetchval(running, bound)
-    deadline = asyncio.get_running_loop().time() + CUT_WAIT_S
-    while await primary.fetchval(running, bound):
-        if asyncio.get_running_loop().time() > deadline:
+    loop = asyncio.get_running_loop()
+    attempts = 0
+    while True:
+        attempts += 1
+        bound = await _xid(primary)
+        # Everything that held an xid before `bound` must finish first. A snapshot's own
+        # in-progress list stops below its xmax (the newest finished xid + 1), so ask by xid.
+        while await primary.fetchval(running, str(bound)):
+            if loop.time() > deadline:
+                raise Refused(
+                    "a write transaction on the primary stayed open past --cut-wait; nothing was changed. "
+                    "Retry once it ends"
+                )
+            await asyncio.sleep(0.1)
+        x0 = await primary.fetchval("SELECT pg_current_wal_insert_lsn()::text")
+        if before_snapshot is not None:
+            await before_snapshot()
+        snapshot = primary.transaction(isolation="repeatable_read", readonly=True)
+        await snapshot.start()
+        if await _xid(primary) == bound + 1:  # nobody else took an xid between the bound and the snapshot
+            return x0, snapshot, attempts
+        await snapshot.rollback()
+        if loop.time() > deadline:
             raise Refused(
-                f"a write transaction on the primary has been open for over {CUT_WAIT_S:.0f} s; nothing was changed, "
-                "retry once it ends"
+                "the primary kept writing, so no exact cut was found within --cut-wait; nothing was changed. "
+                "Pause writes on the primary briefly, or retry"
             )
-        await asyncio.sleep(0.1)
-    return x0, open_at_cut
+        await asyncio.sleep(0.05)
 
 
 async def _wait_for_no_worker(mirror: asyncpg.Connection, subid: int) -> None:
@@ -306,8 +408,9 @@ async def reseed(
     instance: str | None,
     config: ReplicationConfig,
     since: datetime,
+    cut_wait_s: float = CUT_WAIT_S,
     registry: ReplicationRegistry = REGISTRY,
-    after_snapshot: Callable[[], Awaitable[object]] | None = None,
+    hooks: Mapping[str, Callable[[], Awaitable[object]]] | None = None,
 ) -> dict:
     """Copy what the mirror is missing since ``since``, then resume replication at the cut; see the module docstring.
 
@@ -322,25 +425,30 @@ async def reseed(
     config : ReplicationConfig
         Supplies ``publisher_dsn`` when the subscription has to be created.
     since : datetime
-        Copy time-series parents from this time on, with their children.
-    after_snapshot : Callable[[], Awaitable] | None
-        Awaited once the primary's snapshot is taken; for tests.
+        Reconcile the children of parents created or updated from this time on.
+    cut_wait_s : float
+        How long to keep trying for an exact cut.
+    hooks : Mapping[str, Callable[[], Awaitable]] | None
+        For tests: awaited at ``before_snapshot``, ``after_snapshot``, ``before_commit``
+        (inside the copy transaction) and ``after_commit`` (before the origin moves).
 
     Returns
     -------
     dict
         The subscription and whether it was ``created``; the ``cut_lsn`` replication
-        resumed after; per table, rows ``read`` from the primary, ``written`` and
-        ``deleted`` on the mirror; and tables ``skipped`` (not ready: their own
-        initial copy runs once the subscription is enabled).
+        resumed after and the ``cut_attempts`` it took; per table, rows ``read`` from
+        the primary, and ``set_aside``, ``written`` and ``deleted`` on the mirror; and
+        tables ``skipped`` (not ready: their own initial copy runs once the
+        subscription is enabled).
 
     Raises
     ------
     Refused
         Wrong role, missing privileges, an enabled subscription, ``since`` later than
-        the mirror's newest snapshot, or the primary held a transaction open too long.
-        Nothing was copied.
+        the mirror's newest snapshot, no exact cut within ``cut_wait_s``, or a unique
+        value it can't set aside. Nothing was copied.
     """
+    hooks = hooks or {}
     require_role("reseed", "mirror", role)
     name = subscription_name(instance)
     if not await is_superuser(mirror) and not await mirror.fetchval(
@@ -373,41 +481,52 @@ async def reseed(
     ready = sorted(t for t, state in states.items() if state == "ready" and t in registry.replicated)
     skipped = {t: state for t, state in sorted(states.items()) if state != "ready"}
     copies = await _plan(primary, mirror, ready, registry)
-    by_table = {copy.table: copy for copy in copies}
 
-    x0, open_at_cut = await _cut(primary)
-    if open_at_cut:
-        logger.warning(
-            "%d write transactions were open on the primary at the cut; if apply stops on a duplicate key "
-            "after this, skip that transaction (see `reseed` in the history runbooks)",
-            open_at_cut,
-        )
+    x0, snapshot, attempts = await _exact_cut(
+        primary, asyncio.get_running_loop().time() + cut_wait_s, hooks.get("before_snapshot")
+    )
     tables: dict[str, dict] = {}
-    async with primary.transaction(isolation="repeatable_read", readonly=True):
+    try:
         snapshot_lsn = await primary.fetchval("SELECT pg_current_wal_insert_lsn()::text")
-        if after_snapshot is not None:
-            await after_snapshot()
+        if "after_snapshot" in hooks:
+            await hooks["after_snapshot"]()
         async with mirror.transaction():
             temps = {copy.table: f"reseed_{n}" for n, copy in enumerate(copies)}
+            selected: dict[str, list] = {}  # parent table -> ids whose children are reconciled
             for copy in copies:
-                args = [since] if copy.kind is TableClass.TIME_SERIES else []
-                read = await _load(primary, mirror, copy, temps[copy.table], _select(copy, by_table), args)
+                args: list = []
+                if copy.kind is TableClass.TIME_SERIES and copy.bucketing.parent is not None:
+                    args = [selected[copy.bucketing.parent]]
+                read = await _load(primary, mirror, copy, temps[copy.table], _select(copy), args)
+                if copy.kind is TableClass.TIME_SERIES and copy.bucketing.parent is None:
+                    selected[copy.table] = await _selected_parents(mirror, copy, temps[copy.table], since)
                 tables[copy.table] = {"read": read}
-            for copy in reversed(copies):  # children first
-                tables[copy.table]["deleted"] = await _delete_missing(mirror, copy, temps[copy.table], temps)
-            for copy in copies:  # parents first
+            for copy in copies:
+                tables[copy.table]["set_aside"] = await _set_aside(mirror, copy, temps[copy.table])
+            for copy in copies:  # parents first, so rows already point at their new parents ...
                 tables[copy.table]["written"] = await _upsert(mirror, copy, temps[copy.table])
-            await mirror.execute("SELECT pg_replication_origin_advance($1, $2::text::pg_lsn)", f"pg_{sub['oid']}", x0)
-            await mirror.execute(f"ALTER SUBSCRIPTION {quote_ident(name)} ENABLE")
+            for copy in reversed(copies):  # ... before old ones are deleted, children first
+                parents = selected.get(copy.bucketing.parent) if copy.bucketing else None
+                tables[copy.table]["deleted"] = await _delete_missing(mirror, copy, temps[copy.table], parents)
+            if "before_commit" in hooks:
+                await hooks["before_commit"]()
+    finally:
+        await snapshot.rollback()
 
     for table, counts in tables.items():
         logger.info(
-            "Re-seeded %s: %d rows read, %d written, %d deleted",
+            "Re-seeded %s: %d rows read, %d set aside, %d written, %d deleted",
             table,
             counts["read"],
+            counts["set_aside"],
             counts["written"],
             counts["deleted"],
         )
+    # Only now that the copy is in: origin progress isn't transactional.
+    if "after_commit" in hooks:
+        await hooks["after_commit"]()
+    await mirror.execute("SELECT pg_replication_origin_advance($1, $2::text::pg_lsn)", f"pg_{sub['oid']}", x0)
+    await mirror.execute(f"ALTER SUBSCRIPTION {quote_ident(name)} ENABLE")
     logger.info("Subscription %s enabled; replication resumes after %s", name, x0)
     return {
         "subscription": name,
@@ -415,7 +534,7 @@ async def reseed(
         "publications": list(sub["subpublications"]),
         "since": since.isoformat(),
         "cut_lsn": x0,
-        "open_at_cut": open_at_cut,
+        "cut_attempts": attempts,
         "snapshot_lsn": snapshot_lsn,
         "tables": tables,
         "skipped": skipped,
@@ -447,7 +566,13 @@ async def run(args: argparse.Namespace) -> int:
         primary = await asyncpg.connect(reader_dsn, server_settings={**SESSION, "default_transaction_read_only": "on"})
         mirror = await asyncpg.connect(asyncpg_dsn(settings.database_url), server_settings=SESSION)
         report = await reseed(
-            primary, mirror, role=settings.role, instance=settings.instance, config=config, since=args.since
+            primary,
+            mirror,
+            role=settings.role,
+            instance=settings.instance,
+            config=config,
+            since=args.since,
+            cut_wait_s=args.cut_wait,
         )
     except Refused as exc:
         logger.error("refused: %s", redact(str(exc), secrets))

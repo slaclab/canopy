@@ -395,8 +395,8 @@ async def test_drift_check_finds_what_the_mirror_lost(pair: Pair):
         await mirror.close()
 
 
-async def test_drift_check_rereads_what_differed_after_settling(pair: Pair):
-    """The re-check runs in new transactions, so a mirror that was only behind comes out in step."""
+async def test_drift_check_waits_for_a_mirror_that_is_only_behind(pair: Pair):
+    """Lag is never drift: not checked while the mirror can't confirm, in step once it catches up."""
     p = pair
     await _subscribed(p)
     name = f"canopy_history_{p.instance}"
@@ -404,15 +404,74 @@ async def test_drift_check_rereads_what_differed_after_settling(pair: Pair):
     try:
         await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
         await p.pub.execute("INSERT INTO squirrel.snapshot (id, title) VALUES (gen_random_uuid(), 'Not applied yet')")
-        behind = await drift_check(primary, mirror, instance=p.instance)
-        assert list(behind["drift"]) == ["squirrel.snapshot"]
+        behind = await drift_check(primary, mirror, instance=p.instance, settle_s=1)
+        assert behind["status"] == "not_checked" and not behind["drift"]
+        assert list(behind["inconclusive"]) == ["squirrel.snapshot"]
 
-        async def catch_up():
+        async def enable_soon():
+            await asyncio.sleep(1)
             await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" ENABLE')
-            await eventually(lambda: _in_step(p))
 
-        settled = await drift_check(primary, mirror, instance=p.instance, settle=catch_up)
-        assert settled["in_step"] and settled["rechecked"] == ["squirrel.snapshot"]
+        enabling = asyncio.create_task(enable_soon())
+        caught_up = await drift_check(primary, mirror, instance=p.instance, settle_s=30)
+        await enabling
+        assert caught_up["status"] == "in_step", caught_up
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+async def _new_tag(p: Pair) -> None:
+    await p.pub.execute(
+        "INSERT INTO squirrel.tag (id, name, group_id) SELECT gen_random_uuid(), $1, id FROM squirrel.tag_group LIMIT 1",
+        uuid4().hex,
+    )
+
+
+async def test_drift_check_retries_when_the_primary_changes_mid_comparison(pair: Pair):
+    """A write between the reads makes one comparison inconclusive; real drift still shows on the next."""
+    p = pair
+    ids = await _subscribed(p)
+    await p.sub_admin.execute("DELETE FROM squirrel.tag WHERE id = $1", ids["tag_b"])  # the mirror loses a row
+    primary, mirror = await _drift_connections(p)
+    try:
+        hooked = 0
+
+        async def write_once():
+            nonlocal hooked
+            hooked += 1
+            if hooked == 1:
+                await _new_tag(p)
+
+        report = await drift_check(primary, mirror, instance=p.instance, after_mirror_read=write_once)
+        assert report["status"] == "drift" and report["attempts"] == 2
+        assert list(report["drift"]) == ["squirrel.tag"]
+
+        async def write_every_time():
+            await _new_tag(p)
+
+        churned = await drift_check(primary, mirror, instance=p.instance, after_mirror_read=write_every_time)
+        assert churned["status"] == "not_checked" and not churned["drift"]
+        assert churned["attempts"] == 3 and list(churned["inconclusive"]) == ["squirrel.tag"]
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+async def test_drift_check_reports_a_published_table_not_yet_subscribed(pair: Pair):
+    p = pair
+    await _subscribed(p)
+    for conn in (p.sub, p.pub):
+        await conn.execute("CREATE TABLE squirrel.zz_probe (id int PRIMARY KEY)")
+    probe = ReplicationRegistry(
+        tables={**REGISTRY.tables, "squirrel.zz_probe": TableClass.REFERENCE}, publications=REGISTRY.publications
+    )
+    await publish(p.pub, role="primary", config=p.config, registry=probe)
+    primary, mirror = await _drift_connections(p)
+    try:
+        report = await drift_check(primary, mirror, instance=p.instance, registry=probe)
+        assert report["status"] == "not_checked" and not report["drift"]
+        assert report["skipped"] == {"squirrel.zz_probe": "published but not subscribed yet (run refresh)"}
     finally:
         await primary.close()
         await mirror.close()
@@ -433,16 +492,16 @@ async def test_drift_check_command_exit_status(pair: Pair):
         "CANOPY_REPLICATION__READER_DSN": reader_dsn,
     }
 
-    def drift_check_command(**overrides: str) -> subprocess.CompletedProcess:
+    def drift_check_command(settle: str = "10", **overrides: str) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, "-m", "canopy.core.replication", "drift-check", "--settle", "0"],
+            [sys.executable, "-m", "canopy.core.replication", "drift-check", "--settle", settle],
             env=env | overrides,
             capture_output=True,
             text=True,
             timeout=120,
         )
 
-    in_step = drift_check_command()
+    in_step = drift_check_command(settle="0")
     assert in_step.returncode == 0, in_step.stderr
     assert json.loads(in_step.stdout)["in_step"] is True
 
@@ -593,7 +652,7 @@ async def test_reseed_hands_over_to_replication_at_the_cut(pair: Pair):
             instance=p.instance,
             config=p.config,
             since=since,
-            after_snapshot=write_after_the_snapshot,
+            hooks={"after_snapshot": write_after_the_snapshot},
         )
         assert report["created"] is False
         assert report["tables"]["squirrel.snapshot"]["read"] == 2  # the seeded one and `before`
@@ -674,39 +733,221 @@ async def test_reseed_command(pair: Pair):
     await eventually(lambda: _in_step(p))
 
 
-async def test_reseed_cut_waits_for_open_write_transactions(pair: Pair, monkeypatch):
+async def _writer(p: Pair) -> asyncpg.Connection:
+    return await asyncpg.connect(
+        server_dsn(PUBLISHER_ADMIN, database=await p.pub.fetchval("SELECT current_database()"))
+    )
+
+
+async def _apply_error_total(p: Pair) -> int:
+    status = (await subscriber_status(p.sub_admin, instance=p.instance))["subscription"]
+    return status["apply_error_count"] + status["sync_error_count"]
+
+
+async def test_reseed_cut_waits_out_a_write_left_open(pair: Pair):
+    """A write open at the cut is waited for, copied, and not replayed: no apply error."""
     p = pair
     await _subscribed(p)
     name = f"canopy_history_{p.instance}"
     since = await _newest_on_mirror(p)
     await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
     primary, mirror = await _drift_connections(p)
-    writer = await asyncpg.connect(
-        server_dsn(PUBLISHER_ADMIN, database=await p.pub.fetchval("SELECT current_database()"))
-    )
+    writer = await _writer(p)
     try:
-        # Too long: refused before the mirror is touched.
-        monkeypatch.setattr(reseed_module, "CUT_WAIT_S", 0.5)
         open_write = writer.transaction()
         await open_write.start()
-        await writer.execute("INSERT INTO squirrel.snapshot (id, title) VALUES (gen_random_uuid(), 'Open')")
-        with pytest.raises(Refused, match="has been open"):
-            await reseed(primary, mirror, role="mirror", instance=p.instance, config=p.config, since=since)
+        await writer.execute("INSERT INTO squirrel.snapshot (id, title) VALUES (gen_random_uuid(), 'Open at the cut')")
+        with pytest.raises(Refused, match="stayed open past --cut-wait"):
+            await reseed(
+                primary, mirror, role="mirror", instance=p.instance, config=p.config, since=since, cut_wait_s=0.5
+            )
         assert not (await subscriber_status(p.sub_admin, instance=p.instance))["subscription"]["enabled"]
 
-        # Long enough: the cut waits until the transaction ends (here, rolled back).
-        monkeypatch.setattr(reseed_module, "CUT_WAIT_S", 30.0)
         task = asyncio.create_task(
             reseed(primary, mirror, role="mirror", instance=p.instance, config=p.config, since=since)
         )
         await asyncio.sleep(0.5)
         assert not task.done()
-        await open_write.rollback()
-        report = await task
-        assert report["open_at_cut"] >= 1  # the writer, plus anything else running on the server
+        await open_write.commit()
+        await task
         await eventually(lambda: _in_step(p))
+        assert await p.sub.fetchval("SELECT count(*) FROM squirrel.snapshot WHERE title = 'Open at the cut'") == 1
+        assert await _apply_error_total(p) == 0
     finally:
         await writer.close()
+        await primary.close()
+        await mirror.close()
+
+
+async def test_reseed_cut_retries_until_it_is_exact(pair: Pair):
+    """A write between the bound and the snapshot spoils that attempt; one that never stops is refused."""
+    p = pair
+    await _subscribed(p)
+    name = f"canopy_history_{p.instance}"
+    since = await _newest_on_mirror(p)
+    await p.sub_admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
+    primary, mirror = await _drift_connections(p)
+    try:
+        calls = 0
+
+        async def write(always: bool):
+            nonlocal calls
+            calls += 1
+            if always or calls == 1:
+                await p.pub.execute("INSERT INTO squirrel.snapshot (id, title) VALUES (gen_random_uuid(), 'Mid-cut')")
+
+        with pytest.raises(Refused, match="kept writing"):
+            await reseed(
+                primary,
+                mirror,
+                role="mirror",
+                instance=p.instance,
+                config=p.config,
+                since=since,
+                cut_wait_s=0.5,
+                hooks={"before_snapshot": lambda: write(always=True)},
+            )
+        assert not (await subscriber_status(p.sub_admin, instance=p.instance))["subscription"]["enabled"]
+
+        calls = 0
+        report = await reseed(
+            primary,
+            mirror,
+            role="mirror",
+            instance=p.instance,
+            config=p.config,
+            since=since,
+            hooks={"before_snapshot": lambda: write(always=False)},
+        )
+        assert report["cut_attempts"] == 2
+        await eventually(lambda: _in_step(p))
+        assert await _apply_error_total(p) == 0
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+async def test_reseed_moves_the_origin_only_after_the_copy_commits(pair: Pair):
+    """A failure before or after the copy commits leaves the subscription disabled; a rerun converges."""
+    p = pair
+    ids = await _subscribed(p)
+    since = await _newest_on_mirror(p)
+    await _lose_subscription(p)
+    gap = str(uuid4())
+    await p.pub.execute("INSERT INTO squirrel.snapshot (id, title) VALUES ($1, 'In the gap')", gap)
+    name = f"canopy_history_{p.instance}"
+
+    async def origin() -> str | None:
+        return await p.sub_admin.fetchval(
+            "SELECT o.remote_lsn::text FROM pg_replication_origin_status o "
+            "JOIN pg_subscription s ON o.external_id = 'pg_' || s.oid WHERE s.subname = $1",
+            name,
+        )
+
+    async def fail():
+        raise RuntimeError("injected")
+
+    primary, mirror = await _drift_connections(p)
+    try:
+        with pytest.raises(RuntimeError, match="injected"):
+            await reseed(
+                primary,
+                mirror,
+                role="mirror",
+                instance=p.instance,
+                config=p.config,
+                since=since,
+                hooks={"before_commit": fail},
+            )
+        assert await p.sub.fetchval("SELECT count(*) FROM squirrel.snapshot WHERE id = $1", gap) == 0
+        assert await origin() in (None, "0/0")
+        assert not (await subscriber_status(p.sub_admin, instance=p.instance))["subscription"]["enabled"]
+
+        with pytest.raises(RuntimeError, match="injected"):
+            await reseed(
+                primary,
+                mirror,
+                role="mirror",
+                instance=p.instance,
+                config=p.config,
+                since=since,
+                hooks={"after_commit": fail},
+            )
+        assert await p.sub.fetchval("SELECT count(*) FROM squirrel.snapshot WHERE id = $1", gap) == 1
+        assert await origin() in (None, "0/0")
+        assert not (await subscriber_status(p.sub_admin, instance=p.instance))["subscription"]["enabled"]
+
+        await reseed(primary, mirror, role="mirror", instance=p.instance, config=p.config, since=since)
+        await p.pub.execute("UPDATE squirrel.pv SET description = 'after the rerun' WHERE id = $1", ids["pv"])
+        await eventually(lambda: _in_step(p))
+        assert await _apply_error_total(p) == 0
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+async def test_reseed_finds_a_snapshot_by_id_whatever_its_time(pair: Pair):
+    """A snapshot that started before --since but committed in the gap still comes across, with its values."""
+    p = pair
+    ids = await _subscribed(p)
+    since = await _newest_on_mirror(p)
+    await _lose_subscription(p)
+    late = str(uuid4())
+    async with p.pub.transaction():
+        await p.pub.execute(
+            "INSERT INTO squirrel.snapshot (id, title, created_at, updated_at) "
+            "VALUES ($1, 'Started early', $2::timestamptz - interval '1 hour', $2::timestamptz - interval '1 hour')",
+            late,
+            since,
+        )
+        await p.pub.execute(
+            "INSERT INTO squirrel.snapshot_value (id, snapshot_id, pv_id, pv_name) "
+            "VALUES (gen_random_uuid(), $1, $2, 'SIM:PV:1:SETPOINT')",
+            late,
+            ids["pv"],
+        )
+    primary, mirror = await _drift_connections(p)
+    try:
+        await reseed(primary, mirror, role="mirror", instance=p.instance, config=p.config, since=since)
+        assert await p.sub.fetchval("SELECT count(*) FROM squirrel.snapshot_value WHERE snapshot_id = $1", late) == 1
+        await eventually(lambda: _in_step(p))
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+async def test_reseed_follows_swapped_names_and_a_moved_child(pair: Pair):
+    """Unique names swapped through a temporary one, and a child moved off a parent that is then deleted."""
+    p = pair
+    ids = await _subscribed(p)
+    zone, old_parent, new_parent, child = (str(uuid4()) for _ in range(4))
+    async with p.pub.transaction():
+        await p.pub.execute("INSERT INTO squirrel.tag_group (id, name) VALUES ($1, 'Zone')", zone)
+        await p.pub.execute("INSERT INTO core.facility (id, slug, name) VALUES ($1, 'old', 'Old')", old_parent)
+        await p.pub.execute("INSERT INTO core.facility (id, slug, name) VALUES ($1, 'new', 'New')", new_parent)
+        await p.pub.execute(
+            "INSERT INTO core.facility (id, slug, name, parent_id) VALUES ($1, 'child', 'Child', $2)", child, old_parent
+        )
+    await eventually(lambda: _in_step(p))
+    since = await _newest_on_mirror(p)
+    await _lose_subscription(p)
+
+    async with p.pub.transaction():
+        await p.pub.execute("UPDATE squirrel.tag_group SET name = 'tmp' WHERE id = $1", ids["group"])
+        await p.pub.execute("UPDATE squirrel.tag_group SET name = 'Area' WHERE id = $1", zone)
+        await p.pub.execute("UPDATE squirrel.tag_group SET name = 'Zone' WHERE id = $1", ids["group"])
+    await p.pub.execute("UPDATE core.facility SET parent_id = $1 WHERE id = $2", new_parent, child)
+    await p.pub.execute("DELETE FROM core.facility WHERE id = $1", old_parent)
+
+    primary, mirror = await _drift_connections(p)
+    try:
+        report = await reseed(primary, mirror, role="mirror", instance=p.instance, config=p.config, since=since)
+        assert report["tables"]["squirrel.tag_group"]["set_aside"] == 2
+        assert report["tables"]["core.facility"]["deleted"] == 1
+        assert await p.sub.fetchval("SELECT name FROM squirrel.tag_group WHERE id = $1", zone) == "Area"
+        assert await p.sub.fetchval("SELECT parent_id::text FROM core.facility WHERE id = $1", child) == new_parent
+        assert (await drift_check(primary, mirror, instance=p.instance))["in_step"]
+    finally:
         await primary.close()
         await mirror.close()
 
