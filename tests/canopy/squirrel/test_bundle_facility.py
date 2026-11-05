@@ -6,9 +6,10 @@ is gated like a capture. The keys and facilities are ``test_facility_enforcement
 """
 
 from httpx import AsyncClient
+from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from canopy.squirrel.data.models import Pv, Snapshot, SnapshotValue
+from canopy.squirrel.data.models import Pv, Snapshot, SnapshotValue, pv_facility
 from tests.canopy.squirrel.test_facility_enforcement import (  # noqa: F401 - scoped_keys is an autouse fixture
     NC_HEADERS,
     SC_HEADERS,
@@ -18,14 +19,22 @@ from tests.canopy.squirrel.test_facility_enforcement import (  # noqa: F401 - sc
 )
 
 
-async def _seed_snapshot(session: AsyncSession, facility_id: str | None) -> str:
-    pv = Pv(setpoint_address="SC:BUNDLE:SP")
+async def _seed_snapshot(
+    session: AsyncSession, facility_id: str | None, pvs: dict[str, str | None] | None = None
+) -> str:
+    """A snapshot in ``facility_id`` with one value per PV in ``pvs``: ``{address: facility id}``.
+
+    By default it holds one PV in the snapshot's own facility.
+    """
     snapshot = Snapshot(title="sc save", facility_id=facility_id)
-    session.add_all([pv, snapshot])
-    await session.flush()
-    session.add(
-        SnapshotValue(snapshot_id=snapshot.id, pv_id=pv.id, pv_name="SC:BUNDLE:SP", setpoint_value={"value": 1})
-    )
+    session.add(snapshot)
+    for address, pv_facility_id in (pvs or {"SC:BUNDLE:SP": facility_id}).items():
+        pv = Pv(setpoint_address=address)
+        session.add(pv)
+        await session.flush()
+        if pv_facility_id is not None:
+            await session.execute(insert(pv_facility).values(pv_id=pv.id, facility_id=pv_facility_id))
+        session.add(SnapshotValue(snapshot_id=snapshot.id, pv_id=pv.id, pv_name=address, setpoint_value={"value": 1}))
     await session.commit()
     return snapshot.id
 
@@ -91,3 +100,44 @@ async def test_a_bundle_without_a_facility_needs_an_unrestricted_key(client: Asy
     assert restricted.status_code == 403
     assert unrestricted.status_code == 200, unrestricted.text
     assert unrestricted.json()["snapshot"]["facility"] is None
+
+
+async def test_import_keeps_only_values_of_pvs_the_key_can_restore(client: AsyncClient, db_session: AsyncSession):
+    facilities = await _seed_hierarchy(db_session)
+    sc, nc = facilities["lcls-sc"].id, facilities["lcls-nc"].id
+    pvs = {"SC:OWN:SP": sc, "NC:OTHER:SP": nc, "UNASSIGNED:SP": None}
+    bundle = await _export(client, WILD_HEADERS, await _seed_snapshot(db_session, sc, pvs))
+    names = {value["pvName"]: value["pvId"] for value in bundle["values"]}
+
+    r = await client.post("/v1/snapshots/import", headers=SC_HEADERS, json=bundle)
+
+    assert r.status_code == 200, r.text
+    # Left out like an unknown id, so the answer doesn't say the PV exists elsewhere.
+    assert sorted(v["pvName"] for v in r.json()["skipped"]) == ["NC:OTHER:SP", "UNASSIGNED:SP"]
+    assert r.json()["snapshot"]["pvCount"] == 1
+    exported = await _export(client, SC_HEADERS, r.json()["snapshot"]["id"])
+    assert [(v["pvId"], v["setpointAddress"]) for v in exported["values"]] == [(names["SC:OWN:SP"], "SC:OWN:SP")]
+
+
+async def test_import_of_only_another_facilitys_pvs_creates_nothing(client: AsyncClient, db_session: AsyncSession):
+    facilities = await _seed_hierarchy(db_session)
+    sc, nc = facilities["lcls-sc"].id, facilities["lcls-nc"].id
+    bundle = await _export(client, WILD_HEADERS, await _seed_snapshot(db_session, sc, {"NC:ONLY:SP": nc}))
+
+    r = await client.post("/v1/snapshots/import", headers=SC_HEADERS, json=bundle)
+
+    assert r.status_code == 400 and r.json()["code"] == "bad_request"
+    listing = await client.get("/v1/snapshots", headers=WILD_HEADERS)
+    assert listing.json()["totalCount"] == 1
+
+
+async def test_an_unrestricted_import_keeps_every_known_pv(client: AsyncClient, db_session: AsyncSession):
+    facilities = await _seed_hierarchy(db_session)
+    sc, nc = facilities["lcls-sc"].id, facilities["lcls-nc"].id
+    pvs = {"SC:OWN:SP": sc, "NC:OTHER:SP": nc, "UNASSIGNED:SP": None}
+    bundle = await _export(client, WILD_HEADERS, await _seed_snapshot(db_session, sc, pvs))
+
+    r = await client.post("/v1/snapshots/import", headers=WILD_HEADERS, json=bundle)
+
+    assert r.status_code == 200 and r.json()["skipped"] == []
+    assert r.json()["snapshot"]["pvCount"] == 3
