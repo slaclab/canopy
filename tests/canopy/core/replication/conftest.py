@@ -103,3 +103,16 @@ async def privileges(conn: asyncpg.Connection, role: str, table: str) -> set[str
         for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE")
         if await conn.fetchval("SELECT has_table_privilege($1, $2, $3)", role, table, privilege)
     }
+
+
+async def direct_grants(conn: asyncpg.Connection, role: str, table: str) -> set[str]:
+    """The privileges granted on ``table`` to ``role`` itself, ignoring inherited ones."""
+    rows = await conn.fetch(
+        """
+        SELECT a.privilege_type FROM pg_class c, aclexplode(c.relacl) a
+        WHERE c.oid = $2::regclass AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = $1)
+        """,
+        role,
+        table,
+    )
+    return {row["privilege_type"] for row in rows}
