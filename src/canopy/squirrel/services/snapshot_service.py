@@ -325,6 +325,20 @@ class SnapshotService:
         if facility_id not in self.facility_scope:
             raise SnapshotNotFound("Snapshot not found")
 
+    def _require_facility_for_create(self, facility_id: str | None, slug: str | None) -> None:
+        """Gate the facility of a *new* snapshot, as the capture route does.
+
+        A restricted key must name a facility it holds: minting an unassigned snapshot
+        would create data it couldn't reach again. Unlike ``_require_facility_write``,
+        an out-of-scope facility is a 403 naming it, since the caller named it.
+        """
+        if self.facility_scope is None:
+            return
+        if facility_id is None:
+            raise InsufficientFacilityAccess("API key is scoped to specific facilities; 'facility' is required")
+        if facility_id not in self.facility_scope:
+            raise InsufficientFacilityAccess(f"API key is not scoped to facility: {slug}")
+
     async def _facility_slug(self, facility_id: str | None) -> str | None:
         """A stored facility id as the slug reported on the wire."""
         if facility_id is None:
@@ -818,7 +832,7 @@ class SnapshotService:
             if facility is None:
                 raise FacilityNotFound(f"Facility '{bundle.facility}' not found")
             facility_id = facility.id
-        await self._require_facility_write(facility_id, "the imported snapshot")
+        self._require_facility_for_create(facility_id, bundle.facility)
 
         pv_ids = sorted({str(value.pv_id) for value in bundle.values})
         known = await self.pv_repo.get_existing_ids(pv_ids, include_deleted=True)
