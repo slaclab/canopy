@@ -804,20 +804,25 @@ class SnapshotService:
             values=values,
         )
 
-    async def _importable_pv_ids(self, pv_ids: list[str]) -> set[str]:
+    async def _importable_pv_ids(self, pv_ids: list[str], capture_scope: set[str] | None) -> set[str]:
         """The PV ids of a bundle that an import may keep values for.
 
         A PV must exist here (deleted PVs included: a mirror replicates its primary's PV
         rows, ids and all), and the key must be able to restore it (``_pv_in_scope``).
         The new snapshot's export shows each value's PV addresses, so a value of a PV the
-        key can't see would reveal it. Every rule is a condition in the loop below.
+        key can't see would reveal it. For a bundle with a facility, the PV must also be
+        assigned to that facility or one below it (``capture_scope``), as a capture into
+        that facility would take it. Every rule is a condition in the loop below.
         """
         known = await self.pv_repo.get_existing_ids(pv_ids, include_deleted=True)
-        assigned = await self.pv_repo.facility_ids_for_many(sorted(known)) if self.facility_scope is not None else {}
+        needs_facilities = self.facility_scope is not None or capture_scope is not None
+        assigned = await self.pv_repo.facility_ids_for_many(sorted(known)) if needs_facilities else {}
         importable = set()
         for pv_id in known:
             facility_ids = assigned.get(pv_id, set())
             if not self._pv_in_scope(facility_ids):
+                continue
+            if capture_scope is not None and not facility_ids & capture_scope:
                 continue
             importable.add(pv_id)
         return importable
@@ -829,9 +834,10 @@ class SnapshotService:
         recent; ``imported_from`` records the bundle's snapshot id, and each value keeps
         its capture ``timestamp``. Values are matched to PVs here by ``pv_id``, deleted
         PVs included: a history mirror replicates its primary's PV rows, ids and all.
-        Values whose PV isn't here, or that the key couldn't restore, are skipped and
-        listed alike, so the answer doesn't reveal another facility's PV. Nothing is read
-        from EPICS.
+        Values whose PV isn't here, that the key couldn't restore, or that isn't assigned
+        to the bundle's facility or one below it are skipped and listed alike, so the
+        answer doesn't reveal another facility's PV. A PV moved out of that facility since
+        the export is skipped too. Nothing is read from EPICS.
         The new snapshot takes the bundle's facility, which the key must be able to
         write, as it would for a capture; a bundle without one imports unassigned.
 
@@ -862,7 +868,8 @@ class SnapshotService:
             facility_id = facility.id
         self._require_facility_for_create(facility_id, bundle.facility)
 
-        known = await self._importable_pv_ids(sorted({str(value.pv_id) for value in bundle.values}))
+        capture_scope = await facilities_gateway.descendant_ids(facility_id) if facility_id is not None else None
+        known = await self._importable_pv_ids(sorted({str(value.pv_id) for value in bundle.values}), capture_scope)
         rows: list[dict] = []
         skipped: list[SkippedValueDTO] = []
         for value in bundle.values:
