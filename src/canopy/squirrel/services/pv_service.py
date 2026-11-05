@@ -264,7 +264,11 @@ class PvService:
         return (await self._to_dtos(pvs))[0]
 
     async def _find_by_identity(self, kind: str, address: str) -> Pv | None:
-        """Look up the PV already holding an identity, live or deleted.
+        """Look up and lock the PV already holding an identity, live or deleted.
+
+        The row stays locked until the transaction ends, so a concurrent registration of
+        the same address waits, then finds the PV live and is refused, instead of both
+        bringing back the same deleted row.
 
         Parameters
         ----------
@@ -279,10 +283,10 @@ class PvService:
             The PV owning that identity, or ``None`` when no PV ever held it.
         """
         if kind == "setpoint":
-            return await self.pv_repo.find_by_setpoint(address, include_deleted=True)
+            return await self.pv_repo.find_by_setpoint(address, include_deleted=True, for_update=True)
         if kind == "readback":
-            return await self.pv_repo.find_by_readback_without_setpoint(address, include_deleted=True)
-        return await self.pv_repo.find_by_config_only(address, include_deleted=True)
+            return await self.pv_repo.find_by_readback_without_setpoint(address, include_deleted=True, for_update=True)
+        return await self.pv_repo.find_by_config_only(address, include_deleted=True, for_update=True)
 
     async def create(self, data: NewPVElementDTO) -> PVElementDTO:
         """Register a single PV.
@@ -442,10 +446,18 @@ class PvService:
             if existing:
                 raise PvAlreadyExists(f"{kind.capitalize()} addresses already exist: {sorted(existing)[:10]}")
 
+        # Lock every PV holding one of the import's identities. One found deleted above may
+        # have been brought back since by another registration; locked, it can't be again.
         deleted: dict[tuple[str, str], Pv] = {}
+        revived: list[str] = []
         for kind in IDENTITY_KINDS:
-            for address, pv in (await self.pv_repo.get_deleted_by_identity(kind, sorted(identities[kind]))).items():
-                deleted[(kind, address)] = pv
+            for address, pv in (await self.pv_repo.lock_by_identity(kind, sorted(identities[kind]))).items():
+                if pv.deleted_at is None:
+                    revived.append(address)
+                else:
+                    deleted[(kind, address)] = pv
+        if revived:
+            raise PvAlreadyExists(f"Addresses already exist: {sorted(revived)[:10]}")
         # As in `create`, a deleted PV comes back only for a key that could write it.
         if deleted and self.facility_scope is not None:
             old_ids = await self.pv_repo.facility_ids_for_many([pv.id for pv in deleted.values()])
@@ -541,7 +553,8 @@ class PvService:
         BadRequest
             If the PV is still a meta-PV; its marker has to be removed first.
         """
-        if await self.pv_repo.get_by_id(pv_id) is None:
+        # Locked, so a meta-PV marker can't be added between the check below and the delete.
+        if await self.pv_repo.get_by_id(pv_id, for_update=True) is None:
             return False
         await self._require_facility_write(await self.pv_repo.facility_ids_for(pv_id), "this PV")
         if await self.meta_pv_repo.get_one(pv_id) is not None:
@@ -603,7 +616,8 @@ class PvService:
         return MetaPVDTO(pv_id=meta_pv.pv_id, display_name=meta_pv.display_name, is_active=meta_pv.is_active)
 
     async def add_meta_pv(self, pv_name: str, display_name: str) -> MetaPVDTO:
-        pv = await self.pv_repo.find_by_address(pv_name)
+        # Locked, so the PV can't be deleted between this check and the marker's insert.
+        pv = await self.pv_repo.find_by_address(pv_name, for_update=True)
         if pv is None:
             raise PvNotFound(f"PV {pv_name} could not be found")
         try:
