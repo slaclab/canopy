@@ -48,10 +48,11 @@ fails when the models and the migrations disagree.
 A history mirror is a read-only copy of a primary's database, kept in step by Postgres
 logical replication (`canopy.core.replication`). It runs the same migrations, and it
 migrates **before** its primary: in each release the mirror runs `alembic upgrade head`
-while the primary is still on the previous release and still writing. Apply stops, and
-stays stopped until someone repairs it, when the primary sends a column the mirror
-doesn't have or a row the mirror already has. Every migration therefore keeps one
-release of compatibility in either direction:
+while the primary is still on the previous release and still writing. One deploy may
+take the mirror through several revisions at once. Apply stops, and stays stopped until
+someone repairs it, when the primary sends a column the mirror doesn't have or a row
+the mirror already has. So every revision must work with a mirror any number of
+revisions ahead of its primary:
 
 - **Add** a table, column or index in one release. An added column must be nullable or
   have a `server_default`, because the mirror fills it in for rows the primary sends
@@ -59,22 +60,39 @@ release of compatibility in either direction:
   the same pull request; a test fails until you do.
 - **Drop** a column or table publisher first, over two releases. In release N, stop
   using it, and in one migration first make a column nullable on both sides (if it
-  isn't), then drop it under `if on_publisher():`. In release N+1, drop it under
-  `if on_subscriber():`, by which time the mirror has applied every row that still
-  carried it.
+  isn't), then drop it under `if on_publisher():`. In a later release, drop it under
+  `if on_subscriber():` in a revision that declares the release-N revision with a
+  module-level `canopy_requires_primary_at = "<revision>"`, and deploy it with the check
+  below.
 - **Rename** nothing in place: add the new column or table, copy the data under
   `if on_publisher():`, move the code over, then drop the old one as above.
 - **Change a type** only by widening it (`varchar(n)` to `text`, `integer` to `bigint`).
   Anything else is an add plus a drop.
 - **Tighten a constraint** (`NOT NULL`, `CHECK`, `UNIQUE`) a release after the code that
-  could violate it is gone, so the primary can't send a row the mirror would reject.
+  could violate it is gone and any backfill ran (under `if on_publisher():`), so the
+  primary can't send a row the mirror would reject. The tightening revision declares
+  the backfill's revision in `canopy_requires_primary_at` and is deployed with the check
+  below.
 - **Change data** (`INSERT`, `UPDATE`, `DELETE` on a replicated table) under
   `if on_publisher():`. Replication brings the result to the mirror; an `INSERT` run on
   both sides collides with the replicated row.
 - **Index for history only** under `if on_subscriber():`, and keep the index out of the
   models so `alembic check` still passes on a primary. Never make it unique.
 
+- **Retire a table** like a drop, and keep its entry in the replication registry with
+  its name added to `RETIRED` in `canopy/core/replication/registry.py`: a database that
+  hasn't dropped it yet still needs it classified. Remove both once no deployed database
+  can hold it.
+
 Local tables, which never replicate (`core.api_key`), need none of this.
+
+**Deploying a revision that declares `canopy_requires_primary_at`.** Before the mirror
+migrates past it, confirm that the primary runs the named revision or a later one
+(`alembic current` there), and that the mirror has caught up with everything the
+primary wrote before it: on the primary, `python -m canopy.core.replication status`
+shows the mirror's slot `active` with `lag_bytes` at or near 0. A mirror that was
+behind would still be applying rows that carry the dropped column, or that break the
+new constraint.
 
 ```python
 from canopy.core.replication.migration import on_publisher, on_subscriber
@@ -82,8 +100,13 @@ from canopy.core.replication.migration import on_publisher, on_subscriber
 
 `migrations/env.py` takes the side from `CANOPY_ROLE`: `primary` is the publisher, any
 other role a subscriber. `tests/canopy/core/replication/test_migration_order.py` walks
-every revision in this order on two Postgres servers and fails on a migration that
-breaks a rule; CI runs it. To run it locally, start the servers with
+every revision on two Postgres servers twice: one release at a time, mirror first, and
+with the mirror at head while the primary climbs from the first revision (or from the
+newest `canopy_requires_primary_at`). After each step the primary writes a row to every
+published table from its own schema at that moment, filling every column without a
+default, and the walk fails on a migration that breaks a rule. CI runs it. If a new
+column has a `CHECK` the writer's generic value fails, add a value to `OVERRIDES` in that
+test. To run it locally, start the servers with
 `docker compose -f tests/canopy/core/replication/docker-compose.yml up -d --wait` and
 set the variables listed in that file.
 

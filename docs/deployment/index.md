@@ -91,8 +91,10 @@ On a primary with a read-only history mirror, follow the upgrade with
 publication in step with the tables. The mirror runs `alembic upgrade head`,
 then `grants` and `refresh`, before its primary deploys; `subscribe` runs once.
 `status` reports either side as JSON (see [History mirror](history.md)), and `drift-check`, run on the mirror after
-the hourly `refresh`, compares each table with the primary: it exits 1 when the
-copy has drifted (a change replication skipped) and 2 when it can't check. Run each side's migrations with its own
+the hourly `refresh`, compares each table with the primary. It exits 0 only when every
+published table was compared and is in step, 1 when the copy has drifted (a change
+replication skipped), and 2 when it couldn't check every table: one still copying or not
+subscribed yet, a comparison the primary's writes kept inconclusive, or an error. Run each side's migrations with its own
 `CANOPY_ROLE`: a few migration steps run on the primary or on the mirror only (see
 "Database Migrations" in `CONTRIBUTING.md`).
 
