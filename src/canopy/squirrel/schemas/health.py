@@ -56,12 +56,14 @@ class RestoreHooksStatusDTO(CanopyModel):
 class PVCacheStatusDTO(CanopyModel):
     """The worker-side PV cache that cached snapshots (``useCache=true``) read from.
 
-    ``status`` is ``"disabled"`` when no worker is leading the cache and this API
-    process has it disabled too; ``"down"`` when snapshot create won't use the cache
-    (no report although the API has it enabled, an unreadable report, a heartbeat older
-    than the configured maximum, a leader that stepped down, or Redis unreachable:
-    ``error`` says which); ``"degraded"`` while the leader is
-    still hearing from its PVs after taking over (``warm`` false) or when some
+    ``status`` is ``"disabled"`` when this API process has the cache disabled and no
+    worker is leading it: no report, or the one a leader leaves on stepping down.
+    ``"down"`` when snapshot create won't use the cache otherwise (an unreadable
+    report, a heartbeat older than the configured maximum, Redis unreachable, or with
+    the API enabled no report or a leader that stepped down: ``error`` says which).
+    A crashed leader's stale report reads ``"down"`` whatever this process's flag
+    until it expires, an hour after its last write. ``"degraded"`` while the leader
+    is still hearing from its PVs after taking over (``warm`` false) or when some
     monitored PVs are disconnected; ``"ok"`` otherwise. Snapshots still work in every
     state: what the cache can't vouch for is read live.
 

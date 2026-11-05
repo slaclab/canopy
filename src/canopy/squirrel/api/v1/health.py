@@ -152,8 +152,12 @@ async def pv_cache_status() -> PVCacheStatusDTO:
         reason = untrusted_reason(report, now, cfg.heartbeat_max_age_s)
         error = None if reason is None else _sentence(reason)
 
-    if error is not None and not cfg.enabled:
-        # No worker leads a cache this process has switched off too: off, not broken.
+    # Off, not broken, only when this process has the cache off too and no worker is
+    # leading it: no report, or one a leader left on stepping down. The flag is often
+    # set on the worker alone, and a leader that crashed never writes the step-down,
+    # so its stale report stays "down" here until it expires.
+    switched_off = not cfg.enabled and unreadable is None and (report is None or not report.heartbeat_at)
+    if error is not None and switched_off:
         status, error = "disabled", None
     elif error is not None:
         status = "down"

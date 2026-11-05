@@ -206,16 +206,39 @@ async def test_pv_cache_is_disabled_when_nothing_ran_it(http_client: AsyncClient
     assert (status["status"], status["enabled"]) == ("disabled", False)
 
 
-@pytest.mark.parametrize("heartbeat_age_s", [120, None])
-async def test_pv_cache_switched_off_after_a_worker_led_it_is_disabled(
-    http_client: AsyncClient, redis, monkeypatch, heartbeat_age_s
-):
-    """Not down for good once a worker has ever led it: a stale or stepped-down report counts as off."""
+async def test_pv_cache_switched_off_after_a_worker_led_it_is_disabled(http_client: AsyncClient, redis, monkeypatch):
+    """Not down for good once a worker has ever led it: the report a leader leaves on stepping down counts as off."""
     _cache_config(monkeypatch, enabled=False)
-    await _report(redis, heartbeatAt=0 if heartbeat_age_s is None else time.time() - heartbeat_age_s)
+    await _report(redis, heartbeatAt=0)
     status = await _cache_status(http_client)
     assert (status["status"], status["enabled"], status["error"]) == ("disabled", False, None)
     assert status["host"] == "worker-1"  # still says who led it last
+
+
+async def test_pv_cache_whose_leader_crashed_is_down_even_if_this_api_has_it_off(
+    http_client: AsyncClient, redis, monkeypatch
+):
+    """The flag may be set on the worker alone, and a crashed leader never writes the step-down report."""
+    _cache_config(monkeypatch, enabled=False)
+    await _report(redis, heartbeatAt=time.time() - 120)
+    status = await _cache_status(http_client)
+    assert (status["status"], status["enabled"]) == ("down", False)
+    assert "heartbeat" in status["error"]
+
+
+@pytest.mark.parametrize("unreadable", [True, False])
+async def test_an_unreadable_or_generationless_report_is_down_even_if_this_api_has_it_off(
+    http_client: AsyncClient, redis, monkeypatch, unreadable
+):
+    """Something wrote a report a snapshot won't trust, so the cache isn't simply switched off."""
+    _cache_config(monkeypatch, enabled=False)
+    if unreadable:
+        await redis.set(STATUS_KEY, "not json")
+    else:
+        await _report(redis, generation=None)
+    status = await _cache_status(http_client)
+    assert status["status"] == "down"
+    assert ("unreadable" if unreadable else "generation") in status["error"]
 
 
 async def test_pv_cache_led_by_a_worker_is_reported_even_if_this_api_has_it_off(
