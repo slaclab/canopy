@@ -13,13 +13,29 @@ and reports where the two differ:
   parent's (``TIME_SERIES_BUCKETS``), plus rows whose parent is missing, which only a
   mirror can hold, since apply doesn't enforce foreign keys.
 
-Only tables the subscription holds in state ready are compared. A difference can be
-replication lag, so the tables that differ are read again after a pause, in new
-transactions, and only what still differs is drift. ``--days`` limits time-series
-buckets to recent days; once the primary prunes old rows, only its window can match.
+Tables are compared once the subscription holds them in state ready. A table the
+primary publishes that isn't ready, or isn't subscribed at all, is reported as not
+checked.
 
-Exit status: 0 in step, 1 drift found, 2 the check couldn't run. The report goes to
-stdout as JSON; each drifting table and a summary go to the log.
+A difference may only be lag, or a write landing between the two reads, so a table
+that differs is drift only when the comparison is conclusive:
+
+1. Read the primary in a repeatable-read snapshot, with ``L``, the WAL position inside it.
+2. Read the mirror. Equal figures mean in step.
+3. Otherwise wait for the mirror's slot on the primary to confirm ``L``
+   (``confirmed_flush_lsn``), then read the mirror again, then the primary.
+4. Drift when the mirror confirmed ``L``, still differs, and the primary's second read
+   equals its first. When the primary changed or the mirror didn't confirm, the table
+   is tried again, up to ``ATTEMPTS`` times within ``--settle`` seconds, and is then
+   reported as inconclusive.
+
+``--days`` limits time-series buckets to recent days; once the primary prunes old
+rows, only its window can match.
+
+Exit status: 0 when every published table was compared and is in step; 1 drift found;
+2 the check couldn't be completed (a table not ready or not subscribed, nothing to
+compare, an inconclusive comparison, or an error). A scheduled heartbeat passes only on
+0. The report goes to stdout as JSON; each drifting table and a summary go to the log.
 """
 
 from __future__ import annotations
@@ -55,6 +71,9 @@ from canopy.core.replication.subscriber import (
 )
 
 logger = logging.getLogger(__name__)
+
+ATTEMPTS = 3
+"""Comparisons of a table that came out inconclusive, before it is reported so."""
 
 
 @dataclass(frozen=True)
@@ -144,8 +163,11 @@ async def plan(
     *,
     instance: str | None,
     registry: ReplicationRegistry = REGISTRY,
-) -> tuple[list[Check], dict[str, str]]:
-    """The tables to compare, and those skipped with the reason.
+) -> tuple[list[Check], dict[str, str], str | None]:
+    """The tables to compare, those not checked with the reason, and the subscription's slot.
+
+    The publications come from the subscription itself, so this works whichever
+    publications the primary uses.
 
     Raises
     ------
@@ -157,6 +179,13 @@ async def plan(
         raise Refused(f"no subscription {name} here; there is nothing to compare yet")
     states = await _subscribed_tables(mirror, sub["oid"])
     skipped = {table: state for table, state in sorted(states.items()) if state != "ready"}
+    published = await primary.fetch(
+        "SELECT DISTINCT schemaname || '.' || tablename AS name FROM pg_publication_tables WHERE pubname = ANY($1)",
+        list(sub["subpublications"]),
+    )
+    for row in published:
+        if row["name"] in registry.replicated and row["name"] not in states:
+            skipped[row["name"]] = "published but not subscribed yet (run refresh)"
     ready = sorted(table for table, state in states.items() if state == "ready" and table in registry.replicated)
 
     checks = []
@@ -177,7 +206,7 @@ async def plan(
             # One column list, in one order, for both sides' row hashes.
             columns = tuple(c for c in await _columns(mirror, table) if c in on_primary)
             checks.append(Check(table, kind, columns=columns, key=tuple(await _primary_key(mirror, table))))
-    return checks, skipped
+    return checks, dict(sorted(skipped.items())), sub["subslotname"]
 
 
 async def _observe_reference(conn: asyncpg.Connection, check: Check) -> dict:
@@ -213,14 +242,20 @@ async def _observe_buckets(conn: asyncpg.Connection, check: Check, since: date |
 
 async def observe(conn: asyncpg.Connection, checks: list[Check], since: date | None) -> dict[str, dict]:
     """One side's figures for ``checks``, all read in one repeatable-read snapshot."""
+    return (await _observe(conn, checks, since))[0]
+
+
+async def _observe(conn: asyncpg.Connection, checks: list[Check], since: date | None) -> tuple[dict[str, dict], str]:
+    """``observe``, plus the WAL position inside the snapshot: every commit it sees ends before it."""
     observed = {}
     async with conn.transaction(isolation="repeatable_read", readonly=True):
+        lsn = await conn.fetchval("SELECT pg_current_wal_insert_lsn()::text")
         for check in checks:
             if check.kind is TableClass.TIME_SERIES:
                 observed[check.table] = await _observe_buckets(conn, check, since)
             else:
                 observed[check.table] = await _observe_reference(conn, check)
-    return observed
+    return observed, lsn
 
 
 def compare(check: Check, primary: dict, mirror: dict) -> dict | None:
@@ -247,17 +282,64 @@ def compare(check: Check, primary: dict, mirror: dict) -> dict | None:
     }
 
 
-async def _differences(
-    primary: asyncpg.Connection, mirror: asyncpg.Connection, checks: list[Check], since: date | None
-) -> dict[str, dict]:
-    # Primary first: the mirror, read a moment later, has had time to apply what the primary showed.
-    on_primary = await observe(primary, checks, since)
+async def _confirmed(primary: asyncpg.Connection, slot: str | None, lsn: str, deadline: float) -> bool:
+    """Wait until the mirror's slot on the primary confirms ``lsn``, until ``deadline``."""
+    loop = asyncio.get_running_loop()
+    while True:
+        if slot is not None and await primary.fetchval(
+            "SELECT confirmed_flush_lsn >= $2::text::pg_lsn FROM pg_replication_slots WHERE slot_name = $1",
+            slot,
+            lsn,
+        ):
+            return True
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(min(0.5, max(deadline - loop.time(), 0)))
+
+
+async def _compare(
+    primary: asyncpg.Connection,
+    mirror: asyncpg.Connection,
+    checks: list[Check],
+    since: date | None,
+    slot: str | None,
+    deadline: float,
+    after_mirror_read: Callable[[], Awaitable[object]] | None,
+) -> tuple[dict[str, dict], dict[str, str]]:
+    """One conclusive-or-not comparison of ``checks``: ``(drift, inconclusive)``, both by table."""
+    before, lsn = await _observe(primary, checks, since)
     on_mirror = await observe(mirror, checks, since)
-    found = {}
-    for check in checks:
-        if (difference := compare(check, on_primary[check.table], on_mirror[check.table])) is not None:
-            found[check.table] = difference
-    return found
+    differing = [c for c in checks if compare(c, before[c.table], on_mirror[c.table]) is not None]
+    if not differing:
+        return {}, {}
+    confirmed = await _confirmed(primary, slot, lsn, deadline)
+    on_mirror = await observe(mirror, differing, since)
+    if after_mirror_read is not None:
+        await after_mirror_read()
+    after, _ = await _observe(primary, differing, since)
+    drift, inconclusive = {}, {}
+    for check in differing:
+        if (difference := compare(check, before[check.table], on_mirror[check.table])) is None:
+            continue  # it was lag
+        if not confirmed:
+            inconclusive[check.table] = "the mirror didn't confirm the primary's position in time"
+        elif after[check.table] != before[check.table]:
+            inconclusive[check.table] = "the primary changed while it was being compared"
+        else:
+            drift[check.table] = difference
+    return drift, inconclusive
+
+
+def status(report: dict) -> str:
+    """``in_step``, ``drift`` or ``not_checked``; the exit status is 0, 1 or 2 accordingly."""
+    if report["drift"]:
+        return "drift"
+    if report["skipped"] or report["inconclusive"] or not report["compared"]:
+        return "not_checked"
+    return "in_step"
+
+
+EXIT = {"in_step": 0, "drift": 1, "not_checked": 2}
 
 
 async def drift_check(
@@ -266,8 +348,9 @@ async def drift_check(
     *,
     instance: str | None,
     days: int | None = None,
-    settle: Callable[[], Awaitable[object]] | None = None,
+    settle_s: float = 30.0,
     registry: ReplicationRegistry = REGISTRY,
+    after_mirror_read: Callable[[], Awaitable[object]] | None = None,
 ) -> dict:
     """Compare the mirror with the primary; see the module docstring.
 
@@ -281,34 +364,45 @@ async def drift_check(
         ``CANOPY_INSTANCE``; names the subscription.
     days : int | None
         Compare time-series rows dated in the last ``days`` UTC days only (today included).
-    settle : Callable[[], Awaitable[object]] | None
-        Awaited between the first comparison and the re-check of what differed; no
-        re-check when ``None``.
+    settle_s : float
+        Seconds the check may spend waiting for the mirror to confirm the primary's
+        position and trying inconclusive tables again.
+    after_mirror_read : Callable[[], Awaitable[object]] | None
+        Awaited between a differing table's second mirror read and the primary's second
+        read; for tests.
 
     Returns
     -------
     dict
-        ``in_step``; the tables ``compared``; those ``skipped`` with the reason;
-        ``rechecked`` (differed on the first read and were read again after ``settle``;
-        empty without it); and ``drift``: per table, how it
-        still differs.
+        ``status`` (``in_step``, ``drift`` or ``not_checked``) and ``in_step``; the
+        tables ``compared``; those ``skipped`` (not ready or not subscribed) with the
+        reason; those ``inconclusive`` with the reason; ``attempts``; and ``drift``: per
+        table, how it differs.
     """
     since = None if days is None else datetime.now(UTC).date() - timedelta(days=days - 1)
-    checks, skipped = await plan(primary, mirror, instance=instance, registry=registry)
-    drift = await _differences(primary, mirror, checks, since)
-    rechecked = []
-    if drift and settle is not None:
-        rechecked = sorted(drift)
-        await settle()
-        drift = await _differences(primary, mirror, [c for c in checks if c.table in drift], since)
-    return {
-        "in_step": not drift,
+    checks, skipped, slot = await plan(primary, mirror, instance=instance, registry=registry)
+    deadline = asyncio.get_running_loop().time() + settle_s
+    drift: dict[str, dict] = {}
+    inconclusive: dict[str, str] = {}
+    pending, attempts = checks, 0
+    while pending and attempts < ATTEMPTS:
+        attempts += 1
+        found, inconclusive = await _compare(primary, mirror, pending, since, slot, deadline, after_mirror_read)
+        drift.update(found)
+        if asyncio.get_running_loop().time() >= deadline:
+            break
+        pending = [c for c in pending if c.table in inconclusive]
+    report = {
         "since": since.isoformat() if since else None,
         "compared": [check.table for check in checks],
         "skipped": skipped,
-        "rechecked": rechecked,
-        "drift": drift,
+        "inconclusive": dict(sorted(inconclusive.items())),
+        "attempts": attempts,
+        "drift": dict(sorted(drift.items())),
     }
+    report["status"] = status(report)
+    report["in_step"] = report["status"] == "in_step"
+    return report
 
 
 def _log_report(report: dict) -> None:
@@ -337,16 +431,26 @@ def _log_report(report: dict) -> None:
     if not report["compared"]:
         logger.warning("drift-check compared nothing: no subscribed table is ready yet")
     if report["skipped"]:
-        logger.info("Not compared (not ready): %s", ", ".join(f"{t} ({s})" for t, s in report["skipped"].items()))
-    summary = {"in_step": report["in_step"], "drift_tables": len(report["drift"]), "compared": len(report["compared"])}
-    if report["in_step"]:
+        logger.warning("Not checked: %s", ", ".join(f"{t} ({s})" for t, s in report["skipped"].items()))
+    if report["inconclusive"]:
+        logger.warning("Inconclusive: %s", ", ".join(f"{t} ({s})" for t, s in report["inconclusive"].items()))
+    summary = {
+        "status": report["status"],
+        "in_step": report["in_step"],
+        "drift_tables": len(report["drift"]),
+        "compared": len(report["compared"]),
+        "not_checked": len(report["skipped"]) + len(report["inconclusive"]),
+    }
+    if report["status"] == "in_step":
         logger.info("drift-check: %d tables in step", len(report["compared"]), extra=summary)
-    else:
+    elif report["status"] == "drift":
         logger.warning("drift-check: drift in %s", ", ".join(report["drift"]), extra=summary)
+    else:
+        logger.warning("drift-check: couldn't check every table; see above", extra=summary)
 
 
 async def run(args: argparse.Namespace) -> int:
-    """``drift-check``: 0 in step, 1 drift found, 2 the check couldn't run."""
+    """``drift-check``: 0 every table in step, 1 drift found, 2 the check couldn't be completed."""
     settings = get_settings()
     config = get_replication_config()
     reader_dsn = config.reader_dsn.get_secret_value() if config.reader_dsn else None
@@ -365,7 +469,7 @@ async def run(args: argparse.Namespace) -> int:
             mirror,
             instance=settings.instance,
             days=args.days,
-            settle=(lambda: asyncio.sleep(args.settle)) if args.settle > 0 else None,
+            settle_s=args.settle,
         )
     except Refused as exc:
         logger.error("refused: %s", exc)
@@ -382,4 +486,4 @@ async def run(args: argparse.Namespace) -> int:
                 await conn.close()
     print(json.dumps(report, indent=2), file=sys.stdout)
     _log_report(report)
-    return 0 if report["in_step"] else 1
+    return EXIT[report["status"]]
