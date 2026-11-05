@@ -51,13 +51,15 @@ registered through a single variable:
 CANOPY_API_KEYS="<token>:<scope>[+<scope>][@<module>[+<module>]][,<token>:<scope>...]"
 ```
 
-- Scopes are `read` and `write` — e.g. `dev:read+write` or
-  `viewer:read,operator:read+write`.
+- Scopes are `read`, `write`, and `admin` (key management). The
+  `@<module>` suffix limits a key to those modules; `@*` allows every
+  module. For example, `dev:read+write@*` or
+  `viewer:read@*,operator:read+write@squirrel`.
 - Clients send the token in the `X-API-Key` header. WebSocket endpoints also
   accept `?api_key=<token>` for clients that cannot set headers.
 - If `CANOPY_API_KEYS` is unset, no keys exist and every gated endpoint
   returns `401`.
-- `dev:read+write` is fine on a laptop. For deployed instances, see the
+- `dev:read+write@*` is fine on a laptop. For deployed instances, see the
   [API keys runbook](deployment/api-keys.md).
 
 ## Run the API
@@ -127,7 +129,7 @@ exercise the WebSocket APIs — open them directly in a browser:
 
 - `hare-example.html` — subscribe to PVs and watch raw update frames.
 - `hare-plot-example.html` — live strip chart.
-- `fox-ws-example.html` / `fox-rest-example.html` — formula evaluation.
+- `formula-engine-ws-example.html` / `formula-engine-rest-example.html` — formula evaluation.
 
 Each page defaults to `ws://localhost:8000/...?api_key=dev`. See the
 [Hare WebSocket guide](hare/websocket.md) for the protocol itself.
@@ -190,6 +192,6 @@ database migrations, and the production variant.
 - [Modules overview](modules/index.md) — what each module does and where its
   docs live.
 - [Hare](hare/index.md) — live PV reads, writes, and the WebSocket stream.
-- [Fox](fox/index.md) — formulas over live and historical data.
-- [Vole](vole/index.md) — the time-aligned buffer behind Fox.
+- [Formula Engine](formula-engine/index.md) — formulas over live and historical data.
+- [Vole](vole/index.md) — the time-aligned buffer behind the Formula Engine.
 - [Deployment](deployment/index.md) — running Canopy for real users.

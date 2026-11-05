@@ -107,6 +107,24 @@ class Tag(UUIDMixin, TimestampMixin, Base):
 
 
 # --------------------------------------------------------------------------- #
+# Facilities
+# --------------------------------------------------------------------------- #
+
+# Many-to-many: shared infrastructure PVs legitimately belong to more than one facility.
+# Unlike ``pv_tag``, ``facility_id`` gets its own index — every PV/snapshot search filters
+# by facility, so it's the hot side of the join, not the PK-leading side. It's an opaque
+# reference to ``core.facility.id``; facilities live in the ``core`` schema, resolved via
+# ``canopy.core.facilities.gateway``, so there's no cross-schema foreign key.
+pv_facility = Table(
+    "pv_facility",
+    Base.metadata,
+    Column("pv_id", UUID(as_uuid=False), ForeignKey(_fk("pv.id"), ondelete="CASCADE"), primary_key=True),
+    Column("facility_id", UUID(as_uuid=False), primary_key=True, index=True),
+    schema=SQUIRREL_SCHEMA,
+)
+
+
+# --------------------------------------------------------------------------- #
 # Snapshots
 # --------------------------------------------------------------------------- #
 
@@ -120,6 +138,9 @@ class Snapshot(UUIDMixin, TimestampMixin, Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[str | None] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(String(255))
+    # Opaque reference to ``core.facility.id`` — no cross-schema foreign key; resolved
+    # via ``canopy.core.facilities.gateway``.
+    facility_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False), index=True)
 
     values: Mapped[list[SnapshotValue]] = relationship(
         "SnapshotValue", back_populates="snapshot", cascade="all, delete-orphan", lazy="selectin"
