@@ -15,9 +15,10 @@ from httpx import AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from canopy.core.errors import InsufficientFacilityAccess
+from canopy.core.errors import NotOwner, InsufficientFacilityAccess
 from canopy.squirrel.errors import ImportWouldSkip, SnapshotIdConflict
-from canopy.squirrel.data.models import Snapshot, SnapshotValue
+from canopy.squirrel.data.models import Pv, Snapshot, SnapshotValue
+from canopy.core.facilities.models import Facility
 from canopy.squirrel.schemas.snapshot import SnapshotBundleDTO
 from tests.canopy.squirrel.test_soft_deletes import _race
 from canopy.squirrel.services.snapshot_service import SnapshotService
@@ -58,6 +59,7 @@ async def test_a_captured_import_keeps_the_bundles_id_time_and_title(client, db_
     assert (summary.id, summary.created_date, summary.title) == (bundle["id"], TAKEN, "before the energy change")
     assert (summary.description, summary.created_by) == ("before shutdown", "alice")
     assert (summary.imported_from, summary.retain, summary.pv_count) == (None, False, 2)
+    assert summary.owner_instance == "arm1"
     exported = await _export(client, bundle["id"])
     assert exported["values"] == bundle["values"]
     assert exported["createdBy"] == "alice"
@@ -190,3 +192,53 @@ async def test_a_history_import_still_makes_a_new_copy(client, db_session):
     assert result.created and result.snapshot.id != bundle["id"]
     assert result.snapshot.imported_from == bundle["id"]
     assert result.snapshot.title == "Restored from history: before the energy change"
+
+
+# --- owners ----------------------------------------------------------------------- #
+# The suite runs as arm1; rows made inside ``as_instance("arm2")`` stand for an arm's
+# rows replicated to a mirror.
+
+
+@pytest.mark.parametrize("captured", [False, True], ids=["history", "captured"])
+async def test_a_bundle_for_another_instances_facility_is_refused(client, db_session, as_instance, captured):
+    bundle = await _captured_bundle(client, db_session)
+    with as_instance("arm2"):
+        db_session.add(Facility(slug="theirs", name="Theirs"))
+        await db_session.commit()
+
+    with pytest.raises(NotOwner, match="'arm2'"):
+        await SnapshotService(db_session).import_bundle(
+            SnapshotBundleDTO.model_validate({**bundle, "facility": "theirs"}),
+            captured=captured,
+            created_by="alice" if captured else None,
+        )
+
+
+@pytest.mark.parametrize("captured", [False, True], ids=["history", "captured"])
+async def test_values_of_another_instances_pvs_are_skipped(client, db_session, as_instance, captured):
+    bundle = await _captured_bundle(client, db_session)
+    with as_instance("arm2"):
+        theirs = Pv(setpoint_address="THEIRS:SP")
+        db_session.add(theirs)
+        await db_session.commit()
+    bundle["values"].append({**bundle["values"][0], "pvId": theirs.id, "pvName": "THEIRS:SP"})
+
+    result = await SnapshotService(db_session).import_bundle(
+        SnapshotBundleDTO.model_validate(bundle), captured=captured, created_by="alice" if captured else None
+    )
+
+    assert [s.pv_name for s in result.skipped] == ["THEIRS:SP"]
+    assert result.snapshot.pv_count == 2
+    if captured:
+        with pytest.raises(ImportWouldSkip, match="THEIRS:SP"):
+            await _save(db_session, {**bundle, "id": str(uuid.uuid4())}, strict=True)
+
+
+async def test_an_id_another_instance_holds_is_a_conflict(client, db_session, as_instance):
+    bundle = await _captured_bundle(client, db_session)
+    with as_instance("arm2"):
+        db_session.add(Snapshot(id=bundle["id"], title=bundle["title"], created_at=TAKEN))
+        await db_session.commit()
+
+    with pytest.raises(SnapshotIdConflict, match="owned by 'arm2'"):
+        await _save(db_session, bundle)
