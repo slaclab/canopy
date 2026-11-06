@@ -54,7 +54,7 @@ async def create_config(
 ) -> ConfigDTO:
     """Create a config under ``app``, owned by ``owner`` or this instance.
 
-    ``createdBy`` is the client's to set, except on a write a forward instance sent
+    ``createdBy`` is the client's to set, except on a write a history head forwarded
     on someone's behalf: that one records the name it gave.
     """
     _validate_app_name(app)

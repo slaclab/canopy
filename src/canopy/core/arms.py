@@ -7,11 +7,15 @@ setting, keyed by arm name::
     CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=<arm1-host> dbname=canopy user=replicator password=<secret>"
     CANOPY_ARMS__ARM1__READER_DSN="postgresql://canopy_reader:<secret>@<arm1-host>/canopy"
     CANOPY_ARMS__ARM1__HEARTBEAT_DSN="postgresql://canopy_heartbeat:<secret>@<arm1-host>/canopy"
+    CANOPY_ARMS__ARM1__FORWARD_URL="https://<arm1-host>"
+    CANOPY_ARMS__ARM1__SERVICE_KEY="<a service key minted on arm1>"
     CANOPY_ARMS__ARM2__PUBLISHER_DSN="..."
 
 or as JSON, ``CANOPY_ARMS='{"arm1": {"publisher_dsn": "..."}}'``. An arm's name
 is that arm's own ``CANOPY_INSTANCE``, and the head's subscription to it, and the
-slot on the arm, are named ``canopy_history_<arm>``.
+slot on the arm, are named ``canopy_history_<arm>``. An arm with a forward URL
+and a service key is *forwardable*: the head sends writes to that arm's rows there
+(``canopy.core.forwarding``). Without them its rows are read-only on the head.
 
 A fresh instance per ``get_arms_config()`` call (no caching) so tests can vary the
 environment freely.
@@ -21,7 +25,7 @@ from __future__ import annotations
 
 import re
 
-from pydantic import Field, BaseModel, SecretStr, field_validator
+from pydantic import Field, BaseModel, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _SUBSCRIPTION_PREFIX = "canopy_history_"
@@ -57,6 +61,47 @@ class Arm(BaseModel):
             "secret, like the publisher DSN."
         ),
     )
+
+    forward_url: str | None = Field(
+        default=None,
+        description=(
+            "Base URL of this arm's API (e.g. https://canopy.example.org), where the head forwards writes "
+            "to the arm's rows. https, unless CANOPY_FORWARD__ALLOW_INSECURE_HTTP is set. Set it with "
+            "SERVICE_KEY or not at all."
+        ),
+    )
+
+    service_key: SecretStr | None = Field(
+        default=None,
+        description=(
+            "A service key minted on this arm (scripts/create_key.py --service) that the head forwards "
+            "writes with. Supply it from a secret. Set it with FORWARD_URL or not at all."
+        ),
+    )
+
+    @field_validator("forward_url", "service_key", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        """Read a blank value, as Helm and compose render an unset one, as unset."""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("forward_url")
+    @classmethod
+    def _strip_trailing_slash(cls, value: str | None) -> str | None:
+        return value.rstrip("/") if value else value
+
+    @model_validator(mode="after")
+    def _forward_url_and_key_together(self) -> Arm:
+        if (self.forward_url is None) != (self.service_key is None):
+            raise ValueError("forward_url and service_key are set together or not at all")
+        return self
+
+    @property
+    def forwards(self) -> bool:
+        """Whether the head forwards writes to this arm's rows (both forward settings are set)."""
+        return self.forward_url is not None
 
 
 class ArmsConfig(BaseSettings):

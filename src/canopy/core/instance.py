@@ -4,8 +4,9 @@ Clients read ``instance`` to tell which rows they can write here (a row's
 ``ownerInstance`` must match it) and ``historyUrl`` to link to the full history.
 The deploy pipeline compares ``alembicHead`` between a mirror and its primary to
 stop a release that would migrate the primary ahead of the copy subscribed to it.
-On a history head, ``arms`` lists the arms it subscribes to and the state of each
-subscription.
+On a history head, ``arms`` lists the arms it subscribes to, the state of each
+subscription, and whether the head forwards writes to that arm's rows (``forwards``):
+an arm without forwarding is read-only here.
 """
 
 import os
@@ -37,6 +38,9 @@ SubscriptionState = Literal["missing", "disabled", "stopped", "copying", "stream
 class ArmDTO(CanopyModel):
     name: str
     subscription: SubscriptionState
+    # Whether this head sends writes to the arm's rows there (CANOPY_ARMS__<arm>__FORWARD_URL
+    # and __SERVICE_KEY); without, they are read-only here. Not whether the arm is reachable.
+    forwards: bool
 
 
 class InstanceDTO(CanopyModel):
@@ -121,7 +125,8 @@ def shipped_alembic_head() -> str | None:
 @router.get("", dependencies=[Security(require_read_access)])
 async def get_instance(session: SessionDep) -> InstanceDTO:
     settings = get_settings()
-    arms = sorted(get_arms_config().arms) if settings.role == "mirror" else []
+    configured = get_arms_config().arms if settings.role == "mirror" else {}
+    arms = sorted(configured)
     states = await arm_states(session, arms) if arms else {}
     return InstanceDTO(
         role=settings.role,
@@ -129,5 +134,5 @@ async def get_instance(session: SessionDep) -> InstanceDTO:
         history_url=settings.history_url,
         window_days=settings.window_days,
         alembic_head=shipped_alembic_head(),
-        arms=[ArmDTO(name=arm, subscription=states[arm]) for arm in arms],
+        arms=[ArmDTO(name=arm, subscription=states[arm], forwards=configured[arm].forwards) for arm in arms],
     )

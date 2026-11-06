@@ -7,13 +7,25 @@ snapshot bundle) runs inline against the request session.
 """
 
 import logging
-from typing import Annotated
+from typing import Literal, Annotated
 
 from fastapi import Query, Security, APIRouter
 
 from canopy.jobs import gateway as jobs_gateway
-from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
-from canopy.core.security import ActorDep, require_read_access, require_write_access
+from canopy.core.errors import (
+    BadRequest,
+    FacilityNotFound,
+    ForwardedWriteRefused,
+    InsufficientFacilityAccess,
+)
+from canopy.core.security import (
+    ActorDep,
+    WriteKeyDep,
+    forwarded_for,
+    require_read_access,
+    require_write_access,
+    report_commit_position,
+)
 from canopy.contracts.jobs import JobCreatedDTO
 from canopy.core.ownership import OwnerQuery, require_create_owner
 from canopy.core.facilities import gateway as facilities_gateway
@@ -143,7 +155,7 @@ async def create_snapshot(
     facility is given). The worker reads EPICS and persists it. The snapshot is owned by
     its facility's owner, else by this instance; ``owner`` accepts only this instance's name.
 
-    ``createdBy`` records the key's name, or the user a forward instance sent the
+    ``createdBy`` records the key's name, or the user a history head forwarded the
     request for.
     """
     # The facility gate has to run *here*, not in the service: nothing of the caller's
@@ -182,22 +194,57 @@ async def create_snapshot(
 
 @router.post("/import", dependencies=[Security(require_write_access)])
 async def import_snapshot(
-    bundle: SnapshotBundleDTO, service: SnapshotServiceDep, actor: ActorDep
+    bundle: SnapshotBundleDTO,
+    service: SnapshotServiceDep,
+    actor: ActorDep,
+    key: WriteKeyDep,
+    mode: Annotated[
+        Literal["history", "captured"],
+        Query(
+            description=(
+                "history: bring back a snapshot exported from a history copy, as a new snapshot. captured: save "
+                "a snapshot a history head took for this instance, under its own id and time; for the head's "
+                "service key only."
+            ),
+        ),
+    ] = "history",
+    strict: Annotated[
+        bool, Query(description="Refuse, saving nothing, when any of the bundle's values would be left out.")
+    ] = False,
 ) -> SnapshotImportResultDTO:
-    """Create a new snapshot from a bundle exported by ``GET /snapshots/{id}/export``.
+    """Save a snapshot from a bundle.
 
-    Meant for bringing a snapshot back from a history mirror so it can be restored here.
-    The new snapshot has a new id, today's creation time, a "Restored from history" title
-    and ``importedFrom`` set to the bundle's id. A value is kept only when its PV exists
-    here, the key could restore it, and, for a bundle with a facility, the PV is assigned
-    to that facility or one below it, as for a capture. A PV moved out of the facility
-    since the export is therefore left out. Values left out are listed in ``skipped``;
-    nothing is read from or written to EPICS.
+    **History** (the default) brings back a bundle exported by
+    ``GET /snapshots/{id}/export``, typically from a history head, so it can be
+    restored here. The new snapshot has a new id, today's creation time, a "Restored
+    from history" title and ``importedFrom`` set to the bundle's id. ``createdBy`` stays
+    the original snapshot's; who imported it (the key's name, or the user a head
+    forwarded it for) is logged.
 
-    ``createdBy`` stays the original snapshot's; who imported it (the key's name, or the
-    user a forward instance sent it for) is logged.
+    **Captured** saves a snapshot a history head captured for one of this instance's
+    facilities. Only a service key may send it, naming the user it was taken for in
+    ``X-Canopy-On-Behalf-Of``, who becomes its author. It keeps the bundle's id, time,
+    title and description, and is idempotent on the id: a resend answers with
+    ``created`` false and saves nothing. The answer always carries
+    ``X-Canopy-Commit-LSN``, so the head can wait for the snapshot to come back.
+
+    Either way a value is kept only when its PV exists here, the key could restore it,
+    and, for a bundle with a facility, the PV is assigned to that facility or one below
+    it, as for a capture. A PV moved out of the facility since is therefore left out.
+    Values left out are listed in ``skipped``; nothing is read from or written to EPICS.
     """
-    result = await service.import_bundle(bundle)
+    if mode == "captured":
+        if not key.is_service:
+            raise ForwardedWriteRefused("Only a service key may import a captured snapshot")
+        if forwarded_for() is None:
+            raise ForwardedWriteRefused("A captured import names the user it was taken for in X-Canopy-On-Behalf-Of")
+        report_commit_position()
+        result = await service.import_bundle(bundle, captured=True, created_by=actor, strict=strict)
+        logger.info(
+            "Captured snapshot %s %s for %s", bundle.id, "saved" if result.created else "was already saved", actor
+        )
+        return result
+    result = await service.import_bundle(bundle, strict=strict)
     logger.info("Snapshot %s imported as %s for %s", bundle.id, result.snapshot.id, actor)
     return result
 

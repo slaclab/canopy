@@ -6,7 +6,7 @@ EPICS (snapshot create/restore run in the worker, which injects the connector).
 
 The PV and snapshot factories also take the calling key's facility grant, resolved to an
 id set by ``get_facility_scope`` below — the single chokepoint, so no route can forget it.
-When a forward instance sent the request, the grant is narrowed to its caller's. A route
+When a history head forwarded the request, the grant is narrowed to its caller's. A route
 that gates before queueing a job (snapshot create) takes ``FacilityScopeDep`` directly.
 ``None`` means unrestricted, which is what a service built anywhere else (the Arq worker)
 gets by default: the worker acts on a request the route already authorized.
@@ -26,7 +26,7 @@ from canopy.squirrel.services.snapshot_service import SnapshotService
 
 async def get_facility_scope(key: APIKeyDep) -> set[str] | None:
     scope = await facilities_gateway.resolve_key_facility_scope(key.facilities)
-    # A forward instance's service key acts for a caller whose grant comes with the
+    # A history head's service key acts for a caller whose grant comes with the
     # request; the request reaches only what both keys reach.
     if (caller := forwarded_facilities()) is not None:
         caller_scope = await facilities_gateway.resolve_key_facility_scope(caller)

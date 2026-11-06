@@ -287,7 +287,7 @@ class ForwardedWriteRefused(CanopyError):
 
     Only a service key may name another caller, and only on a primary that
     accepts forwarded writes. Refused rather than ignored, so a misconfigured
-    forward instance fails loudly instead of recording writes under its own key.
+    head fails loudly instead of recording writes under its own key.
     """
 
     status_code = 403
@@ -295,10 +295,9 @@ class ForwardedWriteRefused(CanopyError):
 
 
 class ArchivedImmutable(CanopyError):
-    """A forward instance refused to send a change to an entity older than the primary's window.
+    """A change to a snapshot its arm no longer holds, refused on the history head that still does.
 
-    The primary may no longer hold it, and the history copy can't be edited, so
-    the request is answered here without reaching the primary.
+    The arm pruned it, and the head's copy is history that only its owner may change.
     """
 
     status_code = 409
@@ -306,9 +305,9 @@ class ArchivedImmutable(CanopyError):
 
 
 class PrimaryUnavailable(CanopyError):
-    """A forward instance couldn't get an answer from its primary.
+    """A history head couldn't get an answer from the arm that owns a write.
 
-    502 when the primary couldn't be reached (nothing was sent); a subclass with
+    502 when the arm couldn't be reached (nothing was sent); a subclass with
     504 when it stopped answering after the request went out, so the write may
     or may not have been applied.
     """

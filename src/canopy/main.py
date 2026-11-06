@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from canopy import __version__
+from canopy.jobs import gateway as jobs_gateway
 from canopy.core.db import session_scope
 from canopy.elog.app import app as elog_app
 from canopy.elog.app import elog_lifespan
@@ -47,6 +48,7 @@ from canopy.core.keys.registry import build_key_registry
 from canopy.formula_engine.app import app as formula_engine_app
 from canopy.formula_engine.app import formula_engine_lifespan
 from canopy.core.facilities.routes import router as facilities_router
+from canopy.core.forwarding.client import check_forward_urls
 from canopy.core.keys.repositories import ApiKeyRepository
 from canopy.core.forwarding.context import COMMIT_LSN_HEADER, REPLICA_STALE_HEADER
 from canopy.core.forwarding.middleware import ForwardingMiddleware
@@ -90,6 +92,10 @@ async def lifespan(app: FastAPI):
     # can serve, so a bad CANOPY_API_KEYS surfaces in the startup log instead of as
     # an unexplained 401 on the first request.
     settings = get_settings()
+    if settings.role == "mirror":
+        # A head forwards writes to its arms: a bad forward setting stops it here,
+        # not at the first write.
+        check_forward_urls()
     bind_key_registry(build_key_registry(settings))
     # Read the shipped migrations head now, off the request path; /v1/instance serves the cached value.
     shipped_alembic_head()
@@ -125,9 +131,9 @@ app = FastAPI(
 # registration order): preflight OPTIONS requests that CORS answers itself never
 # reach the router, and counting them would only inflate the "unmatched" series.
 app.add_middleware(HTTPMetricsMiddleware)
-# Between the two: on a forward instance it answers forwarded writes itself (they have
-# their own counter, since no route here matched them), and CORS still wraps them.
-app.add_middleware(ForwardingMiddleware)
+# Between the two: on a history head it answers writes it forwards to an arm itself (they
+# have their own counter, since no route here matched them), and CORS still wraps them.
+app.add_middleware(ForwardingMiddleware, remember_job=jobs_gateway.remember_forwarded_job)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

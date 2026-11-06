@@ -308,7 +308,7 @@ def _parse_facilities(value: str | None) -> frozenset[str]:
 
 
 def forwarded_for() -> str | None:
-    """The caller a trusted forward instance named for this request, or ``None``.
+    """The caller a trusted history head named for this request, or ``None``.
 
     Set by ``get_api_key``, so only meaningful once the request's key has resolved.
     """
@@ -317,7 +317,7 @@ def forwarded_for() -> str | None:
 
 
 def forwarded_facilities() -> frozenset[str] | None:
-    """The facility grant of the caller a trusted forward instance named, or ``None``.
+    """The facility grant of the caller a trusted history head named, or ``None``.
 
     Set by ``get_api_key`` alongside ``forwarded_for``. Facility gates intersect it
     with the service key's own grant.
@@ -329,13 +329,24 @@ def forwarded_facilities() -> frozenset[str] | None:
 def request_actor(key: APIKeyDep) -> str:
     """Who this request's writes are recorded under (``created_by``).
 
-    The caller a trusted forward instance named in ``X-Canopy-On-Behalf-Of``,
+    The caller a trusted history head named in ``X-Canopy-On-Behalf-Of``,
     else the key's own name. Never a token.
     """
     return forwarded_for() or key.name
 
 
 ActorDep = Annotated[str, Depends(request_actor)]
+
+
+def report_commit_position() -> None:
+    """Answer this forwarded request with ``X-Canopy-Commit-LSN`` even if it writes nothing.
+
+    For a route whose head always waits for the answer to replicate back: a replay
+    that finds its write already committed still gives the head a position to wait
+    for (``core.db._commit_forwarded``). A no-op outside a forwarded request.
+    """
+    if (write := forwarded_write.get()) is not None:
+        write.report_position = True
 
 
 async def get_optional_api_key(token: Annotated[str | None, Security(api_key_header)]) -> APIKey | None:

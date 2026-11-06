@@ -50,9 +50,9 @@ class Settings(BaseSettings):
         everything. A blank value, as Helm and compose render an unset one, is ``None``
         here and for ``history_url``.
     accept_forwarded_writes : bool
-        On a primary, trust ``X-Canopy-On-Behalf-Of`` from service keys, so a forward
-        instance's writes are recorded under the user it sent them for. Off by
-        default: the header is then refused from every key.
+        On a primary (an arm), trust ``X-Canopy-On-Behalf-Of`` from service keys, so
+        writes a history head forwards are recorded under the user it sent them for.
+        Off by default: the header is then refused from every key.
     """
 
     model_config = SettingsConfigDict(
@@ -104,13 +104,8 @@ class Settings(BaseSettings):
             return None
         return value
 
-    # Primary only: accept writes a forward instance sends on a user's behalf.
+    # Primary (arm) only: accept writes a history head forwards on a user's behalf.
     accept_forwarded_writes: bool = False
-
-    @property
-    def is_replica(self) -> bool:
-        """Whether this instance's database is a subscriber's copy (``mirror`` or ``forward``)."""
-        return self.role != "primary"
 
 
 @lru_cache
