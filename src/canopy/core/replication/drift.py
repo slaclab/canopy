@@ -161,7 +161,8 @@ class Check:
     dated_alias: str = "t"  # time series: the alias whose time column dates a row
 
 
-async def _columns(conn: asyncpg.Connection, table: str) -> list[str]:
+async def table_columns(conn: asyncpg.Connection, table: str) -> list[str]:
+    """``table``'s columns, in order."""
     rows = await conn.fetch(
         "SELECT attname FROM pg_attribute WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped "
         "ORDER BY attnum",
@@ -170,7 +171,8 @@ async def _columns(conn: asyncpg.Connection, table: str) -> list[str]:
     return [row["attname"] for row in rows]
 
 
-async def _primary_key(conn: asyncpg.Connection, table: str) -> list[str]:
+async def primary_key(conn: asyncpg.Connection, table: str) -> list[str]:
+    """``table``'s primary-key columns, in key order."""
     rows = await conn.fetch(
         """
         SELECT a.attname
@@ -232,10 +234,10 @@ async def plan(
             alias = "t" if hop == 0 else f"t_o{hop}"
             checks.append(Check(table, kind, owners, bucketing=TIME_SERIES_BUCKETS[root], dated_alias=alias))
         else:
-            on_primary = set(await _columns(primary, table))
+            on_primary = set(await table_columns(primary, table))
             # One column list, in one order, for both sides' row hashes.
-            columns = tuple(c for c in await _columns(mirror, table) if c in on_primary)
-            checks.append(Check(table, kind, owners, columns=columns, key=tuple(await _primary_key(mirror, table))))
+            columns = tuple(c for c in await table_columns(mirror, table) if c in on_primary)
+            checks.append(Check(table, kind, owners, columns=columns, key=tuple(await primary_key(mirror, table))))
     return checks, dict(sorted(skipped.items())), sub["subslotname"]
 
 

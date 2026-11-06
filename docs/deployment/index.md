@@ -18,6 +18,8 @@ Two deployment paths are documented here:
   production compose file.
 - [Deploy at your facility](production.md) — image tags, required
   configuration, migrations, and health checks for a production instance.
+- [History mirror](history.md) — a head that copies its arms over Postgres
+  logical replication: topology, roles, release order, and runbooks.
 
 ## Configuration
 
@@ -114,7 +116,7 @@ publication in step with the tables. The head runs `alembic upgrade head`, then
 `grants` and `refresh`, before any of its arms deploys; `subscribe` runs once per
 arm. On the head, `subscribe`, `refresh`, `status` and `drift-check` act on every
 arm in `CANOPY_ARMS__<arm>__…`, or on one with `--arm <arm>`. `status` reports
-either side as JSON. `drift-check`, run on the head after the hourly `refresh`,
+either side as JSON (see [History mirror](history.md)). `drift-check`, run on the head after the hourly `refresh`,
 compares each arm's rows with the head's copy, then checks that every reference on
 the head finds its parent. Per arm it exits 0 only when every table was compared and
 is in step, 1 on drift, 2 when it couldn't check everything; a run exits with the
