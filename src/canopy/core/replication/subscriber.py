@@ -164,7 +164,7 @@ async def subscribe(
     conn: asyncpg.Connection,
     *,
     role: str,
-    head: str | None,
+    head: str,
     arms: Mapping[str, Arm],
     only: str | None = None,
     registry: ReplicationRegistry = REGISTRY,
@@ -192,7 +192,7 @@ async def subscribe(
         Connection to the head's database.
     role : str
         This instance's ``CANOPY_ROLE``; must be ``"mirror"``.
-    head : str | None
+    head : str
         The head's own ``CANOPY_INSTANCE``; no arm may share it.
     arms : Mapping[str, Arm]
         The configured arms, keyed by name; each needs a ``publisher_dsn``.

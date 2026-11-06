@@ -13,6 +13,8 @@ patch("pydantic_settings.sources.providers.dotenv.dotenv_values", return_value={
 
 # Seed an API-key registry before canopy.main imports cache settings.
 os.environ["CANOPY_API_KEYS"] = "test-read:read@*,test-write:read+write@*,test-admin:admin@*"
+# CANOPY_INSTANCE is required; the suite runs as an arm named arm1 unless a test says otherwise.
+os.environ.setdefault("CANOPY_INSTANCE", "arm1")
 
 
 READ_HEADERS = {"X-API-Key": "test-read"}
