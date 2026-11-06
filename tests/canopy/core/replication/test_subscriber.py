@@ -29,7 +29,7 @@ async def test_grants_reads_on_replicated_tables_and_writes_on_api_keys(db, conf
     result = await grants(db, role="mirror", config=config)
 
     assert result["replicated"] == PRESENT
-    assert result["local"] == ["core.api_key", "core.history_heartbeat"]
+    assert result["local"] == ["core.api_key", "core.history_heartbeat", "squirrel.snapshot_outbox"]
     for table in PRESENT:
         assert await privileges(db, config.app_role, table) == {"SELECT"}, table
     for table in result["local"]:

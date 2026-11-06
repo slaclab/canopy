@@ -41,6 +41,7 @@ from canopy.core.instance import router as instance_router
 from canopy.core.instance import shipped_alembic_head
 from canopy.core.security import bind_key_registry
 from canopy.core.facilities import gateway as facilities_gateway
+from canopy.squirrel.outbox import metrics as outbox_metrics
 from canopy.core.keys.routes import router as api_keys_router
 from canopy.core.replication import metrics as replication_metrics
 from canopy.core.keys.registry import build_key_registry
@@ -190,6 +191,7 @@ async def ready() -> JSONResponse:
 async def metrics() -> Response:
     """Prometheus exposition for this process."""
     await replication_metrics.refresh()
+    await outbox_metrics.refresh()
     payload, content_type = render_latest()
     return Response(content=payload, media_type=content_type)
 

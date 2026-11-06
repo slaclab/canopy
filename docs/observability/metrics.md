@@ -131,6 +131,9 @@ speculatively.
 - **Replication** to a history mirror (`canopy.core.replication.metrics`); see
   [Replication](#replication) below.
 
+- **A history head's snapshot outbox** (`canopy.squirrel.outbox.metrics`); see
+  [Snapshot outbox](#snapshot-outbox) below.
+
 Candidates deliberately **not** built yet, each its own follow-up: Hare event
 queue depth and dropped updates, Mole archiver round-trip latency, Vole
 ring-buffer bytes and evictions, Formula Engine evaluation latency, Squirrel restore
@@ -178,6 +181,32 @@ over half the WAL cap, out of `reserved`, or a slot with no cap at all; on the
 mirror, a stopped apply worker, nothing received for five minutes, apply or
 copy errors, and a copy unfinished after an hour; on either, a status that
 can't be read. No contact point is provisioned.
+
+## Snapshot outbox
+
+A history head that delivers captures to arms reports its snapshot outbox
+(`canopy.squirrel.outbox`), from the same status function as
+`python -m canopy.squirrel.outbox status`. Like the replication gauges, it is read
+from the database, so the `/metrics` handler awaits its refresh before rendering:
+its own short-lived connection, a two-second budget, and only
+`canopy_squirrel_outbox_status_up 0` if the read fails. An instance that delivers
+to no arm reports none of these series. Every arm it delivers to is listed, with
+zeros while its queue is empty. `arm` is the arm's name in `CANOPY_ARMS`, as on the
+per-arm replication series. Ages are measured on the database's clock.
+
+| Metric | Labels | Meaning |
+|--------|--------|---------|
+| `canopy_squirrel_outbox_status_up` | | 1 when this scrape read the outbox |
+| `canopy_squirrel_outbox_snapshots` | `arm`, `state` | Snapshots queued for the arm: `pending` (waiting or retrying), `delivered` (saved on the arm, not replicated back yet), `failed` (refused by the arm) |
+| `canopy_squirrel_outbox_bytes` | `arm` | Bundle bytes queued for the arm, every state counted, as the size cap counts them |
+| `canopy_squirrel_outbox_oldest_pending_age_seconds` | `arm` | Age of the arm's oldest snapshot not saved there yet; absent when none waits |
+| `canopy_squirrel_outbox_oldest_delivered_age_seconds` | `arm` | Time since the arm saved its oldest snapshot that hasn't replicated back; absent when none |
+| `canopy_squirrel_outbox_max_snapshots`, `_max_bytes` | | The per-arm caps, so rules can compute how full a queue is |
+
+`docker/observability/grafana/provisioning/alerting/outbox.yaml` holds the alert
+rules, per arm: a snapshot waiting over 15 minutes, any failed snapshot, a delivered
+one not back after 30 minutes, a queue over 80% of either cap, a full queue (new
+captures for the arm are refused), and a status that can't be read.
 
 ## Adding a module metric
 

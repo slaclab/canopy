@@ -15,7 +15,8 @@ whether the mirror gets it:
     no deletes, so pruning the primary never removes history.
 ``local``
     Rows that belong to one database and never replicate. API keys are local: a
-    mirror mints and checks its own.
+    mirror mints and checks its own. So is a head's snapshot outbox: an arm's copy of
+    a queued snapshot arrives through ``squirrel.snapshot``, never through the queue.
 
 Two publication layouts carry the same tables. ``publications`` is the single
 ``canopy_history`` every primary starts with; ``split_publications`` is the pair a
@@ -137,6 +138,7 @@ REGISTRY = ReplicationRegistry(
             "squirrel.snapshot_value": TableClass.TIME_SERIES,
             "core.api_key": TableClass.LOCAL,
             "core.history_heartbeat": TableClass.LOCAL,
+            "squirrel.snapshot_outbox": TableClass.LOCAL,
         }
     ),
     # One publication until the primary prunes old rows. TRUNCATE is left out on

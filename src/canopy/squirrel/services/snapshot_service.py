@@ -20,9 +20,9 @@ from canopy.core.config import get_settings
 from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.time_parse import to_utc
-from canopy.squirrel.errors import SnapshotNotFound
+from canopy.squirrel.errors import SnapshotPending, SnapshotNotFound
 from canopy.contracts.pagination import PagedResult
-from canopy.squirrel.data.models import Snapshot
+from canopy.squirrel.data.models import Snapshot, SnapshotValue, SnapshotOutbox
 from canopy.squirrel.restore_hooks import (
     RestoreHook,
     RestoreHookError,
@@ -44,12 +44,15 @@ from canopy.squirrel.schemas.snapshot import (
     SnapshotBundleDTO,
     SnapshotSummaryDTO,
     ComparisonResultDTO,
+    SnapshotDeliveryDTO,
     SnapshotImportResultDTO,
 )
 from canopy.squirrel.adapters.epics_io import EpicsIO
 from canopy.squirrel.data.repositories import (
     PvRepository,
+    BundleValueRow,
     MetaPvRepository,
+    OutboxRepository,
     SnapshotRepository,
     SnapshotValueRepository,
 )
@@ -250,6 +253,27 @@ def _decode_cursor(token: str | None) -> tuple[datetime, str] | None:
     return created_at, snapshot_id
 
 
+def delivery_of(entry: SnapshotOutbox) -> SnapshotDeliveryDTO:
+    """Where an outbox row stands, as the snapshot DTOs show it.
+
+    A row the arm has saved shows as pending until its snapshot replicates back.
+    """
+    if entry.state == "delivered":
+        state, reason = "pending", f"Saved on {entry.arm}; waiting for replication"
+    else:
+        state, reason = entry.state, entry.last_error
+    return SnapshotDeliveryDTO(
+        state=state, arm=entry.arm, queued_at=entry.queued_at, attempts=entry.attempts, reason=reason
+    )
+
+
+def pending_detail(entry: SnapshotOutbox, then: str) -> str:
+    """The ``snapshot_pending`` detail for a change to a snapshot held only in the outbox."""
+    if entry.state == "failed":
+        return f"Snapshot {entry.id} was not saved: its delivery to {entry.arm} failed: {entry.last_error}"
+    return f"Snapshot {entry.id} is waiting for delivery to {entry.arm}; {then}"
+
+
 class SnapshotService:
     """Snapshot operations with EPICS integration. Owns no transaction — the caller
     (request dep or worker ``session_scope``) commits."""
@@ -285,13 +309,22 @@ class SnapshotService:
         self.value_repo = SnapshotValueRepository(session)
         self.pv_repo = PvRepository(session)
         self.meta_pv_repo = MetaPvRepository(session)
+        self.outbox_repo = OutboxRepository(session)
         self.epics = epics_io
         self.restore_hooks = restore_hooks if restore_hooks is not None else get_restore_hooks()
 
-    async def _get_meta_pv_values_for_snapshot(self, snapshot_id: str, pv_ids: list[str]) -> list[MetaPVValueDTO]:
+    async def _get_meta_pv_values_for_snapshot(
+        self, snapshot_id: str, pv_ids: list[str], *, queued: bool = False
+    ) -> list[MetaPVValueDTO]:
+        """The values ``snapshot_id`` holds for the meta-PVs ``pv_ids``; from its bundle when ``queued``."""
         meta_pv_values: list[MetaPVValueDTO] = []
         if pv_ids:
-            for value in await self.value_repo.get_by_snapshot_and_pvs(snapshot_id, pv_ids):
+            values = (
+                await self.outbox_repo.values(snapshot_id, pv_ids=pv_ids)
+                if queued
+                else await self.value_repo.get_by_snapshot_and_pvs(snapshot_id, pv_ids)
+            )
+            for value in values:
                 data = _parse_jsonb(value.setpoint_value) or _parse_jsonb(value.readback_value)
                 meta_pv_values.append(
                     MetaPVValueDTO(
@@ -362,6 +395,25 @@ class SnapshotService:
         """
         return self.facility_scope is None or bool(pv_facility_ids & self.facility_scope)
 
+    async def queued(self, snapshot_id: str) -> SnapshotOutbox | None:
+        """The outbox row for ``snapshot_id`` when this head holds it only there, in the key's scope.
+
+        ``None`` for a stored snapshot (even one whose outbox row isn't swept yet), for an
+        id the outbox doesn't have, and for a row outside the key's facilities, which
+        doesn't exist for it, as ``get_by_id`` has it.
+        """
+        if await self.snapshot_repo.get_by_id(snapshot_id, include_deleted=True) is not None:
+            return None
+        entry = await self.outbox_repo.get(snapshot_id)
+        if entry is None or not self._in_facility_scope(entry.facility_id):
+            return None
+        return entry
+
+    async def _refuse_if_queued(self, snapshot_id: str, change: str) -> None:
+        """Raise ``SnapshotPending`` when ``snapshot_id`` is held only in the outbox."""
+        if (entry := await self.queued(snapshot_id)) is not None:
+            raise SnapshotPending(pending_detail(entry, change))
+
     async def list_snapshots(
         self,
         title: str | None = None,
@@ -427,14 +479,16 @@ class SnapshotService:
             facility_ids=facility_ids,
         )
 
-        # One grouped query for all value counts (avoids N+1).
-        snapshot_ids = [snap.id for snap in snapshots]
+        # One grouped query for all value counts (avoids N+1). A queued snapshot's count
+        # is its bundle's, kept on its outbox row.
+        snapshot_ids = [snap.id for snap in snapshots if not isinstance(snap, SnapshotOutbox)]
         counts = await self.snapshot_repo.get_value_counts_batch(snapshot_ids)
         slug_by_id = await facilities_gateway.slugs_by_id({s.facility_id for s in snapshots if s.facility_id})
 
         meta_pvs = [pv.pv_id for pv in await self.meta_pv_repo.get(active=True)]
         result = []
         for snap in snapshots:
+            queued = isinstance(snap, SnapshotOutbox)
             result.append(
                 SnapshotSummaryDTO(
                     id=snap.id,
@@ -442,11 +496,12 @@ class SnapshotService:
                     description=snap.description,
                     created_date=snap.created_at,
                     created_by=snap.created_by,
-                    pv_count=counts.get(snap.id, 0),
+                    pv_count=snap.value_count if queued else counts.get(snap.id, 0),
                     facility=slug_by_id.get(snap.facility_id),
-                    retain=snap.retain,
-                    imported_from=snap.imported_from,
-                    meta_pvs=await self._get_meta_pv_values_for_snapshot(snap.id, meta_pvs),
+                    retain=False if queued else snap.retain,
+                    imported_from=None if queued else snap.imported_from,
+                    meta_pvs=await self._get_meta_pv_values_for_snapshot(snap.id, meta_pvs, queued=queued),
+                    delivery=delivery_of(snap) if queued else None,
                 )
             )
         return PagedResult(
@@ -464,15 +519,24 @@ class SnapshotService:
         return snapshot is not None and self._in_facility_scope(snapshot.facility_id)
 
     async def get_by_id(self, snapshot_id: str, limit: int | None = None, offset: int = 0) -> SnapshotDTO | None:
-        """Get a snapshot with its values (values optionally paginated)."""
-        result = await self.snapshot_repo.get_with_values(snapshot_id, limit=limit, offset=offset)
-        if not result:
-            return None
-        snapshot, values = result
-        if not self._in_facility_scope(snapshot.facility_id):
-            return None
+        """Get a snapshot with its values (values optionally paginated).
 
-        total_count = await self.value_repo.count_by_snapshot(snapshot_id)
+        On a history head, a snapshot it holds only in its outbox is served from its
+        bundle, with ``delivery`` set; names, devices and tags come from the head's PV
+        rows, as for a stored snapshot.
+        """
+        result = await self.snapshot_repo.get_with_values(snapshot_id, limit=limit, offset=offset)
+        entry = None
+        if result:
+            snapshot, values = result
+            if not self._in_facility_scope(snapshot.facility_id):
+                return None
+            total_count = await self.value_repo.count_by_snapshot(snapshot_id)
+        elif (entry := await self.queued(snapshot_id)) is not None:
+            snapshot, total_count = entry, entry.value_count
+            values = await self.outbox_repo.values(snapshot_id, limit=limit, offset=offset)
+        else:
+            return None
 
         pv_ids = [v.pv_id for v in values]
         # A PV deleted since the capture still names and tags its value here.
@@ -516,10 +580,11 @@ class SnapshotService:
             created_by=snapshot.created_by,
             pv_count=total_count,
             facility=await self._facility_slug(snapshot.facility_id),
-            retain=snapshot.retain,
-            imported_from=snapshot.imported_from,
+            retain=False if entry else snapshot.retain,
+            imported_from=None if entry else snapshot.imported_from,
             pv_values=pv_values,
-            meta_pvs=await self._get_meta_pv_values_for_snapshot(snapshot.id, meta_pvs),
+            meta_pvs=await self._get_meta_pv_values_for_snapshot(snapshot.id, meta_pvs, queued=entry is not None),
+            delivery=delivery_of(entry) if entry else None,
         )
 
     async def update_snapshot_metadata(
@@ -534,6 +599,7 @@ class SnapshotService:
         # refused write must not have already landed.
         existing = await self.snapshot_repo.get_by_id(snapshot_id)
         if not existing:
+            await self._refuse_if_queued(snapshot_id, "change it once it's saved there")
             return None
         await self._require_facility_write(existing.facility_id, "this snapshot")
         snapshot = await self.snapshot_repo.update_metadata(
@@ -746,7 +812,10 @@ class SnapshotService:
 
         # Only the id column: the full row (including the setpoint_value/readback_value
         # JSONB) is never used here, and a snapshot can hold tens of thousands of values.
-        candidate_ids = await self.value_repo.get_pv_ids_by_snapshot(snapshot_id, pv_ids)
+        if await self.queued(snapshot_id) is not None:
+            candidate_ids = [value.pv_id for value in await self.outbox_repo.values(snapshot_id, pv_ids=pv_ids)]
+        else:
+            candidate_ids = await self.value_repo.get_pv_ids_by_snapshot(snapshot_id, pv_ids)
         by_pv = await self.pv_repo.facility_ids_for_many(candidate_ids)
         allowed, skipped = [], []
         for pv_id in candidate_ids:
@@ -774,7 +843,12 @@ class SnapshotService:
             can't reach its facility (the same rule as ``get_by_id``).
         """
         snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
-        if snapshot is None or not self._in_facility_scope(snapshot.facility_id):
+        if snapshot is None:
+            # A snapshot held only in the outbox exports as the bundle it waits with.
+            if await self.queued(snapshot_id) is None:
+                return None
+            return SnapshotBundleDTO.model_validate(await self.outbox_repo.bundle(snapshot_id))
+        if not self._in_facility_scope(snapshot.facility_id):
             return None
         values = [
             BundleValueDTO(
@@ -964,14 +1038,18 @@ class SnapshotService:
         start_time = datetime.now(UTC)
 
         # A deleted snapshot keeps its values, so check first: one deleted after its restore
-        # was queued restores nothing, the same as a snapshot that doesn't exist.
-        if not await self.snapshot_repo.is_live(snapshot_id):
-            return RestoreResultDTO(total_pvs=0, success_count=0, failure_count=0, failures=[])
-
-        if request is not None and request.pv_ids is not None:
-            values = await self.value_repo.get_by_snapshot_and_pvs(snapshot_id, request.pv_ids)
+        # was queued restores nothing, the same as a snapshot that doesn't exist. A snapshot
+        # a history head holds only in its outbox restores from its bundle.
+        pv_ids = request.pv_ids if request is not None else None
+        if await self.snapshot_repo.is_live(snapshot_id):
+            if pv_ids is not None:
+                values = await self.value_repo.get_by_snapshot_and_pvs(snapshot_id, pv_ids)
+            else:
+                values = await self.value_repo.get_by_snapshot(snapshot_id)
+        elif await self.queued(snapshot_id) is not None:
+            values = await self.outbox_repo.values(snapshot_id, pv_ids=pv_ids)
         else:
-            values = await self.value_repo.get_by_snapshot(snapshot_id)
+            return RestoreResultDTO(total_pvs=0, success_count=0, failure_count=0, failures=[])
 
         if not values:
             return RestoreResultDTO(total_pvs=0, success_count=0, failure_count=0, failures=[])
@@ -1145,8 +1223,8 @@ class SnapshotService:
         synchronous allocation. Fine at current scale; a known v1 limit to revisit
         (stream/paginate the diff) if snapshot sizes grow.
         """
-        result1 = await self.snapshot_repo.get_with_values(snapshot1_id)
-        result2 = await self.snapshot_repo.get_with_values(snapshot2_id)
+        result1 = await self._with_all_values(snapshot1_id)
+        result2 = await self._with_all_values(snapshot2_id)
         if not result1 or not result2:
             raise SnapshotNotFound("One or both snapshots not found")
         snap1, values1_list = result1
@@ -1216,6 +1294,17 @@ class SnapshotService:
             difference_count=len(differences),
         )
 
+    async def _with_all_values(
+        self, snapshot_id: str
+    ) -> tuple[Snapshot | SnapshotOutbox, list[SnapshotValue | BundleValueRow]] | None:
+        """A snapshot and every value it holds, stored or queued in the outbox; ``None`` when neither."""
+        if result := await self.snapshot_repo.get_with_values(snapshot_id):
+            return result
+        if (entry := await self.outbox_repo.get(snapshot_id)) is not None:
+            if await self.snapshot_repo.get_by_id(snapshot_id, include_deleted=True) is None:
+                return entry, await self.outbox_repo.values(snapshot_id)
+        return None
+
     @staticmethod
     def _values_within_tolerance(v1: Any, v2: Any, abs_tol: float, rel_tol: float) -> bool:
         """Absolute tolerance first, then relative (vs. ``|v1|``); non-numeric → exact match.
@@ -1254,6 +1343,7 @@ class SnapshotService:
         is no live snapshot to delete."""
         snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
         if not snapshot:
+            await self._refuse_if_queued(snapshot_id, "delete it once it's saved there")
             return False
         await self._require_facility_write(snapshot.facility_id, "this snapshot")
         return await self.snapshot_repo.soft_delete(snapshot_id)

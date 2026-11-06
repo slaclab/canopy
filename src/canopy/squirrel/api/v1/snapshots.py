@@ -12,12 +12,13 @@ from typing import Annotated
 from fastapi import Query, Security, APIRouter
 
 from canopy.jobs import gateway as jobs_gateway
+from canopy.core.config import get_settings
 from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
 from canopy.core.security import ActorDep, require_read_access, require_write_access
 from canopy.contracts.jobs import JobCreatedDTO
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.time_parse import DateTimeBound
-from canopy.squirrel.errors import SnapshotNotFound
+from canopy.squirrel.errors import SnapshotPending, SnapshotNotFound
 from canopy.contracts.pagination import PagedResult
 from canopy.squirrel.dependencies import FacilityScopeDep, SnapshotServiceDep
 from canopy.squirrel.schemas.snapshot import (
@@ -31,6 +32,7 @@ from canopy.squirrel.schemas.snapshot import (
     SnapshotImportResultDTO,
 )
 from canopy.squirrel.api.v1._validation import is_uuid
+from canopy.squirrel.services.snapshot_service import pending_detail
 
 logger = logging.getLogger(__name__)
 
@@ -262,9 +264,18 @@ async def restore_snapshot(
 
     Logs who asked (the key's name, or the user a forward instance sent it for):
     a restore changes the machine and stores no row of its own.
+
+    A snapshot a history head holds only in its outbox (pending or failed) restores
+    from its bundle where this instance writes the machine itself; elsewhere it's a 409
+    ``snapshot_pending`` until its arm has it.
     """
-    if not is_uuid(snapshot_id) or not await service.snapshot_exists(snapshot_id):
+    if not is_uuid(snapshot_id):
         raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
+    if not await service.snapshot_exists(snapshot_id):
+        if (entry := await service.queued(snapshot_id)) is None:
+            raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
+        if not get_settings().machine_writes:
+            raise SnapshotPending(pending_detail(entry, "it can be restored once it's saved there"))
     # Narrow the write set to the key's facilities here, pre-enqueue — the worker has no
     # caller identity to check against.
     pv_ids, skipped = await service.plan_restore(snapshot_id, request.pv_ids if request else None)

@@ -50,3 +50,17 @@ class TagGroupAlreadyExists(SquirrelError):
 class MetaPvNotFound(SquirrelError):
     status_code = 404
     error_code = ErrorCode.META_PV_NOT_FOUND
+
+
+class SnapshotPending(SquirrelError):
+    """A change to a snapshot the head holds only in its outbox: not saved on its arm yet, or refused there."""
+
+    status_code = 409
+    error_code = ErrorCode.SNAPSHOT_PENDING
+
+
+class OutboxFull(SquirrelError):
+    """A capture refused because its arm can't be reached and the arm's outbox is at a cap."""
+
+    status_code = 503
+    error_code = ErrorCode.OUTBOX_FULL

@@ -77,11 +77,29 @@ class NewSnapshotDTO(SnapshotBase):
     facility: str | None = None
 
 
+class SnapshotDeliveryDTO(CanopyModel):
+    """Where a snapshot held only in a history head's outbox stands.
+
+    ``pending``: waiting for its arm, or saved there and waiting for replication.
+    ``failed``: the arm refused it. ``reason`` says why it is still waiting (the last
+    error, or that it's saved on the arm), or why the arm refused it; ``None`` before
+    the first attempt.
+    """
+
+    state: Literal["pending", "failed"]
+    arm: str
+    queued_at: datetime
+    attempts: int = 0
+    reason: str | None = None
+
+
 class SnapshotSummaryDTO(SnapshotBase):
     """Summary DTO for listing snapshots.
 
     ``retain`` exempts the snapshot from pruning of old snapshots. ``imported_from`` is
     the id of the snapshot it was imported from (``POST /snapshots/import``), else ``None``.
+    ``delivery`` is set only on a history head, for a snapshot it captured for an arm
+    and holds in its outbox until the arm's copy replicates back; ``None`` otherwise.
     """
 
     id: str
@@ -92,6 +110,7 @@ class SnapshotSummaryDTO(SnapshotBase):
     retain: bool = False
     imported_from: str | None = None
     meta_pvs: list[MetaPVValueDTO] = Field(default_factory=list)
+    delivery: SnapshotDeliveryDTO | None = None
 
 
 class SnapshotDTO(SnapshotSummaryDTO):
