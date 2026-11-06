@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-    <title>Coverage for src/canopy/squirrel/data/repositories.py: 87%</title>
+    <title>Coverage for src/canopy/squirrel/data/repositories.py: 88%</title>
     <link rel="icon" sizes="32x32" href="favicon_32_cb_c827f16f.png">
     <link rel="stylesheet" href="style_cb_4667309f.css" type="text/css">
     <script src="coverage_html_cb_54cfdca1.js" defer></script>
@@ -12,7 +12,7 @@
     <div class="content">
         <h1>
             <span class="text">Coverage for </span><b>src<span class="sep">/</span>canopy<span class="sep">/</span>squirrel<span class="sep">/</span>data<span class="sep">/</span>repositories.py</b>:
-            <span class="pc_cov">87%</span>
+            <span class="pc_cov">88%</span>
         </h1>
         <aside id="help_panel_wrapper">
             <input id="help_panel_state" type="checkbox">
@@ -55,8 +55,8 @@
         </aside>
         <h2>
             <span class="text">321 statements &nbsp;</span>
-            <button type="button" class="run button_toggle_run" value="run" data-shortcut="r" title="Toggle lines run">279<span class="text"> run</span></button>
-            <button type="button" class="mis show_mis button_toggle_mis" value="mis" data-shortcut="m" title="Toggle lines missing">42<span class="text"> missing</span></button>
+            <button type="button" class="run button_toggle_run" value="run" data-shortcut="r" title="Toggle lines run">282<span class="text"> run</span></button>
+            <button type="button" class="mis show_mis button_toggle_mis" value="mis" data-shortcut="m" title="Toggle lines missing">39<span class="text"> missing</span></button>
             <button type="button" class="exc show_exc button_toggle_exc" value="exc" data-shortcut="x" title="Toggle lines excluded">0<span class="text"> excluded</span></button>
         </h2>
         <p class="text">
@@ -65,7 +65,7 @@
             <a id="nextFileLink" class="nav" href="z_aad31e4326057ffc_dependencies_py.html">&#xbb; next</a>
             &nbsp; &nbsp; &nbsp;
             <a class="nav" href="https://coverage.readthedocs.io/en/7.17.0">coverage.py v7.17.0</a>,
-            created at 2026-11-05 16:38 +0000
+            created at 2026-11-06 17:17 +0000
         </p>
         <aside class="hidden">
             <button type="button" class="button_next_chunk" data-shortcut="j"></button>
@@ -588,7 +588,7 @@
     <p class="run"><span class="n"><a id="t506" href="#t506">506</a></span><span class="t">            <span class="nam">count_query</span> <span class="op">=</span> <span class="nam">count_query</span><span class="op">.</span><span class="nam">where</span><span class="op">(</span><span class="nam">Pv</span><span class="op">.</span><span class="nam">id</span><span class="op">.</span><span class="nam">in_</span><span class="op">(</span><span class="nam">pvs_in_facility</span><span class="op">)</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t507" href="#t507">507</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t508" href="#t508">508</a></span><span class="t">        <span class="key">if</span> <span class="nam">continuation_token</span><span class="op">:</span>&nbsp;</span><span class="r"></span></p>
-    <p class="mis show_mis"><span class="n"><a id="t509" href="#t509">509</a></span><span class="t">            <span class="nam">query</span> <span class="op">=</span> <span class="nam">query</span><span class="op">.</span><span class="nam">where</span><span class="op">(</span><span class="nam">Pv</span><span class="op">.</span><span class="nam">id</span> <span class="op">&gt;</span> <span class="nam">continuation_token</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t509" href="#t509">509</a></span><span class="t">            <span class="nam">query</span> <span class="op">=</span> <span class="nam">query</span><span class="op">.</span><span class="nam">where</span><span class="op">(</span><span class="nam">Pv</span><span class="op">.</span><span class="nam">id</span> <span class="op">&gt;</span> <span class="nam">continuation_token</span><span class="op">)</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t510" href="#t510">510</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t511" href="#t511">511</a></span><span class="t">        <span class="nam">query</span> <span class="op">=</span> <span class="nam">query</span><span class="op">.</span><span class="nam">order_by</span><span class="op">(</span><span class="nam">Pv</span><span class="op">.</span><span class="nam">id</span><span class="op">)</span><span class="op">.</span><span class="nam">limit</span><span class="op">(</span><span class="nam">limit</span> <span class="op">+</span> <span class="num">1</span><span class="op">)</span>  <span class="com"># +1 to detect a next page</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t512" href="#t512">512</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
@@ -600,8 +600,8 @@
     <p class="pln"><span class="n"><a id="t518" href="#t518">518</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t519" href="#t519">519</a></span><span class="t">        <span class="nam">next_token</span> <span class="op">=</span> <span class="key">None</span>&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t520" href="#t520">520</a></span><span class="t">        <span class="key">if</span> <span class="nam">len</span><span class="op">(</span><span class="nam">pvs</span><span class="op">)</span> <span class="op">&gt;</span> <span class="nam">limit</span><span class="op">:</span>&nbsp;</span><span class="r"></span></p>
-    <p class="mis show_mis"><span class="n"><a id="t521" href="#t521">521</a></span><span class="t">            <span class="nam">pvs</span> <span class="op">=</span> <span class="nam">pvs</span><span class="op">[</span><span class="op">:</span><span class="nam">limit</span><span class="op">]</span>&nbsp;</span><span class="r"></span></p>
-    <p class="mis show_mis"><span class="n"><a id="t522" href="#t522">522</a></span><span class="t">            <span class="nam">next_token</span> <span class="op">=</span> <span class="nam">pvs</span><span class="op">[</span><span class="op">-</span><span class="num">1</span><span class="op">]</span><span class="op">.</span><span class="nam">id</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t521" href="#t521">521</a></span><span class="t">            <span class="nam">pvs</span> <span class="op">=</span> <span class="nam">pvs</span><span class="op">[</span><span class="op">:</span><span class="nam">limit</span><span class="op">]</span>&nbsp;</span><span class="r"></span></p>
+    <p class="run"><span class="n"><a id="t522" href="#t522">522</a></span><span class="t">            <span class="nam">next_token</span> <span class="op">=</span> <span class="nam">pvs</span><span class="op">[</span><span class="op">-</span><span class="num">1</span><span class="op">]</span><span class="op">.</span><span class="nam">id</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t523" href="#t523">523</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
     <p class="run"><span class="n"><a id="t524" href="#t524">524</a></span><span class="t">        <span class="key">return</span> <span class="nam">pvs</span><span class="op">,</span> <span class="nam">next_token</span><span class="op">,</span> <span class="nam">total_count</span>&nbsp;</span><span class="r"></span></p>
     <p class="pln"><span class="n"><a id="t525" href="#t525">525</a></span><span class="t">&nbsp;</span><span class="r"></span></p>
@@ -864,7 +864,7 @@
             <a class="nav" href="z_aad31e4326057ffc_dependencies_py.html">&#xbb; next</a>
             &nbsp; &nbsp; &nbsp;
             <a class="nav" href="https://coverage.readthedocs.io/en/7.17.0">coverage.py v7.17.0</a>,
-            created at 2026-11-05 16:38 +0000
+            created at 2026-11-06 17:17 +0000
         </p>
     </div>
 </footer>

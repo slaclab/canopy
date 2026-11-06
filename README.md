@@ -81,6 +81,7 @@
 | src/canopy/core/runtime.py                                   |        8 |        0 |    100% |           |
 | src/canopy/core/security.py                                  |      142 |        7 |     95% |259-260, 298, 364, 372-377 |
 | src/canopy/core/time\_parse.py                               |       52 |        1 |     98% |       131 |
+| src/canopy/core/validation.py                                |       18 |        0 |    100% |           |
 | src/canopy/elog/\_\_init\_\_.py                              |        1 |        0 |    100% |           |
 | src/canopy/elog/adapters/\_\_init\_\_.py                     |        0 |        0 |    100% |           |
 | src/canopy/elog/adapters/base.py                             |       35 |        5 |     86% |52, 62, 68, 74, 78 |
@@ -174,10 +175,10 @@
 | src/canopy/magpie/\_\_init\_\_.py                            |        0 |        0 |    100% |           |
 | src/canopy/magpie/api/\_\_init\_\_.py                        |        0 |        0 |    100% |           |
 | src/canopy/magpie/api/v1/\_\_init\_\_.py                     |        0 |        0 |    100% |           |
-| src/canopy/magpie/api/v1/\_validation.py                     |       11 |        0 |    100% |           |
+| src/canopy/magpie/api/v1/\_validation.py                     |        4 |        0 |    100% |           |
 | src/canopy/magpie/api/v1/apps.py                             |        8 |        0 |    100% |           |
-| src/canopy/magpie/api/v1/configs.py                          |       48 |        2 |     96% |   90, 101 |
-| src/canopy/magpie/api/v1/debug.py                            |       22 |        0 |    100% |           |
+| src/canopy/magpie/api/v1/configs.py                          |       46 |        2 |     96% |    86, 97 |
+| src/canopy/magpie/api/v1/debug.py                            |       20 |        0 |    100% |           |
 | src/canopy/magpie/api/v1/health.py                           |        9 |        1 |     89% |        15 |
 | src/canopy/magpie/api/v1/router.py                           |       10 |        0 |    100% |           |
 | src/canopy/magpie/app.py                                     |       17 |        0 |    100% |           |
@@ -250,23 +251,22 @@
 | src/canopy/squirrel/adapters/epics\_io.py                    |       84 |        1 |     99% |       172 |
 | src/canopy/squirrel/api/\_\_init\_\_.py                      |        0 |        0 |    100% |           |
 | src/canopy/squirrel/api/v1/\_\_init\_\_.py                   |        0 |        0 |    100% |           |
-| src/canopy/squirrel/api/v1/\_validation.py                   |        7 |        0 |    100% |           |
 | src/canopy/squirrel/api/v1/health.py                         |       73 |        2 |     97% |   106-107 |
-| src/canopy/squirrel/api/v1/pvs.py                            |       79 |        6 |     92% |115, 123, 148, 156, 163, 171 |
+| src/canopy/squirrel/api/v1/pvs.py                            |       88 |        1 |     99% |       182 |
 | src/canopy/squirrel/api/v1/router.py                         |       10 |        0 |    100% |           |
-| src/canopy/squirrel/api/v1/snapshots.py                      |       73 |        6 |     92% |142, 190, 193, 201, 203, 239 |
-| src/canopy/squirrel/api/v1/tags.py                           |       93 |       19 |     80% |55-60, 73, 75, 88, 91, 99, 102, 110, 113, 149-151, 163-166 |
+| src/canopy/squirrel/api/v1/snapshots.py                      |       70 |        3 |     96% |142, 191, 200 |
+| src/canopy/squirrel/api/v1/tags.py                           |       89 |       14 |     84% |54-58, 72, 87, 98, 109, 145-147, 159-162 |
 | src/canopy/squirrel/app.py                                   |       24 |        0 |    100% |           |
 | src/canopy/squirrel/config.py                                |       29 |        0 |    100% |           |
 | src/canopy/squirrel/data/\_\_init\_\_.py                     |        0 |        0 |    100% |           |
 | src/canopy/squirrel/data/models.py                           |       64 |        0 |    100% |           |
-| src/canopy/squirrel/data/repositories.py                     |      321 |       42 |     87% |107, 131-137, 250, 273-288, 456-467, 509, 521-522, 625-626, 632-634, 637-639, 655-657, 697, 727-731 |
+| src/canopy/squirrel/data/repositories.py                     |      321 |       39 |     88% |107, 131-137, 250, 273-288, 456-467, 625-626, 632-634, 637-639, 655-657, 697, 727-731 |
 | src/canopy/squirrel/dependencies.py                          |       20 |        0 |    100% |           |
 | src/canopy/squirrel/errors.py                                |       26 |        0 |    100% |           |
 | src/canopy/squirrel/gateway.py                               |       12 |        0 |    100% |           |
 | src/canopy/squirrel/pv\_cache/\_\_init\_\_.py                |        4 |        0 |    100% |           |
 | src/canopy/squirrel/pv\_cache/keys.py                        |       46 |        0 |    100% |           |
-| src/canopy/squirrel/pv\_cache/monitor.py                     |      260 |       28 |     89% |57-59, 64, 111, 156-157, 220-221, 237, 258-263, 276, 305-306, 325, 349-350, 371-376, 414-415 |
+| src/canopy/squirrel/pv\_cache/monitor.py                     |      260 |       27 |     90% |57-59, 64, 111, 156-157, 220-221, 237, 259-263, 276, 305-306, 325, 349-350, 371-376, 414-415 |
 | src/canopy/squirrel/pv\_cache/reader.py                      |       64 |        2 |     97% |     81-82 |
 | src/canopy/squirrel/restore\_hooks/\_\_init\_\_.py           |        4 |        0 |    100% |           |
 | src/canopy/squirrel/restore\_hooks/base.py                   |        7 |        0 |    100% |           |
@@ -283,7 +283,7 @@
 | src/canopy/squirrel/schemas/tag.py                           |       26 |        0 |    100% |           |
 | src/canopy/squirrel/services/\_\_init\_\_.py                 |        0 |        0 |    100% |           |
 | src/canopy/squirrel/services/bulk\_insert.py                 |       36 |        1 |     97% |        88 |
-| src/canopy/squirrel/services/pv\_service.py                  |      247 |       26 |     89% |299, 313-314, 418-419, 439-440, 457, 482, 484, 486-489, 500-504, 510-511, 544-547, 552, 558, 572, 597 |
+| src/canopy/squirrel/services/pv\_service.py                  |      247 |       25 |     90% |299, 313-314, 418-419, 439-440, 482, 484, 486-489, 500-504, 510-511, 544-547, 552, 558, 572, 597 |
 | src/canopy/squirrel/services/snapshot\_service.py            |      439 |       27 |     94% |131-136, 148, 150, 153, 157-159, 285-287, 498, 502, 549, 577, 773, 790, 983, 1029-1030, 1032-1033, 1039 |
 | src/canopy/squirrel/services/tag\_service.py                 |       79 |       18 |     77% |59-70, 75, 94, 114, 118, 121, 128 |
 | src/canopy/squirrel/tasks.py                                 |       56 |       25 |     55% |35-36, 56-58, 79-100, 128-131 |
@@ -314,7 +314,7 @@
 | src/canopy/vole/services/hare\_ingest.py                     |       92 |       11 |     88% |47-48, 55, 77, 103, 121, 131-132, 152-155 |
 | src/canopy/vole/services/notifier.py                         |       35 |        2 |     94% |     33-34 |
 | src/canopy/worker.py                                         |       47 |        1 |     98% |        34 |
-| **TOTAL**                                                    | **9858** |  **751** | **92%** |           |
+| **TOTAL**                                                    | **9860** |  **733** | **93%** |           |
 
 
 ## Setup coverage badge
