@@ -14,8 +14,10 @@ from canopy.squirrel.errors import OutboxFull
 from canopy.squirrel.data.models import Snapshot, SnapshotOutbox
 from canopy.core.forwarding.client import ArmRefused
 from canopy.squirrel.outbox.delivery import (
+    submit,
     enqueue,
     bundle_json,
+    deliver_all,
     deliver_arm,
     outbox_full,
     retry_delay,
@@ -307,3 +309,134 @@ async def test_a_capture_time_without_an_offset_is_read_as_utc(db_session, seede
     await db_session.commit()
 
     assert (await _rows(db_session))[str(bundle.id)].created_at == CAPTURED
+
+
+# --- submit: straight to the arm, or queued ------------------------------------ #
+
+
+@pytest.fixture
+def arm_answers(monkeypatch):
+    """Stub ``deliver_capture`` for ``submit``: ``arm_answers(outcome)``; records each bundle id sent."""
+    sent: list[str] = []
+
+    def _set(outcome=None):
+        async def deliver_capture(arm, bundle, caller, *, strict=False):
+            sent.append(str(bundle.id))
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"type": "snapshot", "id": str(bundle.id), "arm": arm}
+
+        monkeypatch.setattr("canopy.squirrel.outbox.delivery.deliver_capture", deliver_capture)
+        return sent
+
+    return _set
+
+
+async def test_submit_saves_on_a_reachable_arm_and_queues_nothing(db_session, seeded: Seeded, arm_answers):
+    from canopy.core.forwarding.client import Caller
+
+    sent = arm_answers()
+    bundle = make_bundle(seeded)
+
+    result = await submit("arm2", bundle, Caller(**CALLER), facility_id=seeded.facility_id, config=CONFIG)
+
+    assert result == {"type": "snapshot", "id": str(bundle.id), "arm": "arm2"}
+    assert sent == [str(bundle.id)] and await _rows(db_session) == {}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        PrimaryUnavailable("arm2 could not be reached; nothing was sent to it"),
+        PrimaryTimeout("arm2 did not answer"),
+        ArmRefused("arm2", 503, None, "Service Unavailable"),
+    ],
+)
+async def test_submit_queues_what_the_arm_couldnt_take_with_the_attempt(db_session, seeded: Seeded, arm_answers, error):
+    from canopy.core.forwarding.client import Caller
+
+    arm_answers(error)
+    bundle = make_bundle(seeded)
+
+    result = await submit("arm2", bundle, Caller(**CALLER), facility_id=seeded.facility_id, config=CONFIG)
+
+    row = (await _rows(db_session))[str(bundle.id)]
+    assert (row.state, row.attempts, row.caller) == ("pending", 1, CALLER)
+    assert row.next_attempt_at > row.last_attempt_at
+    assert result["delivery"]["state"] == "pending" and result["delivery"]["attempts"] == 1
+    assert result["delivery"]["reason"] == row.last_error and row.last_error
+    assert (result["type"], result["id"], result["arm"]) == ("snapshot", str(bundle.id), "arm2")
+
+
+async def test_submit_queues_behind_a_backlog_without_trying(db_session, seeded: Seeded, arm_answers):
+    from canopy.core.forwarding.client import Caller
+
+    older = await queue(db_session, seeded)
+    sent = arm_answers()
+    bundle = make_bundle(seeded, created=CAPTURED + timedelta(minutes=1))
+
+    result = await submit("arm2", bundle, Caller(**CALLER), facility_id=seeded.facility_id, config=CONFIG)
+
+    assert sent == []
+    assert result["delivery"] == {
+        "state": "pending",
+        "arm": "arm2",
+        "queuedAt": result["delivery"]["queuedAt"],
+        "attempts": 0,
+        "reason": None,
+    }
+    assert list(await _rows(db_session)) == [older, str(bundle.id)]
+
+
+async def test_submit_lets_a_refusal_fail_the_capture(db_session, seeded: Seeded, arm_answers):
+    from canopy.core.forwarding.client import Caller
+
+    arm_answers(ArmRefused("arm2", 404, "facility_not_found", "gone"))
+
+    with pytest.raises(ArmRefused):
+        await submit("arm2", make_bundle(seeded), Caller(**CALLER), facility_id=seeded.facility_id, config=CONFIG)
+    assert await _rows(db_session) == {}
+
+
+async def test_submit_refuses_past_the_cap(db_session, seeded: Seeded, arm_answers):
+    from canopy.core.forwarding.client import Caller
+
+    await queue(db_session, seeded)
+    with pytest.raises(OutboxFull):
+        await submit(
+            "arm2",
+            make_bundle(seeded),
+            Caller(**CALLER),
+            facility_id=seeded.facility_id,
+            config=OutboxConfig(max_snapshots=1),
+        )
+
+
+async def test_a_delivered_send_skipping_values_is_logged(db_session, seeded: Seeded, caplog):
+    await queue(db_session, seeded, strict=False)
+
+    async def allowed_skips(arm, document, caller, strict):
+        return {
+            "type": "snapshot",
+            "id": "x",
+            "arm": arm,
+            "skipped": [{"pvId": seeded.rb_id, "pvName": "LAB:B:ONLY:RB"}],
+        }
+
+    with caplog.at_level(logging.WARNING, logger="canopy.squirrel.outbox.delivery"):
+        await deliver_arm("arm2", allowed_skips, config=CONFIG)
+
+    assert "without 1 value(s), as allowed: LAB:B:ONLY:RB" in caplog.text
+
+
+async def test_deliver_all_runs_each_forwardable_arm(db_session, seeded: Seeded, monkeypatch):
+    await queue(db_session, seeded, arm="arm1")
+    await queue(db_session, seeded, arm="arm2")
+    await queue(db_session, seeded, arm="arm3")
+    monkeypatch.setattr("canopy.squirrel.outbox.delivery.forwardable_arms", lambda: {"arm1", "arm2"})
+    arm = FakeArm()
+
+    runs = await deliver_all(arm, config=CONFIG)
+
+    assert runs == {name: {"delivered": 1, "retried": 0, "failed": 0} for name in ("arm1", "arm2")}
+    assert sorted(a for a, *_ in arm.sent) == ["arm1", "arm2"]
