@@ -1,36 +1,49 @@
 """Migrations released in the documented order keep a history head in step with its arms.
 
-Opt-in, on the arm and head servers the end-to-end tests use (``bare_octopus``). Every
-database is built by Alembic rather than ``create_all``, and every step is a command a
-deploy runs, as a subprocess: ``python -m alembic`` and ``python -m canopy.core.replication``.
-Each instance has its own ``CANOPY_ROLE`` and ``CANOPY_INSTANCE``; the head's commands run
-as its tables' owner role and an arm's as a superuser, as in production.
+Opt-in, on the arm and head servers the end-to-end tests use (``bare_octopus``, two
+arms). Every database is built by Alembic rather than ``create_all``. Each instance
+has its own ``CANOPY_ROLE`` and ``CANOPY_INSTANCE``, and every step is a command a
+deploy runs, as a subprocess (``python -m alembic``, ``python -m canopy.core.replication``),
+except ``subscribe`` and ``refresh``: they also read each arm through its connection
+string, which names the arm as the head's server sees it, so they run in-process with
+the fixture's way of reaching the arms. The head's commands run as its tables' owner
+role and an arm's as a superuser, as in production.
 
-``test_every_revision_in_release_order`` starts every instance at the first revision and
-subscribes the head to each arm, then releases each later revision the way
-``CONTRIBUTING.md`` describes: the head migrates (``alembic upgrade``, ``grants``,
-``refresh``) while every arm keeps writing on its old schema, then each arm in turn
-migrates (``alembic upgrade``, ``publish``), and the head's hourly ``refresh`` copies the
-tables that arm has started publishing.
+Replication starts at ``REPLICATION_BASE``, the ownership revision: the replication
+code first shipped with it, and a deploy migrates an arm before ``publish``, which
+comes before the head's ``subscribe``, so no subscription can exist below it. Below
+the base each arm climbs alone, one revision at a time, writing as an instance in use.
+
+``test_every_revision_in_release_order`` then subscribes the head to both arms at the
+base and releases each later revision the way ``CONTRIBUTING.md`` describes: the
+head migrates (``alembic upgrade``, ``grants``, ``refresh``) while both arms keep
+writing on their old schema, then each arm in turn migrates (``alembic upgrade``,
+``publish``), and the head's hourly ``refresh`` copies the tables that arm has started
+publishing.
 
 ``test_head_at_head_while_the_arms_step_up`` covers a deploy that takes the head through
-several revisions at once: the head goes straight to head, and each arm then climbs one
-revision at a time. They start at the newest revision a subscriber-side drop declares
-with ``canopy_requires_primary_at``, since such a drop may only reach a head whose arms
-all run that revision.
+several revisions at once and arms at different revisions: the head goes straight to
+head, a second arm is subscribed while the first streams, then the first arm climbs
+one revision at a time while the second waits, and the second jumps to head in one
+deploy. They start at the base, or at the newest revision a subscriber-side drop
+declares with ``canopy_requires_primary_at``, since such a drop may only reach a head
+whose arms all run that revision.
 
-After each step every instance writes a round: each arm inserts a row into every table
-it publishes, built from its own schema at that moment, and rewrites every published
-row, and every instance inserts a row into each of its local tables. The head then has
-to hold exactly the arms' rows, compared per arm by primary key, with no apply error.
-It also has to catch up right after it migrates and right after each arm migrates,
-before anyone writes, so a migration's own data change must reach it by replication;
-and while the head migrates, triggers record what its migration writes to replicated
-tables, which may not touch any arm's rows. A migration that breaks the rules (a column
-an arm sends before the head has it, a column the head drops first, a NOT NULL column
-without a default, a data step run on the head as well as on the arms) fails the walk.
+After each step every instance writes a round. Each arm inserts a row into every table
+it publishes, built from its own schema at that moment and stamped with its own name,
+then rewrites every published row. The head inserts rows it owns into every replicated
+table, and every instance inserts a row into each local table. A column unique per
+owner gets the same value from every instance in a round. The head then has to hold
+exactly each arm's rows plus its own, compared per arm by primary key, with every row
+stamped by its owner and no apply error. It also has to catch up right after it
+migrates and right after each arm migrates, before anyone writes, so a migration's own
+data change must reach it by replication. While the head migrates, triggers record what
+its migration writes to replicated tables, which must be rows the head owns. A migration
+that breaks the rules (a column an arm sends before the head has it, a column the head
+drops first, a NOT NULL column without a default, a data step that changes another
+owner's rows) fails the walk.
 
-``test_out_of_order_changes_stop_an_arms_apply`` shows the failures that order prevents.
+``test_out_of_order_changes_stop_only_that_arms_apply`` shows the failures that order prevents.
 """
 
 import os
@@ -40,9 +53,11 @@ import json
 import asyncio
 import subprocess
 from uuid import uuid4
+from hashlib import md5
 from pathlib import Path
 from datetime import UTC, date, datetime
-from dataclasses import dataclass
+from dataclasses import field, dataclass
+from collections.abc import Callable, Awaitable
 
 import pytest
 import asyncpg
@@ -51,18 +66,27 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy.engine import make_url
 
-from canopy.core.arms import subscription_name
-from canopy.core.replication.sql import qualified, quote_ident, tables_present
+from canopy.core.arms import Arm, subscription_name
+from canopy.core.replication.sql import (
+    qualified,
+    owner_join,
+    quote_ident,
+    tables_present,
+)
 from canopy.core.replication.registry import REGISTRY
 from canopy.core.replication.migration import REQUIRES_PRIMARY_AT
+from canopy.core.replication.subscriber import refresh, subscribe
 
 from .conftest import Octopus, eventually
 
 ROOT = Path(__file__).resolve().parents[4]
 PUBLICATIONS = [publication.name for publication in REGISTRY.publications]
 
-# A head subscribes to one arm until rows carry their owner (canopy.core.replication.subscriber).
-ARMS = 1
+REPLICATION_BASE = "89e21441c63c"
+"""The oldest revision a database with a subscription can run: the ownership revision."""
+
+OWNER = "owner_instance"
+ROOTS = sorted(table for table, path in REGISTRY.owner_paths.items() if path.column)
 
 
 def _script() -> ScriptDirectory:
@@ -79,12 +103,11 @@ def revisions() -> list[str]:
 
 
 def oldest_arm_revision_for_head_at_head() -> str:
-    """The first revision, or the newest one a subscriber-side drop says every arm must run."""
+    """The base, or the newest revision a subscriber-side drop says every arm must run, if later."""
     ordered = revisions()
     script = _script()
     required = [getattr(script.get_revision(revision).module, REQUIRES_PRIMARY_AT, None) for revision in ordered]
-    required = [revision for revision in required if revision is not None]
-    return max(required, key=ordered.index) if required else ordered[0]
+    return max([REPLICATION_BASE, *(revision for revision in required if revision is not None)], key=ordered.index)
 
 
 @dataclass
@@ -114,6 +137,28 @@ class Side:
 class Walk:
     head: Side
     arms: list[Side]  # in arm order
+    head_dsn: str  # the head's database as its tables' owner, which runs its commands
+    configured: dict[str, Arm]  # the head's CANOPY_ARMS
+    connect_arm: Callable[[str], Awaitable[asyncpg.Connection]]
+    rounds: int = field(default=0)  # write rounds so far
+
+    async def subscribe(self, only: str | None = None) -> None:
+        """``subscribe`` on the head, every arm or ``only``."""
+        conn = await asyncpg.connect(self.head_dsn)
+        try:
+            await subscribe(
+                conn, role="mirror", head=self.head.name, arms=self.configured, only=only, connect_arm=self.connect_arm
+            )
+        finally:
+            await conn.close()
+
+    async def refresh(self) -> None:
+        """``refresh`` on the head, every arm: the hourly CronJob."""
+        conn = await asyncpg.connect(self.head_dsn)
+        try:
+            await refresh(conn, role="mirror", arms=self.configured, connect_arm=self.connect_arm)
+        finally:
+            await conn.close()
 
 
 def _app_url(dsn: str) -> str:
@@ -146,7 +191,13 @@ async def walk(bare_octopus: Octopus) -> Walk:
         "CANOPY_DATABASE_URL": _app_url(o.head.dsn),
         **{f"CANOPY_ARMS__{name.upper()}__PUBLISHER_DSN": arm.publisher_dsn for name, arm in o.arms.items()},
     }
-    return Walk(head=Side(name=o.head.name, env=head_env, conn=o.head.admin), arms=arms)
+    return Walk(
+        head=Side(name=o.head.name, env=head_env, conn=o.head.admin),
+        arms=arms,
+        head_dsn=o.head.dsn,
+        configured=o.arms_config.arms,
+        connect_arm=o.connect_arm,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -160,6 +211,11 @@ async def _published(conn: asyncpg.Connection) -> list[str]:
         PUBLICATIONS,
     )
     return sorted(row["name"] for row in rows)
+
+
+async def _present(conn: asyncpg.Connection, tables: list[str]) -> list[str]:
+    present = await tables_present(conn, REGISTRY.schemas)
+    return [table for table in tables if table in present]
 
 
 async def _subscribed(conn: asyncpg.Connection, arm: str, *, ready: bool = True) -> list[str]:
@@ -197,6 +253,22 @@ async def _primary_key(conn: asyncpg.Connection, table: str) -> list[str]:
         qualified(table),
     )
     return [row["attname"] for row in rows]
+
+
+async def _unique_per_owner(conn: asyncpg.Connection, table: str) -> set[str]:
+    """Columns of ``table`` in a unique index together with the owner column: unique per owner, not everywhere."""
+    rows = await conn.fetch(
+        """
+        SELECT a.attname, o.attname AS owner
+        FROM pg_index i
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+        LEFT JOIN pg_attribute o ON o.attrelid = i.indrelid AND o.attnum = ANY(i.indkey) AND o.attname = $2
+        WHERE i.indrelid = $1::regclass AND i.indisunique AND NOT i.indisprimary
+        """,
+        qualified(table),
+        OWNER,
+    )
+    return {row["attname"] for row in rows if row["owner"] is not None and row["attname"] != OWNER}
 
 
 async def _column_specs(conn: asyncpg.Connection, table: str) -> list[asyncpg.Record]:
@@ -263,6 +335,11 @@ async def _check_choices(conn: asyncpg.Connection, table: str) -> dict[str, str]
 OVERRIDES: dict[str, dict[str, object]] = {}
 
 
+def _text(seed: str, typmod: int) -> str:
+    length = typmod - 4 if typmod > 4 else 32
+    return md5(seed.encode()).hexdigest()[:length]
+
+
 def _value(table: str, spec: asyncpg.Record, choices: dict[str, str]):
     """A value of ``spec``'s type that an application in use could have written."""
     if (override := OVERRIDES.get(table, {}).get(spec["attname"])) is not None:
@@ -275,8 +352,7 @@ def _value(table: str, spec: asyncpg.Record, choices: dict[str, str]):
     if name == "uuid":
         return str(uuid4())
     if category == "S":  # text, varchar(n), char(n): unique enough for a unique index
-        length = typmod - 4 if typmod > 4 else 32
-        return uuid4().hex[:length]
+        return _text(uuid4().hex, typmod)
     if name in ("int2", "int4", "int8"):
         return uuid4().int % 30_000 + 1
     if name in ("float4", "float8", "numeric"):
@@ -309,12 +385,21 @@ def _parents_first(tables: list[str], keys: dict[str, dict[str, tuple[str, str]]
     return ordered
 
 
-async def _insert_rows(conn: asyncpg.Connection, tables: list[str]) -> None:
+async def _insert_rows(
+    conn: asyncpg.Connection,
+    tables: list[str],
+    *,
+    owner: str | None = None,
+    shared: dict[str, set[str]] | None = None,
+    round_: int = 0,
+) -> None:
     """A new row in each of ``tables``, built from the catalog at this moment, as an application in use writes it.
 
     Every column without a default gets a value, nullable ones too, so a later NOT NULL
-    tightening finds nothing to reject. A foreign key points at the row this call wrote
-    in the parent table (a self-reference stays NULL).
+    tightening finds nothing to reject. A root table's owner column gets ``owner``. A
+    column in ``shared`` gets the same value from every instance in a round. A foreign
+    key points at the row this call wrote in the parent table (a self-reference stays
+    NULL), so child rows follow their parent's owner.
     """
     keys = {table: await _foreign_keys(conn, table) for table in tables}
     written: dict[str, dict[str, object]] = {}
@@ -332,6 +417,10 @@ async def _insert_rows(conn: asyncpg.Connection, tables: list[str]) -> None:
                         row[column] = await conn.fetchval(
                             f"SELECT {quote_ident(parent_column)} FROM {qualified(parent)} LIMIT 1"
                         )
+                elif column == OWNER and table in ROOTS and owner is not None:
+                    row[column] = owner
+                elif column in (shared or {}).get(table, ()):
+                    row[column] = _text(f"{round_}:{table}:{column}", spec["atttypmod"])
                 elif not spec["has_default"]:
                     row[column] = _value(table, spec, choices)
             columns = ", ".join(quote_ident(c) for c in row)
@@ -342,40 +431,54 @@ async def _insert_rows(conn: asyncpg.Connection, tables: list[str]) -> None:
             written[table] = dict(returned)
 
 
-async def _local_tables(conn: asyncpg.Connection) -> list[str]:
-    present = await tables_present(conn, REGISTRY.schemas)
-    return [table for table in REGISTRY.local if table in present]
-
-
-async def _write(w: Walk) -> None:
-    """One round of writes, as instances in use make them.
-
-    Each arm inserts a row into every table it publishes, from its own schema at that
-    moment (before an arm upgrades it has the previous release's columns), then rewrites
-    every published row: a rewrite sends all its columns, so a column the head doesn't
-    have stops apply. Every instance inserts a row into each of its local tables, so a
-    local table's migration always runs over rows.
-    """
-    await _forget_schemas(w)
-    for arm in w.arms:
-        published = await _published(arm.conn)
-        await _insert_rows(arm.conn, published)
-        for table in published:
-            column = quote_ident((await _columns(arm.conn, table))[0])
-            await arm.conn.execute(f"UPDATE {qualified(table)} SET {column} = {column}")
-    for side in (w.head, *w.arms):
-        await _insert_rows(side.conn, await _local_tables(side.conn))
-
-
-# --------------------------------------------------------------------------- #
-# The head's view
-# --------------------------------------------------------------------------- #
+async def _rewrite(conn: asyncpg.Connection, tables: list[str]) -> None:
+    """Rewrite every row of ``tables``: an UPDATE sends all its columns, so one the head lacks stops apply."""
+    for table in tables:
+        column = quote_ident((await _columns(conn, table))[0])
+        await conn.execute(f"UPDATE {qualified(table)} SET {column} = {column}")
 
 
 async def _forget_schemas(w: Walk) -> None:
     """Drop asyncpg's cached statements: a migration since they were prepared can change their rows' shape."""
     for side in (w.head, *w.arms):
         await side.conn.reload_schema_state()
+
+
+async def _write(w: Walk, *, arms: list[Side] | None = None, head: bool = True) -> None:
+    """One round of writes, as instances in use make them.
+
+    Each arm (or each of ``arms``) inserts a row into every table it publishes, from its
+    own schema at that moment, then rewrites every published row. The head inserts rows
+    it owns into every replicated table. Every instance inserts a row into each of its
+    local tables, so a local table's migration always runs over rows.
+    """
+    await _forget_schemas(w)
+    w.rounds += 1
+    replicated = await _present(w.head.conn, REGISTRY.replicated)
+    shared = {table: await _unique_per_owner(w.head.conn, table) for table in replicated}
+    for arm in w.arms if arms is None else arms:
+        published = await _published(arm.conn)
+        await _insert_rows(arm.conn, published, owner=arm.name, shared=shared, round_=w.rounds)
+        await _rewrite(arm.conn, published)
+        await _insert_rows(arm.conn, await _present(arm.conn, REGISTRY.local))
+    if head:
+        await _insert_rows(w.head.conn, replicated, owner=w.head.name, shared=shared, round_=w.rounds)
+        await _insert_rows(w.head.conn, await _present(w.head.conn, REGISTRY.local))
+
+
+async def _climb_to_the_base(w: Walk) -> None:
+    """Each arm, alone, from the first revision to the base, writing as an instance in use after each."""
+    for arm in w.arms:
+        for revision in revisions()[: revisions().index(REPLICATION_BASE) + 1]:
+            arm.migrate(revision)
+            await arm.conn.reload_schema_state()
+            await _insert_rows(arm.conn, await _present(arm.conn, REGISTRY.replicated), owner=arm.name)
+            await _insert_rows(arm.conn, await _present(arm.conn, REGISTRY.local))
+
+
+# --------------------------------------------------------------------------- #
+# The head's view
+# --------------------------------------------------------------------------- #
 
 
 async def _errors(w: Walk, arm: Side) -> int:
@@ -400,15 +503,24 @@ async def _rows(conn: asyncpg.Connection, table: str, columns: list[str], key: l
     }
 
 
-async def _differing(w: Walk) -> list[str]:
-    """How the head differs from its arms, on the tables whose copy is done.
+async def _owned(conn: asyncpg.Connection, table: str, key: list[str], owner: str) -> set[tuple]:
+    """The primary keys of ``table``'s rows that ``owner`` owns, through the registry's owner path."""
+    join, owner_sql = owner_join(REGISTRY, table, alias="t")
+    selected = ", ".join(f"t.{quote_ident(c)}" for c in key)
+    rows = await conn.fetch(f"SELECT {selected} FROM {qualified(table)} t {join} WHERE {owner_sql} = $1", owner)
+    return {tuple(str(v) for v in row.values()) for row in rows}
 
-    Per arm, every row the arm holds must be on the head, equal on the arm's columns;
-    and the head must hold no row that no arm holds.
+
+async def _differing(w: Walk, *, arms: list[Side] | None = None) -> list[str]:
+    """How the head differs from its arms (or ``arms``), on the tables whose copy is done.
+
+    Per arm, every row the arm holds must be on the head, equal on the arm's columns,
+    its owner stamp included. The head must hold no row beyond every subscribed arm's
+    and its own, and stamp no root row with any other name.
     """
     differing: list[str] = []
     held: dict[str, set[tuple]] = {}
-    for arm in w.arms:
+    for arm in w.arms if arms is None else arms:
         ready = set(await _subscribed(w.head.conn, arm.name))
         for table in await _published(arm.conn):
             if table not in ready:
@@ -423,15 +535,23 @@ async def _differing(w: Walk) -> list[str]:
             if wrong := [k for k, row in mine.items() if on_head.get(k) != row]:
                 differing.append(f"{table}: {len(wrong)} of {arm.name}'s rows missing or different on the head")
             held.setdefault(table, set()).update(mine)
+    if arms is not None:
+        return differing
     for table, keys in sorted(held.items()):
-        on_head = await _rows(w.head.conn, table, [], await _primary_key(w.head.conn, table))
-        if extra := set(on_head) - keys:
-            differing.append(f"{table}: {len(extra)} row(s) on the head that no arm holds")
+        key = await _primary_key(w.head.conn, table)
+        on_head = set(await _rows(w.head.conn, table, [], key))
+        if extra := on_head - keys - await _owned(w.head.conn, table, key, w.head.name):
+            differing.append(f"{table}: {len(extra)} row(s) on the head that neither an arm nor the head owns")
+    owners = {w.head.name, *(arm.name for arm in w.arms)}
+    for table in await _present(w.head.conn, ROOTS):
+        stamps = {row[OWNER] for row in await w.head.conn.fetch(f"SELECT DISTINCT {OWNER} FROM {qualified(table)}")}
+        if strange := sorted(str(stamp) for stamp in stamps - owners):
+            differing.append(f"{table}: rows on the head stamped {', '.join(strange)}")
     return differing
 
 
-async def _in_step(w: Walk) -> bool:
-    return not await _differing(w)
+async def _in_step(w: Walk, *, arms: list[Side] | None = None) -> bool:
+    return not await _differing(w, arms=arms)
 
 
 async def _caught_up(w: Walk, when: str, *, timeout: float = 60.0) -> None:
@@ -461,25 +581,41 @@ async def _caught_up(w: Walk, when: str, *, timeout: float = 60.0) -> None:
         await asyncio.sleep(0.2)
 
 
+async def _owner_of(w: Walk, table: str, row: dict, written: dict[tuple[str, str], str | None]) -> str | None:
+    """Who owns ``row`` of ``table`` on the head: its stamp, or its parent's, followed to the root."""
+    for parent, key in REGISTRY.owner_chain(table):
+        if row.get(key) is None:
+            return None
+        if (parent, row[key]) in written:  # the migration changed or deleted the parent too
+            return written[parent, row[key]]
+        table, row = (
+            parent,
+            dict(await w.head.conn.fetchrow(f"SELECT * FROM {qualified(parent)} WHERE id = $1", row[key]) or {}),
+        )
+    return row.get(OWNER)
+
+
 async def _migrate_head(w: Walk, revision: str) -> None:
     """``alembic upgrade`` on the head while triggers record what its migration writes, then ``grants`` and ``refresh``.
 
     The triggers fire for the migration's own INSERT, UPDATE and DELETE statements but
     not for apply, which runs with ``session_replication_role = replica``, nor for a
-    table rewrite. Every row on the head belongs to an arm, so a data step that ran on
-    the head as well as on the arms (rows each arm's own migration changes, and its
-    result replicates) shows up here.
+    table rewrite. Every row they record must be one the head owns: a data step that
+    changed an arm's rows on the head as well as on the arm would show up here.
     """
     conn = w.head.conn
-    tables = sorted(set(REGISTRY.replicated) & await tables_present(conn, REGISTRY.schemas))
+    tables = await _present(conn, REGISTRY.replicated)
     await conn.execute(
         """
         CREATE SCHEMA walk_audit;
-        CREATE TABLE walk_audit.writes (tbl text, op text);
+        CREATE TABLE walk_audit.writes (tbl text, op text, old jsonb, new jsonb);
         CREATE FUNCTION walk_audit.record() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
         SET search_path = pg_catalog AS $$
         BEGIN
-            INSERT INTO walk_audit.writes VALUES (TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME, TG_OP);
+            INSERT INTO walk_audit.writes VALUES (
+                TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME, TG_OP,
+                CASE WHEN TG_OP <> 'INSERT' THEN to_jsonb(OLD) END,
+                CASE WHEN TG_OP <> 'DELETE' THEN to_jsonb(NEW) END);
             RETURN NULL;
         END $$;
         """
@@ -491,17 +627,32 @@ async def _migrate_head(w: Walk, revision: str) -> None:
         )
     try:
         w.head.migrate(revision)
-        writes = await conn.fetch("SELECT tbl, op, count(*) AS n FROM walk_audit.writes GROUP BY tbl, op ORDER BY 1, 2")
+        writes = [
+            (row["tbl"], row["op"], json.loads(row["old"] or "null"), json.loads(row["new"] or "null"))
+            for row in await conn.fetch("SELECT tbl, op, old::text, new::text FROM walk_audit.writes")
+        ]
     finally:
         await conn.execute("DROP SCHEMA walk_audit CASCADE")  # the function, and with it every trigger
-    if writes:
+    await conn.reload_schema_state()
+    root_rows = {
+        (table, version["id"]): version.get(OWNER)
+        for table, _, old, new in writes
+        for version in (old, new)
+        if version is not None and table in ROOTS
+    }
+    foreign: dict[tuple[str, str], int] = {}
+    for table, op, old, new in writes:
+        for version in (old, new):
+            if version is not None and await _owner_of(w, table, version, root_rows) != w.head.name:
+                foreign[table, op] = foreign.get((table, op), 0) + 1
+    if foreign:
         pytest.fail(
-            f"migrating the head to {revision} wrote arms' rows: "
-            + ", ".join(f"{row['op']} x{row['n']} on {row['tbl']}" for row in writes)
-            + ". A data step on a replicated table runs on the arms only, under `if on_publisher():`"
+            f"migrating the head to {revision} wrote rows it doesn't own: "
+            + ", ".join(f"{op} x{n} on {table}" for (table, op), n in sorted(foreign.items()))
+            + f". A data step changes only the rows the instance being migrated owns ({OWNER} = local_instance())"
         )
     w.head.replication("grants")
-    w.head.replication("refresh")
+    await w.refresh()
 
 
 # --------------------------------------------------------------------------- #
@@ -509,29 +660,26 @@ async def _migrate_head(w: Walk, revision: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _subscribe_at(w: Walk, revision: str) -> None:
-    """Every instance at ``revision``, the head first, each arm publishing; then the head subscribes."""
+async def _start_at(w: Walk, revision: str, *, only: str | None = None) -> None:
+    """Every instance at ``revision``, each arm climbing to the base first; then the head subscribes."""
+    await _climb_to_the_base(w)
     w.head.migrate(revision)
     w.head.replication("grants")
-    w.head.replication("refresh")  # no subscription yet: a no-op, as on a first deploy
     for arm in w.arms:
         arm.migrate(revision)
         arm.replication("publish")
+    await _write(w)
+    await w.subscribe(only=only)
+    await _caught_up(w, f"subscribed at {revision}")
 
 
-@pytest.mark.parametrize("bare_octopus", [ARMS], indirect=True)
+@pytest.mark.parametrize("bare_octopus", [2], indirect=True)
 async def test_every_revision_in_release_order(walk: Walk):
     w = walk
-    first, *later = revisions()
+    ordered = revisions()
+    await _start_at(w, REPLICATION_BASE)
 
-    # The first release: the head migrates first, then every arm publishes, then the
-    # one-time subscribe copies what each arm holds.
-    _subscribe_at(w, first)
-    await _write(w)
-    w.head.replication("subscribe")
-    await _caught_up(w, f"subscribed at {first}")
-
-    for revision in later:
+    for revision in ordered[ordered.index(REPLICATION_BASE) + 1 :]:
         await _migrate_head(w, revision)
         await _caught_up(w, f"{revision} on the head, before anyone writes")
         await _write(w)
@@ -542,7 +690,7 @@ async def test_every_revision_in_release_order(walk: Walk):
             arm.replication("publish")
             await _caught_up(w, f"{revision} on {arm.name}, before anyone writes")
             await _write(w)
-            w.head.replication("refresh")  # the hourly CronJob: copies tables first published now
+            await w.refresh()  # the hourly CronJob: copies tables first published now
             await _caught_up(w, f"{revision} on the head and {arm.name}")
 
     status = json.loads(w.head.replication("status"))
@@ -553,59 +701,80 @@ async def test_every_revision_in_release_order(walk: Walk):
         assert sub["apply_error_count"] == 0 and sub["sync_error_count"] == 0
         assert sub["tables_ready"] == len(await _published(arm.conn))
     for side in (w.head, *w.arms):
-        assert await side.conn.fetchval("SELECT version_num FROM public.alembic_version") == later[-1]
+        assert await side.conn.fetchval("SELECT version_num FROM public.alembic_version") == ordered[-1]
 
 
-@pytest.mark.parametrize("bare_octopus", [ARMS], indirect=True)
+@pytest.mark.parametrize("bare_octopus", [2], indirect=True)
 async def test_head_at_head_while_the_arms_step_up(walk: Walk):
-    """One deploy can take the head through every pending revision while its arms wait."""
+    """One deploy can take the head through every pending revision while its arms wait, each at its own revision."""
     w = walk
+    first, second = w.arms
     ordered = revisions()
     start = oldest_arm_revision_for_head_at_head()
-
-    _subscribe_at(w, start)
-    await _write(w)
-    w.head.replication("subscribe")
-    await _caught_up(w, f"subscribed at {start}")
+    await _start_at(w, start, only=first.name)
 
     await _migrate_head(w, "head")
     await _caught_up(w, f"the head at head, the arms at {start}, before anyone writes")
     await _write(w)
     await _caught_up(w, f"the head at head, the arms at {start}")
 
-    for arm in w.arms:
-        for revision in ordered[ordered.index(start) + 1 :]:
-            arm.migrate(revision)
-            arm.replication("publish")
-            w.head.replication("refresh")
-            await _write(w)
-            await _caught_up(w, f"the head at head, {arm.name} at {revision}")
+    # A second arm joins a head that holds the first arm's rows and its own.
+    await w.subscribe(only=second.name)
+    await _caught_up(w, f"{second.name} subscribed to a running head")
 
+    for revision in ordered[ordered.index(start) + 1 :]:
+        first.migrate(revision)
+        first.replication("publish")
+        await w.refresh()
+        await _write(w)
+        await _caught_up(w, f"the head at head, {first.name} at {revision}, {second.name} at {start}")
 
-@pytest.mark.parametrize("bare_octopus", [ARMS], indirect=True)
-async def test_out_of_order_changes_stop_an_arms_apply(walk: Walk):
-    """A column an arm sends and the head lacks stops that arm's apply until the head has it."""
-    w = walk
-    arm = w.arms[0]
-    _subscribe_at(w, "head")
+    # The second arm missed every release: one deploy takes it to head.
+    second.migrate("head")
+    second.replication("publish")
+    await w.refresh()
     await _write(w)
-    w.head.replication("subscribe")
-    await _caught_up(w, "subscribed at head")
+    await _caught_up(w, "every instance at head")
 
-    # Added on the arm first.
-    await arm.conn.execute("ALTER TABLE squirrel.tag_group ADD COLUMN zz_added text")
-    await arm.conn.execute("UPDATE squirrel.tag_group SET zz_added = 'new'")
-    await eventually(lambda: _more_errors(w, arm, 0))
+
+@pytest.mark.parametrize("bare_octopus", [2], indirect=True)
+async def test_out_of_order_changes_stop_only_that_arms_apply(walk: Walk):
+    """A column an arm sends and the head lacks stops that arm's apply, and only that arm's, until the head has it."""
+    w = walk
+    first, second = w.arms
+    await _start_at(w, "head")
+
+    # Added on an arm first.
+    await first.conn.execute("ALTER TABLE squirrel.tag_group ADD COLUMN zz_added text")
+    await first.conn.execute("UPDATE squirrel.tag_group SET zz_added = 'new'")
+    await eventually(lambda: _more_errors(w, first, 0))
+    await _write(w, arms=[second], head=False)
+    await eventually(lambda: _in_step(w, arms=[second]))
     await w.head.conn.execute("ALTER TABLE squirrel.tag_group ADD COLUMN zz_added text")
     await eventually(lambda: _in_step(w))
 
     # Dropped on the head first.
-    errors = await _errors(w, arm)
+    errors = await _errors(w, first)
     await w.head.conn.execute("ALTER TABLE squirrel.tag_group DROP COLUMN description")
-    await arm.conn.execute("UPDATE squirrel.tag_group SET description = 'edited'")
-    await eventually(lambda: _more_errors(w, arm, errors))
+    await first.conn.execute("UPDATE squirrel.tag_group SET description = 'edited'")
+    await eventually(lambda: _more_errors(w, first, errors))
+    assert not await _errors(w, second)
     await w.head.conn.execute("ALTER TABLE squirrel.tag_group ADD COLUMN description text")
+    # The head lost every owner's values in the drop: the first arm's come back with the
+    # change it was stuck on, the second arm's only once it sends its rows again.
+    assert not await _in_step(w)
+    await _rewrite(second.conn, ["squirrel.tag_group"])
     await eventually(lambda: _in_step(w))
+
+
+def test_the_base_is_the_ownership_revision():
+    """Replication starts where rows first carry their owner, and nothing below asks for a primary revision."""
+    ordered = revisions()
+    script = _script()
+    module = script.get_revision(REPLICATION_BASE).module
+    assert "owner_instance" in Path(module.__file__).read_text()
+    below = ordered[: ordered.index(REPLICATION_BASE)]
+    assert not [rev for rev in below if getattr(script.get_revision(rev).module, REQUIRES_PRIMARY_AT, None)]
 
 
 async def test_the_writer_meets_a_check_on_a_list_of_values(db):
