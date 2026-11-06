@@ -80,9 +80,9 @@ An instance writes only rows it owns:
   owner to send it to.
 - A new row belongs to the owner of what it's created in: a facility's parent, a
   PV's facilities, a snapshot's facility, a tag's group. A create with none of those
-  belongs to this instance. Creating a root facility, a PV, a PV import, a tag group,
-  a tag import or a Magpie config also takes `?owner=`; an instance accepts only its own name
-  there (a mirror forwards a create naming an arm to that arm). A create this
+  belongs to this instance. Creating a root facility, a PV, a PV import, a snapshot, a meta-PV
+  marker, a tag group, a tag import or a Magpie config also takes `?owner=`; an instance accepts only its own name
+  there (a mirror's router forwards the creates it routes to that arm). A create this
   instance wouldn't own answers `403 not_owner`.
 - A request that links rows of different owners (a PV with another owner's tag or
   facility, a facility under another owner's parent, an import whose rows span

@@ -14,7 +14,7 @@ from canopy.jobs import gateway as jobs_gateway
 from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
 from canopy.core.security import WriteKeyDep, require_read_access, require_write_access
 from canopy.contracts.jobs import JobCreatedDTO
-from canopy.core.ownership import require_create_owner
+from canopy.core.ownership import OwnerQuery, require_create_owner
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.time_parse import DateTimeBound
 from canopy.core.validation import require_uuid
@@ -131,10 +131,11 @@ async def create_snapshot(
             ),
         ),
     ] = False,
+    owner: OwnerQuery = None,
 ) -> JobCreatedDTO:
     """Enqueue a snapshot of the facility's PVs (every PV this instance owns if no
     facility is given). The worker reads EPICS and persists it. The snapshot is owned by
-    its facility's owner, else by this instance."""
+    its facility's owner, else by this instance; ``owner`` accepts only this instance's name."""
     # The facility gate has to run *here*, not in the service: nothing of the caller's
     # identity crosses the Arq boundary, and a refused write must not become a queued job.
     # The owner check too, so a snapshot this instance wouldn't own is refused at once.
@@ -145,7 +146,7 @@ async def create_snapshot(
         if facility_id is None:
             raise FacilityNotFound(f"Facility '{data.facility}' not found")
         facility_owner = (await facilities_gateway.owners_by_id({facility_id})).get(facility_id)
-    require_create_owner(facility_owner, None, f"A snapshot of {data.facility}")
+    require_create_owner(facility_owner, owner, f"A snapshot of {data.facility or 'every PV'}")
 
     key_scope = await facilities_gateway.resolve_key_facility_scope(key.facilities)
     if key_scope is not None:
