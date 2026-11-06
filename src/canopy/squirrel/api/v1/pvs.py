@@ -12,6 +12,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from canopy.core.errors import BadRequest
 from canopy.core.security import require_read_access, require_write_access
+from canopy.core.ownership import OwnerQuery
 from canopy.core.validation import require_uuid, parse_continuation_token
 from canopy.squirrel.errors import PvNotFound
 from canopy.squirrel.schemas.pv import (
@@ -117,15 +118,18 @@ async def get_all_devices(service: PvServiceDep) -> list[str]:
 
 
 @router.post("", dependencies=[Security(require_write_access)])
-async def create_pv(data: NewPVElementDTO, service: PvServiceDep) -> PVElementDTO:
-    """Create a new PV."""
-    return await service.create(data)
+async def create_pv(data: NewPVElementDTO, service: PvServiceDep, owner: OwnerQuery = None) -> PVElementDTO:
+    """Create a new PV, owned by its facilities' owner, else by ``owner`` or this instance."""
+    return await service.create(data, owner)
 
 
 @router.post("/multi", dependencies=[Security(require_write_access)])
-async def create_multiple_pvs(data: list[NewPVElementDTO], service: PvServiceDep) -> list[PVElementDTO]:
-    """Bulk-create PVs (CSV import)."""
-    return await service.create_many(data)
+async def create_multiple_pvs(
+    data: list[NewPVElementDTO], service: PvServiceDep, owner: OwnerQuery = None
+) -> list[PVElementDTO]:
+    """Bulk-create PVs (CSV import). One import has one owner: its facilities', else this instance.
+    ``owner`` accepts only this instance's name."""
+    return await service.create_many(data, owner)
 
 
 @router.put("/{pv_id}", dependencies=[Security(require_write_access)])
@@ -151,9 +155,9 @@ async def delete_pv(pv_id: str, service: PvServiceDep) -> bool:
 
 
 @router.post("/meta", dependencies=[Security(require_write_access)])
-async def add_meta_pv(pvInfo: NewMetaPVDTO, service: PvServiceDep) -> MetaPVDTO:
-    """Promote an existing PV (by address) to a meta-PV."""
-    return await service.add_meta_pv(pvInfo.pv_name, pvInfo.display_name)
+async def add_meta_pv(pvInfo: NewMetaPVDTO, service: PvServiceDep, owner: OwnerQuery = None) -> MetaPVDTO:
+    """Promote one of this instance's PVs (by address) to a meta-PV. ``owner`` accepts only this instance's name."""
+    return await service.add_meta_pv(pvInfo.pv_name, pvInfo.display_name, owner)
 
 
 @router.get("/meta", dependencies=[Security(require_read_access)])

@@ -17,6 +17,8 @@ class FacilityDTO(CanopyModel):
     name: str
     description: str | None = None
     parent: str | None = None
+    # The instance that created the facility and alone writes it (``canopy.core.ownership``).
+    owner_instance: str
 
 
 class FacilityAccessDTO(CanopyModel):
