@@ -152,6 +152,9 @@ class Snapshot(UUIDMixin, TimestampMixin, OwnedMixin, Base):
 
     __tablename__ = "snapshot"
     __table_args__ = (
+        # Serves the newest-first keyset listing (scanned backward) and range scans by
+        # creation time, such as a cutoff for pruning old snapshots.
+        Index("ix_squirrel_snapshot_created_at_id", "created_at", "id"),
         Index("ix_squirrel_snapshot_owner_instance", "owner_instance"),
         {"schema": SQUIRREL_SCHEMA},
     )
