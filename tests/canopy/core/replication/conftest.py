@@ -1,23 +1,29 @@
-"""Fixtures for the replication commands' single-database tests.
+"""Fixtures for the replication tests: one database, or two arms and a head.
 
-A dedicated database, ``canopy_replication_test`` (publications and default
+``db``: a dedicated database, ``canopy_replication_test`` (publications and default
 privileges belong to one database, so this keeps them away from ``canopy_test``),
 with every registered schema rebuilt per test from ``Base.metadata``. Roles are
 cluster-wide, so each test gets uniquely named ones and drops them afterwards.
 Skips rather than fails when Postgres is unreachable, like the other database tests.
+None of those tests need ``wal_level = logical``: Postgres creates a publication
+without it (with a warning).
 
-None of these need ``wal_level = logical``: Postgres creates a publication without
-it (with a warning). Subscribing needs a second server: the tests marked
-``requires_pair`` run against two (``docker-compose.yml`` here starts them).
+``octopus``: arms (primaries) and a head (a mirror) on separate Postgres 16
+servers, for the end-to-end tests. Opt-in: it skips unless the
+``CANOPY_TEST_REPLICATION_*`` variables point at the servers, as
+``docker-compose.yml`` in this directory starts them.
 """
 
 import os
 import asyncio
 from uuid import uuid4
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 import pytest
 import asyncpg
 import pytest_asyncio
+from pydantic import SecretStr
 from sqlalchemy import text
 from sqlalchemy.pool import NullPool
 from prometheus_client import CollectorRegistry, generate_latest
@@ -30,43 +36,17 @@ import canopy.magpie.data.models  # noqa: F401
 import canopy.squirrel.data.models  # noqa: F401
 import canopy.core.facilities.models  # noqa: F401
 from canopy.core.db import Base
+from canopy.core.arms import Arm, ArmsConfig, subscription_name
+from canopy.core.replication.drift import SESSION
 from canopy.core.replication.config import ReplicationConfig
 from canopy.core.replication.metrics import ReplicationCollector
 from canopy.core.replication.registry import REGISTRY
+from canopy.core.replication.publisher import publish
+from canopy.core.replication.subscriber import grants, subscribe, subscriber_status
 
 _ADMIN_DSN = os.environ.get("CANOPY_TEST_ADMIN_DSN", "postgresql://canopy:canopy@localhost:5432/postgres")
 _DB_NAME = "canopy_replication_test"
 DB_DSN = make_url(_ADMIN_DSN).set(database=_DB_NAME).render_as_string(hide_password=False)
-
-# A primary (wal_level=logical) and a mirror on two servers, for the end-to-end tests.
-PUBLISHER_ADMIN = os.environ.get("CANOPY_TEST_REPLICATION_PUBLISHER_DSN")
-SUBSCRIBER_ADMIN = os.environ.get("CANOPY_TEST_REPLICATION_SUBSCRIBER_DSN")
-# How the mirror's server reaches the primary's: libpq key=value, without dbname/user/password.
-PUBLISHER_CONNINFO = os.environ.get("CANOPY_TEST_REPLICATION_PUBLISHER_CONNINFO")
-
-requires_pair = pytest.mark.skipif(
-    not (PUBLISHER_ADMIN and SUBSCRIBER_ADMIN and PUBLISHER_CONNINFO),
-    reason="set CANOPY_TEST_REPLICATION_{PUBLISHER_DSN,SUBSCRIBER_DSN,PUBLISHER_CONNINFO}; see docker-compose.yml here",
-)
-
-
-def server_dsn(admin: str, *, database: str, user: str | None = None, password: str | None = None) -> str:
-    """``admin`` pointed at ``database``, optionally as another user."""
-    url = make_url(admin).set(database=database)
-    if user is not None:
-        url = url.set(username=user, password=password)
-    return url.render_as_string(hide_password=False)
-
-
-async def eventually(check, timeout: float = 60.0):
-    """Await ``check()`` until it returns something truthy; fail after ``timeout`` seconds."""
-    deadline = asyncio.get_running_loop().time() + timeout
-    while True:
-        if result := await check():
-            return result
-        if asyncio.get_running_loop().time() > deadline:
-            pytest.fail(f"condition not met within {timeout}s")
-        await asyncio.sleep(0.2)
 
 
 async def build_schema(dsn: str) -> None:
@@ -164,3 +144,287 @@ async def direct_grants(conn: asyncpg.Connection, role: str, table: str) -> set[
         table,
     )
     return {row["privilege_type"] for row in rows}
+
+
+# --------------------------------------------------------------------------- #
+# Two arms and a head
+# --------------------------------------------------------------------------- #
+
+# Per arm: its server as a superuser, from here; and how the head's server reaches
+# it (libpq key=value, without dbname, user or password). Then the head's server.
+ARM_SERVERS = [
+    (os.environ.get("CANOPY_TEST_REPLICATION_ARM1_DSN"), os.environ.get("CANOPY_TEST_REPLICATION_ARM1_CONNINFO")),
+    (os.environ.get("CANOPY_TEST_REPLICATION_ARM2_DSN"), os.environ.get("CANOPY_TEST_REPLICATION_ARM2_CONNINFO")),
+]
+HEAD_SERVER = os.environ.get("CANOPY_TEST_REPLICATION_HEAD_DSN")
+
+
+def server_dsn(admin: str, *, database: str, user: str | None = None, password: str | None = None) -> str:
+    """``admin``'s server, at ``database``, optionally as another user."""
+    url = make_url(admin).set(database=database)
+    if user is not None:
+        url = url.set(username=user, password=password)
+    return url.render_as_string(hide_password=False)
+
+
+async def eventually(check, timeout: float = 60.0):
+    """Await ``check()`` until it returns something truthy; fail after ``timeout`` seconds."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        if result := await check():
+            return result
+        if asyncio.get_running_loop().time() > deadline:
+            pytest.fail(f"condition not met within {timeout}s")
+        await asyncio.sleep(0.2)
+
+
+@dataclass
+class ArmSide:
+    """One arm: a primary, set up the way prod's are (a superuser owns its tables)."""
+
+    name: str  # the arm's CANOPY_INSTANCE; its subscription on the head is canopy_history_<name>
+    admin: asyncpg.Connection  # the arm's database, as a superuser
+    dsn: str  # the arm's database, as a superuser
+    replicator: str  # its replication role, which the head's subscription connects as
+    reader: str  # its read-only role
+    publisher_dsn: str  # what the head's server uses to reach it, as the replicator (a secret)
+
+
+@dataclass
+class Head:
+    """The head: a mirror whose tables belong to an ordinary owner role granted
+    ``pg_create_subscription``, which runs the head-side commands."""
+
+    name: str  # the head's CANOPY_INSTANCE
+    admin: asyncpg.Connection  # the head's database, as a superuser
+    conn: asyncpg.Connection  # the head's database, as the tables' owner
+    dsn: str  # the head's database, as the tables' owner
+    owner: str
+    app: str  # the role the head's API would connect as
+
+
+@dataclass
+class Octopus:
+    arms: dict[str, ArmSide]  # by arm name, in arm order
+    head: Head
+    config: ReplicationConfig  # role names; the same on every server
+    arms_config: ArmsConfig  # what the head's settings would hold
+
+    @property
+    def arm(self) -> ArmSide:
+        """The first arm: the only one in a one-arm test."""
+        return next(iter(self.arms.values()))
+
+    async def connect_arm(self, name: str) -> asyncpg.Connection:
+        """An arm's database from here, for the commands' checks that read an arm.
+
+        The arms' connection strings name each server as the head's server sees it,
+        which isn't reachable from the test process.
+        """
+        return await asyncpg.connect(self.arms[name].dsn)
+
+
+@asynccontextmanager
+async def _topology(count: int, *, schema: bool):
+    """``count`` arms and a head, with every table built when ``schema`` is set.
+
+    Every database, role and arm name is fresh; on exit the head's subscriptions
+    (and so their slots on the arms), the databases and the roles are dropped.
+    """
+    servers = ARM_SERVERS[:count]
+    if not HEAD_SERVER or not all(admin and conninfo for admin, conninfo in servers):
+        pytest.skip(
+            f"set CANOPY_TEST_REPLICATION_ARM{{1..{count}}}_DSN and _CONNINFO and CANOPY_TEST_REPLICATION_HEAD_DSN; "
+            "see docker-compose.yml here"
+        )
+    suffix = uuid4().hex[:8]
+    replicator, reader, owner, app = (f"rt_{role}_{suffix}" for role in ("replicator", "reader", "owner", "app"))
+    replicator_pw, owner_pw = uuid4().hex, uuid4().hex
+    head_db = f"rt_head_{suffix}"
+    cleanup = []
+    topology: Octopus | None = None
+
+    head_server = await asyncpg.connect(HEAD_SERVER)
+    try:
+        await head_server.execute(f"CREATE ROLE \"{owner}\" LOGIN PASSWORD '{owner_pw}'")
+        await head_server.execute(f'GRANT pg_create_subscription TO "{owner}"')
+        await head_server.execute(f'CREATE ROLE "{app}" LOGIN')
+        await head_server.execute(f'CREATE DATABASE "{head_db}" OWNER "{owner}"')
+        head_dsn = server_dsn(HEAD_SERVER, database=head_db, user=owner, password=owner_pw)
+        if schema:
+            await build_schema(head_dsn)
+
+        arms: dict[str, ArmSide] = {}
+        for index, (admin, conninfo) in enumerate(servers, start=1):
+            name, arm_db = f"arm{index}_{suffix}", f"rt_arm{index}_{suffix}"
+            arm_server = await asyncpg.connect(admin)
+            cleanup.append((arm_server, arm_db))
+            await arm_server.execute(f'CREATE DATABASE "{arm_db}"')
+            await arm_server.execute(f"CREATE ROLE \"{replicator}\" REPLICATION LOGIN PASSWORD '{replicator_pw}'")
+            await arm_server.execute(f'CREATE ROLE "{reader}" LOGIN')
+            arm_dsn = server_dsn(admin, database=arm_db)
+            if schema:
+                await build_schema(arm_dsn)
+            arms[name] = ArmSide(
+                name=name,
+                admin=await asyncpg.connect(arm_dsn),
+                dsn=arm_dsn,
+                replicator=replicator,
+                reader=reader,
+                publisher_dsn=f"{conninfo} dbname={arm_db} user={replicator} password={replicator_pw}",
+            )
+        topology = Octopus(
+            arms=arms,
+            head=Head(
+                name=f"head_{suffix}",
+                admin=await asyncpg.connect(server_dsn(HEAD_SERVER, database=head_db)),
+                conn=await asyncpg.connect(head_dsn),
+                dsn=head_dsn,
+                owner=owner,
+                app=app,
+            ),
+            config=ReplicationConfig(replicator_role=replicator, reader_role=reader, app_role=app),
+            arms_config=ArmsConfig(
+                arms={name: Arm(publisher_dsn=SecretStr(arm.publisher_dsn)) for name, arm in arms.items()}
+            ),
+        )
+        yield topology
+    finally:
+        if topology is not None:
+            # Dropping a subscription also drops its slot on the arm.
+            for name in topology.arms:
+                await topology.head.admin.execute(f'DROP SUBSCRIPTION IF EXISTS "{subscription_name(name)}"')
+            for conn in (topology.head.admin, topology.head.conn, *(arm.admin for arm in topology.arms.values())):
+                await conn.close()
+        for arm_server, arm_db in cleanup:
+            await arm_server.execute(
+                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE database = $1", arm_db
+            )
+            await arm_server.execute(f'DROP DATABASE IF EXISTS "{arm_db}" WITH (FORCE)')
+            await drop_roles(arm_server, [replicator, reader])
+            await arm_server.close()
+        await head_server.execute(f'DROP DATABASE IF EXISTS "{head_db}" WITH (FORCE)')
+        await drop_roles(head_server, [owner, app])
+        await head_server.close()
+
+
+@pytest_asyncio.fixture
+async def octopus(request):
+    """Arms and a head on their own servers, each with every table built.
+
+    Parametrize it indirectly with the number of arms (1 or 2; 2 by default).
+    """
+    async with _topology(getattr(request, "param", 2), schema=True) as topology:
+        yield topology
+
+
+@pytest_asyncio.fixture
+async def bare_octopus(request):
+    """``octopus`` with empty databases, for tests that build the schema with Alembic.
+
+    The roles and databases are the same: the head's database belongs to its owner
+    role, so a migration run as that role (``head.dsn``) owns what it creates, as in
+    production. Parametrize it indirectly with the number of arms, like ``octopus``.
+    """
+    async with _topology(getattr(request, "param", 2), schema=False) as topology:
+        yield topology
+
+
+async def copied(octopus: Octopus, arm: str) -> bool:
+    """Whether the head's subscription to ``arm`` has finished every table's initial copy."""
+    status = await subscriber_status(octopus.head.admin, arms=octopus.arms_config.arms, only=arm)
+    sub = status["subscriptions"][0]
+    return sub["exists"] and sub["tables_ready"] == len(REGISTRY.replicated) and not sub["tables_not_ready"]
+
+
+async def seed_rows(conn: asyncpg.Connection, owner: str, *, slug: str | None = None) -> dict[str, str]:
+    """One row in every replicated table, all owned by ``owner``; returns their ids.
+
+    The PV's setpoint address and the tag group's name are the same for every owner
+    (both are unique per owner); facility and Magpie slugs, unique everywhere, are
+    ``slug`` (``owner`` by default).
+    """
+    slug = slug or owner
+    ids = {name: str(uuid4()) for name in ("facility", "group", "tag_a", "tag_b", "pv", "snapshot", "value", "config")}
+    await conn.execute(
+        "INSERT INTO core.facility (id, slug, name, owner_instance) VALUES ($1, $2, 'Facility', $3)",
+        ids["facility"],
+        f"fac_{slug}",
+        owner,
+    )
+    await conn.execute(
+        "INSERT INTO squirrel.tag_group (id, name, owner_instance) VALUES ($1, 'Area', $2)", ids["group"], owner
+    )
+    await conn.execute(
+        "INSERT INTO squirrel.tag (id, name, group_id) VALUES ($1, 'Injector', $3), ($2, 'Linac', $3)",
+        ids["tag_a"],
+        ids["tag_b"],
+        ids["group"],
+    )
+    await conn.execute(
+        "INSERT INTO squirrel.pv (id, setpoint_address, device, owner_instance) "
+        "VALUES ($1, 'SIM:PV:1:SETPOINT', 'SIM:DEV:1', $2)",
+        ids["pv"],
+        owner,
+    )
+    await conn.execute("INSERT INTO squirrel.pv_tag (pv_id, tag_id) VALUES ($1, $2)", ids["pv"], ids["tag_a"])
+    await conn.execute(
+        "INSERT INTO squirrel.pv_facility (pv_id, facility_id) VALUES ($1, $2)", ids["pv"], ids["facility"]
+    )
+    await conn.execute("INSERT INTO squirrel.meta_pv (pv_id, display_name) VALUES ($1, 'Meta')", ids["pv"])
+    await conn.execute(
+        "INSERT INTO squirrel.snapshot (id, title, facility_id, owner_instance) VALUES ($1, 'Before', $2, $3)",
+        ids["snapshot"],
+        ids["facility"],
+        owner,
+    )
+    await conn.execute(
+        "INSERT INTO squirrel.snapshot_value (id, snapshot_id, pv_id, pv_name, setpoint_value) "
+        """VALUES ($1, $2, $3, 'SIM:PV:1:SETPOINT', '{"value": 1.0}')""",
+        ids["value"],
+        ids["snapshot"],
+        ids["pv"],
+    )
+    await conn.execute(
+        "INSERT INTO magpie.config (id, slug, app, data, owner_instance) VALUES ($1, $2, 'trace', '{}', $3)",
+        ids["config"],
+        f"cfg_{slug}"[:16],
+        owner,
+    )
+    return ids
+
+
+async def _reader_dsn(octopus: Octopus, arm: str) -> str:
+    """``arm`` as its read-only reader role, which ``publish`` granted SELECT on the published tables."""
+    side = octopus.arms[arm]
+    password = uuid4().hex
+    await side.admin.execute(f"ALTER ROLE \"{side.reader}\" PASSWORD '{password}'")
+    return server_dsn(side.dsn, database=make_url(side.dsn).database, user=side.reader, password=password)
+
+
+async def _arm_connections(octopus: Octopus, arm: str) -> tuple[asyncpg.Connection, asyncpg.Connection]:
+    """``drift-check``'s connections for ``arm``: the arm as its reader role, and the head."""
+    primary = await asyncpg.connect(await _reader_dsn(octopus, arm), server_settings=SESSION)
+    mirror = await asyncpg.connect(octopus.head.dsn, server_settings=SESSION)
+    return primary, mirror
+
+
+async def _subscribed(octopus: Octopus, arm: str | None = None) -> dict[str, str]:
+    """Publish and seed ``arm`` (the first by default), subscribe the head to it, and wait for the copy.
+
+    Returns the seeded ids (``seed_rows``), owned by the arm.
+    """
+    side = octopus.arms[arm or octopus.arm.name]
+    await publish(side.admin, role="primary", config=octopus.config)
+    ids = await seed_rows(side.admin, side.name)
+    await grants(octopus.head.conn, role="mirror", head=octopus.head.name, config=octopus.config)
+    await subscribe(
+        octopus.head.conn,
+        role="mirror",
+        head=octopus.head.name,
+        arms=octopus.arms_config.arms,
+        only=side.name,
+        connect_arm=octopus.connect_arm,
+    )
+    await eventually(lambda: copied(octopus, side.name))
+    return ids
