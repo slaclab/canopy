@@ -288,3 +288,18 @@ class TestDeactivate:
 
         assert resp.status_code == 200
         assert resp.json()["isActive"] is False
+
+
+class TestOnAMirror:
+    """``core.api_key`` is never replicated, so a read-only mirror still manages its own keys."""
+
+    async def test_admin_can_mint_list_and_deactivate(self, session, session_maker, keys_client, mirror_role):
+        with db_backed_registry(env="admin-env-key:admin@*"):
+            created = keys_client.post("/v1/api-keys", json={"appName": "trace", "read": True}, headers=ADMIN_HEADERS)
+            listed = keys_client.get("/v1/api-keys", headers=ADMIN_HEADERS)
+            deactivated = keys_client.delete(f"/v1/api-keys/{created.json()['id']}", headers=ADMIN_HEADERS)
+
+        assert created.status_code == 200, created.text
+        assert [key["appName"] for key in listed.json()] == ["trace"]
+        assert deactivated.status_code == 200
+        assert deactivated.json()["isActive"] is False
