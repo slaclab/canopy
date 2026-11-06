@@ -1,9 +1,14 @@
-"""The mirror's side: subscribe to the primary, pick up new tables, grant the app role, report.
+"""The head's side: subscribe to each arm, pick up new tables, grant the app role, report.
 
-Order on a mirror's deploy: ``alembic upgrade head``, then ``grants``, then
-``refresh``. ``subscribe`` runs once, after the first migration, and is a no-op
-afterwards. The mirror always migrates before its primary, so it never lacks a
-table the primary publishes.
+A head (``CANOPY_ROLE=mirror``) holds one subscription per arm, named
+``canopy_history_<arm>`` (``canopy.core.arms``). ``subscribe``, ``refresh`` and
+``subscriber_status`` act on every configured arm, or on the one named with
+``only``; one arm failing doesn't stop the rest.
+
+Order on a head's deploy: ``alembic upgrade head``, then ``grants``, then
+``refresh``. ``subscribe`` runs once per arm, after the first migration, and is a
+no-op for an arm already subscribed. The head always migrates before its arms, so
+it never lacks a table an arm publishes.
 
 Postgres runs ``CREATE SUBSCRIPTION`` (when it creates the slot) and
 ``ALTER SUBSCRIPTION ... REFRESH`` only outside a transaction, which is how asyncpg
@@ -12,11 +17,12 @@ executes a bare statement.
 
 from __future__ import annotations
 
-import re
 import logging
+from collections.abc import Mapping
 
 import asyncpg
 
+from canopy.core.arms import Arm, subscription_name
 from canopy.core.replication.sql import (
     Refused,
     ReplicationError,
@@ -40,28 +46,57 @@ from canopy.core.replication.registry import EXCLUDED, REGISTRY, ReplicationRegi
 
 logger = logging.getLogger(__name__)
 
-_SUBSCRIPTION_PREFIX = "canopy_history_"
-_INSTANCE_NAME = re.compile(r"[a-z0-9_]+")
-_MAX_IDENTIFIER_BYTES = 63
 _TABLE_STATES = {"i": "initialize", "d": "copying", "f": "copied", "s": "synchronized", "r": "ready"}
 
 
-def subscription_name(instance: str | None) -> str:
-    """``canopy_history_<instance>``, the subscription (and the slot on the primary) for this mirror.
+def _selected_arms(arms: Mapping[str, Arm], only: str | None, head: str | None = None) -> list[str]:
+    """The arms a command acts on: every configured arm, or ``only``.
 
     Raises
     ------
     Refused
-        When ``CANOPY_INSTANCE`` is unset or isn't lowercase letters, digits and underscores.
+        When no arm is configured, ``only`` isn't one of them, or an arm has the
+        head's own name (an instance can't subscribe to itself).
     """
-    if not instance:
-        raise Refused("set CANOPY_INSTANCE to this instance's name; the subscription is named after it")
-    if not _INSTANCE_NAME.fullmatch(instance):
-        raise Refused(f"CANOPY_INSTANCE={instance!r} must be lowercase letters, digits and underscores")
-    name = _SUBSCRIPTION_PREFIX + instance
-    if len(name.encode()) > _MAX_IDENTIFIER_BYTES:
-        raise Refused(f"subscription name {name!r} exceeds Postgres's {_MAX_IDENTIFIER_BYTES}-byte limit")
-    return name
+    if not arms:
+        raise Refused("no arms are configured; set CANOPY_ARMS__<arm>__PUBLISHER_DSN for each arm")
+    if only is not None and only not in arms:
+        raise Refused(f"no arm named {only!r} is configured (configured: {', '.join(sorted(arms))})")
+    if head is not None and head in arms:
+        raise Refused(f"arm {head!r} has this head's own name (CANOPY_INSTANCE); an instance can't subscribe to itself")
+    return [only] if only is not None else sorted(arms)
+
+
+async def _history_subscriptions(conn: asyncpg.Connection) -> list[str]:
+    """Names of every ``canopy_history_*`` subscription in this database."""
+    rows = await conn.fetch(
+        """
+        SELECT subname FROM pg_subscription
+        WHERE subname LIKE 'canopy\\_history\\_%'
+          AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+        ORDER BY subname
+        """
+    )
+    return [row["subname"] for row in rows]
+
+
+def _unexpected(subscriptions: list[str], arms: Mapping[str, Arm]) -> list[str]:
+    """History subscriptions whose arm isn't configured (an arm that was removed)."""
+    expected = {subscription_name(arm) for arm in arms}
+    return [name for name in subscriptions if name not in expected]
+
+
+def _in_order(results: list[dict], arms: list[str]) -> list[dict]:
+    """Per-arm results in arm order, whatever order they were produced in."""
+    return sorted(results, key=lambda result: arms.index(result["arm"]))
+
+
+def _warn_on_unexpected(subscriptions: list[str], arms: Mapping[str, Arm]) -> None:
+    for name in _unexpected(subscriptions, arms):
+        logger.warning(
+            "Subscription %s belongs to no configured arm; drop it if that arm was removed (see the history guide)",
+            name,
+        )
 
 
 async def _subscription(conn: asyncpg.Connection, name: str) -> asyncpg.Record | None:
@@ -129,60 +164,88 @@ async def subscribe(
     conn: asyncpg.Connection,
     *,
     role: str,
-    instance: str | None,
-    config: ReplicationConfig,
+    head: str | None,
+    arms: Mapping[str, Arm],
+    only: str | None = None,
     registry: ReplicationRegistry = REGISTRY,
 ) -> dict:
-    """Create this mirror's subscription to the primary, copying every published table.
+    """Create the head's subscription to each arm, copying every table the arm publishes.
 
-    Idempotent: when the subscription exists, logs where it differs from what this
-    would create and changes nothing. Doesn't wait for the initial copy; ``status``
-    shows its progress.
+    Idempotent: an arm already subscribed gets a log of where its subscription
+    differs from what this would create, and nothing changes. Every selected arm is
+    checked before any subscription is created; a ``CREATE SUBSCRIPTION`` that then
+    fails for one arm is reported and the others still go ahead. Doesn't wait for
+    the initial copies; ``status`` shows their progress.
+
+    Until rows carry their owner, a head subscribes to one arm: a second arm's copy
+    would land in tables that already hold the first arm's rows, and the checks
+    that tell those apart arrive with the owner column.
 
     Run it as the role that owns the tables, granted ``pg_create_subscription``:
     Postgres 16 applies changes as each table's owner, which then needs no superuser.
     As a superuser it also stops this session's failed statements from being written
-    to the server log, which would otherwise record the connection string.
+    to the server log, which would otherwise record a connection string.
 
     Parameters
     ----------
     conn : asyncpg.Connection
-        Connection to the mirror's database.
+        Connection to the head's database.
     role : str
         This instance's ``CANOPY_ROLE``; must be ``"mirror"``.
-    instance : str | None
-        ``CANOPY_INSTANCE``; names the subscription.
-    config : ReplicationConfig
-        Supplies ``publisher_dsn``.
+    head : str | None
+        The head's own ``CANOPY_INSTANCE``; no arm may share it.
+    arms : Mapping[str, Arm]
+        The configured arms, keyed by name; each needs a ``publisher_dsn``.
+    only : str | None
+        Subscribe to this arm only.
     registry : ReplicationRegistry
         Publications to subscribe to, and the tables that must be empty first.
 
     Returns
     -------
     dict
-        ``name``, ``created`` and, when just created, the table states.
+        ``subscriptions``: per arm, ``arm``, ``name``, ``created`` and, when just
+        created, the table states.
 
     Raises
     ------
     Refused
-        Wrong role, missing settings, Postgres older than 16, insufficient privileges,
-        or a replicated table that already has rows.
+        Wrong role, no arm (or an unknown one), an arm without a ``publisher_dsn`` or
+        with the head's name, Postgres older than 16, insufficient privileges, a
+        second arm, or a replicated table that already has rows. Nothing was created.
     ReplicationError
-        ``CREATE SUBSCRIPTION`` failed (message redacted).
+        ``CREATE SUBSCRIPTION`` failed for at least one arm (messages redacted); the
+        others were created.
     """
     require_role("subscribe", "mirror", role)
-    name = subscription_name(instance)
-    if config.publisher_dsn is None or not config.publisher_dsn.get_secret_value():
-        raise Refused("set CANOPY_REPLICATION__PUBLISHER_DSN to the primary's connection string (from a secret)")
-    dsn = config.publisher_dsn.get_secret_value()
+    selected = _selected_arms(arms, only, head)
+    if lacking := [
+        arm for arm in selected if not (arms[arm].publisher_dsn and arms[arm].publisher_dsn.get_secret_value())
+    ]:
+        raise Refused("set CANOPY_ARMS__<arm>__PUBLISHER_DSN (from a secret) for " + ", ".join(lacking))
     if int(await conn.fetchval("SHOW server_version_num")) < 160000:
         raise Refused("subscribe needs Postgres 16 or later (streaming = parallel)")
 
-    if (sub := await _subscription(conn, name)) is not None:
-        logger.info("Subscription %s already exists; nothing to do", name)
-        _warn_on_drift(sub, registry)
-        return {"name": name, "created": False}
+    existing = await _history_subscriptions(conn)
+    _warn_on_unexpected(existing, arms)
+    results = []
+    to_create = []
+    for arm in selected:
+        name = subscription_name(arm)
+        if name in existing:
+            logger.info("Subscription %s already exists; nothing to do", name)
+            _warn_on_drift(await _subscription(conn, name), registry)
+            results.append({"arm": arm, "name": name, "created": False})
+        else:
+            to_create.append(arm)
+    if not to_create:
+        return {"subscriptions": _in_order(results, selected)}
 
+    if len(set(existing) | {subscription_name(arm) for arm in to_create}) > 1:
+        raise Refused(
+            "a head subscribes to one arm until rows carry their owner: a second arm's copy would land in "
+            "tables that already hold the first arm's rows"
+        )
     present = await tables_present(conn, registry.schemas)
     if missing := sorted(set(registry.replicated) - present):
         logger.info("Not in this database yet, not copied: %s", ", ".join(missing))
@@ -208,52 +271,97 @@ async def subscribe(
         )
 
     publications = ", ".join(quote_ident(p.name) for p in registry.publications)
-    try:
-        await conn.execute(
-            f"CREATE SUBSCRIPTION {quote_ident(name)} CONNECTION {quote_literal(dsn)} "
-            f"PUBLICATION {publications} WITH (copy_data = true, streaming = parallel)"
-        )
-    except asyncpg.PostgresError as exc:
-        raise ReplicationError(f"CREATE SUBSCRIPTION failed: {redact(str(exc), [dsn])}") from None
-    sub = await _subscription(conn, name)
-    tables = await _subscribed_tables(conn, sub["oid"])
-    logger.info("Created subscription %s; initial copy of %d tables started", name, len(tables))
-    return {"name": name, "created": True, "tables": tables}
+    failures = []
+    for arm in to_create:
+        name = subscription_name(arm)
+        dsn = arms[arm].publisher_dsn.get_secret_value()
+        try:
+            await conn.execute(
+                f"CREATE SUBSCRIPTION {quote_ident(name)} CONNECTION {quote_literal(dsn)} "
+                f"PUBLICATION {publications} WITH (copy_data = true, streaming = parallel)"
+            )
+        except asyncpg.PostgresError as exc:
+            message = redact(str(exc), [dsn])
+            logger.error("Arm %s: CREATE SUBSCRIPTION failed: %s", arm, message)
+            failures.append(f"{arm}: {message}")
+            continue
+        sub = await _subscription(conn, name)
+        tables = await _subscribed_tables(conn, sub["oid"])
+        logger.info("Created subscription %s; initial copy of %d tables started", name, len(tables))
+        results.append({"arm": arm, "name": name, "created": True, "tables": tables})
+    if failures:
+        raise ReplicationError(f"CREATE SUBSCRIPTION failed for {'; '.join(failures)}")
+    return {"subscriptions": _in_order(results, selected)}
 
 
 async def refresh(
-    conn: asyncpg.Connection, *, role: str, instance: str | None, registry: ReplicationRegistry = REGISTRY
+    conn: asyncpg.Connection,
+    *,
+    role: str,
+    arms: Mapping[str, Arm],
+    only: str | None = None,
+    registry: ReplicationRegistry = REGISTRY,
 ) -> dict:
-    """Pick up tables the primary has started publishing, with their initial copy.
+    """Pick up tables each arm has started publishing, with their initial copy.
 
-    A no-op with a notice when the subscription doesn't exist yet: the first deploy's
-    migration Job runs before the one-time ``subscribe``.
+    Each arm is refreshed on its own: one that can't be reached is reported and the
+    others still go ahead. An arm without a subscription yet gets a notice, not an
+    error: the first deploy's migration Job runs before the one-time ``subscribe``.
+
+    Returns
+    -------
+    dict
+        ``subscriptions``: per arm, ``arm``, ``name``, ``refreshed`` and, when
+        refreshed, the tables ``added`` and ``removed``.
 
     Raises
     ------
     Refused
-        Wrong role, or a table about to get its initial copy already has rows.
+        Wrong role, no arm (or an unknown one), or a table about to get its initial
+        copy already has rows. Nothing was refreshed.
+    ReplicationError
+        The refresh failed for at least one arm; the others were refreshed.
     """
     require_role("refresh", "mirror", role)
-    name = subscription_name(instance)
-    if (sub := await _subscription(conn, name)) is None:
-        logger.info("No subscription %s yet; nothing to refresh (run `subscribe` first)", name)
-        return {"name": name, "refreshed": False}
-    _warn_on_drift(sub, registry)
-
-    before = await _subscribed_tables(conn, sub["oid"])
+    selected = _selected_arms(arms, only)
+    existing = await _history_subscriptions(conn)
+    _warn_on_unexpected(existing, arms)
     present = await tables_present(conn, registry.schemas)
-    await _require_empty(conn, sorted((set(registry.replicated) & present) - set(before)), "refresh")
-    await conn.execute(f"ALTER SUBSCRIPTION {quote_ident(name)} REFRESH PUBLICATION WITH (copy_data = true)")
-    after = await _subscribed_tables(conn, sub["oid"])
-    added, removed = sorted(set(after) - set(before)), sorted(set(before) - set(after))
-    if added:
-        logger.info("Subscription %s: copying newly published %s", name, ", ".join(added))
-    if removed:
-        logger.info("Subscription %s: no longer receives %s", name, ", ".join(removed))
-    if not (added or removed):
-        logger.info("Subscription %s: no change", name)
-    return {"name": name, "refreshed": True, "added": added, "removed": removed}
+
+    pending = []
+    results = []
+    for arm in selected:
+        name = subscription_name(arm)
+        if name not in existing:
+            logger.info("No subscription %s yet; nothing to refresh (run `subscribe` first)", name)
+            results.append({"arm": arm, "name": name, "refreshed": False})
+            continue
+        sub = await _subscription(conn, name)
+        _warn_on_drift(sub, registry)
+        before = await _subscribed_tables(conn, sub["oid"])
+        await _require_empty(conn, sorted((set(registry.replicated) & present) - set(before)), "refresh")
+        pending.append((arm, name, sub, before))
+
+    failures = []
+    for arm, name, sub, before in pending:
+        try:
+            await conn.execute(f"ALTER SUBSCRIPTION {quote_ident(name)} REFRESH PUBLICATION WITH (copy_data = true)")
+        except asyncpg.PostgresError as exc:
+            logger.error("Arm %s: refresh failed: %s", arm, redact(str(exc)))
+            failures.append(f"{arm}: {redact(str(exc))}")
+            continue
+        after = await _subscribed_tables(conn, sub["oid"])
+        added, removed = sorted(set(after) - set(before)), sorted(set(before) - set(after))
+        if added:
+            logger.info("Subscription %s: copying newly published %s", name, ", ".join(added))
+        if removed:
+            logger.info("Subscription %s: no longer receives %s", name, ", ".join(removed))
+        if not (added or removed):
+            logger.info("Subscription %s: no change", name)
+        results.append({"arm": arm, "name": name, "refreshed": True, "added": added, "removed": removed})
+    if failures:
+        raise ReplicationError(f"refresh failed for {'; '.join(failures)}")
+    return {"subscriptions": _in_order(results, selected)}
 
 
 async def grants(
@@ -341,21 +449,11 @@ async def grants(
     }
 
 
-async def subscriber_status(
-    conn: asyncpg.Connection, *, instance: str | None, registry: ReplicationRegistry = REGISTRY
-) -> dict:
-    """The mirror's replication state, as JSON-ready data.
-
-    ``applied_lsn`` is ``pg_replication_origin_status.remote_lsn``: the primary's WAL
-    position of the last transaction applied here. It stays put while the primary is
-    idle, so it is a position, not a lag. The view is readable only by superusers
-    unless granted, so ``applied_lsn`` is ``None`` with ``applied_lsn_error`` set when
-    it can't be read. The connection string (``subconninfo``) is never read.
-    """
-    name = subscription_name(instance)
-    status: dict = {"side": "subscriber", "subscription": {"name": name, "exists": False}}
+async def _arm_status(conn: asyncpg.Connection, arm: str, registry: ReplicationRegistry) -> dict:
+    """One arm's subscription state; see ``subscriber_status``."""
+    name = subscription_name(arm)
     if (sub := await _subscription(conn, name)) is None:
-        return status
+        return {"arm": arm, "name": name, "exists": False}
     worker = await conn.fetchrow(
         """
         SELECT pid, received_lsn::text AS received_lsn, last_msg_send_time, last_msg_receipt_time,
@@ -376,7 +474,8 @@ async def subscriber_status(
     except asyncpg.InsufficientPrivilegeError:
         applied_lsn_error = "pg_replication_origin_status needs a superuser or an explicit grant"
     tables = await _subscribed_tables(conn, sub["oid"])
-    status["subscription"] = {
+    return {
+        "arm": arm,
         "name": name,
         "exists": True,
         "enabled": sub["subenabled"],
@@ -393,4 +492,41 @@ async def subscriber_status(
         "tables_ready": sum(state == "ready" for state in tables.values()),
         "tables_not_ready": {table: state for table, state in sorted(tables.items()) if state != "ready"},
     }
-    return status
+
+
+async def subscriber_status(
+    conn: asyncpg.Connection,
+    *,
+    arms: Mapping[str, Arm],
+    only: str | None = None,
+    registry: ReplicationRegistry = REGISTRY,
+) -> dict:
+    """The head's replication state per arm, as JSON-ready data.
+
+    ``applied_lsn`` is ``pg_replication_origin_status.remote_lsn``: the arm's WAL
+    position of the last transaction applied here. It stays put while the arm is
+    idle, so it is a position, not a lag. The view is readable only by superusers
+    unless granted, so ``applied_lsn`` is ``None`` with ``applied_lsn_error`` set when
+    it can't be read. Connection strings (``subconninfo``) are never read.
+
+    Returns
+    -------
+    dict
+        ``subscriptions``: one entry per configured arm (or ``only``), with its
+        ``arm`` and ``name`` and, when it exists, its state. ``unexpected``: history
+        subscriptions in this database whose arm isn't configured.
+
+    With no arm configured it still reports, so a head whose arms were all taken
+    out of its settings shows their subscriptions under ``unexpected``.
+
+    Raises
+    ------
+    Refused
+        ``only`` isn't a configured arm.
+    """
+    selected = _selected_arms(arms, only) if arms or only is not None else []
+    return {
+        "side": "subscriber",
+        "subscriptions": [await _arm_status(conn, arm, registry) for arm in selected],
+        "unexpected": _unexpected(await _history_subscriptions(conn), arms),
+    }
