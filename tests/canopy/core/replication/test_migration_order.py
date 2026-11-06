@@ -467,7 +467,8 @@ async def _migrate_head(w: Walk, revision: str) -> None:
     The triggers fire for the migration's own INSERT, UPDATE and DELETE statements but
     not for apply, which runs with ``session_replication_role = replica``, nor for a
     table rewrite. Every row on the head belongs to an arm, so a data step that ran on
-    the head, which would change rows its arm's own migration changes, shows up here.
+    the head as well as on the arms (rows each arm's own migration changes, and its
+    result replicates) shows up here.
     """
     conn = w.head.conn
     tables = sorted(set(REGISTRY.replicated) & await tables_present(conn, REGISTRY.schemas))
@@ -497,7 +498,7 @@ async def _migrate_head(w: Walk, revision: str) -> None:
         pytest.fail(
             f"migrating the head to {revision} wrote arms' rows: "
             + ", ".join(f"{row['op']} x{row['n']} on {row['tbl']}" for row in writes)
-            + ". A data step changes only the rows the instance being migrated owns"
+            + ". A data step on a replicated table runs on the arms only, under `if on_publisher():`"
         )
     w.head.replication("grants")
     w.head.replication("refresh")
