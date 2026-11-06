@@ -33,16 +33,17 @@ class Settings(BaseSettings):
         ``"mirror"`` makes this instance a read-only copy of a primary's data: write
         and admin routes refuse with ``read_only_instance`` (API-key management
         excepted) and the worker registers only stateless tasks.
-    instance : str | None
-        Name of the deployment this process belongs to (e.g. ``"site-a"``), reported
-        by ``GET /v1/instance``.
+    instance : str
+        This instance's name: lowercase letters, digits and underscores, at most 48
+        (``canopy_history_<name>`` must fit a Postgres identifier). Required, and
+        permanent once the instance holds data. Reported by ``GET /v1/instance``.
     history_url : str | None
         Base URL of the read-only history instance holding this instance's full
         history, reported by ``GET /v1/instance`` so clients can link to it.
     window_days : int | None
         Days of history this instance keeps, at least 1; ``None`` means it keeps
         everything. A blank value, as Helm and compose render an unset one, is ``None``
-        here and for ``instance`` and ``history_url``.
+        here and for ``history_url``.
     """
 
     model_config = SettingsConfigDict(
@@ -82,11 +83,11 @@ class Settings(BaseSettings):
     # (fed by Postgres logical replication), so nothing here may write the
     # replicated tables. Reported, with the fields below, by GET /v1/instance.
     role: Literal["primary", "mirror"] = "primary"
-    instance: str | None = None
+    instance: str = Field(pattern=r"^[a-z0-9_]{1,48}$")
     history_url: str | None = None
     window_days: int | None = Field(None, ge=1)
 
-    @field_validator("instance", "history_url", "window_days", mode="before")
+    @field_validator("history_url", "window_days", mode="before")
     @classmethod
     def _blank_is_unset(cls, value: object) -> object:
         """Read a blank value as unset rather than as ``""`` or an unparseable int."""
