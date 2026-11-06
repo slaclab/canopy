@@ -6,10 +6,18 @@ from canopy.core.replication.sql import (
     Refused,
     redact,
     qualified,
+    owner_join,
     asyncpg_dsn,
     quote_ident,
     require_role,
     quote_literal,
+    conninfo_as_uri,
+)
+from canopy.core.replication.registry import (
+    REGISTRY,
+    OwnerPath,
+    TableClass,
+    ReplicationRegistry,
 )
 
 
@@ -74,3 +82,47 @@ def test_require_role():
     require_role("publish", "primary", "primary")
     with pytest.raises(Refused, match="runs on a primary"):
         require_role("publish", "primary", "mirror")
+
+
+CHAIN = ReplicationRegistry(
+    tables={"s.root": TableClass.REFERENCE, "s.mid": TableClass.REFERENCE, "s.leaf": TableClass.TIME_SERIES},
+    publications=REGISTRY.publications,
+    owner_paths={
+        "s.root": OwnerPath(column="owner_instance"),
+        "s.mid": OwnerPath(parent="s.root", key="root_id"),
+        "s.leaf": OwnerPath(parent="s.mid", key="mid_id"),
+    },
+)
+
+
+def test_owner_join_for_a_root_child_and_grandchild():
+    assert owner_join(CHAIN, "s.root", alias="t") == ("", 't."owner_instance"')
+    assert owner_join(CHAIN, "s.mid", alias="t") == (
+        'JOIN "s"."root" t_o1 ON t_o1.id = t."root_id"',
+        't_o1."owner_instance"',
+    )
+    assert owner_join(CHAIN, "s.leaf", alias="v") == (
+        'JOIN "s"."mid" v_o1 ON v_o1.id = v."mid_id" JOIN "s"."root" v_o2 ON v_o2.id = v_o1."root_id"',
+        'v_o2."owner_instance"',
+    )
+
+
+def test_owner_join_refuses_a_table_without_a_path():
+    with pytest.raises(ValueError, match="s.other has no owner path"):
+        owner_join(CHAIN, "s.other", alias="t")
+
+
+@pytest.mark.parametrize(
+    ("conninfo", "uri"),
+    [
+        ("postgresql://u:p@h:5432/db?sslmode=require", "postgresql://u:p@h:5432/db?sslmode=require"),
+        (
+            "host=arm1.example.org port=5432 dbname=canopy user=replicator password=s3cret sslmode=verify-full",
+            "postgresql://replicator:s3cret@arm1.example.org:5432/canopy?sslmode=verify-full",
+        ),
+        (r"host=h dbname=db user=u password='it\'s a/secret'", "postgresql://u:it%27s%20a%2Fsecret@h/db"),
+        ("host=h dbname=db", "postgresql://h/db"),
+    ],
+)
+def test_conninfo_as_uri(conninfo, uri):
+    assert conninfo_as_uri(conninfo) == uri

@@ -10,7 +10,10 @@ canopy.core.replication`` (see ``__main__``) applies them:
   creating them.
 * head, every deploy (as the tables' owner): ``alembic upgrade head``, ``grants``,
   ``refresh``. The head deploys before its arms, so it has every table an arm will
-  publish.
+  publish. ``grants`` lets the head's API read every row and write only the head's
+  own (row-level security on the root tables).
+* the registry's owner paths say whose each row is; ``sql.owner_join`` turns them
+  into SQL, for any command that has to tell one arm's rows from another's.
 * head, once per arm: ``subscribe``, as the tables' owner with
   ``pg_create_subscription`` (or a superuser), with each arm's
   ``CANOPY_ARMS__<arm>__PUBLISHER_DSN`` from a secret (``canopy.core.arms``).

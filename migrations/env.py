@@ -17,7 +17,7 @@ import logging
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import pool
+from sqlalchemy import pool, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -76,6 +76,43 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _refuse_a_renamed_primary(connection: Connection) -> None:
+    """Stop when a primary's rows carry another instance's name.
+
+    A primary holds only rows it wrote, so a stamp other than ``CANOPY_INSTANCE``
+    means the name was changed after the instance held data. Its rows would then
+    all belong to an instance that no longer exists, and every write to them would
+    answer ``not_owner``. An instance's name is permanent, so a rename fails here,
+    at the deploy's migration step. A mirror holds its arms' rows beside its own,
+    so it isn't checked here. Tables without ``owner_instance`` yet (a database
+    below ``89e21441c63c``) are skipped.
+    """
+    settings = get_settings()
+    if settings.role != "primary":
+        return
+    for table in target_metadata.sorted_tables:
+        if "owner_instance" not in table.c:
+            continue
+        has_column = connection.execute(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = :schema AND table_name = :table AND column_name = 'owner_instance'"
+            ),
+            {"schema": table.schema, "table": table.name},
+        ).first()
+        if has_column is None:
+            continue
+        other = connection.execute(
+            text(f"SELECT owner_instance FROM {table.fullname} WHERE owner_instance <> :instance LIMIT 1"),
+            {"instance": settings.instance},
+        ).scalar()
+        if other is not None:
+            raise RuntimeError(
+                f"CANOPY_INSTANCE is {settings.instance!r}, but {table.fullname} holds rows stamped {other!r}. "
+                f"An instance's name is permanent: set CANOPY_INSTANCE back to {other!r}."
+            )
+
+
 def do_run_migrations(connection: Connection) -> None:
     context.configure(
         connection=connection,
@@ -86,6 +123,9 @@ def do_run_migrations(connection: Connection) -> None:
         canopy_replication_side=replication_side,
     )
     with context.begin_transaction():
+        # Inside the migration transaction: a query run before it would open one
+        # of its own that Alembic then never commits.
+        _refuse_a_renamed_primary(connection)
         context.run_migrations()
 
 

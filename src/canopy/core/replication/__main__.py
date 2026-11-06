@@ -71,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         sub = commands.add_parser(command, help=help_text)
         sub.add_argument("--arm", metavar="ARM", help="act on this arm only (default: every configured arm)")
-    commands.add_parser("grants", help="head: read access for the app role, read-write on local tables")
+    commands.add_parser("grants", help="head: the app role reads every row and writes only the head's own")
     return parser
 
 
@@ -126,7 +126,7 @@ async def run(command: str, arm: str | None = None) -> int:
         elif command == "refresh":
             await refresh(conn, role=settings.role, arms=arms, only=arm)
         elif command == "grants":
-            await grants(conn, role=settings.role, config=config)
+            await grants(conn, role=settings.role, head=settings.instance, config=config)
         elif settings.role == "mirror":
             print(json.dumps(await subscriber_status(conn, arms=arms, only=arm), indent=2))
         else:
