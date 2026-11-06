@@ -440,3 +440,14 @@ async def test_deliver_all_runs_each_forwardable_arm(db_session, seeded: Seeded,
 
     assert runs == {name: {"delivered": 1, "retried": 0, "failed": 0} for name in ("arm1", "arm2")}
     assert sorted(a for a, *_ in arm.sent) == ["arm1", "arm2"]
+
+
+async def test_the_worker_task_runs_one_delivery_for_every_arm(monkeypatch):
+    from canopy.squirrel import tasks
+
+    async def deliver_all():
+        return {"arm1": {"delivered": 1, "retried": 0, "failed": 0}}
+
+    monkeypatch.setattr(tasks.outbox, "deliver_all", deliver_all)
+
+    assert await tasks.deliver_outbox_task({}) == {"arm1": {"delivered": 1, "retried": 0, "failed": 0}}

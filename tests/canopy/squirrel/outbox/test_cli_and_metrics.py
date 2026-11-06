@@ -150,3 +150,52 @@ async def test_a_failed_read_leaves_only_status_up_0(monkeypatch, failure, app_d
 
     assert "canopy_squirrel_outbox_status_up 0.0" in text
     assert "canopy_squirrel_outbox_snapshots" not in text
+
+
+async def test_cli_exits_1_when_a_command_fails_in_the_database(app_database, monkeypatch, capsys):
+    async def broken(*args, **kwargs):
+        raise asyncpg.UndefinedTableError("relation squirrel.snapshot_outbox does not exist")
+
+    monkeypatch.setattr("canopy.squirrel.outbox.__main__.outbox_status", broken)
+
+    assert (await _cli(capsys, "status"))[0] == 1
+
+
+def test_main_logs_to_stderr_and_returns_the_exit_status(monkeypatch, capsys):
+    import canopy.squirrel.outbox.__main__ as cli
+
+    seen = []
+
+    async def run(options):
+        seen.append(options.command)
+        cli.logger.info("ran")
+        return 0
+
+    monkeypatch.setattr(cli, "run", run)
+
+    assert cli.main(["status"]) == 0
+    assert cli.main(["status"]) == 0
+    assert seen == ["status", "status"]
+    # One handler however often main runs, and only on stderr.
+    assert sum(getattr(h, "_canopy_outbox", False) for h in cli.logger.handlers) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "" and "ran" in captured.err
+
+
+async def test_gauges_come_back_after_a_failed_read(db_session, seeded: Seeded, app_database, monkeypatch, caplog):
+    import logging
+
+    real = outbox_status
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    collector = OutboxCollector(arms=lambda: ["arm2"])
+    monkeypatch.setattr("canopy.squirrel.outbox.metrics.outbox_status", broken)
+    await collector.refresh()
+    monkeypatch.setattr("canopy.squirrel.outbox.metrics.outbox_status", real)
+    with caplog.at_level(logging.INFO, logger="canopy.squirrel.outbox.metrics"):
+        await collector.refresh()
+
+    assert "canopy_squirrel_outbox_status_up 1.0" in _scrape(collector)
+    assert "available again" in caplog.text

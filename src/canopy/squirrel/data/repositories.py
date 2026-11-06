@@ -570,11 +570,6 @@ class OutboxRepository(BaseRepository[SnapshotOutbox]):
         """Set columns of one row (its state, attempt count, times, error)."""
         await self.session.execute(update(SnapshotOutbox).where(SnapshotOutbox.id == entry_id).values(**values))
 
-    async def remove(self, entry_id: str) -> bool:
-        """Delete one row; ``False`` when there was none."""
-        result = await self.session.execute(delete(SnapshotOutbox).where(SnapshotOutbox.id == entry_id))
-        return result.rowcount > 0
-
     async def sweep(self, entry_id: str | None = None) -> list[Row]:
         """Delete rows whose snapshot is in ``squirrel.snapshot`` now, and return them.
 

@@ -6,7 +6,7 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.core.config import get_settings
-from canopy.squirrel.data.models import Snapshot, SnapshotValue
+from canopy.squirrel.data.models import Snapshot, SnapshotValue, pv_facility
 from tests.canopy.squirrel.conftest import READ_HEADERS, WRITE_HEADERS
 from canopy.squirrel.services.snapshot_service import SnapshotService
 from tests.canopy.squirrel.test_services_snapshot import FakeEpicsIO
@@ -227,3 +227,14 @@ async def test_a_queued_snapshot_outside_the_keys_facilities_does_not_exist_for_
     assert await service.export_bundle(sid) is None
     assert await service.queued(sid) is None
     assert (await service.list_snapshots()).total_count == 0
+
+
+async def test_a_restricted_keys_restore_of_a_queued_snapshot_keeps_only_its_facilities(db_session, seeded: Seeded):
+    sid = await queue(db_session, seeded)
+    await db_session.execute(pv_facility.delete().where(pv_facility.c.pv_id == seeded.rb_id))
+    await db_session.commit()
+    service = SnapshotService(db_session, restore_hooks=[], facility_scope={seeded.facility_id})
+
+    allowed, skipped = await service.plan_restore(sid)
+
+    assert (allowed, skipped) == ([seeded.sp_id], [seeded.rb_id])
