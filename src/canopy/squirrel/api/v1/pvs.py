@@ -155,9 +155,9 @@ async def delete_pv(pv_id: str, service: PvServiceDep) -> bool:
 
 
 @router.post("/meta", dependencies=[Security(require_write_access)])
-async def add_meta_pv(pvInfo: NewMetaPVDTO, service: PvServiceDep) -> MetaPVDTO:
-    """Promote one of this instance's PVs (by address) to a meta-PV."""
-    return await service.add_meta_pv(pvInfo.pv_name, pvInfo.display_name)
+async def add_meta_pv(pvInfo: NewMetaPVDTO, service: PvServiceDep, owner: OwnerQuery = None) -> MetaPVDTO:
+    """Promote one of this instance's PVs (by address) to a meta-PV. ``owner`` accepts only this instance's name."""
+    return await service.add_meta_pv(pvInfo.pv_name, pvInfo.display_name, owner)
 
 
 @router.get("/meta", dependencies=[Security(require_read_access)])
