@@ -2,6 +2,7 @@
 
 import os
 import asyncio
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
@@ -38,15 +39,40 @@ async def wait_for(predicate, timeout: float = 5.0, interval: float = 0.01) -> b
 
 @pytest.fixture
 def mirror_role(monkeypatch):
-    """Run the test as a read-only mirror (``CANOPY_ROLE=mirror``).
+    """Run the test as a mirror (``CANOPY_ROLE=mirror``).
 
     Clears the cached ``Settings`` on both sides: ``monkeypatch`` puts the env var
     back but not the object ``get_settings`` already built from it, and a leaked
-    mirror role would refuse every write in whatever test runs next.
+    role would change whatever test runs next.
     """
     from canopy.core.config import get_settings
 
     monkeypatch.setenv("CANOPY_ROLE", "mirror")
     get_settings.cache_clear()
     yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def as_instance(monkeypatch):
+    """Run a block as another instance: ``with as_instance("arm2"): ...``.
+
+    Rows created inside are stamped with that name, the way a mirror receives an
+    arm's rows through replication; outside it the suite is ``arm1`` again. Clears
+    the cached ``Settings`` on the way in and out.
+    """
+    from canopy.core.config import get_settings
+
+    @contextmanager
+    def _as(name: str):
+        previous = os.environ["CANOPY_INSTANCE"]
+        monkeypatch.setenv("CANOPY_INSTANCE", name)
+        get_settings.cache_clear()
+        try:
+            yield
+        finally:
+            monkeypatch.setenv("CANOPY_INSTANCE", previous)
+            get_settings.cache_clear()
+
+    yield _as
     get_settings.cache_clear()
