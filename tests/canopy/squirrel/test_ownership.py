@@ -153,8 +153,14 @@ async def test_a_meta_pv_follows_its_pv(client, as_instance):
 
     # Only arm2 registered this address, so the marker belongs on arm2.
     _refused(await client.post("/v1/pvs/meta", headers=WRITE_HEADERS, json={"pvName": "REMOTE:SP"}), "not_owner", 403)
+    # Naming another owner is refused, not dropped.
+    _refused(
+        await client.post("/v1/pvs/meta?owner=arm2", headers=WRITE_HEADERS, json={"pvName": "SHARED:SP"}),
+        "not_owner",
+        403,
+    )
     # Both did: this instance marks its own.
-    mine = await client.post("/v1/pvs/meta", headers=WRITE_HEADERS, json={"pvName": "SHARED:SP"})
+    mine = await client.post("/v1/pvs/meta?owner=arm1", headers=WRITE_HEADERS, json={"pvName": "SHARED:SP"})
     assert mine.status_code == 200, mine.text
     listed = (await client.get("/v1/pvs/meta", headers=WRITE_HEADERS)).json()
     assert {(m["pvName"], m["ownerInstance"]) for m in listed} == {("REMOTE:SP", "arm2"), ("SHARED:SP", "arm1")}
@@ -179,6 +185,25 @@ async def test_a_snapshot_in_another_owners_facility_is_refused_before_enqueue(
 
     _refused(r, "not_owner", 403)
     assert enqueued == []
+
+
+async def test_the_owner_parameter_on_a_snapshot(client, db_session, as_instance, enqueued):
+    await _facility(db_session, as_instance, "local", "arm1")
+
+    # A name other than this instance's is refused, not dropped: with or without a facility.
+    _refused(
+        await client.post("/v1/snapshots?owner=arm2", headers=WRITE_HEADERS, json={"title": "t"}), "not_owner", 403
+    )
+    _refused(
+        await client.post("/v1/snapshots?owner=arm2", headers=WRITE_HEADERS, json={"title": "t", "facility": "local"}),
+        "not_owner",
+        403,
+    )
+    assert enqueued == []
+    assert (
+        await client.post("/v1/snapshots?owner=arm1", headers=WRITE_HEADERS, json={"title": "t"})
+    ).status_code == 200
+    assert len(enqueued) == 1
 
 
 async def test_another_owners_snapshot_cant_be_edited_or_deleted(client, db_session, as_instance):
