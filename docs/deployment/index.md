@@ -37,7 +37,7 @@ essentials:
 | `CANOPY_SQUIRREL__RESTORE_HOOKS` | Extra writes Squirrel makes during a snapshot restore, such as magnet trims. Empty means none. Must reach the **worker**, which performs restores. See [Restore hooks](../squirrel/restore_hooks.md) |
 | `CANOPY_ROLE` | `primary` (default) or `mirror`. A mirror is a read-only copy of a primary's database: write and admin routes return 403 `read_only_instance` (API-key management still works, since keys are local to each instance), and the worker runs only `ping` and batch conversion. Set it on both the API and the worker |
 | `CANOPY_INSTANCE`, `CANOPY_HISTORY_URL`, `CANOPY_WINDOW_DAYS` | Optional. Reported by `GET /v1/instance` with the role and the Alembic head shipped in the image: the instance name, the URL of its read-only history copy, and how many days of history it keeps (a whole number of at least 1; unset means all). A blank value counts as unset |
-| `CANOPY_REPLICATION__PUBLISHER_DSN` | Mirror only, for `python -m canopy.core.replication subscribe`: the libpq connection string the subscription uses to reach the primary as the replication role. Supply it from a secret; the CLI never prints it |
+| `CANOPY_ARMS__<arm>__PUBLISHER_DSN` | History head only (`CANOPY_ROLE=mirror`): one per arm, named after that arm's `CANOPY_INSTANCE` (lowercase letters, digits and underscores, at most 48). The libpq connection string the head's subscription `canopy_history_<arm>` uses to reach the arm as its replication role. `python -m canopy.core.replication subscribe` reads it; supply it from a secret, and the CLI never prints it. The arms can also be set as JSON in `CANOPY_ARMS` |
 | `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_ROLE`, `__APP_ROLE` | Role names for the replication CLI: on a primary, `publish` grants the replication role (default `replicator`) and the reader role (default `canopy_reader`) SELECT on the published tables; on a mirror, `grants` gives the app role (default `canopy_app`) read access to replicated tables and read-write on API keys |
 | `CANOPY_<MODULE>__<FIELD>` | Per-module tuning (e.g. `CANOPY_VOLE__GLOBAL_BYTES_MAX`) |
 
@@ -79,11 +79,13 @@ The production image carries the migration tree, so run
 (see [Upgrade](production.md#upgrade)). A fresh database serves nothing until
 its first migration.
 
-On a primary with a read-only history mirror, follow the upgrade with
+On an arm (a primary with a history head), follow the upgrade with
 `python -m canopy.core.replication publish`, which keeps the replication
-publication in step with the tables. The mirror runs `alembic upgrade head`,
-then `grants` and `refresh`, before its primary deploys; `subscribe` runs once.
-`status` reports either side as JSON.
+publication in step with the tables. The head runs `alembic upgrade head`, then
+`grants` and `refresh`, before any of its arms deploys; `subscribe` runs once per
+arm. On the head, `subscribe`, `refresh` and `status` act on every arm in
+`CANOPY_ARMS__<arm>__…`, or on one with `--arm <arm>`. `status` reports either
+side as JSON.
 
 ## Health checks
 
@@ -92,5 +94,5 @@ then `grants` and `refresh`, before its primary deploys; `subscribe` runs once.
 | `GET /health` | Process liveness — used by the container healthchecks and post-deploy checks |
 | `GET /<module>/v1/health/watchdog` | Per-module liveness heartbeat (version, uptime) |
 | `GET /<module>/v1/health/summary` | Per-module status rollup (requires read access) — e.g. Hare's reports backend, client and monitor counts |
-| `GET /v1/instance` | `{role, instance, historyUrl, windowDays, alembicHead}` (requires read access on `core`). `alembicHead` is the migrations head shipped in the image, not the database's, read once at startup. It is `null` where the process finds no migrations tree, as in the dev image, or the tree has more than one head |
+| `GET /v1/instance` | `{role, instance, historyUrl, windowDays, alembicHead, arms}` (requires read access on `core`). `alembicHead` is the migrations head shipped in the image, not the database's, read once at startup. `arms` is empty except on a history head, where it lists each arm as `{name, subscription}`, with `subscription` one of `missing`, `disabled`, `stopped`, `copying` or `streaming`. It is `null` where the process finds no migrations tree, as in the dev image, or the tree has more than one head |
 | `GET /metrics` | Prometheus exposition (unauthenticated, like `/health`): request counts and latency per module route, plus module gauges — see [Metrics](../observability/metrics.md) |
