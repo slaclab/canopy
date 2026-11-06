@@ -107,6 +107,22 @@ async def test_meta_pv_still_blocks_delete(client: AsyncClient, sample_pv: dict)
     assert (await client.delete(f"/v1/pvs/{pid}", headers=WRITE_HEADERS)).status_code == 200
 
 
+@pytest.mark.parametrize(("deleted", "status", "code"), [(False, 403, "not_owner"), (True, 404, "pv_not_found")])
+async def test_a_meta_pv_marker_names_only_live_owners(
+    client: AsyncClient, as_instance, deleted: bool, status: int, code: str
+):
+    # On a mirror the address may belong only to an arm's PV. A live one is the arm's to
+    # mark; a deleted one can't be marked anywhere, so nobody is named.
+    with as_instance("arm2"):
+        theirs = (await client.post("/v1/pvs", headers=WRITE_HEADERS, json={"setpointAddress": "THEIRS:META"})).json()
+        if deleted:
+            assert (await client.delete(f"/v1/pvs/{theirs['id']}", headers=WRITE_HEADERS)).status_code == 200
+
+    r = await client.post("/v1/pvs/meta", headers=WRITE_HEADERS, json={"pvName": "THEIRS:META"})
+
+    assert (r.status_code, r.json()["code"]) == (status, code), r.text
+
+
 @pytest.mark.parametrize(
     "addresses",
     [
