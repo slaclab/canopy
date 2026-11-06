@@ -174,6 +174,11 @@ async def prune_snapshots(ctx: dict) -> dict:
         logger.info("Prune is disabled (CANOPY_PRUNE__ENABLED); nothing to do")
         return {"enabled": False}
     settings = get_settings()
+    if settings.role != "primary":
+        # A mirror holds the history a primary prunes, its own rows included, and
+        # never registers this job; this guards a job queued here some other way.
+        logger.error("Prune runs only on a primary, and this instance is a %s; nothing deleted", settings.role)
+        return {"enabled": True, "refused": f"CANOPY_ROLE={settings.role}; prune runs only on a primary"}
     replication = get_replication_config()
     conn = await asyncpg.connect(
         asyncpg_dsn(settings.database_url), server_settings={"application_name": "canopy-prune"}
