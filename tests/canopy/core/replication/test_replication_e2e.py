@@ -392,3 +392,58 @@ async def test_gauges_on_the_arms_and_per_arm_on_the_head(octopus: Octopus, monk
         return samples[("canopy_replication_subscription_worker_up", arm1)] == 0
 
     await eventually(worker_stopped)
+
+
+async def _facility_on(conn: asyncpg.Connection, facility_id: str) -> bool:
+    return bool(await conn.fetchval("SELECT count(*) FROM core.facility WHERE id = $1", facility_id))
+
+
+async def test_a_slug_another_owner_holds_stops_only_that_arms_apply(octopus: Octopus, monkeypatch):
+    """The apply-stopped alert's case: two arms create one facility slug after subscribing."""
+    o = octopus
+    first, second = o.arms.values()
+    monkeypatch.setattr("canopy.core.replication.metrics.get_arms_config", lambda: o.arms_config)
+    for arm in o.arms.values():
+        await publish(arm.admin, role="primary", config=o.config)
+    await grants(o.head.conn, role="mirror", head=o.head.name, config=o.config)
+    await _subscribe(o)
+    for arm in o.arms.values():
+        await eventually(lambda arm=arm: copied(o, arm.name))
+    arm1, arm2 = (frozenset({"arm": arm.name}.items()) for arm in (first, second))
+
+    async def create(arm, slug: str) -> str:
+        facility_id = str(uuid4())
+        await arm.admin.execute(
+            "INSERT INTO core.facility (id, slug, name, owner_instance) VALUES ($1, $2, 'Facility', $3)",
+            facility_id,
+            slug,
+            arm.name,
+        )
+        return facility_id
+
+    async def apply_errors(arm: frozenset) -> float:
+        samples = metric_samples(await read_status(o.head.admin, role="mirror"))
+        return samples[("canopy_replication_subscription_apply_errors_total", arm)]
+
+    held = await create(first, "fac_shared")
+    await eventually(lambda: _facility_on(o.head.conn, held))
+    stuck = await create(second, "fac_shared")  # unique everywhere: the head can't apply it
+    await eventually(lambda: _more_than(apply_errors(arm2), 1))
+
+    # The other arm keeps streaming, with no errors of its own.
+    later = await create(first, "fac_later")
+    await eventually(lambda: _facility_on(o.head.conn, later))
+    assert await apply_errors(arm1) == 0
+    assert not await _facility_on(o.head.conn, stuck)
+
+    # The fix: rename the other owner's facility where it's owned; the stuck change then applies.
+    await first.admin.execute("UPDATE core.facility SET slug = 'fac_renamed' WHERE id = $1", held)
+    await eventually(lambda: _facility_on(o.head.conn, stuck))
+    errors = await apply_errors(arm2)
+    after = await create(second, "fac_after")
+    await eventually(lambda: _facility_on(o.head.conn, after))
+    assert await apply_errors(arm2) == errors
+
+
+async def _more_than(value, limit: float) -> bool:
+    return await value > limit
