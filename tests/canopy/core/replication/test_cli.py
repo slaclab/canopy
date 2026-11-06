@@ -71,9 +71,9 @@ def _sqlalchemy_url(dsn: str) -> str:
     return make_url(dsn).set(drivername="postgresql+asyncpg").render_as_string(hide_password=False)
 
 
-async def _run(command: str) -> int:
+async def _run(command: str, arm: str | None = None) -> int:
     # main() calls asyncio.run, which can't nest inside the test's loop.
-    return await cli.run(command)
+    return await cli.run(command, arm)
 
 
 async def test_publish_then_status_through_the_cli(db, config, env, capsys):
@@ -99,7 +99,45 @@ async def test_a_refusal_inside_a_command_exits_2(db, env, caplog):
     assert "unclassified tables: magpie.mystery" in caplog.text
 
 
-async def test_mirror_status_through_the_cli(db, env, capsys):
-    env(CANOPY_DATABASE_URL=_sqlalchemy_url(DB_DSN), CANOPY_ROLE="mirror", CANOPY_INSTANCE="lab")
+async def test_head_status_through_the_cli(db, env, capsys):
+    env(
+        CANOPY_DATABASE_URL=_sqlalchemy_url(DB_DSN),
+        CANOPY_ROLE="mirror",
+        CANOPY_INSTANCE="head",
+        CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=arm1.example.org password=s3cret-arm",
+        CANOPY_ARMS__ARM2__PUBLISHER_DSN="host=arm2.example.org password=s3cret-arm",
+    )
     assert await _run("status") == 0
-    assert json.loads(capsys.readouterr().out)["subscription"] == {"name": "canopy_history_lab", "exists": False}
+    every = json.loads(capsys.readouterr().out)
+    assert [sub["arm"] for sub in every["subscriptions"]] == ["arm1", "arm2"]
+
+    assert await _run("status", arm="arm2") == 0
+    out = capsys.readouterr().out
+    assert json.loads(out)["subscriptions"] == [{"arm": "arm2", "name": "canopy_history_arm2", "exists": False}]
+    assert "s3cret-arm" not in out
+
+
+async def test_an_unknown_arm_is_refused(db, env, caplog):
+    env(CANOPY_DATABASE_URL=_sqlalchemy_url(DB_DSN), CANOPY_ROLE="mirror", CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=x")
+    assert await _run("refresh", arm="arm9") == 2
+    assert "no arm named 'arm9'" in caplog.text
+
+
+def test_arm_applies_only_on_a_head(env, no_connect, caplog):
+    assert cli.main(["status", "--arm", "arm1"]) == 2
+    assert "--arm applies on a head" in caplog.text
+
+
+def test_an_invalid_arm_name_is_refused_without_echoing_its_settings(env, no_connect, caplog, monkeypatch):
+    monkeypatch.setenv("CANOPY_ARMS", '{"Bad-Name": {"publisher_dsn": "host=x password=s3cret-arm"}}')
+    assert cli.main(["status"]) == 2
+    assert "arm names must be" in caplog.text and "s3cret-arm" not in caplog.text
+
+
+def test_only_head_commands_take_an_arm():
+    parser = cli.build_parser()
+    for command in ("subscribe", "refresh", "status"):
+        assert parser.parse_args([command, "--arm", "arm1"]).arm == "arm1"
+    for command in ("publish", "grants"):
+        with pytest.raises(SystemExit):
+            parser.parse_args([command, "--arm", "arm1"])

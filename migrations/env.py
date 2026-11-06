@@ -5,10 +5,11 @@ metadata lives on the shared ``canopy.core.db.Base``, so a single autogenerate
 pass sees every module's tables; ``include_schemas=True`` makes the comparison
 schema-aware, and the lone ``alembic_version`` table is pinned to ``public``.
 
-A history mirror runs this same tree against its own database, so the side being
-migrated (publisher or subscriber, from ``CANOPY_ROLE``) goes into the migration
-context, where ``canopy.core.replication.migration.on_publisher`` and
-``on_subscriber`` read it for the few steps that belong to one side only.
+A history head and each of its arms run this same tree against their own
+databases, so the side being migrated (an arm publishes, the head subscribes; from
+``CANOPY_ROLE``) goes into the migration context, where
+``canopy.core.replication.migration.on_publisher`` and ``on_subscriber`` read it for
+the few steps that belong to one side only.
 """
 
 import asyncio

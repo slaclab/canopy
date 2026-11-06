@@ -11,7 +11,6 @@ from canopy.core.replication.sql import (
     require_role,
     quote_literal,
 )
-from canopy.core.replication.subscriber import subscription_name
 
 
 def test_quote_ident():
@@ -69,13 +68,6 @@ def test_redact_leaves_ordinary_messages_alone():
     assert redact('relation "squirrel.pv" does not exist', ["host=h password=pw"]) == (
         'relation "squirrel.pv" does not exist'
     )
-
-
-def test_subscription_name():
-    assert subscription_name("lab_a") == "canopy_history_lab_a"
-    for bad in (None, "", "Lab", "lab-a", "lab a", "x" * 49):
-        with pytest.raises(Refused):
-            subscription_name(bad)
 
 
 def test_require_role():
