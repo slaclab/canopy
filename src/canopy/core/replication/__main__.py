@@ -93,8 +93,7 @@ async def run(command: str, arm: str | None = None) -> int:
     try:
         arms = get_arms_config().arms
     except pydantic.ValidationError as exc:
-        # Only the messages: the error's own text would echo the settings it was given.
-        logger.error("refused: CANOPY_ARMS is invalid: %s", "; ".join(error["msg"] for error in exc.errors()))
+        logger.error("refused: %s", _settings_errors(exc, "CANOPY_"))
         return 2
     local_dsn = asyncpg_dsn(settings.database_url)
     # Only the arms' DSNs enter SQL text. Redacting the local one too would mask its
@@ -146,9 +145,22 @@ async def run(command: str, arm: str | None = None) -> int:
     return 0
 
 
+def _settings_errors(exc: pydantic.ValidationError, prefix: str) -> str:
+    """Which settings are wrong and why, without the values: the error's own text would echo them."""
+    return "; ".join(
+        f"{prefix}{'__'.join(str(part) for part in error['loc']).upper()}: {error['msg']}" for error in exc.errors()
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    _configure_logging(get_settings().log_format)
+    try:
+        settings = get_settings()
+    except pydantic.ValidationError as exc:
+        _configure_logging("text")
+        logger.error("refused: %s", _settings_errors(exc, "CANOPY_"))
+        return 2
+    _configure_logging(settings.log_format)
     return asyncio.run(run(args.command, getattr(args, "arm", None)))
 
 
