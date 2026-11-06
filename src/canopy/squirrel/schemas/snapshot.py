@@ -72,7 +72,7 @@ class SnapshotBase(CanopyModel):
 
 class NewSnapshotDTO(SnapshotBase):
     """Create a snapshot. With ``facility``, captures the PVs assigned to that facility
-    or its descendants; without, every registered PV."""
+    or its descendants; without, every PV this instance owns."""
 
     facility: str | None = None
 
@@ -103,6 +103,8 @@ class SnapshotSummaryDTO(SnapshotBase):
     """
 
     id: str
+    # The instance that took the snapshot and alone writes it (``canopy.core.ownership``).
+    owner_instance: str
     created_date: datetime
     created_by: str | None = None
     pv_count: int = 0
@@ -197,17 +199,22 @@ class SnapshotBundleDTO(CanopyModel):
 
 
 class SkippedValueDTO(CanopyModel):
-    """A bundle value that wasn't imported, because no PV here has its ``pv_id``."""
+    """A bundle value that wasn't imported, because its PV isn't here or can't be imported here."""
 
     pv_id: str
     pv_name: str
 
 
 class SnapshotImportResultDTO(CanopyModel):
-    """The snapshot an import created, and the bundle values it left out."""
+    """The snapshot an import saved, the bundle values it left out, and whether this call saved it.
+
+    ``created`` is false only for a captured import whose snapshot was already here: the
+    answer then describes what was saved before.
+    """
 
     snapshot: SnapshotSummaryDTO
     skipped: list[SkippedValueDTO] = []
+    created: bool = True
 
 
 class RestoreRequestDTO(CanopyModel):

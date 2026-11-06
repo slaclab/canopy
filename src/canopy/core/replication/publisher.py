@@ -7,8 +7,8 @@ A primary that will prune old rows switches from the single layout to the split
 one, once, in three steps:
 
 1. ``publish --split`` creates ``canopy_ref`` and ``canopy_ts`` beside ``canopy_history``.
-2. ``switch`` on the mirror moves its subscription to them.
-3. ``publish --split`` again drops ``canopy_history``, but only once every mirror's
+2. ``switch --arm <this arm>`` on the head moves its subscription to them.
+3. ``publish --split`` again drops ``canopy_history``, but only once the head's
    walsender is seen streaming the split publications.
 
 From then on, plain ``publish`` keeps the split pair in step. A deploy never
@@ -90,7 +90,7 @@ def walsender_publications(command: str | None) -> list[str] | None:
 
 
 async def _subscription_walsenders(conn: asyncpg.Connection) -> list[dict]:
-    """Each history mirror's slot here, whether a walsender holds it, and what it streams."""
+    """Each history slot here (the head's), whether a walsender holds it, and what it streams."""
     rows = await conn.fetch(
         """
         SELECT s.slot_name, s.active, a.query AS command
@@ -108,14 +108,14 @@ async def _subscription_walsenders(conn: asyncpg.Connection) -> list[dict]:
 
 
 def _not_switched(walsenders: list[dict], registry: ReplicationRegistry) -> list[str]:
-    """Why ``canopy_history`` can't be dropped yet: one reason per mirror not streaming the split pair."""
+    """Why ``canopy_history`` can't be dropped yet: one reason per history slot not streaming the split pair."""
     if not walsenders:
-        return ["no history mirror's slot exists here, so none can be seen to have switched"]
+        return ["no history slot exists here, so the head can't be seen to have switched"]
     split = {p.name for p in registry.split_publications}
     reasons = []
     for walsender in walsenders:
         if not walsender["active"]:
-            reasons.append(f"slot {walsender['slot']} has no walsender (its mirror isn't connected)")
+            reasons.append(f"slot {walsender['slot']} has no walsender (the head isn't connected)")
         elif walsender["publications"] is None:
             reasons.append(
                 f"can't read what slot {walsender['slot']} streams; publish needs a superuser or pg_read_all_stats"
@@ -220,7 +220,7 @@ async def _sync_publication(conn: asyncpg.Connection, publication: Publication, 
     if state.all_tables:
         raise Refused(
             f"publication {publication.name} is FOR ALL TABLES, so it publishes local tables such as core.api_key "
-            f"and can't be altered. Drop it by hand (DROP PUBLICATION {name}) once no mirror streams it, then run "
+            f"and can't be altered. Drop it by hand (DROP PUBLICATION {name}) once no head streams it, then run "
             "publish again"
         )
     created = not state.exists
@@ -255,7 +255,7 @@ async def _sync_publication(conn: asyncpg.Connection, publication: Publication, 
         logger.info("Publication %s: removed %s", publication.name, ", ".join(removed))
     if cleared:
         logger.warning(
-            "Publication %s: cleared row filters or column lists on %s. A mirror that copied them while restricted "
+            "Publication %s: cleared row filters or column lists on %s. A head that copied them while restricted "
             "holds only part of them; re-seed those tables there",
             publication.name,
             ", ".join(cleared),
@@ -323,7 +323,7 @@ async def publish(
 
     Keeps whichever layout the database has. ``split`` moves to the split layout:
     the first run creates the split pair beside ``canopy_history``; a later run, once
-    every mirror streams the split pair, drops ``canopy_history``.
+    the head streams the split pair, drops ``canopy_history``.
 
     Parameters
     ----------
@@ -352,7 +352,7 @@ async def publish(
         table history would silently miss); when a publication is ``FOR ALL TABLES``;
         when the replicator, reader or heartbeat role can reach more than its share
         (as a superuser, through a table owner, another role or PUBLIC); or, for
-        ``split`` with both layouts present, when some mirror isn't yet streaming the
+        ``split`` with both layouts present, when the head isn't yet streaming the
         split pair. Nothing is changed.
     """
     require_role("publish", "primary", role)
@@ -374,8 +374,8 @@ async def publish(
     if drop_single and (reasons := _not_switched(await _subscription_walsenders(conn), registry)):
         names = ", ".join(p.name for p in registry.publications)
         raise Refused(
-            f"{names} is still needed: {'; '.join(reasons)}. Run `switch` on the mirror, "
-            "then `publish --split` here again"
+            f"{names} is still needed: {'; '.join(reasons)}. Run `switch --arm <this arm>` on the "
+            "head, then `publish --split` here again"
         )
     if split or layout in ("switching", "split"):
         publications = registry.split_publications + (
@@ -433,7 +433,8 @@ async def publish(
         )
     elif split and layout != "split":
         logger.info(
-            "Split publications are in place. Next: run `switch` on the mirror, then `publish --split` here again"
+            "Split publications are in place. Next: run `switch --arm <this arm>` on the head, then "
+            "`publish --split` here again"
         )
     result["layout"] = await publication_layout(conn, registry)
     return result
@@ -458,7 +459,7 @@ async def publisher_status(
         inactive is holding WAL for a failed copy. For a slot a walsender holds: the
         publications it streams and when the walsender started (both ``None`` when this
         role may not see them), its flush lag (``None`` once caught up and idle) and the
-        age of the mirror's last reply, in seconds.
+        age of the head's last reply, in seconds.
     """
     present = await tables_present(conn, registry.schemas)
     layout = await publication_layout(conn, registry)

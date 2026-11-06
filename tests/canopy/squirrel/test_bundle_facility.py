@@ -128,7 +128,7 @@ async def test_import_of_only_another_facilitys_pvs_creates_nothing(client: Asyn
 
     r = await client.post("/v1/snapshots/import", headers=SC_HEADERS, json=bundle)
 
-    assert r.status_code == 400 and r.json()["code"] == "bad_request"
+    assert r.status_code == 400 and r.json()["code"] == "nothing_to_import"
     listing = await client.get("/v1/snapshots", headers=WILD_HEADERS)
     assert listing.json()["totalCount"] == 1
 

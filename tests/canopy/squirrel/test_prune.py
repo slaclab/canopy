@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from canopy.squirrel import prune as prune_module
+from canopy.core.config import get_settings
 from canopy.squirrel.prune import prune
 from canopy.squirrel.data.models import Pv, Snapshot, SnapshotValue
 from canopy.core.replication.gate import GateResult
@@ -149,6 +150,23 @@ async def test_the_cron_task_does_nothing_while_disabled(monkeypatch):
     monkeypatch.setattr(prune_module.asyncpg, "connect", no_connect)
 
     assert await prune_module.prune_snapshots({}) == {"enabled": False}
+
+
+async def test_the_cron_task_refuses_on_a_mirror(monkeypatch, caplog):
+    async def no_connect(*args, **kwargs):
+        raise AssertionError("connected on a mirror")
+
+    monkeypatch.setattr(prune_module.asyncpg, "connect", no_connect)
+    monkeypatch.setenv("CANOPY_PRUNE__ENABLED", "true")
+    monkeypatch.setenv("CANOPY_ROLE", "mirror")
+    get_settings.cache_clear()
+    try:
+        result = await prune_module.prune_snapshots({})
+    finally:
+        get_settings.cache_clear()
+
+    assert result == {"enabled": True, "refused": "CANOPY_ROLE=mirror; prune runs only on a primary"}
+    assert "nothing deleted" in caplog.text
 
 
 async def test_each_facility_keeps_its_newest_snapshot(maker, db_session):

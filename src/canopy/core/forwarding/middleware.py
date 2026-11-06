@@ -1,10 +1,12 @@
-"""``ForwardingMiddleware``: both halves of forward mode at the HTTP edge.
+"""``ForwardingMiddleware``: both halves of forwarding at the HTTP edge.
 
-On a forward instance it answers allowlisted writes (``routes.FORWARDABLE``) by
-sending them to the primary; every other request goes on to the app, where a write
-is refused with ``read_only_instance`` as on a mirror. On a primary that accepts
-forwarded writes it adds ``X-Canopy-Commit-LSN`` to the answer of a forwarded
-request that committed a write. Everywhere else it passes requests straight through.
+On a history head (``CANOPY_ROLE=mirror``) with a forwardable arm, it finds the
+owner of each routed write (``routes.ROUTES``) in the head's copy and, when that
+owner is a forwardable arm, sends the write there; every other request goes on to
+the app, whose services write the head's own rows and refuse an arm's with
+``not_owner``. On a primary that accepts forwarded writes it adds
+``X-Canopy-Commit-LSN`` to the answer of a forwarded request that committed a
+write. Everywhere else it passes requests straight through.
 
 It runs outside every sub-app's exception handlers, so it builds the uniform
 ``{code, detail}`` error body itself.
@@ -12,35 +14,29 @@ It runs outside every sub-app's exception handlers, so it builds the uniform
 
 from __future__ import annotations
 
+import json
 import logging
-from uuid import UUID
-from datetime import UTC, datetime, timedelta
+from collections.abc import Callable, Awaitable
 
-from sqlalchemy import text
 from starlette.types import Send, Scope, ASGIApp, Message, Receive
 from prometheus_client import Counter
 from starlette.responses import Response, JSONResponse
-from starlette.datastructures import Headers
+from starlette.datastructures import Headers, QueryParams
 
-from canopy.core.db import session_scope
 from canopy.core.config import get_settings
-from canopy.core.errors import (
-    CanopyError,
-    InvalidAPIKey,
-    MachineReadOnly,
-    ArchivedImmutable,
-    InsufficientWriteAccess,
-    InsufficientModuleAccess,
-)
-from canopy.core.security import MACHINE_READ_ONLY_DETAIL, APIKey, get_registry
-from canopy.core.forwarding import routes
+from canopy.core.errors import CanopyError, ArchivedImmutable
+from canopy.core.security import APIKey, get_registry
+from canopy.core.forwarding import owners, routes
 from canopy.core.forwarding.client import (
     PASSED_RESPONSE_HEADERS,
-    on_behalf_of,
-    send_to_primary,
+    Caller,
+    ArmTarget,
+    send_to_arm,
+    forward_target,
+    forwardable_arms,
     wait_until_applied,
 )
-from canopy.core.forwarding.config import ForwardConfig, get_forward_config
+from canopy.core.forwarding.config import get_forward_config
 from canopy.core.forwarding.context import (
     COMMIT_LSN_HEADER,
     ON_BEHALF_OF_HEADER,
@@ -53,19 +49,23 @@ logger = logging.getLogger(__name__)
 
 FORWARDED_REQUESTS = Counter(
     "canopy_forwarded_requests_total",
-    "Writes a forward instance answered, by route template, status code and outcome "
+    "Writes a head sent to an arm, or refused on the way, by route template, arm, status code and outcome "
     "(applied, stale, not_waited, refused, failed).",
-    ["method", "route", "status", "outcome"],
+    ["method", "route", "arm", "status", "outcome"],
 )
 
 _WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_ON_BEHALF_OF = ON_BEHALF_OF_HEADER.lower().encode()
+
+RememberJob = Callable[[str, str], Awaitable[None]]
+"""Records that job ``job_id`` (first) runs on arm ``arm`` (second), for ``GET /jobs/v1/{id}``."""
 
 
 def _route_path(scope: Scope) -> str:
     """The path the app routes on: ``scope["path"]`` without the ``root_path`` prefix.
 
     Behind a path-prefixed ingress (``uvicorn --root-path``) the server includes the
-    prefix in ``path``; the primary has its own, so it is never sent on.
+    prefix in ``path``; the arm has its own, so it is never sent on.
     """
     path, root_path = scope["path"], scope.get("root_path", "")
     if root_path and path.startswith(root_path + "/"):
@@ -78,59 +78,111 @@ def _error(exc: CanopyError) -> JSONResponse:
 
 
 class ForwardingMiddleware:
-    """Pure-ASGI middleware for forward mode. A no-op unless the role calls for it."""
+    """Pure-ASGI middleware for forwarding. A no-op unless the role calls for it.
 
-    def __init__(self, app: ASGIApp) -> None:
+    ``remember_job`` records where a forwarded write's job runs; the jobs module
+    passes it when the app is composed, so ``core`` imports no module.
+    """
+
+    def __init__(self, app: ASGIApp, remember_job: RememberJob | None = None) -> None:
         self.app = app
+        self.remember_job = remember_job
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         settings = get_settings()
-        if settings.role == "forward" and scope["method"] in _WRITE_METHODS:
-            config = get_forward_config()
-            if found := routes.match(scope["method"], _route_path(scope), allow_shared=config.allow_shared):
-                route, params = found
-                await self._forward(scope, receive, send, config, route, params)
+        if settings.role == "mirror" and scope["method"] in _WRITE_METHODS:
+            if found := routes.match(scope["method"], _route_path(scope)):
+                await self._route(scope, receive, send, *found)
                 return
         elif settings.role == "primary" and settings.accept_forwarded_writes:
-            if ON_BEHALF_OF_HEADER.lower().encode() in dict(scope["headers"]):
+            if _ON_BEHALF_OF in dict(scope["headers"]):
                 await self._serve_forwarded(scope, receive, send)
                 return
         await self.app(scope, receive, send)
 
     # ------------------------------------------------------------------ #
-    # Forward instance
+    # Head
     # ------------------------------------------------------------------ #
+
+    async def _route(
+        self, scope: Scope, receive: Receive, send: Send, route: routes.WriteRoute, params: dict[str, str]
+    ) -> None:
+        """Send ``route``'s write to its owner if that's a forwardable arm; otherwise to the app here.
+
+        The caller's key is checked first, against the gates the app's route has: an
+        arm checks only the head's service key. A request the key can't make, or that
+        names a caller itself (``X-Canopy-On-Behalf-Of``), goes to the app, which
+        refuses it as it would anywhere.
+        """
+        arms = forwardable_arms()
+        headers = Headers(scope=scope)
+        query = QueryParams(scope.get("query_string", b""))
+        if not arms or _ON_BEHALF_OF in dict(scope["headers"]):
+            await self.app(scope, receive, send)
+            return
+        if route.local_when is not None and query.get(route.local_when[0]) == route.local_when[1]:
+            await self.app(scope, receive, send)
+            return
+        if route.machine and get_settings().machine_writes:
+            await self.app(scope, receive, send)
+            return
+        if (caller := await _authorize(headers.get("x-api-key"), route)) is None:
+            await self.app(scope, receive, send)
+            return
+        body = b""
+        if route.reads_body:
+            body = await _read_body(receive)
+            receive = _replay(body, receive)
+        parsed = owners.parse_body(body) if body else None
+        local = get_settings().instance
+        requested = query.get("owner") if route.owner_param else None
+        owner = await owners.owner_of(route, params, parsed, requested=requested, local=local)
+        if owner is None or owner == local or owner not in arms or (arm := forward_target(owner)) is None:
+            await self.app(scope, receive, send)
+            return
+        await self._forward(scope, receive, send, route, params, arm, caller, body, parsed)
 
     async def _forward(
         self,
         scope: Scope,
         receive: Receive,
         send: Send,
-        config: ForwardConfig,
-        route: routes.ForwardRoute,
+        route: routes.WriteRoute,
         params: dict[str, str],
+        arm: ArmTarget,
+        caller: APIKey,
+        body: bytes,
+        parsed: object,
     ) -> None:
         headers = Headers(scope=scope)
+        config = get_forward_config()
         outcome = "refused"
         try:
-            caller = await self._authorize(headers.get("x-api-key"), route)
-            await self._check_age(route, params, config)
-            body = await _read_body(receive)
+            await owners.require_unused(route, parsed)
+            if not body:
+                body = await _read_body(receive)
             outcome = "failed"
-            answer = await send_to_primary(
-                config,
+            answer = await send_to_arm(
+                arm,
                 scope["method"],
                 _route_path(scope),
-                caller=caller,
+                caller=Caller.of(caller),
                 query=scope.get("query_string", b"").decode("latin-1"),
                 body=body,
                 headers=dict(headers),
+                config=config,
             )
+            if answer.status_code == 404 and await _pruned_on_arm(route, params, answer):
+                outcome = "refused"
+                raise ArchivedImmutable(
+                    f"Snapshot {params[route.owner.param]} is no longer on arm '{arm.name}'; it is kept here as "
+                    "history and can't be changed"
+                )
         except CanopyError as exc:
-            FORWARDED_REQUESTS.labels(scope["method"], route.path, str(exc.status_code), outcome).inc()
+            FORWARDED_REQUESTS.labels(scope["method"], route.path, arm.name, str(exc.status_code), outcome).inc()
             await _error(exc)(scope, receive, send)
             return
 
@@ -141,72 +193,24 @@ class ForwardingMiddleware:
         }
         outcome = "not_waited"
         if commit_lsn := answer.headers.get(COMMIT_LSN_HEADER):
-            if await wait_until_applied(commit_lsn, config.wait_s):
+            if await wait_until_applied(commit_lsn, config.wait_s, subscription=arm.subscription):
                 outcome = "applied"
             else:
                 outcome = "stale"
                 relayed[REPLICA_STALE_HEADER] = "true"
+        if self.remember_job is not None and (job_id := _job_id(answer)) is not None:
+            await self.remember_job(job_id, arm.name)
         logger.info(
-            "Forwarded %s %s for %s: %d (%s)",
+            "Forwarded %s %s to %s for %s: %d (%s)",
             scope["method"],
             route.path,
-            on_behalf_of(caller),
+            arm.name,
+            caller.name,
             answer.status_code,
             outcome,
         )
-        FORWARDED_REQUESTS.labels(scope["method"], route.path, str(answer.status_code), outcome).inc()
+        FORWARDED_REQUESTS.labels(scope["method"], route.path, arm.name, str(answer.status_code), outcome).inc()
         await Response(content=answer.content, status_code=answer.status_code, headers=relayed)(scope, receive, send)
-
-    @staticmethod
-    async def _authorize(token: str | None, route: routes.ForwardRoute) -> APIKey:
-        """The caller's key on this instance, holding write scope on the route's module.
-
-        Same order as the gates: an unknown key is a 401 and a machine route without
-        machine access a ``machine_read_only`` before the key's scope is looked at,
-        so no key is suggested as the fix.
-        """
-        if not token:
-            raise InvalidAPIKey("Missing X-API-Key header")
-        key = await get_registry().get(token)
-        if key is None:
-            raise InvalidAPIKey("Invalid API key")
-        if not key.allows_module(route.module):
-            raise InsufficientModuleAccess(f"API key is not scoped to '{route.module}'")
-        if route.route_class is routes.MACHINE and not get_settings().machine_writes:
-            raise MachineReadOnly(MACHINE_READ_ONLY_DETAIL)
-        if not key.write:
-            raise InsufficientWriteAccess("API key does not have write access")
-        return key
-
-    @staticmethod
-    async def _check_age(route: routes.ForwardRoute, params: dict[str, str], config: ForwardConfig) -> None:
-        """Refuse a change to a snapshot older than the primary's window, from this instance's copy.
-
-        Retained snapshots are exempt: pruning keeps them on the primary. A snapshot
-        this copy doesn't have (bad id, not replicated yet) or holds as deleted is
-        left for the primary to answer.
-        """
-        if route.snapshot_param is None or config.primary_window_days is None:
-            return
-        snapshot_id = params[route.snapshot_param]
-        try:
-            UUID(snapshot_id)
-        except ValueError:
-            return
-        async with session_scope() as session:
-            snapshot = (
-                await session.execute(
-                    text("SELECT created_at, retain, deleted_at FROM squirrel.snapshot WHERE id = CAST(:id AS uuid)"),
-                    {"id": snapshot_id},
-                )
-            ).first()
-        if snapshot is None or snapshot.retain or snapshot.deleted_at is not None:
-            return
-        if snapshot.created_at < datetime.now(UTC) - timedelta(days=config.primary_window_days):
-            raise ArchivedImmutable(
-                f"Snapshot {snapshot_id} is older than the primary's {config.primary_window_days}-day window; "
-                "it is kept here as history and can't be changed"
-            )
 
     # ------------------------------------------------------------------ #
     # Primary
@@ -236,6 +240,53 @@ class ForwardingMiddleware:
             forwarded_write.reset(token)
 
 
+async def _authorize(token: str | None, route: routes.WriteRoute) -> APIKey | None:
+    """The caller's key here, if it passes ``route``'s gates; else ``None``.
+
+    ``None`` too when the key store can't be read: the app then answers each of these
+    the way it always does (401, 403 or 503).
+    """
+    if not token:
+        return None
+    try:
+        key = await get_registry().get(token)
+        if key is None or not key.allows_module(route.module):
+            return None
+        for gate in route.gates:
+            gate(key)
+    except CanopyError:
+        return None
+    return key
+
+
+async def _pruned_on_arm(route: routes.WriteRoute, params: dict[str, str], answer) -> bool:
+    """Whether the arm's 404 is for a snapshot it pruned, which this copy still holds as live.
+
+    A snapshot held here as deleted is a user's delete that replicated, so the arm's
+    404 is the right answer and is relayed as it is.
+    """
+    rule = route.owner
+    if not isinstance(rule, routes.Row) or rule.table != "squirrel.snapshot":
+        return False
+    try:
+        code = answer.json().get("code")
+    except (ValueError, AttributeError):
+        return False
+    return code == "snapshot_not_found" and await owners.snapshot_is_live(params[rule.param])
+
+
+def _job_id(answer) -> str | None:
+    """The job id of an arm's ``JobCreatedDTO`` answer, if it is one."""
+    if not 200 <= answer.status_code < 300:
+        return None
+    try:
+        payload = answer.json()
+    except (ValueError, json.JSONDecodeError):
+        return None
+    job_id = payload.get("jobId") if isinstance(payload, dict) else None
+    return job_id if isinstance(job_id, str) and job_id else None
+
+
 async def _read_body(receive: Receive) -> bytes:
     chunks = []
     while True:
@@ -246,3 +297,17 @@ async def _read_body(receive: Receive) -> bytes:
         if not message.get("more_body", False):
             break
     return b"".join(chunks)
+
+
+def _replay(body: bytes, receive: Receive) -> Receive:
+    """A ``receive`` that yields ``body`` once, for the app after the body was read here."""
+    sent = False
+
+    async def replay() -> Message:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return await receive()
+
+    return replay

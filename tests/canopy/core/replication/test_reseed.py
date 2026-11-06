@@ -42,15 +42,20 @@ def test_since_without_a_zone_is_utc():
         parse_since("yesterday")
 
 
+RESEED = ["reseed", "--arm", "arm1"]
+
+
 def test_cut_wait_defaults_to_a_minute():
-    assert build_parser().parse_args(["reseed", "--since", "2026-10-01"]).cut_wait == 60.0
-    assert build_parser().parse_args(["reseed", "--since", "2026-10-01", "--cut-wait", "5"]).cut_wait == 5.0
+    assert build_parser().parse_args([*RESEED, "--since", "2026-10-01"]).cut_wait == 60.0
+    assert build_parser().parse_args([*RESEED, "--since", "2026-10-01", "--cut-wait", "5"]).cut_wait == 5.0
 
 
-def test_since_is_required():
-    assert build_parser().parse_args(["reseed", "--since", "2026-10-01"]).since == datetime(2026, 10, 1, tzinfo=UTC)
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["reseed"])
+def test_since_and_arm_are_required():
+    args = build_parser().parse_args([*RESEED, "--since", "2026-10-01"])
+    assert (args.arm, args.since) == ("arm1", datetime(2026, 10, 1, tzinfo=UTC))
+    for missing in (RESEED, ["reseed", "--since", "2026-10-01"]):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(missing)
 
 
 @pytest.fixture
@@ -60,32 +65,40 @@ def env(monkeypatch):
             monkeypatch.setenv(name, value)
         get_settings.cache_clear()
 
+    monkeypatch.delenv("CANOPY_ARMS", raising=False)
     yield set_env
     get_settings.cache_clear()
 
 
-ARGS = Namespace(command="reseed", since=datetime(2026, 10, 1, tzinfo=UTC))
+ARGS = Namespace(command="reseed", arm="arm1", since=datetime(2026, 10, 1, tzinfo=UTC), cut_wait=1.0)
 
 
-async def test_refused_on_a_primary(env, caplog):
-    env(CANOPY_ROLE="primary")
+async def test_refused_on_an_arm(env, caplog):
+    env(CANOPY_ROLE="primary", CANOPY_INSTANCE="arm1")
     assert await reseed.run(ARGS) == 2
     assert "runs on a mirror" in caplog.text
 
 
-async def test_refused_without_the_readers_connection(env, monkeypatch, caplog):
-    env(CANOPY_ROLE="mirror", CANOPY_INSTANCE="site_a")
-    monkeypatch.delenv("CANOPY_REPLICATION__READER_DSN", raising=False)
+async def test_refused_for_an_arm_not_configured(env, caplog):
+    env(CANOPY_ROLE="mirror", CANOPY_INSTANCE="head", CANOPY_ARMS__ARM2__READER_DSN="postgresql://r:pw@x/db")
     assert await reseed.run(ARGS) == 2
-    assert "CANOPY_REPLICATION__READER_DSN" in caplog.text
+    assert "no arm named 'arm1'" in caplog.text
 
 
-async def test_a_failed_connection_is_exit_1_and_never_shows_the_password(env, caplog, capsys):
-    secret = "s3cret-reader-pw"
+async def test_refused_without_the_arms_reader_connection(env, caplog):
+    env(CANOPY_ROLE="mirror", CANOPY_INSTANCE="head", CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=arm1-db")
+    assert await reseed.run(ARGS) == 2
+    assert "CANOPY_ARMS__ARM1__READER_DSN" in caplog.text
+
+
+async def test_a_failed_connection_is_exit_1_and_never_shows_a_password(env, caplog, capsys):
+    secret, other = "s3cret-reader-pw", "s3cret-publisher-pw"
     env(
         CANOPY_ROLE="mirror",
-        CANOPY_INSTANCE="site_a",
-        CANOPY_REPLICATION__READER_DSN=f"postgresql://reader:{secret}@127.0.0.1:1/canopy",
+        CANOPY_INSTANCE="head",
+        CANOPY_ARMS__ARM1__READER_DSN=f"postgresql://reader:{secret}@127.0.0.1:1/canopy",
+        CANOPY_ARMS__ARM1__PUBLISHER_DSN=f"host=127.0.0.1 port=1 password={other}",
     )
     assert await reseed.run(ARGS) == 1
-    assert secret not in caplog.text and secret not in capsys.readouterr().out
+    out = caplog.text + capsys.readouterr().out
+    assert secret not in out and other not in out

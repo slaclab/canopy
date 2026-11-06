@@ -128,8 +128,8 @@ speculatively.
   count includes in-process consumers (Vole holds a permanent broker client),
   exactly as the health summary does.
 
-- **Replication** to a history mirror (`canopy.core.replication.metrics`); see
-  [Replication](#replication) below.
+- **Replication** between arms and their history head
+  (`canopy.core.replication.metrics`); see [Replication](#replication) below.
 
 - **A history head's snapshot outbox** (`canopy.squirrel.outbox.metrics`); see
   [Snapshot outbox](#snapshot-outbox) below.
@@ -142,45 +142,71 @@ above).
 
 ## Replication
 
-An instance with a history mirror reports its side of the replication, read
-from the same status function as `python -m canopy.core.replication status`.
-That status comes from database queries, which are async, and a collector's
-`collect()` is not, so this is the one collector that doesn't fetch at
-collect time: the `/metrics` handler awaits its refresh just before rendering.
-The refresh opens its own short-lived connection (`CANOPY_DATABASE_URL`,
-`application_name=canopy-metrics`) with a two-second budget. If it fails, the
-scrape still succeeds and carries only `canopy_replication_status_up 0`.
+An arm (`CANOPY_ROLE=primary`) reports its logical slots, and a history head
+(`mirror`) reports its subscription to each arm in `CANOPY_ARMS__<arm>__…`,
+both read from the same status function as
+`python -m canopy.core.replication status`. That status comes from database
+queries, which are async, and a collector's `collect()` is not, so this is the
+one collector that doesn't fetch at collect time: the `/metrics` handler awaits
+its refresh just before rendering. The refresh opens its own short-lived
+connection (`CANOPY_DATABASE_URL`, `application_name=canopy-metrics`) with a
+two-second budget. If it fails, the scrape still succeeds and carries only
+`canopy_replication_status_up 0`.
+
+A series about one of a head's arms carries an `arm` label (the arm's name,
+which is also its `CANOPY_INSTANCE`); the head's subscription to it is
+`canopy_history_<arm>`. An arm's own series describe the arm itself and carry
+no `arm` label: the scrape's `instance` tells arms apart. Other per-arm series
+on a head follow the same rule.
 
 | Metric | Labels | Meaning |
 |--------|--------|---------|
 | `canopy_replication_status_up` | | 1 when this scrape read the status |
-| `canopy_replication_slot_active` | `slot`, `kind` | Primary: 1 while a mirror streams from the logical slot. `kind` is `subscription`, `tablesync` (an initial table copy) or `other` |
+| `canopy_replication_slot_active` | `slot`, `kind` | Arm: 1 while the head streams from the logical slot. `kind` is `subscription`, `tablesync` (an initial table copy) or `other` |
 | `canopy_replication_slot_wal_status` | `slot`, `kind`, `wal_status` | 1 for the slot's current `wal_status` (`reserved`, `extended`, `unreserved`, `lost`) |
-| `canopy_replication_slot_retained_bytes` | `slot`, `kind` | WAL the slot keeps on the primary's disk |
-| `canopy_replication_slot_lag_bytes` | `slot`, `kind` | WAL the mirror hasn't confirmed applying: **the** replication lag |
+| `canopy_replication_slot_retained_bytes` | `slot`, `kind` | WAL the slot keeps on the arm's disk |
+| `canopy_replication_slot_lag_bytes` | `slot`, `kind` | WAL the head hasn't confirmed applying: **the** replication lag |
 | `canopy_replication_slot_safe_wal_bytes` | `slot`, `kind` | WAL left before the slot is lost (only under a cap) |
-| `canopy_replication_max_slot_wal_keep_bytes` | | The primary's `max_slot_wal_keep_size`; absent when unlimited |
-| `canopy_replication_subscription_exists`, `_enabled`, `_worker_up` | `subscription` | Mirror: the subscription, and whether its apply worker runs |
-| `canopy_replication_subscription_receive_age_seconds` | `subscription` | Seconds since the primary last sent anything, keepalives included; the API host's clock against the database's, so clock skew shows up here |
-| `canopy_replication_subscription_apply_errors_total`, `_sync_errors_total` | `subscription` | Errors applying changes, and during initial copies |
-| `canopy_replication_subscription_tables_not_ready` | `subscription` | Tables still in their initial copy |
-| `canopy_replication_subscription_applied_lsn_bytes` | `subscription` | The primary's WAL position of the last transaction applied: a position, not a lag |
+| `canopy_replication_max_slot_wal_keep_bytes` | | The arm's `max_slot_wal_keep_size`; absent when unlimited |
+| `canopy_replication_subscription_exists` | `arm` | Head: 1 when its subscription to the arm exists, 0 for an arm it lists without one (that arm then has no other series) |
+| `canopy_replication_subscription_enabled`, `_worker_up` | `arm` | Whether the subscription is enabled, and whether its apply worker runs |
+| `canopy_replication_subscription_receive_age_seconds` | `arm` | Seconds since the arm last sent anything, keepalives included; the API host's clock against the database's, so clock skew shows up here |
+| `canopy_replication_subscription_apply_errors_total`, `_sync_errors_total` | `arm` | Errors applying the arm's changes, and during initial copies |
+| `canopy_replication_subscription_tables_not_ready` | `arm` | Tables still in their initial copy |
+| `canopy_replication_subscription_applied_lsn_bytes` | `arm` | The arm's WAL position of the last transaction applied: a position, not a lag |
+| `canopy_replication_subscriptions_unexpected` | | Head: history subscriptions whose arm isn't in `CANOPY_ARMS` |
 
-A mirror has no honest apply-lag figure of its own. Its received position
-follows every keepalive, which covers WAL the primary wrote to tables it
-doesn't publish, so received minus applied grows while nothing is waiting.
-Alert on the primary's `canopy_replication_slot_lag_bytes` instead. The
-applied position is readable only by a superuser unless a superuser grants
-the API's role both `SELECT ON pg_replication_origin_status` and
-`EXECUTE ON FUNCTION pg_show_replication_origin_status()` (`pg_read_all_stats`
-isn't enough). Without them that one series is absent.
+A head has no honest apply-lag figure of its own. Its received position follows
+every keepalive, which covers WAL the arm wrote to tables it doesn't publish,
+so received minus applied grows while nothing is waiting. Alert on the arm's
+`canopy_replication_slot_lag_bytes` instead. The applied position is readable
+only by a superuser unless a superuser grants the API's role both
+`SELECT ON pg_replication_origin_status` and
+`EXECUTE ON FUNCTION pg_show_replication_origin_status()`
+(`pg_read_all_stats` isn't enough). Without them that one series is absent.
 
 `docker/observability/grafana/provisioning/alerting/replication.yaml` holds
-the alert rules: on the primary, a slot inactive for 15 minutes, retaining
-over half the WAL cap, out of `reserved`, or a slot with no cap at all; on the
-mirror, a stopped apply worker, nothing received for five minutes, apply or
-copy errors, and a copy unfinished after an hour; on either, a status that
-can't be read. No contact point is provisioned.
+the alert rules, and `tests/test_alert_rules.py` checks every rule file there
+against the exported series.
+
+- **On each arm:** a slot inactive for 15 minutes (`slot-inactive`), retaining
+  over half the WAL cap (`slot-wal-retained`), out of `reserved`
+  (`slot-wal-status`), or a slot with no cap at all (`no-wal-cap`).
+- **On the head, per arm:**
+  - `apply-stopped` (critical): apply errors still rising after 10 minutes.
+    Apply retries the failing transaction, so nothing more from that arm
+    arrives while the other arms keep streaming. The usual cause is a facility
+    or Magpie slug that another owner already holds.
+  - `copy-errors`: an initial copy failed in the last 15 minutes;
+    `copy-stuck` follows when tables are still copying after an hour.
+  - `worker-down`: no apply worker for 5 minutes. `receive-stale`: nothing
+    received for 5 minutes.
+  - `subscription-missing`: an arm in `CANOPY_ARMS` with no subscription for
+    30 minutes. `subscription-unlisted`: a subscription for an arm the head
+    doesn't list, for an hour.
+- **On either:** a status that can't be read (`status-down`).
+
+No contact point is provisioned.
 
 ## Snapshot outbox
 

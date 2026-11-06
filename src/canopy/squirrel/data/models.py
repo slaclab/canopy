@@ -25,6 +25,7 @@ from sqlalchemy import (
     BigInteger,
     ForeignKey,
     CheckConstraint,
+    UniqueConstraint,
     func,
     text,
 )
@@ -32,6 +33,7 @@ from sqlalchemy.orm import Mapped, relationship, mapped_column
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
 from canopy.core.db import Base, UUIDMixin, TimestampMixin, SoftDeleteMixin
+from canopy.core.ownership import OwnedMixin
 
 SQUIRREL_SCHEMA = "squirrel"
 
@@ -56,13 +58,14 @@ pv_tag = Table(
 )
 
 
-class Pv(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
+class Pv(UUIDMixin, TimestampMixin, OwnedMixin, SoftDeleteMixin, Base):
     """A registered PV: its address(es), owning device, and compare tolerances.
 
     Address resolution (the three ``*_address`` columns + ``device``) is kept
     independent of the comparison policy (``abs_tolerance``/``rel_tolerance``) so a
     later Raccoon directory delegation can resolve addresses externally while the
-    tolerances stay local. Only ``setpoint_address`` is unique; the
+    tolerances stay local. Only ``setpoint_address`` is unique, per owner: the same
+    PV can be registered on two instances, and a mirror holds both rows. The
     at-least-one-address rule is enforced in the service layer, not the DB.
 
     Deleting a PV sets ``deleted_at``: the row, its tags and its values in past
@@ -71,9 +74,12 @@ class Pv(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     """
 
     __tablename__ = "pv"
-    __table_args__ = {"schema": SQUIRREL_SCHEMA}
+    __table_args__ = (
+        UniqueConstraint("owner_instance", "setpoint_address", name="uq_pv_owner_instance_setpoint_address"),
+        {"schema": SQUIRREL_SCHEMA},
+    )
 
-    setpoint_address: Mapped[str | None] = mapped_column(String(255), index=True, unique=True)
+    setpoint_address: Mapped[str | None] = mapped_column(String(255), index=True)
     readback_address: Mapped[str | None] = mapped_column(String(255), index=True)
     config_address: Mapped[str | None] = mapped_column(String(255), index=True)
     device: Mapped[str | None] = mapped_column(String(255), index=True)
@@ -88,13 +94,16 @@ class Pv(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     )
 
 
-class TagGroup(UUIDMixin, TimestampMixin, Base):
-    """A named group of tags (e.g. ``Region``); group name is globally unique."""
+class TagGroup(UUIDMixin, TimestampMixin, OwnedMixin, Base):
+    """A named group of tags (e.g. ``Region``); the name is unique per owner."""
 
     __tablename__ = "tag_group"
-    __table_args__ = {"schema": SQUIRREL_SCHEMA}
+    __table_args__ = (
+        UniqueConstraint("owner_instance", "name", name="uq_tag_group_owner_instance_name"),
+        {"schema": SQUIRREL_SCHEMA},
+    )
 
-    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True, unique=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[str | None] = mapped_column(Text)
 
     tags: Mapped[list[Tag]] = relationship("Tag", back_populates="group", cascade="all, delete-orphan", lazy="selectin")
@@ -114,6 +123,11 @@ class Tag(UUIDMixin, TimestampMixin, Base):
 
     group: Mapped[TagGroup] = relationship("TagGroup", back_populates="tags", lazy="selectin")
     pvs: Mapped[list[Pv]] = relationship("Pv", secondary=pv_tag, back_populates="tags")
+
+    @staticmethod
+    def __owner_parent__() -> tuple[type[TagGroup], str]:
+        """A tag is owned by its group's owner (``canopy.core.ownership``)."""
+        return TagGroup, "group_id"
 
 
 # --------------------------------------------------------------------------- #
@@ -139,13 +153,14 @@ pv_facility = Table(
 # --------------------------------------------------------------------------- #
 
 
-class Snapshot(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
+class Snapshot(UUIDMixin, TimestampMixin, OwnedMixin, SoftDeleteMixin, Base):
     """A captured machine state: metadata + one ``SnapshotValue`` per read address.
 
-    Deleting a snapshot sets ``deleted_at`` and keeps its values. ``retain`` exempts it
-    from any pruning of old snapshots. ``imported_from`` is the id of the snapshot it was
-    imported from, usually on a history mirror; no foreign key, since that snapshot may
-    no longer exist here.
+    Its facility and every PV its values reference share its ``owner_instance``.
+    Deleting a snapshot sets ``deleted_at`` and keeps its values; the row keeps its
+    owner. ``retain`` exempts it from any pruning of old snapshots. ``imported_from`` is
+    the id of the snapshot it was imported from, usually on a history mirror; no foreign
+    key, since that snapshot may no longer exist here.
     """
 
     __tablename__ = "snapshot"
@@ -153,6 +168,7 @@ class Snapshot(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
         # Serves the newest-first keyset listing (scanned backward) and range scans by
         # creation time, such as a cutoff for pruning old snapshots.
         Index("ix_squirrel_snapshot_created_at_id", "created_at", "id"),
+        Index("ix_squirrel_snapshot_owner_instance", "owner_instance"),
         {"schema": SQUIRREL_SCHEMA},
     )
 
@@ -239,9 +255,10 @@ class SnapshotOutbox(Base):
     ``state`` is ``pending`` (waiting, or backing off after a transient failure),
     ``delivered`` (the arm saved it; waiting for replication) or ``failed`` (the arm
     refused it, for the reason in ``last_error``). Each arm's rows are delivered in
-    ``seq`` order. ``facility_id`` has no foreign key: ``core.facility`` is a
-    replica on the head, and a reference from a local row would stop an arm's
-    facility delete from applying, and with it that arm's replication.
+    ``seq`` order. ``facility_id`` is ``None`` for a snapshot of every PV the arm
+    owns, and has no foreign key: ``core.facility`` is a replica on the head, and a
+    reference from a local row would stop an arm's facility delete from applying,
+    and with it that arm's replication.
 
     ``caller`` is who the capture was taken for, as the capture job carried it:
     delivery sends that user and facility grant, not whatever holds when it runs.
@@ -258,7 +275,7 @@ class SnapshotOutbox(Base):
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True)
     seq: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
     arm: Mapped[str] = mapped_column(String(48), nullable=False)
-    facility_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False)
+    facility_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False))
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(String(255))

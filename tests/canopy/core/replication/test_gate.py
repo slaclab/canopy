@@ -142,7 +142,7 @@ def test_the_reasons_say_what_to_fix():
 
     assert failures["no_delete_publication"] == "squirrel.snapshot is published with deletes by canopy_history"
     assert "pg_read_all_stats" in failures["streams_split"]
-    assert failures["heartbeat_ok"] == "the mirror reported failed checks: backup_ok, drift_ok"
+    assert failures["heartbeat_ok"] == "the head reported failed checks: backup_ok, drift_ok"
 
 
 def test_a_publication_that_does_not_exist_carries_nothing():
@@ -191,7 +191,7 @@ def test_the_reasons_name_the_new_checks():
         heartbeat={**HEARTBEAT, "written_at": STARTED - timedelta(hours=1)},
     ).failures
 
-    assert failures["streams_split"] == "the mirror streams canopy_ts, without canopy_ref"
+    assert failures["streams_split"] == "the head streams canopy_ts, without canopy_ref"
     assert failures["no_initial_copy"] == "an initial table copy is running (pg_16399_sync_16388_7431)"
     assert (
         failures["heartbeat_fresh"]
@@ -201,5 +201,5 @@ def test_the_reasons_name_the_new_checks():
 
 def test_a_partly_published_table_doesnt_count_as_carried():
     assert _judge(status=_restricted(_status())).failures == {
-        "streams_split": "the mirror streams canopy_ref, canopy_ts, which carry no squirrel.snapshot"
+        "streams_split": "the head streams canopy_ref, canopy_ts, which carry no squirrel.snapshot"
     }

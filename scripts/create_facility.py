@@ -25,7 +25,6 @@ from pydantic import ValidationError
 
 from canopy.core.db import session_scope, dispose_engine
 from canopy.core.errors import CanopyError
-from canopy.core.security import READ_ONLY_DETAIL, is_read_only_instance
 from canopy.core.facilities.schemas import FacilityCreate
 from canopy.core.facilities.service import FacilityService
 
@@ -41,10 +40,6 @@ async def main() -> int:
         help="Slug of the parent facility. A grant on the parent also covers this one.",
     )
     args = parser.parse_args()
-    if is_read_only_instance():
-        # core.facility replicates from the primary; a table owner could still write it here.
-        print(f"error: {READ_ONLY_DETAIL}", file=sys.stderr)
-        return 2
 
     try:
         data = FacilityCreate(

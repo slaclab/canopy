@@ -51,16 +51,15 @@ def test_a_command_is_required():
     ("command", "role"),
     [
         ("publish", "mirror"),
-        ("publish", "forward"),
         ("subscribe", "primary"),
         ("grants", "primary"),
-        ("switch", "primary"),
-        ("heartbeat", "primary"),
+        ("switch --arm arm1", "primary"),
+        ("heartbeat --arm arm1", "primary"),
     ],
 )
 def test_wrong_side_is_refused_without_connecting(env, no_connect, caplog, command, role):
     env(CANOPY_ROLE=role)
-    assert cli.main([command]) == 2
+    assert cli.main(command.split()) == 2
     assert "refused:" in caplog.text
 
 
@@ -76,23 +75,48 @@ def test_split_switch_and_heartbeat_options():
 
     assert parser.parse_args(["publish", "--split"]).split is True
     assert parser.parse_args(["publish"]).split is False
-    assert parser.parse_args(["subscribe", "--split"]).split is True
-    assert parser.parse_args(["switch"]).timeout == 120.0
-    checks = parser.parse_args(["heartbeat", "--backup-ok", "--drift-ok"])
-    assert (checks.backup_ok, checks.wal_archive_ok, checks.drift_ok) == (True, False, True)
+    assert parser.parse_args(["subscribe", "--split", "--arm", "arm1"]).split is True
+    switch = parser.parse_args(["switch", "--arm", "arm1"])
+    assert (switch.arm, switch.timeout) == ("arm1", 120.0)
+    checks = parser.parse_args(["heartbeat", "--arm", "arm2", "--backup-ok", "--drift-ok"])
+    assert (checks.arm, checks.backup_ok, checks.wal_archive_ok, checks.drift_ok) == ("arm2", True, False, True)
 
 
-async def test_an_unreachable_primary_is_reported_without_the_heartbeat_password():
+@pytest.mark.parametrize("command", ["switch", "heartbeat"])
+def test_switch_and_heartbeat_name_one_arm(command, capsys):
+    # One arm's layout moves, and one arm's drift result is recorded: never every arm.
+    with pytest.raises(SystemExit) as caught:
+        cli.build_parser().parse_args([command])
+    assert caught.value.code == 2
+    assert "--arm" in capsys.readouterr().err
+
+
+async def test_split_without_an_arm_is_refused(db, env, caplog):
+    env(CANOPY_DATABASE_URL=_sqlalchemy_url(DB_DSN), CANOPY_ROLE="mirror", CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=x")
+    options = cli.build_parser().parse_args(["subscribe", "--split"])
+    assert await cli.run("subscribe", None, options) == 2
+    assert "the split layout is one arm's; name it with --arm" in caplog.text
+
+
+async def test_an_unreachable_arm_is_reported_without_its_heartbeat_password():
     from pydantic import SecretStr
 
-    from canopy.core.replication.config import ReplicationConfig
-    from canopy.core.replication.subscriber import ReplicationError, _connect_primary
+    from canopy.core.arms import Arm
+    from canopy.core.replication.subscriber import ReplicationError, _connect_arm
 
-    config = ReplicationConfig(heartbeat_dsn=SecretStr("postgresql://beat:s3cret-beat@127.0.0.1:1/canopy"))
+    arm = Arm(heartbeat_dsn=SecretStr("postgresql://beat:s3cret-beat@127.0.0.1:1/canopy"))
     with pytest.raises(ReplicationError) as caught:
-        await _connect_primary(config, "heartbeat")
-    assert "cannot connect to the primary" in str(caught.value)
+        await _connect_arm("arm1", arm, "heartbeat")
+    assert "cannot connect to arm arm1" in str(caught.value)
     assert "s3cret-beat" not in str(caught.value)
+
+
+async def test_a_missing_heartbeat_dsn_names_the_arms_setting():
+    from canopy.core.arms import Arm
+    from canopy.core.replication.subscriber import Refused, _connect_arm
+
+    with pytest.raises(Refused, match="CANOPY_ARMS__ARM1__HEARTBEAT_DSN"):
+        await _connect_arm("arm1", Arm(), "switch")
 
 
 def test_logging_is_configured_once():
@@ -105,9 +129,9 @@ def _sqlalchemy_url(dsn: str) -> str:
     return make_url(dsn).set(drivername="postgresql+asyncpg").render_as_string(hide_password=False)
 
 
-async def _run(command: str) -> int:
+async def _run(command: str, arm: str | None = None) -> int:
     # main() calls asyncio.run, which can't nest inside the test's loop.
-    return await cli.run(command)
+    return await cli.run(command, arm)
 
 
 async def test_publish_then_status_through_the_cli(db, config, env, capsys):
@@ -133,8 +157,52 @@ async def test_a_refusal_inside_a_command_exits_2(db, env, caplog):
     assert "unclassified tables: magpie.mystery" in caplog.text
 
 
-@pytest.mark.parametrize("role", ["mirror", "forward"])
-async def test_mirror_status_through_the_cli(db, env, capsys, role):
-    env(CANOPY_DATABASE_URL=_sqlalchemy_url(DB_DSN), CANOPY_ROLE=role, CANOPY_INSTANCE="lab")
+async def test_head_status_through_the_cli(db, env, capsys):
+    env(
+        CANOPY_DATABASE_URL=_sqlalchemy_url(DB_DSN),
+        CANOPY_ROLE="mirror",
+        CANOPY_INSTANCE="head",
+        CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=arm1.example.org password=s3cret-arm",
+        CANOPY_ARMS__ARM2__PUBLISHER_DSN="host=arm2.example.org password=s3cret-arm",
+    )
     assert await _run("status") == 0
-    assert json.loads(capsys.readouterr().out)["subscription"] == {"name": "canopy_history_lab", "exists": False}
+    every = json.loads(capsys.readouterr().out)
+    assert [sub["arm"] for sub in every["subscriptions"]] == ["arm1", "arm2"]
+
+    assert await _run("status", arm="arm2") == 0
+    out = capsys.readouterr().out
+    assert json.loads(out)["subscriptions"] == [{"arm": "arm2", "name": "canopy_history_arm2", "exists": False}]
+    assert "s3cret-arm" not in out
+
+
+async def test_an_unknown_arm_is_refused(db, env, caplog):
+    env(CANOPY_DATABASE_URL=_sqlalchemy_url(DB_DSN), CANOPY_ROLE="mirror", CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=x")
+    assert await _run("refresh", arm="arm9") == 2
+    assert "no arm named 'arm9'" in caplog.text
+
+
+def test_arm_applies_only_on_a_head(env, no_connect, caplog):
+    assert cli.main(["status", "--arm", "arm1"]) == 2
+    assert "--arm applies on a head" in caplog.text
+
+
+def test_an_invalid_arm_name_is_refused_without_echoing_its_settings(env, no_connect, caplog, monkeypatch):
+    monkeypatch.setenv("CANOPY_ARMS", '{"Bad-Name": {"publisher_dsn": "host=x password=s3cret-arm"}}')
+    assert cli.main(["status"]) == 2
+    assert "CANOPY_ARMS: Value error, arm names must be" in caplog.text and "s3cret-arm" not in caplog.text
+
+
+def test_a_missing_instance_is_refused(env, no_connect, caplog, monkeypatch):
+    monkeypatch.delenv("CANOPY_INSTANCE", raising=False)
+    env()
+    assert cli.main(["status"]) == 2
+    assert "refused: CANOPY_INSTANCE: Field required" in caplog.text
+
+
+def test_only_head_commands_take_an_arm():
+    parser = cli.build_parser()
+    for command in ("subscribe", "refresh", "status"):
+        assert parser.parse_args([command, "--arm", "arm1"]).arm == "arm1"
+    for command in ("publish", "grants"):
+        with pytest.raises(SystemExit):
+            parser.parse_args([command, "--arm", "arm1"])

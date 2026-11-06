@@ -35,7 +35,7 @@ def client(monkeypatch):
 
 @pytest.fixture
 def history_settings(monkeypatch, mirror_role):
-    monkeypatch.setenv("CANOPY_INSTANCE", "site-a")
+    monkeypatch.setenv("CANOPY_INSTANCE", "site_a")
     monkeypatch.setenv("CANOPY_HISTORY_URL", "https://history.example.org")
     get_settings.cache_clear()
 
@@ -46,11 +46,12 @@ def test_primary_defaults(client):
     assert resp.status_code == 200, resp.text
     assert resp.json() == {
         "role": "primary",
-        "instance": None,
+        "instance": "arm1",
         "historyUrl": None,
         "windowDays": None,
         "alembicHead": SHIPPED_HEAD,
         "machineAccess": "write",
+        "arms": [],
     }
 
 
@@ -60,18 +61,40 @@ def test_mirror_reports_its_role_and_history_fields(client, history_settings):
     assert resp.status_code == 200, resp.text
     assert resp.json() == {
         "role": "mirror",
-        "instance": "site-a",
+        "instance": "site_a",
         "historyUrl": "https://history.example.org",
         "windowDays": None,
         "alembicHead": SHIPPED_HEAD,
         "machineAccess": "read",
+        "arms": [],
     }
 
 
-def test_forward_reports_its_role_and_machine_access(client, forward_role):
-    body = client.get("/v1/instance", headers={"X-API-Key": "ro"}).json()
+def test_a_head_lists_its_arms_and_their_subscriptions(client, history_settings, monkeypatch):
+    monkeypatch.setenv("CANOPY_ARMS__ARM2__PUBLISHER_DSN", "host=arm2.example.org")
+    monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "host=arm1.example.org")
+    monkeypatch.setenv("CANOPY_ARMS__ARM1__FORWARD_URL", "https://arm1.example.org")
+    monkeypatch.setenv("CANOPY_ARMS__ARM1__SERVICE_KEY", "s3cret-key")
 
-    assert (body["role"], body["machineAccess"]) == ("forward", "read")
+    async def states(session, arms):
+        assert arms == ["arm1", "arm2"]
+        return {"arm1": "streaming", "arm2": "missing"}
+
+    monkeypatch.setattr(instance, "arm_states", states)
+    resp = client.get("/v1/instance", headers={"X-API-Key": "ro"})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["arms"] == [
+        {"name": "arm1", "subscription": "streaming", "forwards": True},
+        {"name": "arm2", "subscription": "missing", "forwards": False},
+    ]
+    assert "arm1.example.org" not in resp.text
+    assert "s3cret-key" not in resp.text
+
+
+def test_a_primary_lists_no_arms_even_if_some_are_set(client, monkeypatch):
+    monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "host=arm1.example.org")
+    assert client.get("/v1/instance", headers={"X-API-Key": "ro"}).json()["arms"] == []
 
 
 def test_requires_a_key(client):

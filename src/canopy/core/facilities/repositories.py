@@ -44,6 +44,13 @@ class FacilityRepository(BaseRepository[Facility]):
         result = await self.session.execute(select(Facility.slug, Facility.id).where(Facility.slug.in_(slugs)))
         return {slug: id_ for slug, id_ in result.all()}
 
+    async def owners_by_id(self, ids: list[str] | set[str]) -> dict[str, str]:
+        """``{id: owner_instance}`` for the subset of ``ids`` that exist."""
+        if not ids:
+            return {}
+        result = await self.session.execute(select(Facility.id, Facility.owner_instance).where(Facility.id.in_(ids)))
+        return {row.id: row.owner_instance for row in result}
+
     async def slugs_by_id(self, ids: list[str] | set[str]) -> dict[str, str]:
         """``{id: slug}`` for the subset of ``ids`` that exist, in one query."""
         if not ids:

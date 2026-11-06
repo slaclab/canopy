@@ -1,46 +1,14 @@
-"""``canopy-worker``'s task list per instance role: a mirror registers only stateless tasks, and only a
-primary schedules pruning."""
+"""``canopy-worker``'s schedule per instance role: only a primary (an arm) schedules pruning."""
 
 import os
 import sys
 import subprocess
 
-from canopy.worker import (
-    FUNCTIONS,
-    MIRROR_FUNCTIONS,
-    ping,
-    convert_batch,
-    prune_snapshots,
-    worker_cron_jobs,
-    worker_functions,
-)
+import pytest
 
-
-def test_mirror_registers_only_ping_and_convert_batch():
-    assert worker_functions("mirror") == [ping, convert_batch]
-    assert MIRROR_FUNCTIONS == [ping, convert_batch]
-
-
-def test_forward_registers_what_a_mirror_does():
-    # A forward instance sends writes to its primary; its own worker never captures or restores.
-    assert worker_functions("forward") == MIRROR_FUNCTIONS
-
-
-def test_primary_registers_every_task():
-    assert worker_functions("primary") == FUNCTIONS
-    assert {f.__name__ for f in FUNCTIONS} >= {"create_snapshot_task", "restore_snapshot_task"}
-
-
-def test_worker_settings_follow_canopy_role():
-    # A fresh interpreter: WorkerSettings reads the role at import, and reloading
-    # canopy.worker here would leak a mirror task list into every later test.
-    code = "from canopy.worker import WorkerSettings; print(' '.join(f.__name__ for f in WorkerSettings.functions))"
-    env = {**os.environ, "CANOPY_ROLE": "mirror"}
-
-    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
-
-    assert out.returncode == 0, out.stderr
-    assert out.stdout.split() == ["ping", "convert_batch"]
+from canopy.worker import FUNCTIONS, prune_snapshots, worker_cron_jobs, worker_functions
+from canopy.core.config import Settings
+from canopy.squirrel.tasks import create_snapshot_task, restore_snapshot_task
 
 
 def test_only_a_primary_schedules_pruning():
@@ -48,4 +16,39 @@ def test_only_a_primary_schedules_pruning():
     assert job.coroutine is prune_snapshots
     assert job.unique and not job.run_at_startup
     assert worker_cron_jobs("mirror") == []
-    assert worker_cron_jobs("forward") == []
+
+
+def test_a_heads_worker_schedules_nothing():
+    # A fresh interpreter: WorkerSettings reads the role at import, and reloading
+    # canopy.worker here would leak a mirror's schedule into every later test.
+    code = "from canopy.worker import WorkerSettings; print(len(WorkerSettings.cron_jobs))"
+    env = {**os.environ, "CANOPY_ROLE": "mirror"}
+
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["0"]
+
+
+@pytest.mark.parametrize("role", ["primary", "mirror"])
+def test_only_machine_access_registers_the_restore_task(role):
+    with_write = worker_functions(Settings(role=role, machine_access="write"))
+    with_read = worker_functions(Settings(role=role, machine_access="read"))
+
+    assert with_write == FUNCTIONS
+    assert restore_snapshot_task not in with_read
+    # A capture only reads EPICS, so every worker takes one.
+    assert create_snapshot_task in with_read
+
+
+def test_a_heads_worker_restores_only_when_told_to():
+    code = "from canopy.worker import WorkerSettings; print(' '.join(f.__name__ for f in WorkerSettings.functions))"
+
+    def registered(**env: str) -> list[str]:
+        out = subprocess.run([sys.executable, "-c", code], env={**os.environ, **env}, capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+        return out.stdout.split()
+
+    assert "restore_snapshot_task" not in registered(CANOPY_ROLE="mirror")
+    assert "restore_snapshot_task" in registered(CANOPY_ROLE="mirror", CANOPY_MACHINE_ACCESS="write")
+    assert "restore_snapshot_task" in registered(CANOPY_ROLE="primary")

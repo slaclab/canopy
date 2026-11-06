@@ -1,4 +1,7 @@
-"""Forward-mode configuration (``CANOPY_FORWARD__*``), read only when ``CANOPY_ROLE=forward``.
+"""Settings every forwarded write shares (``CANOPY_FORWARD__*``), read on a history head.
+
+Where each arm's writes go is that arm's own setting (``CANOPY_ARMS__<arm>__FORWARD_URL``
+and ``__SERVICE_KEY``, in ``canopy.core.arms``); these apply to all of them.
 
 A fresh instance per ``get_forward_config()`` call (no caching), like the module
 configs, so tests can vary the environment freely.
@@ -6,12 +9,12 @@ configs, so tests can vary the environment freely.
 
 from __future__ import annotations
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class ForwardConfig(BaseSettings):
-    """Where a forward instance sends writes, and which ones."""
+    """How a head forwards writes to its arms, and how long it waits for them to come back."""
 
     model_config = SettingsConfigDict(
         env_prefix="CANOPY_FORWARD__",
@@ -20,62 +23,29 @@ class ForwardConfig(BaseSettings):
         extra="ignore",
     )
 
-    primary_url: str | None = Field(
-        default=None,
-        description=(
-            "Base URL of the primary's API (e.g. https://canopy.example.org), without a trailing slash. "
-            "Forwarded routes keep their paths under it. Must be https unless ALLOW_INSECURE_HTTP is set."
-        ),
-    )
-    service_key: SecretStr | None = Field(
-        default=None,
-        description=(
-            "A service key on the primary (scripts/create_key.py --service), with write scope on the "
-            "forwarded modules. Supply it from a secret."
-        ),
-    )
-    allow_shared: bool = Field(
-        default=False,
-        description=(
-            "Also forward writes to tables every facility shares (tag groups and tags, meta-PVs, Magpie "
-            "configs). Off by default: a facility key grant can't limit those rows."
-        ),
-    )
-    primary_window_days: int | None = Field(
-        default=None,
-        ge=1,
-        description=(
-            "The primary's window (its CANOPY_WINDOW_DAYS). A change to a snapshot older than this is "
-            "refused here with 409 archived_immutable instead of being forwarded. Unset: no age check."
-        ),
-    )
     wait_s: float = Field(
         default=2.0,
         ge=0,
         description=(
-            "How long to wait for replication to apply a forwarded write before answering with X-Canopy-Replica-Stale."
+            "How long to wait for replication to bring a forwarded write back from its arm before answering "
+            "with X-Canopy-Replica-Stale."
         ),
     )
-    timeout_s: float = Field(default=30.0, gt=0, description="Timeout for one request to the primary.")
+    timeout_s: float = Field(default=30.0, gt=0, description="Timeout for one request to an arm.")
     ca_bundle: str | None = Field(
-        default=None, description="CA bundle that verifies the primary's certificate; the system store when unset."
+        default=None, description="CA bundle that verifies the arms' certificates; the system store when unset."
     )
     allow_insecure_http: bool = Field(
-        default=False, description="Allow an http:// primary_url. For local development and tests only."
+        default=False, description="Allow an http:// arm forward URL. For local development and tests only."
     )
 
-    @field_validator("primary_url", "service_key", "primary_window_days", "ca_bundle", mode="before")
+    @field_validator("ca_bundle", mode="before")
     @classmethod
     def _blank_is_unset(cls, value: object) -> object:
         """Read a blank value, as Helm and compose render an unset one, as unset (like ``Settings``)."""
         if isinstance(value, str) and not value.strip():
             return None
         return value
-
-    @field_validator("primary_url")
-    @classmethod
-    def _strip_trailing_slash(cls, value: str | None) -> str | None:
-        return value.rstrip("/") if value else value
 
 
 def get_forward_config() -> ForwardConfig:

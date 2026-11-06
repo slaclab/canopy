@@ -1,12 +1,12 @@
 """Replication bookkeeping tables — the ``core`` Postgres schema, never replicated.
 
-``core.history_heartbeat`` lives on the primary and is written by its history
-mirror: ``python -m canopy.core.replication heartbeat`` runs on the mirror after
-its backup, WAL-archive and drift checks and records their outcome here, over a
-connection as a role that may write only this table. The prune job reads it
-before deleting anything, so the primary never removes old rows while history's
-copy of them is unchecked. The registry classifies it ``local``: a mirror must
-not receive its primary's heartbeat, or the row it writes would collide with it.
+``core.history_heartbeat`` lives on each arm and is written by its history head:
+``python -m canopy.core.replication heartbeat --arm <arm>`` runs on the head after
+its backup, WAL-archive and drift checks and records their outcome for that arm
+here, over a connection as a role that may write only this table. The arm's prune
+job reads it before deleting anything, so the arm never removes old rows while the
+head's copy of them is unchecked. The registry classifies it ``local``: the head
+must not receive an arm's heartbeat rows.
 """
 
 from __future__ import annotations
@@ -22,11 +22,11 @@ CORE_SCHEMA = "core"
 
 
 class HistoryHeartbeat(Base):
-    """The latest checks reported by one history mirror, keyed by its subscription name.
+    """The latest checks the head reported for this arm, keyed by its subscription name.
 
-    ``applied_lsn`` is the primary's WAL position the mirror had applied, as text
-    (``0/16B3748``), or ``None`` when the mirror's role may not read it.
-    ``written_at`` is set by the primary's clock, so freshness is judged on one clock.
+    ``applied_lsn`` is this arm's WAL position the head had applied, as text
+    (``0/16B3748``), or ``None`` when the head's role may not read it.
+    ``written_at`` is set by this arm's clock, so freshness is judged on one clock.
     """
 
     __tablename__ = "history_heartbeat"
