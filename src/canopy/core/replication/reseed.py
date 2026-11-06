@@ -378,6 +378,7 @@ async def _set_aside(
     """
     parked = 0
     join_sql, owner_sql = copy.owners
+    owner_column = getattr(registry.owner_paths.get(copy.table), "column", None)
     for columns in await _unique_indexes(mirror, copy.table):
         if not set(columns) <= set(copy.columns):
             continue
@@ -406,7 +407,11 @@ async def _set_aside(
                 f"{copy.table} keeps a row the arm no longer has whose {', '.join(columns)} the arm now "
                 "gives another row; reconcile it by hand"
             )
-        assignments = ", ".join([f"{quote_ident(c)} = {await _placeholder(mirror, copy, c)}" for c in columns])
+        # The owner column is never parked: the clash already matches it, so parking the
+        # other columns frees a per-owner constraint, and the row keeps its owner for
+        # the owner-scoped delete that follows.
+        park = [c for c in columns if c != owner_column]
+        assignments = ", ".join([f"{quote_ident(c)} = {await _placeholder(mirror, copy, c)}" for c in park])
         status = await mirror.execute(
             f"UPDATE {qualified(copy.table)} t SET {assignments} WHERE {mine_owned} AND {clash}", owner
         )

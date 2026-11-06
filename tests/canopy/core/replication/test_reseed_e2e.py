@@ -489,6 +489,45 @@ async def test_follows_swapped_names_and_a_moved_child(octopus: Octopus):
 
 
 @one_arm
+async def test_a_replaced_pv_keeps_its_owner_and_is_deleted(octopus: Octopus):
+    """A PV deleted and created again at the same address: the old row is set aside, then deleted, never re-owned."""
+    o = octopus
+    arm = o.arm.name
+    await _subscribed(o)
+    old_pv, new_pv = str(uuid4()), str(uuid4())
+    await o.arm.admin.execute(
+        "INSERT INTO squirrel.pv (id, setpoint_address, owner_instance) VALUES ($1, 'SIM:PV:2:SETPOINT', $2)",
+        old_pv,
+        arm,
+    )
+    await eventually(lambda: _in_step(o, arm))
+    since = await _newest_on_head(o)
+    await _lose_subscription(o)
+    await o.arm.admin.execute("DELETE FROM squirrel.pv WHERE id = $1", old_pv)
+    await o.arm.admin.execute(
+        "INSERT INTO squirrel.pv (id, setpoint_address, owner_instance) VALUES ($1, 'SIM:PV:2:SETPOINT', $2)",
+        new_pv,
+        arm,
+    )
+
+    primary, mirror = await _connections(o)
+    try:
+        report = await _reseed(o, primary, mirror, since=since)
+        assert report["tables"]["squirrel.pv"]["set_aside"] == 1 and report["tables"]["squirrel.pv"]["deleted"] == 1
+        rows = await o.head.conn.fetch(
+            "SELECT id::text, owner_instance FROM squirrel.pv WHERE setpoint_address = 'SIM:PV:2:SETPOINT'"
+        )
+        assert [tuple(row.values()) for row in rows] == [(new_pv, arm)]
+        assert not await o.head.conn.fetchval(
+            "SELECT count(*) FROM squirrel.pv WHERE owner_instance <> ALL($1::text[])", [arm, o.head.name]
+        )
+        await eventually(lambda: _in_step(o, arm))
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+@one_arm
 async def test_waits_for_the_apply_worker_to_stop(octopus: Octopus, monkeypatch):
     o = octopus
     await _subscribed(o)
