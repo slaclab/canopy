@@ -5,6 +5,7 @@ keeps one subscription per arm and holds every arm's rows. The arms are one
 setting, keyed by arm name::
 
     CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=<arm1-host> dbname=canopy user=replicator password=<secret>"
+    CANOPY_ARMS__ARM1__READER_DSN="postgresql://canopy_reader:<secret>@<arm1-host>/canopy"
     CANOPY_ARMS__ARM2__PUBLISHER_DSN="..."
 
 or as JSON, ``CANOPY_ARMS='{"arm1": {"publisher_dsn": "..."}}'``. An arm's name
@@ -35,6 +36,14 @@ class Arm(BaseModel):
             "libpq connection string (key=value or URI) the head's subscription uses to reach this arm, "
             "as its replication role. Only `subscribe` reads it. Supply it from a secret; it never goes "
             "on the command line or into the CLI's output."
+        ),
+    )
+
+    reader_dsn: SecretStr | None = Field(
+        default=None,
+        description=(
+            "postgresql:// URI the head's `drift-check` uses to read this arm, as its read-only reader "
+            "role. Supply it from a secret, like the publisher DSN."
         ),
     )
 

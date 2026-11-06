@@ -37,10 +37,12 @@ import canopy.squirrel.data.models  # noqa: F401
 import canopy.core.facilities.models  # noqa: F401
 from canopy.core.db import Base
 from canopy.core.arms import Arm, ArmsConfig, subscription_name
+from canopy.core.replication.drift import SESSION
 from canopy.core.replication.config import ReplicationConfig
 from canopy.core.replication.metrics import ReplicationCollector
 from canopy.core.replication.registry import REGISTRY
-from canopy.core.replication.subscriber import subscriber_status
+from canopy.core.replication.publisher import publish
+from canopy.core.replication.subscriber import grants, subscribe, subscriber_status
 
 _ADMIN_DSN = os.environ.get("CANOPY_TEST_ADMIN_DSN", "postgresql://canopy:canopy@localhost:5432/postgres")
 _DB_NAME = "canopy_replication_test"
@@ -389,4 +391,40 @@ async def seed_rows(conn: asyncpg.Connection, owner: str, *, slug: str | None = 
         f"cfg_{slug}"[:16],
         owner,
     )
+    return ids
+
+
+async def _reader_dsn(octopus: Octopus, arm: str) -> str:
+    """``arm`` as its read-only reader role, which ``publish`` granted SELECT on the published tables."""
+    side = octopus.arms[arm]
+    password = uuid4().hex
+    await side.admin.execute(f"ALTER ROLE \"{side.reader}\" PASSWORD '{password}'")
+    return server_dsn(side.dsn, database=make_url(side.dsn).database, user=side.reader, password=password)
+
+
+async def _arm_connections(octopus: Octopus, arm: str) -> tuple[asyncpg.Connection, asyncpg.Connection]:
+    """``drift-check``'s connections for ``arm``: the arm as its reader role, and the head."""
+    primary = await asyncpg.connect(await _reader_dsn(octopus, arm), server_settings=SESSION)
+    mirror = await asyncpg.connect(octopus.head.dsn, server_settings=SESSION)
+    return primary, mirror
+
+
+async def _subscribed(octopus: Octopus, arm: str | None = None) -> dict[str, str]:
+    """Publish and seed ``arm`` (the first by default), subscribe the head to it, and wait for the copy.
+
+    Returns the seeded ids (``seed_rows``), owned by the arm.
+    """
+    side = octopus.arms[arm or octopus.arm.name]
+    await publish(side.admin, role="primary", config=octopus.config)
+    ids = await seed_rows(side.admin, side.name)
+    await grants(octopus.head.conn, role="mirror", head=octopus.head.name, config=octopus.config)
+    await subscribe(
+        octopus.head.conn,
+        role="mirror",
+        head=octopus.head.name,
+        arms=octopus.arms_config.arms,
+        only=side.name,
+        connect_arm=octopus.connect_arm,
+    )
+    await eventually(lambda: copied(octopus, side.name))
     return ids
