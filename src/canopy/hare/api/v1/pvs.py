@@ -50,7 +50,7 @@ async def put_pv(
     blocks until the IOC processes the write, so a 200 means it landed; a failure
     or timeout raises `PVWriteFailed` (-> 502).
 
-    On a forward instance this runs only with ``CANOPY_MACHINE_ACCESS=write``.
+    Runs only with ``CANOPY_MACHINE_ACCESS=write``, the default on a primary.
     """
     await broker.put(pv, body.value, wait=body.wait, timeout=body.timeout)
     return PVWriteResultDTO(pv=pv)

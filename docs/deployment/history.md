@@ -303,8 +303,10 @@ nor named as local.
 
 | Writes | Owner |
 |---|---|
-| Snapshot edit, retain, delete and restore; PV edit and delete; meta-PV edit and delete; tag group and tag changes; Magpie config edit and delete; facility edit and delete | The row's |
-| Snapshot capture and history import | The facility's, from the body |
+| Snapshot edit, retain and delete; PV edit and delete; meta-PV edit and delete; tag group and tag changes; Magpie config edit and delete; facility edit and delete | The row's |
+| Snapshot restore | Here with machine access `write`; otherwise the snapshot's ([Machine access](#machine-access)) |
+| Snapshot capture | Taken here; saved here or on the facility's arm ([Snapshots taken on the head](#snapshots-taken-on-the-head)) |
+| Snapshot history import | The facility's, from the body |
 | PV create and PV import (`/pvs/multi`) | The facilities' in the body, which must share one owner |
 | Meta-PV create | The owner of the PV at that address: the head's own first, else the one arm that holds it |
 | Facility create | The parent's |
@@ -329,9 +331,9 @@ arm, export it on the head (`GET /squirrel/v1/snapshots/{id}/export`) and post t
 bundle to `POST /squirrel/v1/snapshots/import`, which goes to the facility's arm and
 creates a new snapshot there.
 
-A forwarded capture or restore runs as a job on the arm. Clients poll it on the head
-as usual: `GET /jobs/v1/{id}` asks that arm about a job the head started there, for a
-day after it started.
+A forwarded restore runs as a job on the arm. Clients poll it on the head as usual:
+`GET /jobs/v1/{id}` asks that arm about a job the head started there, for a day after
+it started.
 
 ### Who wrote it
 
@@ -395,6 +397,42 @@ of the two doesn't start. Optional, for every arm: `CANOPY_FORWARD__WAIT_S`,
 `CANOPY_ACCEPT_FORWARDED_WRITES=true`. The full list is in the
 [environment table](index.md). Deploy the head from the same release as its arms, so
 what it forwards has the shapes they expect.
+
+### Machine access
+
+`CANOPY_MACHINE_ACCESS` says whether an instance writes to the machine: a Hare PV write
+(`PUT /hare/v1/pvs/{pv}`) and a snapshot restore. It is `write` on a primary and `read`
+on a head unless set. With `read` both are refused with 403 `machine_read_only`, and
+the worker doesn't register the restore task; captures, which only read EPICS, run on
+every instance.
+
+With `write`, an instance restores from its own copy of the snapshot, a head an arm's
+snapshot included, through its own EPICS gateway, which must then allow writes. With
+`read`, a head sends a restore of a forwardable arm's snapshot to that arm, whose
+worker runs it; a read-only arm's snapshot gets 403 `not_owner`, and the head's own
+gets `machine_read_only`.
+
+Nothing coordinates two instances writing the same IOCs. Give `write` to one instance
+per facility, normally its arm. `GET /v1/instance` reports the setting as
+`machineAccess`.
+
+### Snapshots taken on the head
+
+The head reads EPICS for every facility, so a capture runs on its own worker,
+whoever owns the facility. A snapshot of the head's own facility is saved on the head.
+One of a forwardable arm's facility (or with `?owner=` naming that arm) is read from
+that arm's PVs, given an id and time on the head, and sent to the arm's captured
+import (`POST /squirrel/v1/snapshots/import?mode=captured`) as the head's service key,
+on the user's behalf. The arm saves it under that id, with the user as its author, and
+replication brings it back to the head unchanged. A capture for a read-only arm's
+facility is refused with 403 `not_owner` before anything is queued.
+
+The capture job's result names the arm: `{"type": "snapshot", "id", "arm"}`, with the
+values the arm left out under `skipped`. It waits up to `CANOPY_FORWARD__TIMEOUT_S`
+(30 s) for the snapshot to come back; one that takes longer is saved on the arm all
+the same. The captured import is idempotent on the id, so sending a bundle again
+saves nothing twice. When the arm can't be reached, the job fails with
+`primary_unavailable`, or with the arm's refusal.
 
 ### When an arm is unreachable
 

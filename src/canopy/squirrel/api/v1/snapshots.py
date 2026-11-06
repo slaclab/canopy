@@ -8,10 +8,12 @@ snapshot bundle) runs inline against the request session.
 
 import logging
 from typing import Literal, Annotated
+from dataclasses import asdict
 
 from fastapi import Query, Security, APIRouter
 
 from canopy.jobs import gateway as jobs_gateway
+from canopy.core.config import get_settings
 from canopy.core.errors import (
     BadRequest,
     FacilityNotFound,
@@ -25,15 +27,18 @@ from canopy.core.security import (
     require_read_access,
     require_write_access,
     report_commit_position,
+    require_machine_access,
 )
 from canopy.contracts.jobs import JobCreatedDTO
-from canopy.core.ownership import OwnerQuery, require_create_owner
+from canopy.core.ownership import OwnerQuery, require_owned
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.time_parse import DateTimeBound
 from canopy.core.validation import require_uuid
 from canopy.squirrel.errors import SnapshotNotFound
+from canopy.squirrel.capture import capture_target
 from canopy.contracts.pagination import PagedResult
 from canopy.squirrel.dependencies import FacilityScopeDep, SnapshotServiceDep
+from canopy.core.forwarding.client import Caller
 from canopy.squirrel.schemas.snapshot import (
     SnapshotDTO,
     NewSnapshotDTO,
@@ -134,6 +139,7 @@ async def list_snapshots(
 async def create_snapshot(
     data: NewSnapshotDTO,
     actor: ActorDep,
+    key: WriteKeyDep,
     key_scope: FacilityScopeDep,
     use_cache: Annotated[
         bool,
@@ -151,16 +157,21 @@ async def create_snapshot(
     ] = False,
     owner: OwnerQuery = None,
 ) -> JobCreatedDTO:
-    """Enqueue a snapshot of the facility's PVs (every PV this instance owns if no
-    facility is given). The worker reads EPICS and persists it. The snapshot is owned by
-    its facility's owner, else by this instance; ``owner`` accepts only this instance's name.
+    """Enqueue a snapshot of the facility's PVs (every PV of its owner if no facility is
+    given). The worker reads EPICS here and saves it. The snapshot is owned by its
+    facility's owner, else by ``owner``, else by this instance.
+
+    On a history head a snapshot of a forwardable arm's facility (or with ``owner`` naming
+    one) is still taken here, then saved on that arm under the id and time it got here
+    (``canopy.squirrel.capture``); the job's result names the arm. Any other owner is
+    refused with ``not_owner``.
 
     ``createdBy`` records the key's name, or the user a history head forwarded the
     request for.
     """
     # The facility gate has to run *here*, not in the service: nothing of the caller's
     # identity crosses the Arq boundary, and a refused write must not become a queued job.
-    # The owner check too, so a snapshot this instance wouldn't own is refused at once.
+    # The owner check too, so a snapshot this instance can't save is refused at once.
     facility_id = None
     facility_owner = None
     if data.facility is not None:
@@ -168,7 +179,7 @@ async def create_snapshot(
         if facility_id is None:
             raise FacilityNotFound(f"Facility '{data.facility}' not found")
         facility_owner = (await facilities_gateway.owners_by_id({facility_id})).get(facility_id)
-    require_create_owner(facility_owner, owner, f"A snapshot of {data.facility or 'every PV'}")
+    target = capture_target(facility_owner, owner, f"A snapshot of {data.facility or 'every PV'}")
 
     if key_scope is not None:
         # A facility-restricted key must name a facility it holds. Unlike mutating an
@@ -181,6 +192,9 @@ async def create_snapshot(
 
     # use_cache goes to the job only when set, so a plain snapshot asks nothing new of the worker.
     extra = {"use_cache": True} if use_cache else {}
+    if target.arm is not None:
+        # Saved on the arm, as the caller: who they are, and their facility grant, go with the job.
+        extra |= {"arm": target.arm, "caller": asdict(Caller.of(key))}
     job_id = await jobs_gateway.enqueue(
         "create_snapshot_task",
         title=data.title,
@@ -308,10 +322,24 @@ async def restore_snapshot(
     actor: ActorDep,
     request: RestoreRequestDTO | None = None,
 ) -> JobCreatedDTO:
-    """Enqueue a restore of a snapshot's setpoints to EPICS (``pv_ids=None`` restores all)."""
+    """Enqueue a restore of a snapshot's setpoints to EPICS (``pv_ids=None`` restores all).
+
+    Only with ``CANOPY_MACHINE_ACCESS=write``, from this instance's copy of the
+    snapshot, whoever owns it. Without it, a history head sends the restore to the
+    snapshot's arm when that arm forwards; anything else is refused, with
+    ``not_owner`` for another instance's snapshot and ``machine_read_only`` for this
+    one's.
+
+    Logs who asked (the key's name, or the user a history head forwarded it for): a
+    restore changes the machine and stores no row of its own.
+    """
     snapshot_id = require_uuid(snapshot_id, SnapshotNotFound, f"Snapshot {snapshot_id} not found")
-    if not await service.snapshot_exists(snapshot_id):
+    snapshot_owner = await service.restorable_owner(snapshot_id)
+    if snapshot_owner is None:
         raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
+    if not get_settings().machine_writes:
+        require_owned(snapshot_owner, f"Snapshot {snapshot_id}")
+        require_machine_access()
     # Narrow the write set to the key's facilities here, pre-enqueue — the worker has no
     # caller identity to check against.
     pv_ids, skipped = await service.plan_restore(snapshot_id, request.pv_ids if request else None)

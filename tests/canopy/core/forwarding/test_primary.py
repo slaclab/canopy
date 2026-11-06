@@ -302,7 +302,8 @@ async def test_a_forwarded_restore_logs_the_caller(http, monkeypatch, caplog):
     snapshot_id = "6f1c2c1e-0d4b-4c43-9a55-2f0d7a3c9b10"
     async with db.get_session_maker()() as session:
         await session.execute(
-            text("INSERT INTO squirrel.snapshot (id, title) VALUES (:id, 'Before')"), {"id": snapshot_id}
+            text("INSERT INTO squirrel.snapshot (id, title, owner_instance) VALUES (:id, 'Before', 'arm1')"),
+            {"id": snapshot_id},
         )
         await session.commit()
 
@@ -312,7 +313,7 @@ async def test_a_forwarded_restore_logs_the_caller(http, monkeypatch, caplog):
         )
 
     assert resp.status_code == 200, resp.text
-    assert f"Restore of snapshot {snapshot_id} queued as job job-r for operator@site_a" in caplog.text
+    assert f"Restore of snapshot {snapshot_id} queued as job job-r for operator@head" in caplog.text
 
 
 class TestForwardedImport:

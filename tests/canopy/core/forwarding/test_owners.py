@@ -72,7 +72,6 @@ class TestRows:
 
 class TestCreates:
     async def test_by_facility(self, rows):
-        assert await _owner("POST", "/squirrel/v1/snapshots", {"title": "t", "facility": "arm1-site"}) == "arm1"
         assert await _owner("POST", "/squirrel/v1/snapshots/import", {"facility": "arm2-site"}) == "arm2"
         assert await _owner("POST", "/v1/facilities", {"slug": "child", "parent": "arm1-site"}) == "arm1"
 
@@ -88,13 +87,12 @@ class TestCreates:
         assert await _owner("POST", "/squirrel/v1/pvs/multi", multi) is None
 
     async def test_an_unknown_facility_is_the_apps(self, rows):
-        assert await _owner("POST", "/squirrel/v1/snapshots", {"facility": "nowhere"}) is None
+        assert await _owner("POST", "/squirrel/v1/snapshots/import", {"facility": "nowhere"}) is None
         assert await _owner("POST", "/squirrel/v1/pvs", {"facilities": ["nowhere"]}) is None
 
     @pytest.mark.parametrize(
         ("method", "path", "body"),
         [
-            ("POST", "/squirrel/v1/snapshots", {"title": "t"}),
             ("POST", "/squirrel/v1/pvs", {"setpointAddress": "NEW:PV"}),
             ("POST", "/squirrel/v1/pvs/multi", [{"setpointAddress": "NEW:PV"}]),
             ("POST", "/squirrel/v1/tags", {"name": "Area"}),
@@ -111,12 +109,12 @@ class TestCreates:
     async def test_an_owner_param_the_target_contradicts_is_the_apps(self, rows):
         assert await _owner("POST", "/squirrel/v1/pvs", {"facilities": ["arm1-site"]}, requested="arm1") == "arm1"
         assert await _owner("POST", "/squirrel/v1/pvs", {"facilities": ["head-site"]}, requested="arm1") is None
-        body = {"title": "t", "facility": "arm2-site"}
-        assert await _owner("POST", "/squirrel/v1/snapshots", body, requested="head") is None
+        body = {"slug": "child", "parent": "arm2-site"}
+        assert await _owner("POST", "/v1/facilities", body, requested="head") is None
 
     async def test_a_body_that_isnt_json_is_the_apps(self, rows):
         assert await _owner("POST", "/squirrel/v1/pvs", None) is None
-        assert await _owner("POST", "/squirrel/v1/snapshots", {"facility": 3}) is None
+        assert await _owner("POST", "/squirrel/v1/snapshots/import", {"facility": 3}) is None
 
 
 class TestMetaPvByAddress:

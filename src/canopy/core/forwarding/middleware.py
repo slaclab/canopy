@@ -126,6 +126,9 @@ class ForwardingMiddleware:
         if route.local_when is not None and query.get(route.local_when[0]) == route.local_when[1]:
             await self.app(scope, receive, send)
             return
+        if route.machine and get_settings().machine_writes:
+            await self.app(scope, receive, send)
+            return
         if (caller := await _authorize(headers.get("x-api-key"), route)) is None:
             await self.app(scope, receive, send)
             return

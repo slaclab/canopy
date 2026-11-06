@@ -278,6 +278,24 @@ class TestLeftToTheAppHere:
 
         assert calls == []
 
+    def test_a_restore_with_machine_access_runs_here(self, client, owner, app_here, monkeypatch):
+        calls = owner("arm1")
+        monkeypatch.setenv("CANOPY_MACHINE_ACCESS", "write")
+        get_settings.cache_clear()
+
+        resp = client.post(f"/squirrel/v1/snapshots/{SNAPSHOT_ID}/restore", json={}, headers=_as(WRITER))
+
+        assert resp.status_code == 299
+        assert calls == []
+
+    def test_a_capture_is_taken_here(self, client, owner, app_here):
+        calls = owner("arm1")
+
+        resp = client.post("/squirrel/v1/snapshots", json={"title": "t", "facility": "a"}, headers=_as(WRITER))
+
+        assert resp.status_code == 299
+        assert calls == []
+
     def test_nothing_on_a_primary(self, bind_keys, owner):
         bind_keys(WRITER)
         calls = owner("arm1")
@@ -307,15 +325,6 @@ class TestArmTrouble:
         assert resp.status_code == 504
         assert resp.json()["code"] == "primary_unavailable"
         assert "may or may not have been applied" in resp.json()["detail"]
-
-    def test_a_capture_is_refused_too(self, client, owner, httpx_mock: HTTPXMock):
-        # Only #86's head-side capture queues; a forwarded capture request doesn't.
-        owner("arm1")
-        httpx_mock.add_exception(httpx.ConnectError("connection refused"))
-
-        resp = client.post("/squirrel/v1/snapshots", json={"title": "t", "facility": "a"}, headers=_as(WRITER))
-
-        assert resp.status_code == 502
 
     def test_plain_http_needs_the_override(self, client, owner, httpx_mock: HTTPXMock, monkeypatch):
         owner("arm1")
@@ -380,7 +389,7 @@ class TestReadYourWrites:
         calls = waited(False)
         httpx_mock.add_response(json={"jobId": "j1", "statusUrl": "/jobs/v1/j1"})
 
-        resp = client.post("/squirrel/v1/snapshots", json={"title": "t", "facility": "a"}, headers=_as(WRITER))
+        resp = client.post(f"/squirrel/v1/snapshots/{SNAPSHOT_ID}/restore", json={}, headers=_as(WRITER))
 
         assert calls == []
         assert "x-canopy-replica-stale" not in resp.headers

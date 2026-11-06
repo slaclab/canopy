@@ -13,6 +13,7 @@ from canopy.core.errors import (
     ErrorCode,
     BadRequest,
     InvalidAPIKey,
+    MachineReadOnly,
     KeyStoreUnavailable,
     ForwardedWriteRefused,
     InsufficientReadAccess,
@@ -376,6 +377,37 @@ def require_read_access(key: APIKeyDep) -> APIKey:
 
 
 def require_write_access(key: APIKeyDep) -> APIKey:
+    if not key.write:
+        raise InsufficientWriteAccess("API key does not have write access")
+    return key
+
+
+MACHINE_READ_ONLY_DETAIL = (
+    "This Canopy instance doesn't write to the machine (CANOPY_MACHINE_ACCESS=read); "
+    "make machine changes where it is allowed"
+)
+
+
+def require_machine_access() -> None:
+    """Refuse with ``machine_read_only`` unless this instance writes to the machine.
+
+    Raises
+    ------
+    MachineReadOnly
+        With ``CANOPY_MACHINE_ACCESS=read``.
+    """
+    if not get_settings().machine_writes:
+        raise MachineReadOnly(MACHINE_READ_ONLY_DETAIL)
+
+
+def require_machine_write_access(key: APIKeyDep) -> APIKey:
+    """Gate for a write to the machine made by this process (a Hare PV write).
+
+    Refused with ``machine_read_only`` without ``CANOPY_MACHINE_ACCESS=write``, in any
+    role. That comes after the key resolves (a bad token is still a 401) but before
+    its scope, so a caller learns that no key would succeed here.
+    """
+    require_machine_access()
     if not key.write:
         raise InsufficientWriteAccess("API key does not have write access")
     return key

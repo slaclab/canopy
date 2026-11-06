@@ -322,10 +322,10 @@ class PrimaryTimeout(PrimaryUnavailable):
 
 
 class MachineReadOnly(CanopyError):
-    """A forward instance without machine access refused a machine write (a PV write, a restore).
+    """A machine write (a PV write, a restore) refused by an instance without machine access.
 
-    Distinct from ``ReadOnlyInstance``: the instance does take some writes, just
-    not ones that change the machine (``CANOPY_MACHINE_ACCESS=read``).
+    The instance takes other writes, just not ones that change the machine
+    (``CANOPY_MACHINE_ACCESS=read``).
     """
 
     status_code = 403

@@ -89,7 +89,9 @@ class WriteRoute:
     must be unique across every owner (``ReplicationRegistry.shared_keys``), as
     ``(table, column)``: a forwarded create may not reuse one the head already holds,
     or the arm's new row would stop replication from that arm. ``local_when`` is a
-    query parameter value that keeps the request here.
+    query parameter value that keeps the request here. ``machine`` marks a write to
+    the machine, which runs here when this instance has machine access, whoever owns
+    the row it reads.
     """
 
     method: str
@@ -99,6 +101,7 @@ class WriteRoute:
     owner_param: bool = False
     unique: tuple[str, str] | None = None
     local_when: tuple[str, str] | None = None
+    machine: bool = False
     regex: re.Pattern = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -123,8 +126,6 @@ _CONFIG = Row("magpie.config", "slug", column="slug")
 _FACILITY = Row("core.facility", "facility_slug", column="slug")
 
 ROUTES: tuple[WriteRoute, ...] = (
-    # A capture is a job on the owner's worker; GET /jobs/v1/{job_id} here asks that arm about it.
-    WriteRoute("POST", "/squirrel/v1/snapshots", Facility("facility"), owner_param=True),
     # A history import makes a new snapshot in the bundle's facility. A captured import is
     # how this head saves a snapshot it took for an arm: only a service key sends one, to
     # the arm directly, so one arriving here is this instance's.
@@ -132,7 +133,9 @@ ROUTES: tuple[WriteRoute, ...] = (
     WriteRoute("PUT", "/squirrel/v1/snapshots/{snapshot_id}", _SNAPSHOT),
     WriteRoute("PATCH", "/squirrel/v1/snapshots/{snapshot_id}", _SNAPSHOT),
     WriteRoute("DELETE", "/squirrel/v1/snapshots/{snapshot_id}", _SNAPSHOT),
-    WriteRoute("POST", "/squirrel/v1/snapshots/{snapshot_id}/restore", _SNAPSHOT),
+    # A restore writes the machine from this instance's copy when it has machine access;
+    # otherwise the owner's worker restores, and GET /jobs/v1/{job_id} here asks that arm.
+    WriteRoute("POST", "/squirrel/v1/snapshots/{snapshot_id}/restore", _SNAPSHOT, machine=True),
     WriteRoute("POST", "/squirrel/v1/pvs", Facilities("facilities"), owner_param=True),
     WriteRoute("POST", "/squirrel/v1/pvs/multi", Facilities("facilities", rows=True), owner_param=True),
     WriteRoute("PUT", "/squirrel/v1/pvs/{pv_id}", _PV),
@@ -165,6 +168,9 @@ ROUTES: tuple[WriteRoute, ...] = (
 )
 
 LOCAL: dict[tuple[str, str], str] = {
+    # The head reads EPICS for every facility; an arm's snapshot is saved on that arm
+    # through its captured import (canopy.squirrel.capture).
+    ("POST", "/squirrel/v1/snapshots"): "captured here, and saved here or on the facility's arm",
     ("POST", "/v1/api-keys"): "API keys are each instance's own and never replicate",
     ("DELETE", "/v1/api-keys/{key_id}"): "API keys are each instance's own and never replicate",
     ("PUT", "/hare/v1/pvs/{pv:path}"): "writes the machine from this instance; machine access decides",
