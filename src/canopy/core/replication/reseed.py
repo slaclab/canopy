@@ -1,46 +1,53 @@
-"""``reseed``: fill a mirror's gap from its primary, then hand over to replication at one WAL position.
+"""``reseed``: fill the head's gap in one arm from that arm, then hand over to replication at one WAL position.
 
-After the primary's slot is lost, or the mirror is restored to an earlier point in
-time, the changes the mirror is missing are no longer in any slot. ``reseed --since
-<ts>`` copies them from the primary, read as the reader role:
+After an arm's slot is lost, or the head is restored to an earlier point in time,
+the changes the head is missing from that arm are no longer in any slot. ``reseed
+--arm <arm> --since <ts>`` copies them from the arm, read as its reader role
+(``CANOPY_ARMS__<arm>__READER_DSN``). Only that arm's subscription and the rows it
+owns are touched (``sql.owner_join``); other arms keep streaming, and their rows and
+the head's own are never read, written or deleted:
 
-* every reference table, fully reconciled: rows the primary no longer has are
+* every reference table, fully reconciled: rows the arm no longer has are
   deleted, the rest are inserted or updated;
-* every time-series parent the primary has, inserted or updated; parents the primary
-  no longer has are never deleted, since once the primary prunes old rows history is
+* every time-series parent the arm has, inserted or updated; parents the arm
+  no longer has are never deleted, since once the arm prunes old rows the head is
   the only copy;
-* the children of each parent the mirror was missing, and of each parent created (or,
+* the children of each parent the head was missing, and of each parent created (or,
   where the table has ``updated_at``, updated) at or after ``--since``, reconciled per
   parent.
 
-It runs with the subscription disabled, creating it disabled and without the initial
-copy when there is none. The hand-over:
+It runs with that arm's subscription disabled, creating it disabled and without the
+initial copy when there is none. The hand-over:
 
-1. Take ``B = pg_current_xact_id()`` on the primary and wait until no lower xid is
+1. Take ``B = pg_current_xact_id()`` on the arm and wait until no lower xid is
    still running. Read ``x0 = pg_current_wal_insert_lsn()``. Open a repeatable-read
    snapshot whose first statement takes another xid, ``X``.
 2. ``X = B + 1`` means no other transaction got an xid in between. Everything that
    committed before ``x0`` is then visible in the snapshot, and nothing committed
    between ``x0`` and the snapshot. Otherwise the attempt is dropped and the cut is
-   tried again, for up to ``--cut-wait`` seconds; a primary that never pauses writing
+   tried again, for up to ``--cut-wait`` seconds; an arm that never pauses writing
    that long is refused, and nothing changes.
-3. Copy from that snapshot into the mirror in one transaction. Inside it, unique
-   values the primary has moved between rows are set aside first, parents are written
-   before children, and rows the primary no longer has are deleted last, children
+3. Copy from that snapshot into the head in one transaction. Inside it, unique
+   values the arm has moved between rows are set aside first, parents are written
+   before children, and rows the arm no longer has are deleted last, children
    first.
-4. Once the copy has committed, advance the subscription's replication origin to
+4. Once the copy has committed, advance the arm's subscription's replication origin to
    ``x0`` and enable the subscription. Apply resumes with the first transaction that
    committed after ``x0``: nothing is replayed and nothing is lost.
 
 The origin's progress isn't transactional, so it moves only after the copy is safely
-in. If a run fails, the subscription stays disabled: run ``reseed`` again, and never
-enable the subscription by hand.
+in. If a run fails, the arm's subscription stays disabled: run ``reseed`` again, and
+never enable the subscription by hand.
 
-``--since`` must not be later than the newest snapshot the mirror holds. Missing
+A key, or a value unique across owners (a facility or Magpie slug), that another
+owner's row already holds here is refused, naming that owner: never overwritten, set
+aside or deleted. So is deleting a row another owner's row still references.
+
+``--since`` must not be later than the newest snapshot the head holds from that arm. Missing
 parents are found by id whatever their time, but children of a parent both sides hold
 are re-read only from ``--since`` on. Earlier is always safe, only slower.
 
-Run it as a superuser of the mirror's database, or as the tables' and
+Run it as a superuser of the head's database, or as the tables' and
 subscription's owner with EXECUTE on ``pg_replication_origin_advance(text, pg_lsn)``.
 """
 
@@ -57,12 +64,14 @@ from collections.abc import Mapping, Callable, Awaitable
 
 import asyncpg
 
+from canopy.core.arms import Arm, get_arms_config, subscription_name
 from canopy.core.config import get_settings
 from canopy.core.replication.sql import (
     Refused,
     ReplicationError,
     redact,
     qualified,
+    owner_join,
     asyncpg_dsn,
     quote_ident,
     is_superuser,
@@ -73,15 +82,15 @@ from canopy.core.replication.drift import (
     SESSION,
     TIME_SERIES_BUCKETS,
     Bucketing,
+    references,
     primary_key,
     table_columns,
 )
-from canopy.core.replication.config import ReplicationConfig, get_replication_config
 from canopy.core.replication.registry import REGISTRY, TableClass, ReplicationRegistry
 from canopy.core.replication.subscriber import (
     subscribe,
     _subscription,
-    subscription_name,
+    _selected_arms,
     _subscribed_tables,
 )
 
@@ -104,9 +113,19 @@ class Copy:
     kind: TableClass
     columns: tuple[str, ...]  # present on both sides, in the mirror's order
     key: tuple[str, ...]
-    bucketing: Bucketing | None = None  # time series
+    owners: tuple[str, str] = ("", "")  # sql.owner_join for alias t
+    bucketing: Bucketing | None = None  # time-series parent
     updated_column: str | None = None  # time-series parent: also selected by this, when present
-    parent_id: str = "id"  # time-series child: the parent's primary key column
+    parent: str | None = None  # time-series child: its owner-path parent
+    parent_key: str | None = None  # time-series child: its column holding the parent's id
+
+    @property
+    def time_series_parent(self) -> bool:
+        return self.kind is TableClass.TIME_SERIES and self.parent is None
+
+    @property
+    def time_series_child(self) -> bool:
+        return self.kind is TableClass.TIME_SERIES and self.parent is not None
 
 
 async def _foreign_keys(conn: asyncpg.Connection, tables: list[str]) -> set[tuple[str, str]]:
@@ -147,12 +166,19 @@ def parents_first(tables: list[str], foreign_keys: set[tuple[str, str]]) -> list
     return ordered
 
 
-async def _newest_parent(conn: asyncpg.Connection, tables: set[str]) -> datetime | None:
-    """The newest timestamp of any time-series parent row the mirror holds."""
+async def _newest_parent(
+    conn: asyncpg.Connection, tables: set[str], owner: str, registry: ReplicationRegistry
+) -> datetime | None:
+    """The newest timestamp of any time-series parent row ``owner`` owns here."""
     newest = None
     for table, bucketing in TIME_SERIES_BUCKETS.items():
-        if bucketing.parent is None and table in tables:
-            value = await conn.fetchval(f"SELECT max({quote_ident(bucketing.time_column)}) FROM {qualified(table)}")
+        if table in tables:
+            join_sql, owner_sql = owner_join(registry, table, alias="t")
+            value = await conn.fetchval(
+                f"SELECT max(t.{quote_ident(bucketing.time_column)}) FROM {qualified(table)} t {join_sql} "
+                f"WHERE {owner_sql} = $1",
+                owner,
+            )
             if value is not None and (newest is None or value > newest):
                 newest = value
     return newest
@@ -167,30 +193,44 @@ async def _plan(
         on_primary = set(await table_columns(primary, table))
         columns = tuple(c for c in await table_columns(mirror, table) if c in on_primary)
         key = tuple(await primary_key(mirror, table))
+        owners = owner_join(registry, table, alias="t")
+        if blocked := [parent for parent, _ in registry.owner_chain(table) if parent not in ready]:
+            raise Refused(f"{table} is ready but its owner-path parent {blocked[0]} isn't; run `refresh` and wait")
         if kind is not TableClass.TIME_SERIES:
-            copies[table] = Copy(table, kind, columns, key)
-            continue
-        if (bucketing := TIME_SERIES_BUCKETS.get(table)) is None:
-            raise Refused(f"time-series table {table} has no entry in TIME_SERIES_BUCKETS")
-        if bucketing.parent is None:
+            copies[table] = Copy(table, kind, columns, key, owners)
+        elif (bucketing := TIME_SERIES_BUCKETS.get(table)) is not None:
             updated = "updated_at" if "updated_at" in columns else None
-            copies[table] = Copy(table, kind, columns, key, bucketing=bucketing, updated_column=updated)
-        elif bucketing.parent in ready:
-            (parent_id,) = await primary_key(mirror, bucketing.parent)
-            copies[table] = Copy(table, kind, columns, key, bucketing=bucketing, parent_id=parent_id)
+            copies[table] = Copy(table, kind, columns, key, owners, bucketing=bucketing, updated_column=updated)
+        elif (path := registry.owner_paths.get(table)) is not None and path.parent in TIME_SERIES_BUCKETS:
+            copies[table] = Copy(table, kind, columns, key, owners, parent=path.parent, parent_key=path.key)
         else:
-            raise Refused(f"{table} is ready but its parent {bucketing.parent} isn't; run `refresh` and wait")
+            raise Refused(
+                f"time-series table {table} has no entry in TIME_SERIES_BUCKETS, and its owner-path parent "
+                "isn't a time-series table that has one"
+            )
     order = parents_first(list(copies), await _foreign_keys(mirror, list(copies)))
     return [copies[table] for table in order]
 
 
 def _select(copy: Copy) -> str:
-    """The query that reads ``copy``'s rows on the primary; a child's takes its parents' ids as ``$1``."""
-    columns = ", ".join(quote_ident(c) for c in copy.columns)
-    query = f"SELECT {columns} FROM {qualified(copy.table)}"
-    if copy.kind is TableClass.TIME_SERIES and copy.bucketing.parent is not None:
-        query += f" WHERE {quote_ident(copy.bucketing.parent_key)} = ANY($1)"
+    """The query that reads the arm's rows of ``copy`` (owner ``$1``); a child's takes its parents' ids as ``$2``.
+
+    On the arm the owner filter is a safety belt: an arm holds only its own rows.
+    """
+    join_sql, owner_sql = copy.owners
+    columns = ", ".join(f"t.{quote_ident(c)}" for c in copy.columns)
+    query = f"SELECT {columns} FROM {qualified(copy.table)} t {join_sql} WHERE {owner_sql} = $1"
+    if copy.time_series_child:
+        query += f" AND t.{quote_ident(copy.parent_key)} = ANY($2)"
     return query
+
+
+def _owned(copy: Copy, owner_param: str, registry: ReplicationRegistry) -> str:
+    """SQL true for a row ``t`` of ``copy.table`` that the arm (``owner_param``) owns: for deletes and updates."""
+    join_sql, owner_sql = owner_join(registry, copy.table, alias="x")
+    mine = ", ".join(f"t.{quote_ident(k)}" for k in copy.key)
+    theirs = ", ".join(f"x.{quote_ident(k)}" for k in copy.key)
+    return f"({mine}) IN (SELECT {theirs} FROM {qualified(copy.table)} x {join_sql} WHERE {owner_sql} = {owner_param})"
 
 
 async def _selected_parents(mirror: asyncpg.Connection, copy: Copy, temp: str, since: datetime) -> list:
@@ -232,18 +272,54 @@ async def _load(
     return total
 
 
-async def _delete_missing(mirror: asyncpg.Connection, copy: Copy, temp: str, parents: list | None) -> int:
-    """Delete the mirror rows in ``copy``'s scope that the primary's copy lacks."""
-    args: list = []
-    if copy.kind is not TableClass.TIME_SERIES:
-        scope = ""
-    elif copy.bucketing.parent is None:
-        return 0  # parents are never deleted: the primary may have pruned them
-    else:
-        scope, args = f"t.{quote_ident(copy.bucketing.parent_key)} = ANY($1) AND ", [parents]
+async def _refuse_other_owners_references(
+    mirror: asyncpg.Connection,
+    copy: Copy,
+    temp: str,
+    owner: str,
+    references: list[tuple],
+    registry: ReplicationRegistry,
+) -> None:
+    """Refuse when a row about to be deleted is still referenced by a row of another owner.
+
+    The same-owner rules make this practically impossible; the refusal names the owner
+    rather than leave a foreign key to fail, or a row to dangle, on the head.
+    """
+    if copy.key != ("id",):
+        return  # only rows with an id are referenced
+    doomed = (
+        f"SELECT t.id FROM {qualified(copy.table)} t WHERE {_owned(copy, '$1', registry)} "
+        f"AND NOT EXISTS (SELECT 1 FROM {quote_ident(temp)} y WHERE y.id = t.id)"
+    )
+    for child, column, parent, parent_column in references:
+        if parent != copy.table or parent_column != "id":
+            continue
+        join_sql, owner_sql = owner_join(registry, child, alias="c")
+        rows = await mirror.fetch(
+            f"SELECT DISTINCT {owner_sql} AS owner FROM {qualified(child)} c {join_sql} "
+            f"WHERE {owner_sql} <> $1 AND c.{quote_ident(column)} IN ({doomed}) ORDER BY 1",
+            owner,
+        )
+        if rows:
+            raise Refused(
+                f"{copy.table} rows the arm no longer has are still referenced here by {child}.{column} rows of "
+                f"{', '.join(row['owner'] for row in rows)}; reconcile those by hand"
+            )
+
+
+async def _delete_missing(
+    mirror: asyncpg.Connection, copy: Copy, temp: str, parents: list | None, owner: str, registry: ReplicationRegistry
+) -> int:
+    """Delete the head's rows of the arm (``owner``) in ``copy``'s scope that the arm's copy lacks."""
+    if copy.time_series_parent:
+        return 0  # parents are never deleted: the arm may have pruned them
+    scope, args = _owned(copy, "$1", registry), [owner]
+    if copy.time_series_child:
+        scope += f" AND t.{quote_ident(copy.parent_key)} = ANY($2)"
+        args.append(parents)
     status = await mirror.execute(
         f"DELETE FROM {qualified(copy.table)} t "
-        f"WHERE {scope}NOT EXISTS (SELECT 1 FROM {quote_ident(temp)} x WHERE {_matches('x', 't', copy.key)})",
+        f"WHERE {scope} AND NOT EXISTS (SELECT 1 FROM {quote_ident(temp)} x WHERE {_matches('x', 't', copy.key)})",
         *args,
     )
     return int(status.split()[-1])
@@ -290,14 +366,18 @@ async def _placeholder(conn: asyncpg.Connection, copy: Copy, column: str) -> str
     return f"left(chr(1) || md5({key}), {length})"
 
 
-async def _set_aside(mirror: asyncpg.Connection, copy: Copy, temp: str) -> int:
-    """Give a stand-in to each mirror row holding a unique value the primary gives another row.
+async def _set_aside(
+    mirror: asyncpg.Connection, copy: Copy, temp: str, owner: str, registry: ReplicationRegistry
+) -> int:
+    """Give a stand-in to each of the arm's rows here holding a unique value the arm gives another row.
 
     Every such row is rewritten or deleted later in the same transaction, so the stand-in
-    never outlives it; a row that would be kept as it is (history the primary no longer
-    has) is refused instead.
+    never outlives it; a row that would be kept as it is (history the arm no longer
+    has) is refused instead. A row of another owner holding the value is never touched:
+    that is refused, naming the owner (only values unique across owners can clash so).
     """
     parked = 0
+    join_sql, owner_sql = copy.owners
     for columns in await _unique_indexes(mirror, copy.table):
         if not set(columns) <= set(copy.columns):
             continue
@@ -307,22 +387,49 @@ async def _set_aside(mirror: asyncpg.Connection, copy: Copy, temp: str) -> int:
         clash = f"EXISTS (SELECT 1 FROM {quote_ident(temp)} x WHERE {same} AND ({theirs}) IS DISTINCT FROM ({mine}))"
         if not await mirror.fetchval(f"SELECT EXISTS (SELECT 1 FROM {qualified(copy.table)} t WHERE {clash})"):
             continue
-        kept = f"EXISTS (SELECT 1 FROM {quote_ident(temp)} x WHERE {_matches('x', 't', copy.key)})"
-        if copy.kind is TableClass.TIME_SERIES and await mirror.fetchval(
-            f"SELECT EXISTS (SELECT 1 FROM {qualified(copy.table)} t WHERE {clash} AND NOT {kept})"
+        if foreign := await mirror.fetch(
+            f"SELECT DISTINCT {owner_sql} AS owner FROM {qualified(copy.table)} t {join_sql} "
+            f"WHERE {owner_sql} <> $1 AND {clash} ORDER BY 1",
+            owner,
         ):
             raise Refused(
-                f"{copy.table} keeps a row the primary no longer has whose {', '.join(columns)} the primary now "
+                f"{copy.table}.{', '.join(columns)}: a value the arm gives one of its rows is held here by a row of "
+                f"{', '.join(row['owner'] for row in foreign)}; rename one of them on its owner"
+            )
+        mine_owned = _owned(copy, "$1", registry)
+        kept = f"EXISTS (SELECT 1 FROM {quote_ident(temp)} x WHERE {_matches('x', 't', copy.key)})"
+        if copy.kind is TableClass.TIME_SERIES and await mirror.fetchval(
+            f"SELECT EXISTS (SELECT 1 FROM {qualified(copy.table)} t WHERE {mine_owned} AND {clash} AND NOT {kept})",
+            owner,
+        ):
+            raise Refused(
+                f"{copy.table} keeps a row the arm no longer has whose {', '.join(columns)} the arm now "
                 "gives another row; reconcile it by hand"
             )
         assignments = ", ".join([f"{quote_ident(c)} = {await _placeholder(mirror, copy, c)}" for c in columns])
-        status = await mirror.execute(f"UPDATE {qualified(copy.table)} t SET {assignments} WHERE {clash}")
+        status = await mirror.execute(
+            f"UPDATE {qualified(copy.table)} t SET {assignments} WHERE {mine_owned} AND {clash}", owner
+        )
         parked += int(status.split()[-1])
     return parked
 
 
+async def _refuse_other_owners_keys(mirror: asyncpg.Connection, copy: Copy, temp: str, owner: str) -> None:
+    """Refuse when a key the arm has is held here by another owner's row; it is never overwritten."""
+    join_sql, owner_sql = copy.owners
+    if rows := await mirror.fetch(
+        f"SELECT DISTINCT {owner_sql} AS owner FROM {qualified(copy.table)} t {join_sql} WHERE {owner_sql} <> $1 "
+        f"AND EXISTS (SELECT 1 FROM {quote_ident(temp)} x WHERE {_matches('x', 't', copy.key)}) ORDER BY 1",
+        owner,
+    ):
+        raise Refused(
+            f"{copy.table}: rows the arm has are held here under the same key by "
+            f"{', '.join(row['owner'] for row in rows)}; nothing was copied. Reconcile that row by hand"
+        )
+
+
 async def _upsert(mirror: asyncpg.Connection, copy: Copy, temp: str) -> int:
-    """Insert the primary's rows, or update the mirror's where they differ."""
+    """Insert the arm's rows, or update the head's where they differ (after ``_refuse_other_owners_keys``)."""
     columns = ", ".join(quote_ident(c) for c in copy.columns)
     key = ", ".join(quote_ident(k) for k in copy.key)
     others = [c for c in copy.columns if c not in copy.key]
@@ -402,25 +509,33 @@ async def reseed(
     mirror: asyncpg.Connection,
     *,
     role: str,
-    instance: str | None,
-    config: ReplicationConfig,
+    arm: str,
+    arms: Mapping[str, Arm],
+    head: str | None,
     since: datetime,
     cut_wait_s: float = CUT_WAIT_S,
     registry: ReplicationRegistry = REGISTRY,
     hooks: Mapping[str, Callable[[], Awaitable[object]]] | None = None,
 ) -> dict:
-    """Copy what the mirror is missing since ``since``, then resume replication at the cut; see the module docstring.
+    """Copy what the head is missing from ``arm`` since ``since``, then resume its replication at the cut.
+
+    See the module docstring.
 
     Parameters
     ----------
     primary : asyncpg.Connection
-        Read-only connection to the primary.
+        Read-only connection to the arm, as its reader role.
     mirror : asyncpg.Connection
-        Connection to this mirror's database (see the module docstring for the role).
-    role, instance : str, str | None
-        ``CANOPY_ROLE`` (must be a mirror) and ``CANOPY_INSTANCE`` (names the subscription).
-    config : ReplicationConfig
-        Supplies ``publisher_dsn`` when the subscription has to be created.
+        Connection to the head's database (see the module docstring for the role).
+    role : str
+        ``CANOPY_ROLE``; must be ``"mirror"``.
+    arm : str
+        The arm re-seeded; names its subscription (``canopy_history_<arm>``).
+    arms : Mapping[str, Arm]
+        The configured arms; ``arm``'s ``publisher_dsn`` is used when its subscription
+        has to be created.
+    head : str | None
+        The head's own ``CANOPY_INSTANCE``.
     since : datetime
         Reconcile the children of parents created or updated from this time on.
     cut_wait_s : float
@@ -441,29 +556,30 @@ async def reseed(
     Raises
     ------
     Refused
-        Wrong role, missing privileges, an enabled subscription, ``since`` later than
-        the mirror's newest snapshot, no exact cut within ``cut_wait_s``, or a unique
+        Wrong role, an arm not configured, missing privileges, an enabled
+        subscription, ``since`` later than the head's newest snapshot from the arm, no exact cut within ``cut_wait_s``, or a unique
         value it can't set aside. Nothing was copied.
     """
     hooks = hooks or {}
     require_role("reseed", "mirror", role)
-    name = subscription_name(instance)
+    _selected_arms(arms, arm, head)
+    name = subscription_name(arm)
     if not await is_superuser(mirror) and not await mirror.fetchval(
         "SELECT has_function_privilege('pg_replication_origin_advance(text, pg_lsn)', 'EXECUTE')"
     ):
         raise Refused("reseed needs a superuser, or EXECUTE on pg_replication_origin_advance(text, pg_lsn)")
 
     present = set(registry.replicated) & await tables_present(mirror, registry.schemas)
-    if (newest := await _newest_parent(mirror, present)) is not None and since > newest:
+    if (newest := await _newest_parent(mirror, present, arm, registry)) is not None and since > newest:
         raise Refused(
-            f"--since {since.isoformat()} is later than the newest snapshot here ({newest.isoformat()}); "
+            f"--since {since.isoformat()} is later than the newest snapshot here from {arm} ({newest.isoformat()}); "
             "changes in between would be lost. Use a time no later than that"
         )
 
     sub = await _subscription(mirror, name)
     created = sub is None
     if created:
-        await subscribe(mirror, role=role, instance=instance, config=config, registry=registry, copy_data=False)
+        await subscribe(mirror, role=role, head=head, arms=arms, only=arm, registry=registry, copy_data=False)
         sub = await _subscription(mirror, name)
     elif sub["subenabled"]:
         raise Refused(f"subscription {name} is enabled; disable it first (ALTER SUBSCRIPTION {name} DISABLE)")
@@ -473,6 +589,7 @@ async def reseed(
     ready = sorted(t for t, state in states.items() if state == "ready" and t in registry.replicated)
     skipped = {t: state for t, state in sorted(states.items()) if state != "ready"}
     copies = await _plan(primary, mirror, ready, registry)
+    refs = await references(mirror, registry)
 
     x0, snapshot, attempts = await _exact_cut(
         primary, asyncio.get_running_loop().time() + cut_wait_s, hooks.get("before_snapshot")
@@ -486,20 +603,27 @@ async def reseed(
             temps = {copy.table: f"reseed_{n}" for n, copy in enumerate(copies)}
             selected: dict[str, list] = {}  # parent table -> ids whose children are reconciled
             for copy in copies:
-                args: list = []
-                if copy.kind is TableClass.TIME_SERIES and copy.bucketing.parent is not None:
-                    args = [selected[copy.bucketing.parent]]
+                args: list = [arm]
+                if copy.time_series_child:
+                    args.append(selected[copy.parent])
                 read = await _load(primary, mirror, copy, temps[copy.table], _select(copy), args)
-                if copy.kind is TableClass.TIME_SERIES and copy.bucketing.parent is None:
+                if copy.time_series_parent:
                     selected[copy.table] = await _selected_parents(mirror, copy, temps[copy.table], since)
                 tables[copy.table] = {"read": read}
+            # The copy is one transaction, so a refusal here or in _set_aside leaves nothing written.
             for copy in copies:
-                tables[copy.table]["set_aside"] = await _set_aside(mirror, copy, temps[copy.table])
+                await _refuse_other_owners_keys(mirror, copy, temps[copy.table], arm)
+                if not copy.time_series_parent:
+                    await _refuse_other_owners_references(mirror, copy, temps[copy.table], arm, refs, registry)
+            for copy in copies:
+                tables[copy.table]["set_aside"] = await _set_aside(mirror, copy, temps[copy.table], arm, registry)
             for copy in copies:  # parents first, so rows already point at their new parents ...
                 tables[copy.table]["written"] = await _upsert(mirror, copy, temps[copy.table])
             for copy in reversed(copies):  # ... before old ones are deleted, children first
-                parents = selected.get(copy.bucketing.parent) if copy.bucketing else None
-                tables[copy.table]["deleted"] = await _delete_missing(mirror, copy, temps[copy.table], parents)
+                parents = selected.get(copy.parent) if copy.time_series_child else None
+                tables[copy.table]["deleted"] = await _delete_missing(
+                    mirror, copy, temps[copy.table], parents, arm, registry
+                )
             if "before_commit" in hooks:
                 await hooks["before_commit"]()
     finally:
@@ -519,8 +643,9 @@ async def reseed(
         await hooks["after_commit"]()
     await mirror.execute("SELECT pg_replication_origin_advance($1, $2::text::pg_lsn)", f"pg_{sub['oid']}", x0)
     await mirror.execute(f"ALTER SUBSCRIPTION {quote_ident(name)} ENABLE")
-    logger.info("Subscription %s enabled; replication resumes after %s", name, x0)
+    logger.info("Subscription %s enabled; replication from %s resumes after %s", name, arm, x0)
     return {
+        "arm": arm,
         "subscription": name,
         "created": created,
         "since": since.isoformat(),
@@ -542,17 +667,18 @@ def parse_since(value: str) -> datetime:
 
 
 async def run(args: argparse.Namespace) -> int:
-    """``reseed``: 0 done, 1 a database step failed, 2 refused (nothing copied)."""
+    """``reseed --arm``: 0 done, 1 a database step failed, 2 refused (nothing copied)."""
     settings = get_settings()
-    config = get_replication_config()
-    reader_dsn = config.reader_dsn.get_secret_value() if config.reader_dsn else None
-    secrets = [reader_dsn, config.publisher_dsn.get_secret_value() if config.publisher_dsn else None]
+    arms = get_arms_config().arms
+    secrets = [dsn.get_secret_value() for arm in arms.values() for dsn in (arm.reader_dsn, arm.publisher_dsn) if dsn]
     primary = mirror = None
     try:
         require_role("reseed", "mirror", settings.role)
+        (name,) = _selected_arms(arms, args.arm, settings.instance)
+        reader_dsn = arms[name].reader_dsn.get_secret_value() if arms[name].reader_dsn else None
         if not reader_dsn:
             raise Refused(
-                "set CANOPY_REPLICATION__READER_DSN to the primary's read-only connection URI (from a secret)"
+                f"set CANOPY_ARMS__{name.upper()}__READER_DSN to this arm's read-only connection URI (from a secret)"
             )
         primary = await asyncpg.connect(reader_dsn, server_settings={**SESSION, "default_transaction_read_only": "on"})
         mirror = await asyncpg.connect(asyncpg_dsn(settings.database_url), server_settings=SESSION)
@@ -560,8 +686,9 @@ async def run(args: argparse.Namespace) -> int:
             primary,
             mirror,
             role=settings.role,
-            instance=settings.instance,
-            config=config,
+            arm=name,
+            arms=arms,
+            head=settings.instance,
             since=args.since,
             cut_wait_s=args.cut_wait,
         )
