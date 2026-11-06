@@ -5,8 +5,7 @@ Same image as ``canopy-api``, different command::
     arq canopy.worker.WorkerSettings
 
 Runs long operations (snapshot create/restore) off the request path. Each
-persistent module contributes its task functions — on a read-only mirror
-(``CANOPY_ROLE=mirror``) only the stateless ones; ``on_startup`` builds the
+persistent module contributes its task functions; ``on_startup`` builds the
 process-wide resources a task needs - the EPICS connector - and stashes them in
 the Arq context so every job reuses one connection set rather than rebuilding it.
 """
@@ -86,25 +85,13 @@ async def on_shutdown(ctx: dict) -> None:
 # Task functions registered with Arq. Each module appends its tasks here.
 FUNCTIONS = [ping, convert_batch, create_snapshot_task, restore_snapshot_task]
 
-# What a mirror's (or forward instance's) worker runs: tasks that write no replicated table and
-# touch no machine state. Snapshot create/restore are simply not registered there,
-# so a job that reached a mirror's queue anyway fails instead of running. That is
-# also why each instance needs its own Redis (or database number): on a shared
-# queue a mirror's worker would take, and fail, its primary's snapshot jobs.
-MIRROR_FUNCTIONS = [ping, convert_batch]
-
-
-def worker_functions(role: str) -> list:
-    """The task functions a worker registers for an instance ``role`` (``Settings.role``)."""
-    return FUNCTIONS if role == "primary" else MIRROR_FUNCTIONS
-
 
 def worker_cron_jobs(role: str) -> list:
-    """Scheduled tasks for an instance ``role``: pruning, on a primary only.
+    """Scheduled tasks for an instance ``role``: pruning, on a primary (an arm) only.
 
     ``unique`` makes one worker run each tick when several share the queue. The job
-    itself does nothing unless ``CANOPY_PRUNE__ENABLED``; a mirror never registers it,
-    since it holds the history the primary prunes.
+    itself does nothing unless ``CANOPY_PRUNE__ENABLED``; a mirror (a head) never
+    registers it, since it holds the history its arms prune, and its own rows too.
     """
     if role != "primary":
         return []
@@ -124,7 +111,7 @@ def worker_cron_jobs(role: str) -> list:
 
 
 class WorkerSettings:
-    functions = worker_functions(get_settings().role)
+    functions = FUNCTIONS
     cron_jobs = worker_cron_jobs(get_settings().role)
     on_startup = on_startup
     on_shutdown = on_shutdown

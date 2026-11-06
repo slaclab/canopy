@@ -1,27 +1,34 @@
-"""Postgres logical replication from a primary to its read-only history mirror.
+"""Postgres logical replication from arms (primaries) to their history head (a mirror).
 
 ``registry`` classifies every table (``reference``, ``time_series`` or ``local``)
 and defines the publications built from those classes; ``python -m
 canopy.core.replication`` (see ``__main__``) applies them:
 
-* primary, every deploy: ``alembic upgrade head`` then ``publish``. Needs CREATE on
+* arm, every deploy: ``alembic upgrade head`` then ``publish``. Needs CREATE on
   the database and ownership of the tables. Grants the replication and reader roles
   SELECT on the published tables once those roles exist, so run it again after
   creating them.
-* mirror, every deploy (as the tables' owner): ``alembic upgrade head``, ``grants``,
-  ``refresh``. The mirror deploys before its primary, so it has every table the
-  primary will publish.
-* mirror, once: ``subscribe``, as the tables' owner with ``pg_create_subscription``
-  (or a superuser), with ``CANOPY_REPLICATION__PUBLISHER_DSN`` from a secret.
-* mirror, hourly after its backup, WAL-archive and drift checks: ``heartbeat``,
-  which records them on the primary over ``CANOPY_REPLICATION__HEARTBEAT_DSN`` (a
-  role that may write only ``core.history_heartbeat``; ``publish`` grants it).
+* head, every deploy (as the tables' owner): ``alembic upgrade head``, ``grants``,
+  ``refresh``. The head deploys before its arms, so it has every table an arm will
+  publish. ``grants`` lets the head's API read every row and write only the head's
+  own (row-level security on the root tables).
+* the registry's owner paths say whose each row is; ``sql.owner_join`` turns them
+  into SQL, for any command that has to tell one arm's rows from another's.
+* head, once per arm: ``subscribe``, as the tables' owner with
+  ``pg_create_subscription`` (or a superuser), with each arm's
+  ``CANOPY_ARMS__<arm>__PUBLISHER_DSN`` from a secret (``canopy.core.arms``).
+* head, hourly per arm after its backup, WAL-archive and drift checks:
+  ``heartbeat --arm <arm>``, which records them on that arm over
+  ``CANOPY_ARMS__<arm>__HEARTBEAT_DSN`` (a role that may write only
+  ``core.history_heartbeat``; the arm's ``publish`` grants it).
 
-``status`` reports either side as JSON. ``drift-check`` runs on a mirror, hourly
-after ``refresh``, and compares each table with the primary over a read-only
-connection (``CANOPY_REPLICATION__READER_DSN``).
+``status`` reports either side as JSON; on a head, per arm. ``drift-check`` runs on
+a head, hourly after ``refresh``: it compares each arm's rows with the head's copy
+over that arm's read-only connection (``CANOPY_ARMS__<arm>__READER_DSN``), then
+checks every reference on the head (see ``drift``).
 
-A primary that prunes old rows (see ``gate``) first moves to the split layout:
-``publish --split`` on the primary, ``switch`` on the mirror, ``publish --split`` on
-the primary again. Afterwards time-series deletes no longer reach the mirror.
+An arm that prunes old rows (see ``gate``) first moves to the split layout:
+``publish --split`` on the arm, ``switch --arm <arm>`` on the head, ``publish
+--split`` on the arm again. Afterwards time-series deletes no longer reach the head.
+The head never prunes.
 """

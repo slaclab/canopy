@@ -17,6 +17,27 @@ class SnapshotNotFound(SquirrelError):
     error_code = ErrorCode.SNAPSHOT_NOT_FOUND
 
 
+class SnapshotIdConflict(SquirrelError):
+    """A captured import's snapshot id is taken by a snapshot with another owner, facility or time."""
+
+    status_code = 409
+    error_code = ErrorCode.SNAPSHOT_ID_CONFLICT
+
+
+class NothingToImport(SquirrelError):
+    """A bundle has values, and none of them can be imported here."""
+
+    status_code = 400
+    error_code = ErrorCode.NOTHING_TO_IMPORT
+
+
+class ImportWouldSkip(SquirrelError):
+    """A strict import would leave values out; the detail names their PVs."""
+
+    status_code = 409
+    error_code = ErrorCode.IMPORT_WOULD_SKIP
+
+
 class PvNotFound(SquirrelError):
     status_code = 404
     error_code = ErrorCode.PV_NOT_FOUND

@@ -1,4 +1,4 @@
-"""Prometheus gauges for replication to a history mirror, from the status ``replication status`` prints.
+"""Prometheus gauges for history replication, from the status ``replication status`` prints.
 
 Read at scrape time, like the module gauges (docs/observability/metrics.md), with
 one difference: the status comes from database queries, which are async, and a
@@ -7,15 +7,18 @@ just before rendering. It runs the replication CLI's own status function over a
 short-lived connection, and the collector yields families from that snapshot, so
 the gauges and ``python -m canopy.core.replication status`` can't disagree.
 
-A primary reports its logical slots. Any other role reports its subscription. A
-refresh that fails (database down, a mirror without ``CANOPY_INSTANCE``) leaves only
+An arm (``CANOPY_ROLE=primary``) reports its logical slots. A head (``mirror``)
+reports its subscription to each arm in ``CANOPY_ARMS__<arm>__…``, every series
+labelled ``arm``: a series about one of several arms carries that label, while an
+arm's own series describe the arm itself and carry none. A refresh that fails
+(database down, unreadable arms settings) leaves only
 ``canopy_replication_status_up 0``; it never fails the scrape.
 
-A mirror reports where apply has got to (``applied_lsn``), not how far behind it
-is. ``received_lsn`` follows every keepalive, which covers WAL the primary wrote to
-tables it doesn't publish, so the gap between the two grows while nothing waits to
-be applied. The lag to alert on is the primary's per-slot ``lag_bytes``: WAL the
-mirror hasn't confirmed yet.
+A head reports where apply from each arm has got to (``applied_lsn``), not how far
+behind it is. ``received_lsn`` follows every keepalive, which covers WAL the arm
+wrote to tables it doesn't publish, so the gap between the two grows while nothing
+waits to be applied. The lag to alert on is the arm's per-slot ``lag_bytes``: WAL
+the head hasn't confirmed yet.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ from prometheus_client import REGISTRY, CollectorRegistry
 from prometheus_client.core import Metric, GaugeMetricFamily, CounterMetricFamily
 from prometheus_client.registry import Collector
 
+from canopy.core.arms import get_arms_config
 from canopy.core.config import get_settings
 from canopy.core.replication.sql import asyncpg_dsn
 from canopy.core.replication.config import get_replication_config
@@ -45,14 +49,14 @@ TIMEOUT_S = 2.0
 WAL_STATUSES = ("reserved", "extended", "unreserved", "lost")
 
 
-async def read_status(conn: asyncpg.Connection, *, role: str, instance: str | None) -> dict:
+async def read_status(conn: asyncpg.Connection, *, role: str) -> dict:
     """This side's replication status, as ``python -m canopy.core.replication status`` reports it.
 
-    A primary's also carries ``max_slot_wal_keep_bytes``: the WAL cap on every slot,
-    ``None`` when there is none.
+    A head's covers every arm in its settings. An arm's also carries
+    ``max_slot_wal_keep_bytes``: the WAL cap on every slot, ``None`` when there is none.
     """
     if side_for_role(role) == "subscriber":
-        return await subscriber_status(conn, instance=instance)
+        return await subscriber_status(conn, arms=get_arms_config().arms)
     status = await publisher_status(conn, config=get_replication_config())
     cap = await conn.fetchval("SELECT pg_size_bytes(current_setting('max_slot_wal_keep_size'))")
     status["max_slot_wal_keep_bytes"] = cap if cap >= 0 else None
@@ -81,7 +85,7 @@ class ReplicationCollector(Collector):
                 conn = await asyncpg.connect(
                     asyncpg_dsn(settings.database_url), server_settings={"application_name": "canopy-metrics"}
                 )
-                status = await read_status(conn, role=settings.role, instance=settings.instance)
+                status = await read_status(conn, role=settings.role)
         except Exception as exc:  # a scrape must never fail on this
             if not self._failing:
                 logger.warning("Replication metrics unavailable until the status can be read: %r", exc)
@@ -109,17 +113,17 @@ class ReplicationCollector(Collector):
         if status["side"] == "publisher":
             yield from _slot_families(status)
         else:
-            yield from _subscription_families(status["subscription"])
+            yield from _subscription_families(status)
 
 
 def _slot_families(status: dict) -> Iterable[Metric]:
     labels = ["slot", "kind"]
     active = GaugeMetricFamily(
-        "canopy_replication_slot_active", "1 while a mirror is streaming from the logical slot.", labels=labels
+        "canopy_replication_slot_active", "1 while a head is streaming from the logical slot.", labels=labels
     )
     wal_status = GaugeMetricFamily(
         "canopy_replication_slot_wal_status",
-        "1 for the slot's wal_status. reserved is healthy; lost means the WAL the mirror needs is gone.",
+        "1 for the slot's wal_status. reserved is healthy; lost means the WAL the head needs is gone.",
         labels=[*labels, "wal_status"],
     )
     retained = GaugeMetricFamily(
@@ -127,7 +131,7 @@ def _slot_families(status: dict) -> Iterable[Metric]:
     )
     lag = GaugeMetricFamily(
         "canopy_replication_slot_lag_bytes",
-        "WAL the mirror hasn't confirmed applying yet (from the slot's confirmed_flush_lsn).",
+        "WAL the head hasn't confirmed applying yet (from the slot's confirmed_flush_lsn).",
         labels=labels,
     )
     safe = GaugeMetricFamily(
@@ -153,61 +157,62 @@ def _slot_families(status: dict) -> Iterable[Metric]:
         )
 
 
-def _subscription_families(sub: dict) -> Iterable[Metric]:
-    labels, values = ["subscription"], [sub["name"]]
+def _subscription_families(status: dict) -> Iterable[Metric]:
+    """The head's families, one sample per configured arm in each."""
+    labels = ["arm"]
 
-    def gauge(name: str, help_text: str, value: float) -> GaugeMetricFamily:
-        family = GaugeMetricFamily(name, help_text, labels=labels)
-        family.add_metric(values, value)
-        return family
+    def gauge(name: str, help_text: str) -> GaugeMetricFamily:
+        return GaugeMetricFamily(name, help_text, labels=labels)
 
-    def counter(name: str, help_text: str, value: float) -> CounterMetricFamily:
-        family = CounterMetricFamily(name, help_text, labels=labels)
-        family.add_metric(values, value)
-        return family
-
-    yield gauge(
-        "canopy_replication_subscription_exists", "1 when this mirror's subscription exists.", int(sub["exists"])
+    exists = gauge("canopy_replication_subscription_exists", "1 when the head has its subscription to the arm.")
+    enabled = gauge("canopy_replication_subscription_enabled", "1 while the subscription is enabled.")
+    worker_up = gauge(
+        "canopy_replication_subscription_worker_up", "1 while the subscription's apply worker is running."
     )
-    if not sub["exists"]:
-        return
-    # pg_stat_subscription keeps a row for a subscription with no worker running, with pid NULL.
-    worker = sub["worker"] if sub["worker"] is not None and sub["worker"]["pid"] is not None else None
-    yield gauge("canopy_replication_subscription_enabled", "1 while the subscription is enabled.", int(sub["enabled"]))
-    yield gauge(
-        "canopy_replication_subscription_worker_up",
-        "1 while the subscription's apply worker is running.",
-        int(worker is not None),
+    receive_age = gauge(
+        "canopy_replication_subscription_receive_age_seconds",
+        "Seconds since the apply worker last heard from the arm (keepalives included), "
+        "by this host's clock against the database's.",
     )
-    if worker is not None and worker["last_msg_receipt_time"] is not None:
-        received = datetime.fromisoformat(worker["last_msg_receipt_time"])
-        yield gauge(
-            "canopy_replication_subscription_receive_age_seconds",
-            "Seconds since the apply worker last heard from the primary (keepalives included), "
-            "by this host's clock against the database's.",
-            (datetime.now(UTC) - received).total_seconds(),
-        )
-    yield counter(
+    apply_errors = CounterMetricFamily(
         "canopy_replication_subscription_apply_errors",
-        "Errors applying changes from the primary; apply retries the same transaction until it succeeds.",
-        sub["apply_error_count"],
+        "Errors applying the arm's changes; apply retries the same transaction until it succeeds.",
+        labels=labels,
     )
-    yield counter(
-        "canopy_replication_subscription_sync_errors",
-        "Errors during a table's initial copy.",
-        sub["sync_error_count"],
+    sync_errors = CounterMetricFamily(
+        "canopy_replication_subscription_sync_errors", "Errors during a table's initial copy.", labels=labels
     )
-    yield gauge(
+    not_ready = gauge(
         "canopy_replication_subscription_tables_not_ready",
         "Subscribed tables still waiting for or in their initial copy.",
-        len(sub["tables_not_ready"]),
     )
-    if sub["applied_lsn"] is not None:
-        yield gauge(
-            "canopy_replication_subscription_applied_lsn_bytes",
-            "The primary's WAL position of the last transaction applied here: a position, not a lag.",
-            lsn_bytes(sub["applied_lsn"]),
-        )
+    applied = gauge(
+        "canopy_replication_subscription_applied_lsn_bytes",
+        "The arm's WAL position of the last transaction applied here: a position, not a lag.",
+    )
+    for sub in status["subscriptions"]:
+        arm = [sub["arm"]]
+        exists.add_metric(arm, int(sub["exists"]))
+        if not sub["exists"]:
+            continue
+        # pg_stat_subscription keeps a row for a subscription with no worker running, with pid NULL.
+        worker = sub["worker"] if sub["worker"] is not None and sub["worker"]["pid"] is not None else None
+        enabled.add_metric(arm, int(sub["enabled"]))
+        worker_up.add_metric(arm, int(worker is not None))
+        if worker is not None and worker["last_msg_receipt_time"] is not None:
+            received = datetime.fromisoformat(worker["last_msg_receipt_time"])
+            receive_age.add_metric(arm, (datetime.now(UTC) - received).total_seconds())
+        apply_errors.add_metric(arm, sub["apply_error_count"])
+        sync_errors.add_metric(arm, sub["sync_error_count"])
+        not_ready.add_metric(arm, len(sub["tables_not_ready"]))
+        if sub["applied_lsn"] is not None:
+            applied.add_metric(arm, lsn_bytes(sub["applied_lsn"]))
+    yield from (exists, enabled, worker_up, receive_age, apply_errors, sync_errors, not_ready, applied)
+    yield GaugeMetricFamily(
+        "canopy_replication_subscriptions_unexpected",
+        "History subscriptions on the head whose arm isn't configured: an arm taken out of CANOPY_ARMS.",
+        value=len(status["unexpected"]),
+    )
 
 
 COLLECTOR = ReplicationCollector()

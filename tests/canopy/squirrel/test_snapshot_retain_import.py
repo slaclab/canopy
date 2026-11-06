@@ -23,9 +23,9 @@ REPEATED = str(uuid.uuid4())
 
 @pytest.fixture
 def instance_name(monkeypatch):
-    monkeypatch.setenv("CANOPY_INSTANCE", "site-a")
+    monkeypatch.setenv("CANOPY_INSTANCE", "head")
     get_settings.cache_clear()
-    yield "site-a"
+    yield "head"
     get_settings.cache_clear()
 
 

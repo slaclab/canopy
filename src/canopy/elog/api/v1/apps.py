@@ -10,11 +10,7 @@ from typing import Annotated
 from fastapi import File, Query, Security, APIRouter, UploadFile
 
 from canopy.elog.errors import ElogAttachmentTooLarge
-from canopy.core.security import (
-    APIKey,
-    require_read_access,
-    require_external_write_access,
-)
+from canopy.core.security import APIKey, require_read_access, require_write_access
 from canopy.elog.dependencies import ElogServiceDep
 from canopy.elog.schemas.elog import (
     ElogTagDTO,
@@ -84,7 +80,7 @@ async def list_recent_entries(
     return await service.list_recent_entries(app, logbook_ids, limit=limit)
 
 
-@router.post("/attachments", dependencies=[Security(require_external_write_access)])
+@router.post("/attachments", dependencies=[Security(require_write_access)])
 async def upload_attachment(
     app: str,
     service: ElogServiceDep,
@@ -102,7 +98,7 @@ async def create_entry(
     app: str,
     entry: ElogEntryCreateDTO,
     service: ElogServiceDep,
-    api_key: Annotated[APIKey, Security(require_external_write_access)],
+    api_key: Annotated[APIKey, Security(require_write_access)],
 ) -> ElogEntryResultDTO:
     """Post an entry as ``app``, or a follow-up of ``followsUpEntryId`` when that is set.
 
