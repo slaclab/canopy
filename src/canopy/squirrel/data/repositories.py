@@ -32,6 +32,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import noload, raiseload, selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from canopy.core.db import BaseRepository
 from canopy.squirrel.data.models import (
@@ -73,6 +74,20 @@ class SnapshotRepository(BaseRepository[Snapshot]):
             query = query.where(Snapshot.deleted_at.is_(None))
         result = await self.session.execute(query)
         return result.scalar_one_or_none()
+
+    async def insert_unless_taken(self, fields: dict) -> bool:
+        """Insert a snapshot row with ``fields`` (``id`` included) unless that id exists.
+
+        Returns whether it was inserted. A concurrent insert of the same id waits for
+        the other transaction, then finds the id taken if that one committed.
+        """
+        inserted = await self.session.scalar(
+            pg_insert(Snapshot)
+            .values(**fields)
+            .on_conflict_do_nothing(index_elements=[Snapshot.id])
+            .returning(Snapshot.id)
+        )
+        return inserted is not None
 
     async def is_live(self, snapshot_id: str) -> bool:
         """Whether ``snapshot_id`` exists and hasn't been deleted."""
@@ -255,6 +270,11 @@ class SnapshotRepository(BaseRepository[Snapshot]):
             select(func.count()).select_from(SnapshotValue).where(SnapshotValue.snapshot_id == snapshot_id)
         )
         return result.scalar() or 0
+
+    async def get_value_pv_ids(self, snapshot_id: str) -> set[str]:
+        """The PV ids ``snapshot_id`` holds values for."""
+        result = await self.session.execute(select(SnapshotValue.pv_id).where(SnapshotValue.snapshot_id == snapshot_id))
+        return set(result.scalars())
 
     async def get_value_counts_batch(self, snapshot_ids: list[str]) -> dict[str, int]:
         """Value counts for many snapshots in a single grouped query."""
