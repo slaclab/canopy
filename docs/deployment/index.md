@@ -38,6 +38,8 @@ essentials:
 | `CANOPY_ROLE` | `primary` (default) or `mirror`: which side of history replication this instance's database is on. A primary holds only rows it owns, publishes them and may prune. A mirror (the head) subscribes to its arms and holds their rows beside its own, and never prunes. Either way an instance writes only rows it owns (see [Row owners](#row-owners)); a mirror meant to stay read-only gives its users read keys only. Set it on the API, the worker and every `alembic` run |
 | `CANOPY_INSTANCE` | **Required.** This instance's name: lowercase letters, digits and underscores, at most 48 (e.g. `arm1`). It is stamped on every row the instance creates, so it is permanent once the instance holds data: on a primary, `alembic` refuses to run when the database holds rows stamped with another name. Set it on the API, the worker and every `alembic` run. Reported by `GET /v1/instance` |
 | `CANOPY_HISTORY_URL`, `CANOPY_WINDOW_DAYS` | Optional. Reported by `GET /v1/instance` with the role, the instance name and the Alembic head shipped in the image: the URL of the instance's read-only history copy, and how many days of history it keeps (a whole number of at least 1; unset means all). A blank value counts as unset |
+| `CANOPY_ARMS__<arm>__PUBLISHER_DSN` | History head only (`CANOPY_ROLE=mirror`): one per arm, named after that arm's `CANOPY_INSTANCE` (lowercase letters, digits and underscores, at most 48). The libpq connection string (key=value or URI) the head's subscription `canopy_history_<arm>` uses to reach the arm as its replication role. `subscribe` and `refresh` also open it themselves before an initial copy, to refuse facility or Magpie slugs the head already holds, so the CLI's network must reach the arm at that address too. Supply it from a secret; the CLI never prints it. The arms can also be set as JSON in `CANOPY_ARMS` |
+| `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_ROLE`, `__APP_ROLE` | Role names for the replication CLI: on a primary, `publish` grants the replication role (default `replicator`) and the reader role (default `canopy_reader`) SELECT on the published tables; on a history head, `grants` lets the app role (default `canopy_app`) read every row and write only the head's own: row-level security on the tables that name a row's owner (facilities, PVs, snapshots, tag groups, Magpie configs) limits its writes to rows whose `owner_instance` is the head's `CANOPY_INSTANCE`, and any other role but the tables' owner sees none of those tables' rows. It also gets read-write on API keys |
 | `CANOPY_<MODULE>__<FIELD>` | Per-module tuning (e.g. `CANOPY_VOLE__GLOBAL_BYTES_MAX`) |
 
 The annotated template
@@ -105,6 +107,14 @@ The production image carries the migration tree, so run
 (see [Upgrade](production.md#upgrade)). A fresh database serves nothing until
 its first migration.
 
+On an arm (a primary with a history head), follow the upgrade with
+`python -m canopy.core.replication publish`, which keeps the replication
+publication in step with the tables. The head runs `alembic upgrade head`, then
+`grants` and `refresh`, before any of its arms deploys; `subscribe` runs once per
+arm. On the head, `subscribe`, `refresh` and `status` act on every arm in
+`CANOPY_ARMS__<arm>__…`, or on one with `--arm <arm>`. `status` reports either
+side as JSON.
+
 ## Health checks
 
 | Endpoint | Use |
@@ -112,5 +122,5 @@ its first migration.
 | `GET /health` | Process liveness — used by the container healthchecks and post-deploy checks |
 | `GET /<module>/v1/health/watchdog` | Per-module liveness heartbeat (version, uptime) |
 | `GET /<module>/v1/health/summary` | Per-module status rollup (requires read access) — e.g. Hare's reports backend, client and monitor counts |
-| `GET /v1/instance` | `{role, instance, historyUrl, windowDays, alembicHead}` (requires read access on `core`). `alembicHead` is the migrations head shipped in the image, not the database's, read once at startup. It is `null` where the process finds no migrations tree, as in the dev image, or the tree has more than one head |
+| `GET /v1/instance` | `{role, instance, historyUrl, windowDays, alembicHead, arms}` (requires read access on `core`). `alembicHead` is the migrations head shipped in the image, not the database's, read once at startup. `arms` is empty except on a history head, where it lists each arm as `{name, subscription}`, with `subscription` one of `missing`, `disabled`, `stopped`, `copying` or `streaming`. It is `null` where the process finds no migrations tree, as in the dev image, or the tree has more than one head |
 | `GET /metrics` | Prometheus exposition (unauthenticated, like `/health`): request counts and latency per module route, plus module gauges — see [Metrics](../observability/metrics.md) |

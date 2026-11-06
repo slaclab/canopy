@@ -50,6 +50,7 @@ def test_primary_defaults(client):
         "historyUrl": None,
         "windowDays": None,
         "alembicHead": SHIPPED_HEAD,
+        "arms": [],
     }
 
 
@@ -63,7 +64,32 @@ def test_mirror_reports_its_role_and_history_fields(client, history_settings):
         "historyUrl": "https://history.example.org",
         "windowDays": None,
         "alembicHead": SHIPPED_HEAD,
+        "arms": [],
     }
+
+
+def test_a_head_lists_its_arms_and_their_subscriptions(client, history_settings, monkeypatch):
+    monkeypatch.setenv("CANOPY_ARMS__ARM2__PUBLISHER_DSN", "host=arm2.example.org")
+    monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "host=arm1.example.org")
+
+    async def states(session, arms):
+        assert arms == ["arm1", "arm2"]
+        return {"arm1": "streaming", "arm2": "missing"}
+
+    monkeypatch.setattr(instance, "arm_states", states)
+    resp = client.get("/v1/instance", headers={"X-API-Key": "ro"})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["arms"] == [
+        {"name": "arm1", "subscription": "streaming"},
+        {"name": "arm2", "subscription": "missing"},
+    ]
+    assert "arm1.example.org" not in resp.text
+
+
+def test_a_primary_lists_no_arms_even_if_some_are_set(client, monkeypatch):
+    monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "host=arm1.example.org")
+    assert client.get("/v1/instance", headers={"X-API-Key": "ro"}).json()["arms"] == []
 
 
 def test_requires_a_key(client):
