@@ -49,10 +49,8 @@ def downgrade() -> None:
 '''
 
 
-@pytest.mark.parametrize(
-    ("role", "side"), [("primary", "publisher"), ("mirror", "subscriber"), ("forward", "subscriber")]
-)
-def test_only_a_primary_is_the_publisher(role, side):
+@pytest.mark.parametrize(("role", "side"), [("primary", "publisher"), ("mirror", "subscriber")])
+def test_an_arm_publishes_and_a_head_subscribes(role, side):
     assert side_for_role(role) == side
 
 

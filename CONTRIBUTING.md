@@ -43,70 +43,92 @@ Keep the tree to one head: before merging, point your revision's `down_revision`
 the head on `main`. CI migrates an empty database and runs `alembic check`, which
 fails when the models and the migrations disagree.
 
-### History mirrors
+### Arms and the history head
 
-A history mirror is a read-only copy of a primary's database, kept in step by Postgres
-logical replication (`canopy.core.replication`). It runs the same migrations, and it
-migrates **before** its primary: in each release the mirror runs `alembic upgrade head`
-while the primary is still on the previous release and still writing. One deploy may
-take the mirror through several revisions at once. Apply stops, and stays stopped until
-someone repairs it, when the primary sends a column the mirror doesn't have or a row
-the mirror already has. So every revision must work with a mirror any number of
-revisions ahead of its primary:
+A history head (`CANOPY_ROLE=mirror`) holds the rows of one or more arms (primaries)
+and is kept in step with each of them by Postgres logical replication
+(`canopy.core.replication`): one subscription per arm. It also writes rows of its own.
+Every row of the five root tables carries `owner_instance`, the `CANOPY_INSTANCE` of
+the instance that created it, and every child row follows its parent's
+(`owner_paths` in `canopy/core/replication/registry.py`). The head runs the same
+migrations,
+and it migrates **before every arm**: in each release the head runs
+`alembic upgrade head` while its arms are still on the previous release and still
+writing, then each arm migrates in turn. One deploy may take the head, or an arm,
+through several revisions at once, so arms can sit at different revisions. Apply from
+an arm stops, and stays stopped until someone repairs it, when that arm sends a column
+the head doesn't have or a row the head already has; the other arms keep streaming.
+So every revision must work with a head any number of revisions ahead of each arm:
 
 - **Add** a table, column or index in one release. An added column must be nullable or
-  have a `server_default`, because the mirror fills it in for rows the primary sends
-  before it migrates. Classify a new table in `canopy/core/replication/registry.py` in
-  the same pull request; a test fails until you do.
-- **Drop** a column or table publisher first, over two releases. In release N, stop
-  using it, and in one migration first make a column nullable on both sides (if it
+  have a constant `server_default`, because the head fills it in for rows an arm sends
+  before that arm migrates. Classify a new table in
+  `canopy/core/replication/registry.py` in the same pull request; a test fails until
+  you do.
+- **Drop** a column or table on the arms first, over two releases. In release N, stop
+  using it, and in one migration first make a column nullable on every side (if it
   isn't), then drop it under `if on_publisher():`. In a later release, drop it under
   `if on_subscriber():` in a revision that declares the release-N revision with a
   module-level `canopy_requires_primary_at = "<revision>"`, and deploy it with the check
   below.
-- **Rename** nothing in place: add the new column or table, copy the data under
-  `if on_publisher():`, move the code over, then drop the old one as above.
+- **Rename** nothing in place: add the new column or table, copy the data as a data
+  step (below), move the code over, then drop the old one as above.
 - **Change a type** only by widening it (`varchar(n)` to `text`, `integer` to `bigint`).
   Anything else is an add plus a drop.
 - **Tighten a constraint** (`NOT NULL`, `CHECK`, `UNIQUE`) a release after the code that
-  could violate it is gone and any backfill ran (under `if on_publisher():`), so the
-  primary can't send a row the mirror would reject. The tightening revision declares
-  the backfill's revision in `canopy_requires_primary_at` and is deployed with the check
+  could violate it is gone and any backfill ran (a data step, below), so no arm can
+  send a row the head would reject. The tightening revision declares the
+  backfill's revision in `canopy_requires_primary_at` and is deployed with the check
   below.
-- **Change data** (`INSERT`, `UPDATE`, `DELETE` on a replicated table) under
-  `if on_publisher():`. Replication brings the result to the mirror; an `INSERT` run on
-  both sides collides with the replicated row.
+- **Change data** (`INSERT`, `UPDATE`, `DELETE` on a replicated table) only in the rows
+  the instance being migrated owns, on every instance: filter on
+  `owner_instance = local_instance()` (`canopy.core.ownership`), reaching a child table
+  through its parent. An arm changes all its rows, the head only its own, and each
+  arm's change reaches the head by replication. A step that also changed an arm's rows
+  on the head would be overwritten, or stop apply. An `INSERT` stamps `owner_instance`
+  with `local_instance()`, and never uses a fixed facility or Magpie slug: those are
+  unique across every arm and the head, so the copies collide on the head.
 - **Index for history only** under `if on_subscriber():`, and keep the index out of the
-  models so `alembic check` still passes on a primary. Never make it unique.
-
+  models so `alembic check` still passes on an arm. Never make it unique.
 - **Retire a table** like a drop, and keep its entry in the replication registry with
-  its name added to `RETIRED` in `canopy/core/replication/registry.py`: a database that
-  hasn't dropped it yet still needs it classified. Remove both once no deployed database
-  can hold it.
+  its name added to `RETIRED` in `canopy/core/replication/registry.py`, and its owner
+  path: a database that hasn't dropped it yet still needs it classified. Remove them
+  once no deployed database can hold it.
 
 Local tables, which never replicate (`core.api_key`), need none of this.
 
-**Deploying a revision that declares `canopy_requires_primary_at`.** Before the mirror
-migrates past it, confirm that the primary runs the named revision or a later one
-(`alembic current` there), and that the mirror has caught up with everything the
-primary wrote before it: on the primary, `python -m canopy.core.replication status`
-shows the mirror's slot `active` with `lag_bytes` at or near 0. A mirror that was
-behind would still be applying rows that carry the dropped column, or that break the
-new constraint.
+**Deploying a revision that declares `canopy_requires_primary_at`.** Before the head
+migrates past it, confirm on **each** arm that it runs the named revision or a later
+one (`alembic current` there), and that the head has caught up with everything the arm
+wrote before it: on that arm, `python -m canopy.core.replication status` shows the
+slot `canopy_history_<arm>` `active` with `lag_bytes` at or near 0. A head that was
+behind an arm would still be applying rows that carry the dropped column, or that
+break the new constraint. There is no command for this; check every arm by hand.
 
 ```python
 from canopy.core.replication.migration import on_publisher, on_subscriber
 ```
 
-`migrations/env.py` takes the side from `CANOPY_ROLE`: `primary` is the publisher, any
-other role a subscriber. `tests/canopy/core/replication/test_migration_order.py` walks
-every revision on two Postgres servers twice: one release at a time, mirror first, and
-with the mirror at head while the primary climbs from the first revision (or from the
-newest `canopy_requires_primary_at`). After each step the primary writes a row to every
-published table from its own schema at that moment, filling every column without a
-default, and the walk fails on a migration that breaks a rule. CI runs it. If a new
-column has a `CHECK` the writer's generic value fails, add a value to `OVERRIDES` in that
-test. To run it locally, start the servers with
+`migrations/env.py` takes the side from `CANOPY_ROLE`: a `primary` (an arm) is a
+publisher, a `mirror` (the head) the subscriber.
+
+`tests/canopy/core/replication/test_migration_order.py` walks the tree on a head and
+two arms, each on its own Postgres server. Replication starts at the ownership
+revision `89e21441c63c` (`REPLICATION_BASE`): the replication code first shipped with
+it, and `subscribe` follows each arm's migration and `publish`, so no subscription
+exists below it. Each arm climbs to it alone, then the walk runs twice: one release at
+a time, the head first and then each arm, and with the head at head while one arm
+climbs and the other jumps to head in one deploy (from the base, or from the newest
+`canopy_requires_primary_at`). After each step each arm writes a row to every table it
+publishes from its own schema at that moment, filling every column without a default,
+the head writes rows it owns, and every instance writes to its local tables; a column
+unique per owner gets the same value on every instance. The head must then hold
+exactly each arm's rows plus its own, compared per arm by primary key, each stamped by
+its owner, including right after a migration and before anyone writes; and while the
+head migrates, its migration may change only rows it owns. The walk fails on a
+migration that breaks a rule. CI runs it. If a new column has a `CHECK` the writer's
+generic value fails (one that limits it to a list of values is handled), add a value to
+`OVERRIDES` in that test. To run it locally, start the servers with
 `docker compose -f tests/canopy/core/replication/docker-compose.yml up -d --wait` and
 set the variables listed in that file.
 

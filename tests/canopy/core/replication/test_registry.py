@@ -7,9 +7,18 @@ adds a table fails here until it says whether the history mirror receives it.
 import pkgutil
 import importlib
 
+from sqlalchemy import UniqueConstraint
+
 import canopy
 from canopy.core.db import Base
-from canopy.core.replication.registry import RETIRED, EXCLUDED, REGISTRY, TableClass
+from canopy.core.ownership import OwnedMixin
+from canopy.core.replication.registry import (
+    RETIRED,
+    EXCLUDED,
+    REGISTRY,
+    OwnerPath,
+    TableClass,
+)
 
 
 def _raise(name: str) -> None:
@@ -88,3 +97,59 @@ def test_derived_views():
     assert REGISTRY.local == ["core.api_key"]
     assert REGISTRY.schemas == ["core", "magpie", "squirrel"]
     assert set(REGISTRY.replicated) == {name for name, cls in REGISTRY.tables.items() if cls is not TableClass.LOCAL}
+
+
+# --------------------------------------------------------------------------- #
+# Owner paths and keys shared across owners
+# --------------------------------------------------------------------------- #
+
+
+def test_every_replicated_table_has_an_owner_path_and_no_local_one_does():
+    for name in REGISTRY.replicated:
+        REGISTRY.owner_chain(name)  # raises for a table, or a parent, with no path
+    assert set(REGISTRY.owner_paths) <= set(REGISTRY.replicated)
+
+
+def test_root_tables_carry_their_owner_column():
+    for name, path in REGISTRY.owner_paths.items():
+        if path.column is not None:
+            column = METADATA_TABLES[name].c[path.column]
+            assert not column.nullable, f"{name}.{path.column} must be NOT NULL"
+
+
+def test_child_keys_point_at_their_parents_id():
+    for name, path in REGISTRY.owner_paths.items():
+        if path.parent is not None:
+            targets = {
+                (fk.column.table.fullname, fk.column.name) for fk in METADATA_TABLES[name].c[path.key].foreign_keys
+            }
+            assert (path.parent, "id") in targets, f"{name}.{path.key} isn't a foreign key to {path.parent}.id"
+
+
+def test_owner_paths_agree_with_the_models():
+    for mapper in Base.registry.mappers:
+        model, name = mapper.class_, mapper.local_table.fullname
+        if issubclass(model, OwnedMixin):
+            assert REGISTRY.owner_paths[name] == OwnerPath(column="owner_instance"), name
+        if (declared := getattr(model, "__owner_parent__", None)) is not None:
+            parent, attribute = declared()
+            key = mapper.attrs[attribute].columns[0].name
+            assert REGISTRY.owner_paths[name] == OwnerPath(parent=parent.__table__.fullname, key=key), name
+
+
+def _unique_column_sets(table) -> set[tuple[str, ...]]:
+    sets = {tuple(c.name for c in con.columns) for con in table.constraints if isinstance(con, UniqueConstraint)}
+    sets |= {tuple(c.name for c in index.columns) for index in table.indexes if index.unique}
+    return sets | {(c.name,) for c in table.columns if c.unique}
+
+
+def test_shared_keys_are_exactly_the_unique_keys_without_the_owner():
+    # A key unique per owner (it includes owner_instance) can't clash across arms; any
+    # other unique key can, and the subscribe and refresh checks must know about it.
+    found = {}
+    for name in REGISTRY.replicated:
+        table = METADATA_TABLES[name]
+        for columns in _unique_column_sets(table):
+            if "owner_instance" not in columns and set(columns) != {c.name for c in table.primary_key.columns}:
+                found.setdefault(name, set()).add(columns)
+    assert found == {name: {columns} for name, columns in REGISTRY.shared_keys.items()}

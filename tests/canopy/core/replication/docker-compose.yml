@@ -1,11 +1,14 @@
-# Two Postgres 16 servers for test_replication_e2e.py: a primary with
-# wal_level=logical, and a mirror that reaches it by service name.
+# Two arms (primaries with wal_level=logical) and a head, for the replication
+# end-to-end tests. The head's server reaches each arm by its service name. CI runs
+# this project; for local runs each session uses its own servers instead.
 #
 #   docker compose -f tests/canopy/core/replication/docker-compose.yml up -d --wait
-#   export CANOPY_TEST_REPLICATION_PUBLISHER_DSN=postgresql://postgres:postgres@localhost:55442/postgres
-#   export CANOPY_TEST_REPLICATION_SUBSCRIBER_DSN=postgresql://postgres:postgres@localhost:55443/postgres
-#   export CANOPY_TEST_REPLICATION_PUBLISHER_CONNINFO="host=publisher port=5432"
-#   uv run pytest tests/canopy/core/replication/test_replication_e2e.py
+#   export CANOPY_TEST_REPLICATION_ARM1_DSN=postgresql://postgres:postgres@localhost:55442/postgres
+#   export CANOPY_TEST_REPLICATION_ARM1_CONNINFO="host=arm1 port=5432"
+#   export CANOPY_TEST_REPLICATION_ARM2_DSN=postgresql://postgres:postgres@localhost:55444/postgres
+#   export CANOPY_TEST_REPLICATION_ARM2_CONNINFO="host=arm2 port=5432"
+#   export CANOPY_TEST_REPLICATION_HEAD_DSN=postgresql://postgres:postgres@localhost:55443/postgres
+#   uv run pytest tests/canopy/core/replication
 #   docker compose -f tests/canopy/core/replication/docker-compose.yml down
 
 name: canopy-replication-test
@@ -26,13 +29,19 @@ x-postgres: &postgres
       max-file: "3"
 
 services:
-  publisher:
+  arm1:
     <<: *postgres
     command: ["postgres", "-c", "wal_level=logical"]
     ports:
       - "55442:5432"
 
-  subscriber:
+  arm2:
+    <<: *postgres
+    command: ["postgres", "-c", "wal_level=logical"]
+    ports:
+      - "55444:5432"
+
+  head:
     <<: *postgres
     ports:
       - "55443:5432"

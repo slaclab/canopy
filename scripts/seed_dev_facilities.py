@@ -12,12 +12,10 @@ Run::
     uv run python scripts/seed_dev_facilities.py
 """
 
-import sys
 import asyncio
 
 from canopy.core.db import session_scope, dispose_engine
 from canopy.core.errors import FacilitySlugConflict
-from canopy.core.security import READ_ONLY_DETAIL, is_read_only_instance
 from canopy.core.facilities.schemas import FacilityCreate
 from canopy.core.facilities.service import FacilityService
 
@@ -33,10 +31,6 @@ _FACILITIES = [
 
 
 async def main() -> int:
-    if is_read_only_instance():
-        # core.facility replicates from the primary; a table owner could still write it here.
-        print(f"error: {READ_ONLY_DETAIL}", file=sys.stderr)
-        return 2
     try:
         async with session_scope() as session:
             service = FacilityService(session)
