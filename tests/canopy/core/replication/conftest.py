@@ -26,8 +26,10 @@ import pytest_asyncio
 from pydantic import SecretStr
 from sqlalchemy import text
 from sqlalchemy.pool import NullPool
+from prometheus_client import CollectorRegistry, generate_latest
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
+from prometheus_client.parser import text_string_to_metric_families
 
 import canopy.core.keys.models  # noqa: F401 — register every persistent module's tables
 import canopy.magpie.data.models  # noqa: F401
@@ -36,6 +38,7 @@ import canopy.core.facilities.models  # noqa: F401
 from canopy.core.db import Base
 from canopy.core.arms import Arm, ArmsConfig, subscription_name
 from canopy.core.replication.config import ReplicationConfig
+from canopy.core.replication.metrics import ReplicationCollector
 from canopy.core.replication.registry import REGISTRY
 from canopy.core.replication.subscriber import subscriber_status
 
@@ -112,6 +115,19 @@ async def privileges(conn: asyncpg.Connection, role: str, table: str) -> set[str
         privilege
         for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE")
         if await conn.fetchval("SELECT has_table_privilege($1, $2, $3)", role, table, privilege)
+    }
+
+
+def metric_samples(status: dict | None) -> dict[tuple[str, frozenset], float]:
+    """What a scrape shows for ``status``: ``{(sample name, labels): value}``."""
+    collector = ReplicationCollector()
+    collector.status = status
+    registry = CollectorRegistry()
+    registry.register(collector)
+    return {
+        (sample.name, frozenset(sample.labels.items())): sample.value
+        for family in text_string_to_metric_families(generate_latest(registry).decode())
+        for sample in family.samples
     }
 
 

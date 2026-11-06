@@ -123,7 +123,8 @@ steps change only the rows the instance owns (see "Database Migrations" in
 | Endpoint | Use |
 |----------|-----|
 | `GET /health` | Process liveness — used by the container healthchecks and post-deploy checks |
+| `GET /health/ready` | Readiness: 200 `{"status": "ready"}` once the database answers `SELECT 1` within two seconds, 503 while it doesn't. Use it for a Kubernetes readiness probe; keep `/health` as the liveness probe, so a database outage takes the API out of rotation instead of restarting it |
 | `GET /<module>/v1/health/watchdog` | Per-module liveness heartbeat (version, uptime) |
 | `GET /<module>/v1/health/summary` | Per-module status rollup (requires read access) — e.g. Hare's reports backend, client and monitor counts |
 | `GET /v1/instance` | `{role, instance, historyUrl, windowDays, alembicHead, arms}` (requires read access on `core`). `alembicHead` is the migrations head shipped in the image, not the database's, read once at startup. `arms` is empty except on a history head, where it lists each arm as `{name, subscription}`, with `subscription` one of `missing`, `disabled`, `stopped`, `copying` or `streaming`. It is `null` where the process finds no migrations tree, as in the dev image, or the tree has more than one head |
-| `GET /metrics` | Prometheus exposition (unauthenticated, like `/health`): request counts and latency per module route, plus module gauges — see [Metrics](../observability/metrics.md) |
+| `GET /metrics` | Prometheus exposition (unauthenticated, like `/health`): request counts and latency per module route, module gauges, and replication state: an arm's slot, or a head's subscription to each arm — see [Metrics](../observability/metrics.md) |
