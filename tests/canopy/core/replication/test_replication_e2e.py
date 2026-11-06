@@ -15,6 +15,7 @@ from pydantic import SecretStr
 
 from canopy.core.arms import Arm, ArmsConfig, subscription_name
 from canopy.core.replication.sql import Refused, ReplicationError
+from canopy.core.replication.metrics import read_status
 from canopy.core.replication.registry import REGISTRY, TableClass, ReplicationRegistry
 from canopy.core.replication.publisher import publish, publisher_status
 from canopy.core.replication.subscriber import (
@@ -24,7 +25,7 @@ from canopy.core.replication.subscriber import (
     subscriber_status,
 )
 
-from .conftest import Octopus, copied, eventually
+from .conftest import Octopus, copied, eventually, metric_samples
 
 PRESENT = sorted(REGISTRY.replicated)
 one_arm = pytest.mark.parametrize("octopus", [1], indirect=True)
@@ -233,3 +234,55 @@ async def test_bare_octopus_has_its_roles_and_no_tables(bare_octopus: Octopus):
     # The head's owner can create the schema itself and subscribe, as in production.
     assert await o.head.conn.fetchval("SELECT pg_has_role(current_user, 'pg_create_subscription', 'MEMBER')")
     assert await o.head.conn.fetchval("SELECT has_database_privilege(current_database(), 'CREATE')")
+
+
+async def test_gauges_on_the_arms_and_per_arm_on_the_head(octopus: Octopus, monkeypatch):
+    o = octopus
+    first, second = o.arms.values()
+    monkeypatch.setattr("canopy.core.replication.metrics.get_arms_config", lambda: o.arms_config)
+    for arm in o.arms.values():
+        await publish(arm.admin, role="primary", config=o.config)
+    await _seed(first.admin)
+    await grants(o.head.conn, role="mirror", config=o.config)
+    await _subscribe(o, only=first.name)  # the second arm stays listed without a subscription
+    await eventually(lambda: copied(o, first.name))
+    # One streamed change, so the applied position moves past the initial copy's 0/0.
+    await first.admin.execute("UPDATE squirrel.pv SET description = 'streamed'")
+    await eventually(lambda: _in_step(o))
+
+    slot = frozenset({"slot": subscription_name(first.name), "kind": "subscription"}.items())
+    on_first = metric_samples(await read_status(first.admin, role="primary"))
+    assert on_first[("canopy_replication_slot_active", slot)] == 1
+    assert on_first[("canopy_replication_slot_wal_status", slot | {("wal_status", "reserved")})] == 1
+    assert on_first[("canopy_replication_slot_retained_bytes", slot)] >= 0
+    assert ("canopy_replication_slot_lag_bytes", slot) in on_first
+    assert metric_samples(await read_status(second.admin, role="primary")) == {
+        ("canopy_replication_status_up", frozenset()): 1
+    }
+
+    # The head's API reads its gauges as the app role, which can't see the applied position.
+    arm1, arm2 = (frozenset({"arm": arm.name}.items()) for arm in (first, second))
+    await o.head.admin.execute(f'SET ROLE "{o.config.app_role}"')
+    head = metric_samples(await read_status(o.head.admin, role="mirror"))
+    await o.head.admin.execute("RESET ROLE")
+    assert head[("canopy_replication_subscription_exists", arm1)] == 1
+    assert head[("canopy_replication_subscription_worker_up", arm1)] == 1
+    assert head[("canopy_replication_subscription_receive_age_seconds", arm1)] < 60
+    assert head[("canopy_replication_subscription_apply_errors_total", arm1)] == 0
+    assert head[("canopy_replication_subscription_tables_not_ready", arm1)] == 0
+    assert ("canopy_replication_subscription_applied_lsn_bytes", arm1) not in head
+    assert head[("canopy_replication_subscription_exists", arm2)] == 0
+    assert not [name for name, labels in head if labels == arm2 and not name.endswith("_exists")]
+    assert head[("canopy_replication_subscriptions_unexpected", frozenset())] == 0
+
+    as_superuser = metric_samples(await read_status(o.head.admin, role="mirror"))
+    assert as_superuser[("canopy_replication_subscription_applied_lsn_bytes", arm1)] > 0
+
+    # A disabled subscription keeps its pg_stat_subscription row, without a worker.
+    await o.head.admin.execute(f'ALTER SUBSCRIPTION "{subscription_name(first.name)}" DISABLE')
+
+    async def worker_stopped():
+        samples = metric_samples(await read_status(o.head.admin, role="mirror"))
+        return samples[("canopy_replication_subscription_worker_up", arm1)] == 0
+
+    await eventually(worker_stopped)

@@ -14,7 +14,7 @@ from .conftest import DB_DSN, metric_samples
 
 def _slot(**overrides) -> dict:
     slot = {
-        "slot_name": "canopy_history_site_a",
+        "slot_name": "canopy_history_arm1",
         "kind": "subscription",
         "active": True,
         "wal_status": "reserved",
@@ -29,9 +29,10 @@ def _publisher(*slots: dict, cap: int | None = 2_000) -> dict:
     return {"side": "publisher", "slots": list(slots), "max_slot_wal_keep_bytes": cap}
 
 
-def _subscriber(**overrides) -> dict:
+def _subscription(arm: str = "arm1", **overrides) -> dict:
     subscription = {
-        "name": "canopy_history_site_a",
+        "arm": arm,
+        "name": f"canopy_history_{arm}",
         "exists": True,
         "enabled": True,
         "worker": {"pid": 4242, "last_msg_receipt_time": (datetime.now(UTC) - timedelta(seconds=12)).isoformat()},
@@ -40,15 +41,19 @@ def _subscriber(**overrides) -> dict:
         "sync_error_count": 0,
         "tables_not_ready": {"squirrel.pv": "copying"},
     }
-    return {"side": "subscriber", "subscription": subscription | overrides}
+    return subscription | overrides
+
+
+def _head(*subscriptions: dict, unexpected: tuple[str, ...] = ()) -> dict:
+    return {"side": "subscriber", "subscriptions": list(subscriptions), "unexpected": list(unexpected)}
 
 
 def _labels(**labels) -> frozenset:
     return frozenset(labels.items())
 
 
-SLOT = {"slot": "canopy_history_site_a", "kind": "subscription"}
-SUB = {"subscription": "canopy_history_site_a"}
+SLOT = {"slot": "canopy_history_arm1", "kind": "subscription"}
+ARM1, ARM2 = {"arm": "arm1"}, {"arm": "arm2"}
 
 
 def test_a_primary_reports_each_slot():
@@ -84,35 +89,57 @@ def test_a_primary_without_slots_reports_only_that_it_read_them():
     assert metric_samples(_publisher(cap=None)) == {("canopy_replication_status_up", _labels()): 1}
 
 
-def test_a_mirror_reports_its_subscription():
-    samples = metric_samples(_subscriber())
+def test_a_head_reports_each_arm():
+    samples = metric_samples(
+        _head(_subscription(), _subscription("arm2", applied_lsn="0/10", apply_error_count=0, tables_not_ready={}))
+    )
 
-    assert samples[("canopy_replication_subscription_exists", _labels(**SUB))] == 1
-    assert samples[("canopy_replication_subscription_enabled", _labels(**SUB))] == 1
-    assert samples[("canopy_replication_subscription_worker_up", _labels(**SUB))] == 1
-    assert 12 <= samples[("canopy_replication_subscription_receive_age_seconds", _labels(**SUB))] < 60
-    assert samples[("canopy_replication_subscription_apply_errors_total", _labels(**SUB))] == 3
-    assert samples[("canopy_replication_subscription_sync_errors_total", _labels(**SUB))] == 0
-    assert samples[("canopy_replication_subscription_tables_not_ready", _labels(**SUB))] == 1
-    assert samples[("canopy_replication_subscription_applied_lsn_bytes", _labels(**SUB))] == (1 << 32) + 2
+    for name in ("exists", "enabled", "worker_up"):
+        assert samples[(f"canopy_replication_subscription_{name}", _labels(**ARM1))] == 1
+        assert samples[(f"canopy_replication_subscription_{name}", _labels(**ARM2))] == 1
+    assert 12 <= samples[("canopy_replication_subscription_receive_age_seconds", _labels(**ARM1))] < 60
+    assert samples[("canopy_replication_subscription_apply_errors_total", _labels(**ARM1))] == 3
+    assert samples[("canopy_replication_subscription_apply_errors_total", _labels(**ARM2))] == 0
+    assert samples[("canopy_replication_subscription_sync_errors_total", _labels(**ARM1))] == 0
+    assert samples[("canopy_replication_subscription_tables_not_ready", _labels(**ARM1))] == 1
+    assert samples[("canopy_replication_subscription_tables_not_ready", _labels(**ARM2))] == 0
+    assert samples[("canopy_replication_subscription_applied_lsn_bytes", _labels(**ARM1))] == (1 << 32) + 2
+    assert samples[("canopy_replication_subscription_applied_lsn_bytes", _labels(**ARM2))] == 0x10
+    assert samples[("canopy_replication_subscriptions_unexpected", _labels())] == 0
+    assert {
+        dict(labels).get("arm") for name, labels in samples if name.startswith("canopy_replication_subscription_")
+    } == {
+        "arm1",
+        "arm2",
+    }
 
 
 @pytest.mark.parametrize("worker", [None, {"pid": None, "last_msg_receipt_time": None}])
 def test_a_stopped_worker_has_no_receive_age(worker):
-    """A disabled subscription keeps its pg_stat_subscription row, with no pid."""
-    samples = metric_samples(_subscriber(worker=worker, applied_lsn=None))
+    """A disabled subscription keeps its pg_stat_subscription row, with no pid; the other arm's is unaffected."""
+    samples = metric_samples(_head(_subscription(), _subscription("arm2", worker=worker, applied_lsn=None)))
 
-    assert samples[("canopy_replication_subscription_worker_up", _labels(**SUB))] == 0
-    names = {name for name, _ in samples}
-    assert "canopy_replication_subscription_receive_age_seconds" not in names
-    assert "canopy_replication_subscription_applied_lsn_bytes" not in names
+    assert samples[("canopy_replication_subscription_worker_up", _labels(**ARM1))] == 1
+    assert samples[("canopy_replication_subscription_worker_up", _labels(**ARM2))] == 0
+    assert ("canopy_replication_subscription_receive_age_seconds", _labels(**ARM1)) in samples
+    assert ("canopy_replication_subscription_receive_age_seconds", _labels(**ARM2)) not in samples
+    assert ("canopy_replication_subscription_applied_lsn_bytes", _labels(**ARM2)) not in samples
 
 
-def test_a_mirror_without_its_subscription_says_so():
-    samples = metric_samples({"side": "subscriber", "subscription": {"name": "canopy_history_site_a", "exists": False}})
+def test_an_arm_without_its_subscription_says_so():
+    samples = metric_samples(_head({"arm": "arm1", "name": "canopy_history_arm1", "exists": False}))
     assert samples == {
         ("canopy_replication_status_up", _labels()): 1,
-        ("canopy_replication_subscription_exists", _labels(**SUB)): 0,
+        ("canopy_replication_subscription_exists", _labels(**ARM1)): 0,
+        ("canopy_replication_subscriptions_unexpected", _labels()): 0,
+    }
+
+
+def test_a_head_counts_the_subscriptions_no_arm_claims():
+    samples = metric_samples(_head(unexpected=("canopy_history_gone", "canopy_history_old")))
+    assert samples == {
+        ("canopy_replication_status_up", _labels()): 1,
+        ("canopy_replication_subscriptions_unexpected", _labels()): 2,
     }
 
 
@@ -151,8 +178,8 @@ async def test_a_failed_refresh_reports_status_down_and_warns_once(settings_env,
     assert len([r for r in caplog.records if "unavailable" in r.getMessage()]) == 1
 
 
-async def test_a_mirror_without_an_instance_name_reports_status_down(db, settings_env):
-    settings_env(CANOPY_DATABASE_URL=_app_url(DB_DSN), CANOPY_ROLE="mirror")
+async def test_a_head_whose_arms_setting_is_unreadable_reports_status_down(db, settings_env):
+    settings_env(CANOPY_DATABASE_URL=_app_url(DB_DSN), CANOPY_ROLE="mirror", CANOPY_ARMS="{not json")
     collector = ReplicationCollector()
     await collector.refresh()
     assert collector.status is None
@@ -171,13 +198,16 @@ async def test_refresh_reads_the_primary_side(db, settings_env, caplog):
     assert "available again" in caplog.text
 
 
-async def test_refresh_reads_the_mirror_side(db, settings_env):
-    settings_env(CANOPY_DATABASE_URL=_app_url(DB_DSN), CANOPY_ROLE="mirror", CANOPY_INSTANCE="site_a")
+async def test_refresh_reads_the_head_side(db, settings_env):
+    settings_env(
+        CANOPY_DATABASE_URL=_app_url(DB_DSN), CANOPY_ROLE="mirror", CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=arm1"
+    )
     collector = ReplicationCollector()
     await collector.refresh()
     assert collector.status == {
         "side": "subscriber",
-        "subscription": {"name": "canopy_history_site_a", "exists": False},
+        "subscriptions": [{"arm": "arm1", "name": "canopy_history_arm1", "exists": False}],
+        "unexpected": [],
     }
 
 

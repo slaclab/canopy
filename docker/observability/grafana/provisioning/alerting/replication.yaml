@@ -1,9 +1,10 @@
-# Alert rules for replication to a history mirror, on the gauges from
-# canopy.core.replication.metrics (docs/observability/metrics.md, "Replication").
-# The primary's rules watch its logical slots: an inactive slot or a slot near the
-# WAL cap fills the primary's disk, and a lost slot means re-seeding the mirror.
-# The mirror's rules watch its subscription. Series that don't exist (a primary
-# with no mirror) evaluate to "no data", which is OK.
+# Alert rules for history replication, on the gauges from canopy.core.replication.metrics
+# (docs/observability/metrics.md, "Replication").
+# An arm's rules watch its logical slots: an inactive slot or a slot near the WAL cap
+# fills the arm's disk, and a lost slot means re-seeding that arm's rows on the head.
+# The head's rules watch its subscription to each arm, labelled `arm`, so one arm's
+# trouble alerts for that arm alone. Series that don't exist (an arm with no head)
+# evaluate to "no data", which is OK.
 #
 # Grafana loads these at startup; they are read-only in the UI, like the
 # provisioned dashboards. No contact point is provisioned: route the
@@ -16,6 +17,7 @@ groups:
     folder: Canopy
     interval: 1m
     rules:
+      # --- On each arm -------------------------------------------------------
       - uid: canopy-replication-slot-inactive
         title: Replication slot inactive
         condition: C
@@ -24,11 +26,11 @@ groups:
         execErrState: Error
         labels: {severity: critical, team: canopy}
         annotations:
-          summary: "Slot {{ $labels.slot }} on {{ $labels.instance }} has had no mirror streaming from it for 15 minutes."
+          summary: "Slot {{ $labels.slot }} on {{ $labels.instance }} has had no head streaming from it for 15 minutes."
           description: >-
-            The primary keeps every WAL file the slot still needs until the mirror reconnects or
-            max_slot_wal_keep_size invalidates the slot. Check the mirror's subscription worker and
-            the network path to the primary's Postgres.
+            The arm keeps every WAL file the slot still needs until the head reconnects or
+            max_slot_wal_keep_size invalidates the slot. Check the head's subscription worker for this
+            arm and the network path to the arm's Postgres.
         data:
           - refId: A
             relativeTimeRange: {from: 600, to: 0}
@@ -56,8 +58,8 @@ groups:
         annotations:
           summary: "Slot {{ $labels.slot }} on {{ $labels.instance }} keeps over half of max_slot_wal_keep_size."
           description: >-
-            At the cap Postgres invalidates the slot (wal_status lost) and the mirror has to be
-            re-seeded. The mirror is behind or disconnected.
+            At the cap Postgres invalidates the slot (wal_status lost) and this arm's rows on the head
+            have to be re-seeded. The head is behind on this arm, or disconnected from it.
         data:
           - refId: A
             relativeTimeRange: {from: 600, to: 0}
@@ -88,7 +90,7 @@ groups:
           summary: "Slot {{ $labels.slot }} on {{ $labels.instance }} has left wal_status reserved."
           description: >-
             extended or unreserved: the slot is keeping WAL past max_wal_size and is heading for the
-            cap. lost: the WAL the mirror needs is gone; follow the slot-lost runbook.
+            cap. lost: the WAL the head needs from this arm is gone; follow the slot-lost runbook.
         data:
           - refId: A
             relativeTimeRange: {from: 600, to: 0}
@@ -116,8 +118,8 @@ groups:
         annotations:
           summary: "{{ $labels.instance }} has a replication slot but no max_slot_wal_keep_size."
           description: >-
-            Without the cap a stalled mirror makes the primary keep WAL until its disk is full, and the
-            half-the-cap alert can't fire. Set max_slot_wal_keep_size on the primary.
+            Without the cap a stalled head makes the arm keep WAL until its disk is full, and the
+            half-the-cap alert can't fire. Set max_slot_wal_keep_size on the arm.
         data:
           - refId: A
             relativeTimeRange: {from: 600, to: 0}
@@ -137,18 +139,49 @@ groups:
               conditions:
                 - evaluator: {type: gt, params: [0]}
 
+      # --- On the head, per arm ----------------------------------------------
+      - uid: canopy-replication-subscription-missing
+        title: Head not subscribed to an arm
+        condition: C
+        for: 30m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: canopy}
+        annotations:
+          summary: "{{ $labels.instance }} lists arm {{ $labels.arm }} but has no subscription to it."
+          description: >-
+            Nothing from this arm reaches the head. On the head, run
+            `python -m canopy.core.replication subscribe --arm {{ $labels.arm }}`.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: canopy_replication_subscription_exists
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: lt, params: [1]}
+
       - uid: canopy-replication-worker-down
-        title: Mirror apply worker not running
+        title: Head apply worker not running
         condition: C
         for: 5m
         noDataState: OK
         execErrState: Error
         labels: {severity: critical, team: canopy}
         annotations:
-          summary: "Subscription {{ $labels.subscription }} on {{ $labels.instance }} has no apply worker."
+          summary: "The subscription to arm {{ $labels.arm }} on {{ $labels.instance }} has no apply worker."
           description: >-
-            The mirror isn't receiving changes. The subscription may be disabled, or its worker may be
-            failing to connect to the primary or to apply a change (see the apply-errors alert).
+            The head isn't receiving this arm's changes. The subscription canopy_history_{{ $labels.arm }}
+            may be disabled, or its worker may be failing to connect to the arm or to apply a change
+            (see the apply-stopped alert).
         data:
           - refId: A
             relativeTimeRange: {from: 600, to: 0}
@@ -167,17 +200,17 @@ groups:
                 - evaluator: {type: lt, params: [1]}
 
       - uid: canopy-replication-receive-stale
-        title: Mirror hasn't heard from the primary
+        title: Head hasn't heard from an arm
         condition: C
         for: 5m
         noDataState: OK
         execErrState: Error
         labels: {severity: warning, team: canopy}
         annotations:
-          summary: "Subscription {{ $labels.subscription }} on {{ $labels.instance }} has received nothing for 5 minutes."
+          summary: "The subscription to arm {{ $labels.arm }} on {{ $labels.instance }} has received nothing for 5 minutes."
           description: >-
-            The primary sends a keepalive at least every half wal_sender_timeout, so silence means the
-            connection is down or stuck.
+            An arm sends a keepalive at least every half wal_sender_timeout, so silence means the
+            connection to that arm is down or stuck.
         data:
           - refId: A
             relativeTimeRange: {from: 600, to: 0}
@@ -195,27 +228,58 @@ groups:
               conditions:
                 - evaluator: {type: gt, params: [300]}
 
-      - uid: canopy-replication-apply-errors
-        title: Mirror failing to apply changes
+      - uid: canopy-replication-apply-stopped
+        title: Head stopped applying an arm's changes
         condition: C
-        for: 0s
+        for: 10m
         noDataState: OK
         execErrState: Error
         labels: {severity: critical, team: canopy}
         annotations:
-          summary: "Subscription {{ $labels.subscription }} on {{ $labels.instance }} hit apply or copy errors."
+          summary: "Apply from arm {{ $labels.arm }} on {{ $labels.instance }} has kept failing for 10 minutes."
           description: >-
-            Apply retries the same transaction until it succeeds, so one bad change (a column the
-            mirror lacks, a duplicate key) stops all replication. The mirror's Postgres log has the error.
+            Apply retries the failing transaction every few seconds, so nothing more from this arm
+            reaches the head until it is fixed; the other arms keep streaming. The head's Postgres log
+            names the error. A duplicate key on a facility or Magpie slug means another owner (another
+            arm, or the head) already holds that slug: rename the other owner's row where it is owned,
+            and the stuck change then applies. A column the head lacks means an arm migrated before
+            the head. The history guide's runbooks have the steps.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: increase(canopy_replication_subscription_apply_errors_total[5m])
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+
+      - uid: canopy-replication-copy-errors
+        title: Head failing to copy an arm's tables
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: canopy}
+        annotations:
+          summary: "An initial copy from arm {{ $labels.arm }} on {{ $labels.instance }} failed in the last 15 minutes."
+          description: >-
+            A table copy that fails is retried and leaves a slot on the arm holding WAL meanwhile.
+            The head's Postgres log has the error; the copy-stuck alert follows if it doesn't recover.
         data:
           - refId: A
             relativeTimeRange: {from: 900, to: 0}
             datasourceUid: canopy-prometheus
             model:
               refId: A
-              expr: >-
-                increase(canopy_replication_subscription_apply_errors_total[15m])
-                + increase(canopy_replication_subscription_sync_errors_total[15m])
+              expr: increase(canopy_replication_subscription_sync_errors_total[15m])
               instant: true
           - refId: C
             datasourceUid: __expr__
@@ -227,17 +291,17 @@ groups:
                 - evaluator: {type: gt, params: [0]}
 
       - uid: canopy-replication-copy-stuck
-        title: Mirror table copy not finishing
+        title: Head table copy not finishing
         condition: C
         for: 1h
         noDataState: OK
         execErrState: Error
         labels: {severity: warning, team: canopy}
         annotations:
-          summary: "Subscription {{ $labels.subscription }} on {{ $labels.instance }} has tables still copying after an hour."
+          summary: "The subscription to arm {{ $labels.arm }} on {{ $labels.instance }} has tables still copying after an hour."
           description: >-
-            A failed initial copy leaves the table unsynchronized and an inactive slot on the primary
-            holding WAL. Check the mirror's log and `python -m canopy.core.replication status`.
+            A failed initial copy leaves the table unsynchronized and an inactive slot on the arm
+            holding WAL. Check the head's log and `python -m canopy.core.replication status --arm {{ $labels.arm }}`.
         data:
           - refId: A
             relativeTimeRange: {from: 600, to: 0}
@@ -255,6 +319,37 @@ groups:
               conditions:
                 - evaluator: {type: gt, params: [0]}
 
+      - uid: canopy-replication-subscription-unexpected
+        title: Head subscribed to an arm it doesn't list
+        condition: C
+        for: 1h
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: canopy}
+        annotations:
+          summary: "{{ $labels.instance }} has history subscriptions for arms missing from CANOPY_ARMS."
+          description: >-
+            An arm taken out of the head's settings still streams into it and keeps a slot on that arm.
+            `python -m canopy.core.replication status` lists them under unexpected; put the arm back,
+            or drop its subscription on the head.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: canopy_replication_subscriptions_unexpected
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+
+      # --- On either -----------------------------------------------------------
       - uid: canopy-replication-status-down
         title: Replication status unreadable
         condition: C
@@ -265,8 +360,8 @@ groups:
         annotations:
           summary: "{{ $labels.instance }} can't read its replication status, so its other replication alerts are blind."
           description: >-
-            The API's metrics refresh can't query its database, or a mirror has no CANOPY_INSTANCE.
-            The API log has the reason.
+            The API's metrics refresh can't query its database, or a head can't read its arms
+            setting. The API log has the reason.
         data:
           - refId: A
             relativeTimeRange: {from: 600, to: 0}
