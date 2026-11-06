@@ -101,9 +101,12 @@ async def create_pv(data: NewPVElementDTO, service: PvServiceDep, owner: OwnerQu
 
 
 @router.post("/multi", dependencies=[Security(require_write_access)])
-async def create_multiple_pvs(data: list[NewPVElementDTO], service: PvServiceDep) -> list[PVElementDTO]:
-    """Bulk-create PVs (CSV import). One import has one owner: its facilities', else this instance."""
-    return await service.create_many(data)
+async def create_multiple_pvs(
+    data: list[NewPVElementDTO], service: PvServiceDep, owner: OwnerQuery = None
+) -> list[PVElementDTO]:
+    """Bulk-create PVs (CSV import). One import has one owner: its facilities', else this instance.
+    ``owner`` accepts only this instance's name."""
+    return await service.create_many(data, owner)
 
 
 @router.put("/{pv_id}", dependencies=[Security(require_write_access)])
