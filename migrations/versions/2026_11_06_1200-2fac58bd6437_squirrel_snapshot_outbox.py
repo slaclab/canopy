@@ -28,7 +28,7 @@ def upgrade() -> None:
         sa.Column("id", postgresql.UUID(as_uuid=False), nullable=False),
         sa.Column("seq", sa.BigInteger(), sa.Identity(always=False), nullable=False),
         sa.Column("arm", sa.String(length=48), nullable=False),
-        sa.Column("facility_id", postgresql.UUID(as_uuid=False), nullable=False),
+        sa.Column("facility_id", postgresql.UUID(as_uuid=False), nullable=True),
         sa.Column("title", sa.String(length=255), nullable=False),
         sa.Column("description", sa.Text(), nullable=True),
         sa.Column("created_by", sa.String(length=255), nullable=True),

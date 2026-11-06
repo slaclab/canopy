@@ -25,8 +25,8 @@ from prometheus_client.registry import Collector
 from canopy.core.config import get_settings
 from canopy.squirrel.config import get_squirrel_config
 from canopy.core.replication.sql import asyncpg_dsn
+from canopy.core.forwarding.client import forwardable_arms
 from canopy.squirrel.outbox.status import outbox_status
-from canopy.squirrel.outbox.delivery import delivery_arms
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ STATES = ("pending", "delivered", "failed")
 class OutboxCollector(Collector):
     """Yields the gauges of the last status ``refresh()`` read; ``None`` means it failed."""
 
-    def __init__(self, arms: Callable[[], list[str]] = delivery_arms) -> None:
+    def __init__(self, arms: Callable[[], list[str]] = lambda: sorted(forwardable_arms())) -> None:
         self.arms = arms
         self.status: dict | None = None
         self.enabled = False

@@ -36,8 +36,8 @@ from canopy.core.config import get_settings
 from canopy.core.logging import JsonFormatter
 from canopy.squirrel.config import get_squirrel_config
 from canopy.core.replication.sql import asyncpg_dsn
+from canopy.core.forwarding.client import forwardable_arms
 from canopy.squirrel.outbox.status import outbox_status
-from canopy.squirrel.outbox.delivery import delivery_arms
 
 logger = logging.getLogger("canopy.squirrel.outbox")
 
@@ -92,7 +92,7 @@ async def run(options: argparse.Namespace) -> int:
         return 1
     try:
         if options.command == "status":
-            status = await outbox_status(conn, arms=delivery_arms(), config=get_squirrel_config().outbox)
+            status = await outbox_status(conn, arms=sorted(forwardable_arms()), config=get_squirrel_config().outbox)
             print(json.dumps(status, indent=2))
             return 0
         if options.command == "retry":

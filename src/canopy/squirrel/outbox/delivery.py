@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import time
 import random
+import asyncio
 import logging
 from typing import Any
 from datetime import UTC, datetime, timedelta
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from collections.abc import Callable, Awaitable, AsyncIterator
 
 from sqlalchemy import text
@@ -29,11 +31,14 @@ from sqlalchemy import text
 from canopy.core.db import session_scope
 from canopy.core.errors import PrimaryTimeout, PrimaryUnavailable
 from canopy.core.time_parse import to_utc
-from canopy.squirrel.config import OutboxConfig
+from canopy.squirrel.config import OutboxConfig, get_squirrel_config
 from canopy.squirrel.errors import OutboxFull
+from canopy.squirrel.capture import deliver_capture
 from canopy.squirrel.data.models import SnapshotOutbox
+from canopy.core.forwarding.client import Caller, ArmRefused, forwardable_arms
 from canopy.squirrel.schemas.snapshot import SnapshotBundleDTO
 from canopy.squirrel.data.repositories import OutboxRepository
+from canopy.squirrel.services.snapshot_service import delivery_of
 
 logger = logging.getLogger(__name__)
 
@@ -50,31 +55,26 @@ _CONFIGURATION_CODES = frozenset(
 _RETRIED_STATUSES = frozenset({408, 429})
 
 
-class ArmRefused(Exception):
-    """The arm answered a delivery with an error: its status, ``code`` and ``detail``."""
-
-    def __init__(self, status: int, code: str, detail: str) -> None:
-        super().__init__(f"{status} {code}: {detail}")
-        self.status = status
-        self.code = code
-        self.detail = detail
-
-
 def transient(refusal: ArmRefused) -> bool:
     """Whether a later attempt can succeed with nothing changed about the snapshot."""
     return refusal.status >= 500 or refusal.status in _RETRIED_STATUSES or refusal.code in _CONFIGURATION_CODES
 
 
 def refusal_reason(refusal: ArmRefused) -> str:
-    """How a failed row records the arm's answer: ``<code>: <detail>``."""
-    return f"{refusal.code}: {refusal.detail}"
+    """How a row records the arm's answer: ``<code>: <detail>``, or the status when the arm sent no code."""
+    return f"{refusal.code or refusal.status}: {refusal.detail}"
 
 
-Send = Callable[[str, str, dict, bool], Awaitable[Any]]
+Send = Callable[[str, str, dict, bool], Awaitable[dict]]
 """``send(arm, bundle_json, caller, strict)``: post one bundle to the arm's captured
-import and wait for it to replicate. ``caller`` is the stored ``Caller``
-(``{on_behalf_of, facilities}``). Raises ``PrimaryUnavailable`` (nothing sent),
+import and wait for it to replicate; ``send_queued`` in production. ``caller`` is the
+stored ``Caller`` as a dict. Raises ``PrimaryUnavailable`` (nothing sent),
 ``PrimaryTimeout`` (sent, no answer) or ``ArmRefused``."""
+
+
+async def send_queued(arm: str, document: str, caller: dict, strict: bool) -> dict:
+    """Deliver one queued bundle through ``deliver_capture``, as its capture would have."""
+    return await deliver_capture(arm, SnapshotBundleDTO.model_validate_json(document), Caller(**caller), strict=strict)
 
 
 def retry_delay(attempts: int, config: OutboxConfig, rng: random.Random | None = None) -> float:
@@ -98,12 +98,25 @@ async def outbox_full(repo: OutboxRepository, arm: str, config: OutboxConfig) ->
     return None
 
 
+async def refuse_if_full(repo: OutboxRepository, arm: str, config: OutboxConfig) -> None:
+    """Refuse a capture for ``arm`` up front when it would only queue, and its outbox is full.
+
+    Raises
+    ------
+    OutboxFull
+        When the arm has snapshots waiting and is at a cap. Without a backlog the capture
+        may reach the arm directly, so it isn't refused here.
+    """
+    if await repo.has_backlog(arm) and (reason := await outbox_full(repo, arm, config)):
+        raise OutboxFull(reason)
+
+
 async def enqueue(
     repo: OutboxRepository,
     *,
     arm: str,
     bundle: SnapshotBundleDTO,
-    facility_id: str,
+    facility_id: str | None,
     caller: dict,
     config: OutboxConfig,
 ) -> None:
@@ -138,6 +151,64 @@ async def enqueue(
         caller=caller,
     )
     logger.info("Snapshot %s queued for %s (%d values, %d bytes)", bundle.id, arm, len(bundle.values), size)
+
+
+async def submit(
+    arm: str, bundle: SnapshotBundleDTO, caller: Caller, *, facility_id: str | None, config: OutboxConfig | None = None
+) -> dict:
+    """Save a capture on its arm now, or queue it; returns the capture job's result.
+
+    A capture for an arm with snapshots already waiting queues behind them, so the arm
+    gets its snapshots in the order they were taken. Otherwise it goes straight to the
+    arm (``deliver_capture``). If that can't reach the arm, gets no answer, or meets a
+    failure the outbox would retry, the snapshot is queued with the attempt recorded;
+    a refusal of the snapshot itself is raised, so the capture job fails with it.
+
+    Returns
+    -------
+    dict
+        ``deliver_capture``'s result when the arm saved it; for a queued one,
+        ``{"type": "snapshot", "id", "arm", "delivery"}`` with the same ``delivery``
+        object the snapshot API shows.
+
+    Raises
+    ------
+    OutboxFull
+        When the snapshot had to queue and the arm's outbox is at a cap.
+    ArmRefused
+        When the arm refused the snapshot.
+    """
+    config = config or get_squirrel_config().outbox
+    async with session_scope() as session:
+        behind = await OutboxRepository(session).has_backlog(arm)
+    attempted: str | None = None
+    if not behind:
+        try:
+            return await deliver_capture(arm, bundle, caller)
+        except PrimaryUnavailable as exc:  # and PrimaryTimeout, a 504 that may have been applied
+            attempted = exc.detail
+        except ArmRefused as exc:
+            if not transient(exc):
+                raise
+            attempted = refusal_reason(exc)
+    snapshot_id = str(bundle.id)
+    async with session_scope() as session:
+        repo = OutboxRepository(session)
+        await enqueue(repo, arm=arm, bundle=bundle, facility_id=facility_id, caller=asdict(caller), config=config)
+        if attempted is not None:
+            now = datetime.now(UTC)
+            await repo.update_state(
+                snapshot_id,
+                attempts=1,
+                last_attempt_at=now,
+                last_error=attempted,
+                next_attempt_at=now + timedelta(seconds=retry_delay(1, config)),
+            )
+            logger.warning("Snapshot %s queued for %s, which it couldn't be saved on: %s", snapshot_id, arm, attempted)
+        await session.commit()
+        entry = await repo.get(snapshot_id)
+    delivery = delivery_of(entry).model_dump(mode="json", by_alias=True)
+    return {"type": "snapshot", "id": snapshot_id, "arm": arm, "delivery": delivery}
 
 
 def log_swept(rows: list) -> None:
@@ -227,7 +298,7 @@ async def deliver_arm(
             entry, document = due
             attempts = entry.attempts + 1
             try:
-                await send(arm, document, entry.caller, entry.strict)
+                outcome = await send(arm, document, entry.caller, entry.strict)
             except (PrimaryUnavailable, PrimaryTimeout, ArmRefused) as exc:
                 now = clock()
                 if isinstance(exc, ArmRefused) and not transient(exc):
@@ -261,11 +332,23 @@ async def deliver_arm(
                 )
                 counts["retried"] += 1
                 break
+            if skipped := (outcome or {}).get("skipped"):
+                # Only a row retried with --allow-skips is sent without strict.
+                logger.warning(
+                    "Snapshot %s saved on %s without %d value(s), as allowed: %s",
+                    entry.id,
+                    arm,
+                    len(skipped),
+                    ", ".join(value["pvName"] for value in skipped),
+                )
             await _delivered(entry, attempts, clock())
             counts["delivered"] += 1
     return counts
 
 
-def delivery_arms() -> list[str]:
-    """The arms this instance delivers captures to: those with a forward URL and a service key."""
-    return []
+async def deliver_all(send: Send = send_queued, *, config: OutboxConfig | None = None) -> dict[str, dict[str, int]]:
+    """One delivery run for every arm this head forwards to, the arms side by side."""
+    config = config or get_squirrel_config().outbox
+    arms = sorted(forwardable_arms())
+    runs = await asyncio.gather(*(deliver_arm(arm, send, config=config) for arm in arms))
+    return dict(zip(arms, runs, strict=True))

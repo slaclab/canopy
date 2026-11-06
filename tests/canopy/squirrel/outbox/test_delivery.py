@@ -12,8 +12,8 @@ from canopy.core.errors import PrimaryTimeout, PrimaryUnavailable
 from canopy.squirrel.config import OutboxConfig
 from canopy.squirrel.errors import OutboxFull
 from canopy.squirrel.data.models import Snapshot, SnapshotOutbox
+from canopy.core.forwarding.client import ArmRefused
 from canopy.squirrel.outbox.delivery import (
-    ArmRefused,
     enqueue,
     bundle_json,
     deliver_arm,
@@ -153,10 +153,10 @@ async def test_delivers_one_arms_queue_in_capture_order(db_session, seeded: Seed
     [
         PrimaryUnavailable("arm2 could not be reached"),
         PrimaryTimeout("arm2 did not answer"),
-        ArmRefused(503, "unhandled_exception", "down for maintenance"),
-        ArmRefused(401, "invalid_api_key", "Invalid API key"),
-        ArmRefused(403, "insufficient_write_access", "API key does not have write access"),
-        ArmRefused(429, "too_many_requests", "slow down"),
+        ArmRefused("arm2", 503, "unhandled_exception", "down for maintenance"),
+        ArmRefused("arm2", 401, "invalid_api_key", "Invalid API key"),
+        ArmRefused("arm2", 403, "insufficient_write_access", "API key does not have write access"),
+        ArmRefused("arm2", 429, "too_many_requests", "slow down"),
     ],
 )
 async def test_a_transient_failure_backs_off_and_holds_the_arms_queue(db_session, seeded: Seeded, error):
@@ -187,12 +187,12 @@ async def test_a_transient_failure_backs_off_and_holds_the_arms_queue(db_session
 @pytest.mark.parametrize(
     "error",
     [
-        ArmRefused(404, "facility_not_found", "Facility 'lab-b' not found"),
-        ArmRefused(409, "import_would_skip", "would skip LAB:B:SP (moved out of lab-b)"),
-        ArmRefused(409, "snapshot_id_conflict", "id exists with another createdDate"),
-        ArmRefused(403, "insufficient_facility_access", "API key is not scoped to facility: lab-b"),
-        ArmRefused(400, "nothing_to_import", "None of the bundle's PVs can be imported here"),
-        ArmRefused(422, "unprocessable_entity", "bad bundle"),
+        ArmRefused("arm2", 404, "facility_not_found", "Facility 'lab-b' not found"),
+        ArmRefused("arm2", 409, "import_would_skip", "would skip LAB:B:SP (moved out of lab-b)"),
+        ArmRefused("arm2", 409, "snapshot_id_conflict", "id exists with another createdDate"),
+        ArmRefused("arm2", 403, "insufficient_facility_access", "API key is not scoped to facility: lab-b"),
+        ArmRefused("arm2", 400, "nothing_to_import", "None of the bundle's PVs can be imported here"),
+        ArmRefused("arm2", 422, "unprocessable_entity", "bad bundle"),
     ],
 )
 async def test_a_refusal_fails_the_row_with_the_arms_reason_and_the_queue_goes_on(

@@ -5,7 +5,7 @@ from datetime import timedelta
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from canopy.core.config import Settings
+from canopy.core.config import get_settings
 from canopy.squirrel.data.models import Snapshot, SnapshotValue
 from tests.canopy.squirrel.conftest import READ_HEADERS, WRITE_HEADERS
 from canopy.squirrel.services.snapshot_service import SnapshotService
@@ -181,11 +181,14 @@ async def test_edit_and_delete_are_refused_while_pending_or_failed(client, db_se
 
 
 async def test_restore_runs_from_the_bundle_only_with_machine_access(
-    client, db_session, seeded: Seeded, enqueued, monkeypatch
+    client, db_session, seeded: Seeded, enqueued, mirror_role, monkeypatch
 ):
     pending = await queue(db_session, seeded)
     failed = await queue(db_session, seeded, minutes=1, state="failed", last_error="x: y")
 
+    # A head writes the machine only with CANOPY_MACHINE_ACCESS=write.
+    monkeypatch.setenv("CANOPY_MACHINE_ACCESS", "write")
+    get_settings.cache_clear()
     for sid in (pending, failed):
         r = await client.post(f"/v1/snapshots/{sid}/restore", headers=WRITE_HEADERS)
         assert r.status_code == 200, r.text
@@ -194,7 +197,9 @@ async def test_restore_runs_from_the_bundle_only_with_machine_access(
         ("restore_snapshot_task", failed),
     ]
 
-    monkeypatch.setattr(Settings, "machine_writes", property(lambda self: False))
+    # The default on a head is read.
+    monkeypatch.delenv("CANOPY_MACHINE_ACCESS")
+    get_settings.cache_clear()
     r = await client.post(f"/v1/snapshots/{pending}/restore", headers=WRITE_HEADERS)
     assert r.status_code == 409
     assert r.json() == {

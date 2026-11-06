@@ -19,9 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tests.conftest import WRITE_HEADERS
 from canopy.squirrel import tasks, capture
 from canopy.core.config import get_settings
-from canopy.core.errors import NotOwner, PrimaryUnavailable
+from canopy.core.errors import NotOwner
 from canopy.squirrel.capture import CaptureTarget, capture_target
-from canopy.squirrel.data.models import Pv, Snapshot, pv_facility
+from canopy.squirrel.data.models import Pv, Snapshot, SnapshotOutbox, pv_facility
 from canopy.core.facilities.models import Facility
 from canopy.core.forwarding.client import Caller, ArmRefused
 from canopy.squirrel.services.snapshot_service import SnapshotService
@@ -150,7 +150,13 @@ class TestTheTask:
         monkeypatch.setattr(tasks, "report_progress", no_progress)
         monkeypatch.setattr(tasks, "_build_epics_io", lambda ctx: io)
         monkeypatch.setattr(capture, "wait_until_applied", wait_until_applied)
-        return SimpleNamespace(io=io, waits=waits, ctx={"redis": None, "job_id": "j"})
+        triggered = []
+
+        class Redis:
+            async def enqueue_job(self, function, *args, **kwargs):
+                triggered.append(function)
+
+        return SimpleNamespace(io=io, waits=waits, triggered=triggered, ctx={"redis": Redis(), "job_id": "j"})
 
     @staticmethod
     def _saved(request: httpx.Request, *, skipped: list | None = None, created: bool = True) -> httpx.Response:
@@ -216,13 +222,32 @@ class TestTheTask:
         assert (refused.value.status, refused.value.code, refused.value.detail) == (404, "facility_not_found", "gone")
         assert worker.waits == []
 
-    async def test_an_unreachable_arm_fails_the_job(self, sites, worker, httpx_mock: HTTPXMock):
+    async def test_an_unreachable_arm_gets_the_snapshot_through_the_outbox(
+        self, sites, worker, httpx_mock: HTTPXMock, db_session
+    ):
         httpx_mock.add_exception(httpx.ConnectError("refused"))
 
-        with pytest.raises(PrimaryUnavailable, match="nothing was sent"):
-            await tasks.create_snapshot_task(
-                worker.ctx, "t", facility_id=sites["arm1"]["facility"], arm="arm1", caller=CALLER
-            )
+        result = await tasks.create_snapshot_task(
+            worker.ctx, "t", facility_id=sites["arm1"]["facility"], arm="arm1", caller=CALLER
+        )
+
+        queued = await db_session.get(SnapshotOutbox, result["id"])
+        assert (queued.arm, queued.state, queued.attempts, queued.caller) == ("arm1", "pending", 1, CALLER)
+        assert "could not be reached" in queued.last_error
+        assert result == {
+            "type": "snapshot",
+            "id": queued.id,
+            "arm": "arm1",
+            "delivery": {
+                "state": "pending",
+                "arm": "arm1",
+                "queuedAt": result["delivery"]["queuedAt"],
+                "attempts": 1,
+                "reason": queued.last_error,
+            },
+        }
+        assert worker.triggered == ["deliver_outbox_task"]
+        assert (await db_session.scalar(select(Snapshot.id))) is None
 
     async def test_strict_goes_with_the_bundle(self, sites, worker, httpx_mock: HTTPXMock, db_session):
         httpx_mock.add_callback(self._saved, method="POST", url=f"{IMPORT}&strict=true")
