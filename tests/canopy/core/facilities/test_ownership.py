@@ -41,11 +41,11 @@ async def test_a_child_belongs_to_its_parents_owner(session, session_maker, as_i
         await FacilityService(session).create(FacilityCreate(slug="remote-child", name="Child", parent="remote"))
 
 
-async def test_a_requested_owner_must_match_the_parents(session, session_maker):
+async def test_an_instance_accepts_only_its_own_name_as_the_owner(session, session_maker):
     service = FacilityService(session)
     await service.create(FacilityCreate(slug="local", name="Local"))
 
-    with pytest.raises(OwnerMismatch):
+    with pytest.raises(NotOwner, match="'arm2'"):
         await service.create(FacilityCreate(slug="local-child", name="Child", parent="local"), owner="arm2")
 
 

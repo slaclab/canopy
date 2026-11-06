@@ -8,8 +8,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.core.errors import (
+    NotOwner,
     BadRequest,
-    OwnerMismatch,
     FacilityNotFound,
     InsufficientFacilityAccess,
 )
@@ -348,15 +348,13 @@ class PvService:
         # id-to-slug round trip and report them straight back.
         return self._to_dto(pv, sorted(set(data.facilities)))
 
-    async def create_many(self, data_list: list[NewPVElementDTO], owner: str | None = None) -> list[PVElementDTO]:
-        """Register many PVs in one import, all with one owner.
+    async def create_many(self, data_list: list[NewPVElementDTO]) -> list[PVElementDTO]:
+        """Register many PVs in one import, all owned by this instance.
 
         Parameters
         ----------
         data_list : list[NewPVElementDTO]
             Wire payloads for the PVs to import.
-        owner : str | None
-            The ``?owner=`` the caller named, for an import whose rows name no facility.
 
         Returns
         -------
@@ -438,7 +436,7 @@ class PvService:
         # One import, one owner: rows naming no facility take the owner the others take.
         facility_owners = await facilities_gateway.owners_by_id(set(ids_by_slug.values()))
         require_create_owner(
-            one_owner(facility_owners.values(), "The imported PVs' facilities"), owner, "The imported PVs"
+            one_owner(facility_owners.values(), "The imported PVs' facilities"), None, "The imported PVs"
         )
 
         existence_lookups = (
@@ -616,23 +614,17 @@ class PvService:
             raise MetaPvNotFound(f"Meta PV {id} not found")
         return MetaPVDTO(pv_id=meta_pv.pv_id, display_name=meta_pv.display_name, is_active=meta_pv.is_active)
 
-    async def add_meta_pv(self, pv_name: str, display_name: str, owner: str | None = None) -> MetaPVDTO:
-        """Mark a PV, found by any of its addresses, as a meta-PV.
+    async def add_meta_pv(self, pv_name: str, display_name: str) -> MetaPVDTO:
+        """Mark one of this instance's PVs, found by any of its addresses, as a meta-PV.
 
-        On a mirror an address can belong to several owners' PVs; ``owner`` picks one,
-        and is required when the address is ambiguous.
+        On a mirror the address may belong only to arms' PVs; that answers
+        ``not_owner``, naming them.
         """
-        if owner is None:
-            owners = await self.pv_repo.owners_by_address(pv_name)
-            if len(owners) > 1:
-                raise OwnerMismatch(
-                    f"PV {pv_name} is registered by several instances ({', '.join(sorted(owners))}); "
-                    "name one with ?owner="
-                )
-            owner = next(iter(owners), local_instance())
-        require_owned(owner, f"PV {pv_name}")
-        pv = await self.pv_repo.find_by_address(pv_name, owner=owner)
+        pv = await self.pv_repo.find_by_address(pv_name, owner=local_instance())
         if pv is None:
+            owners = await self.pv_repo.owners_by_address(pv_name)
+            if owners:
+                raise NotOwner(f"PV {pv_name} is owned by {', '.join(repr(o) for o in sorted(owners))}; write it there")
             raise PvNotFound(f"PV {pv_name} could not be found")
         try:
             new_pv = await self.meta_pv_repo.add(pv.id, display_name)
@@ -659,6 +651,7 @@ class PvService:
                 pv_name=pvs[meta_pv.pv_id].setpoint_address or pvs[meta_pv.pv_id].readback_address or "",
                 display_name=meta_pv.display_name,
                 is_active=meta_pv.is_active,
+                owner_instance=pvs[meta_pv.pv_id].owner_instance,
             )
             for meta_pv in meta_pv_metadata
         ]

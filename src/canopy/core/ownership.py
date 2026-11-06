@@ -16,9 +16,10 @@ backstop for an ORM write that a service check missed.
 
 A create's owner is the owner of what it is created in: a facility's parent, a
 PV's facilities, a snapshot's facility, a tag's group. A create with none of those
-belongs to the instance that receives it, unless it names another owner with
-``?owner=``. Either way, an instance only creates rows it will own; on a mirror,
-the router forwards a create meant for an arm before it gets here.
+belongs to the instance that receives it. A root facility, a PV, a tag group, a
+tag import and a Magpie config also take ``?owner=``, which an instance accepts
+only with its own name; on a mirror, the router forwards a create naming an arm
+before it gets here.
 """
 
 from __future__ import annotations
@@ -80,14 +81,16 @@ def one_owner(owners: Iterable[str], what: str) -> str | None:
 
 
 def require_create_owner(target_owner: str | None, requested: str | None, what: str) -> None:
-    """Refuse a create this instance wouldn't own.
+    """Refuse with ``not_owner`` a create this instance wouldn't own.
 
     ``target_owner`` is the owner of what the row is created in (``None`` when it
     has no facility or parent); ``requested`` is the ``?owner=`` the caller named.
+    An instance accepts only its own name as ``requested``.
     """
-    if target_owner is not None and requested is not None and requested != target_owner:
-        raise OwnerMismatch(f"{what} would belong to '{target_owner}', not the requested owner '{requested}'")
-    require_owned(target_owner or requested or local_instance(), what)
+    if requested is not None:
+        require_owned(requested, what)
+    if target_owner is not None:
+        require_owned(target_owner, what)
 
 
 def require_same_owner(owner: str, others: Iterable[str], what: str) -> None:

@@ -43,9 +43,11 @@ def test_a_create_another_instance_would_own(target, requested):
         require_create_owner(target, requested, "row")
 
 
-def test_a_requested_owner_that_disagrees_with_the_target():
-    with pytest.raises(OwnerMismatch):
-        require_create_owner("arm1", "arm2", "row")
+@pytest.mark.parametrize(("target", "requested"), [("arm1", "arm2"), ("arm2", "arm1")])
+def test_a_requested_owner_or_target_that_isnt_this_instance(target, requested):
+    # One code for "belongs elsewhere", whichever of the two names it.
+    with pytest.raises(NotOwner, match="'arm2'"):
+        require_create_owner(target, requested, "row")
 
 
 def test_require_same_owner():

@@ -101,11 +101,9 @@ async def create_pv(data: NewPVElementDTO, service: PvServiceDep, owner: OwnerQu
 
 
 @router.post("/multi", dependencies=[Security(require_write_access)])
-async def create_multiple_pvs(
-    data: list[NewPVElementDTO], service: PvServiceDep, owner: OwnerQuery = None
-) -> list[PVElementDTO]:
-    """Bulk-create PVs (CSV import). One import has one owner: its facilities', else ``owner`` or this instance."""
-    return await service.create_many(data, owner)
+async def create_multiple_pvs(data: list[NewPVElementDTO], service: PvServiceDep) -> list[PVElementDTO]:
+    """Bulk-create PVs (CSV import). One import has one owner: its facilities', else this instance."""
+    return await service.create_many(data)
 
 
 @router.put("/{pv_id}", dependencies=[Security(require_write_access)])
@@ -133,10 +131,9 @@ async def delete_pv(pv_id: str, service: PvServiceDep) -> bool:
 
 
 @router.post("/meta", dependencies=[Security(require_write_access)])
-async def add_meta_pv(pvInfo: NewMetaPVDTO, service: PvServiceDep, owner: OwnerQuery = None) -> MetaPVDTO:
-    """Promote an existing PV (by address) to a meta-PV. ``owner`` picks the PV when
-    several instances registered the address."""
-    return await service.add_meta_pv(pvInfo.pv_name, pvInfo.display_name, owner)
+async def add_meta_pv(pvInfo: NewMetaPVDTO, service: PvServiceDep) -> MetaPVDTO:
+    """Promote one of this instance's PVs (by address) to a meta-PV."""
+    return await service.add_meta_pv(pvInfo.pv_name, pvInfo.display_name)
 
 
 @router.get("/meta", dependencies=[Security(require_read_access)])
