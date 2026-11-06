@@ -51,6 +51,17 @@ class TimestampMixin:
     )
 
 
+class SoftDeleteMixin:
+    """``deleted_at``: set when a user deletes the row, which then stays in the table.
+
+    Reads skip rows with ``deleted_at`` set. Deleting is an UPDATE, so it still reaches
+    a history mirror whose publication carries inserts and updates only, and anything
+    that refers to the row (snapshot values referring to a PV) keeps working.
+    """
+
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class BaseRepository[ModelType: Base]:
     """Base repository with common CRUD operations (flush-not-commit).
 

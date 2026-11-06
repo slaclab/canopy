@@ -1,0 +1,396 @@
+"""Deleting a PV or a snapshot sets ``deleted_at``; the rows and their snapshot values stay.
+
+API tests go through the squirrel sub-app; the restore and capture tests drive
+``SnapshotService`` with the fake EPICS adapter from ``test_services_snapshot``.
+"""
+
+import asyncio
+from datetime import UTC, datetime
+from contextlib import asynccontextmanager
+
+import pytest
+from httpx import AsyncClient
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from canopy.core.errors import BadRequest
+from canopy.squirrel.errors import PvNotFound, PvAlreadyExists
+from canopy.squirrel.schemas.pv import NewPVElementDTO
+from canopy.squirrel.data.models import Pv, Snapshot, SnapshotValue
+from tests.canopy.squirrel.conftest import READ_HEADERS, WRITE_HEADERS
+from canopy.squirrel.schemas.snapshot import NewSnapshotDTO, RestoreRequestDTO
+from canopy.squirrel.services.pv_service import PvService
+from canopy.squirrel.services.snapshot_service import SnapshotService
+from tests.canopy.squirrel.test_services_snapshot import FakeEpicsIO, _ev, _NoHook
+
+
+async def _snapshot_with_values(session: AsyncSession, title: str, values: dict[str, float]) -> str:
+    """Commit a snapshot holding one setpoint value per PV id in ``values``."""
+    snap = Snapshot(title=title)
+    session.add(snap)
+    await session.flush()
+    for pv_id, value in values.items():
+        pv = await session.get(Pv, pv_id)
+        session.add(
+            SnapshotValue(
+                snapshot_id=snap.id,
+                pv_id=pv_id,
+                pv_name=pv.setpoint_address or pv.readback_address or pv.config_address,
+                setpoint_value={"value": value, "severity": 0, "status": 0},
+                timestamp=datetime.now(UTC),
+            )
+        )
+    await session.commit()
+    return snap.id
+
+
+async def _value_rows(session: AsyncSession, snapshot_id: str) -> int:
+    return await session.scalar(
+        select(func.count()).select_from(SnapshotValue).where(SnapshotValue.snapshot_id == snapshot_id)
+    )
+
+
+async def _new_tag(client: AsyncClient, group_id: str, name: str) -> str:
+    r = await client.post(f"/v1/tags/{group_id}/tags", headers=WRITE_HEADERS, json={"name": name})
+    assert r.status_code == 200, r.text
+    return next(t["id"] for t in r.json()["group"]["tags"] if t["name"] == name)
+
+
+# --- PVs ---------------------------------------------------------------------- #
+
+
+async def test_deleted_pv_keeps_its_values_in_past_snapshots(
+    client: AsyncClient, db_session: AsyncSession, sample_tag_group: dict
+):
+    tag = await _new_tag(client, sample_tag_group["id"], "kept")
+    r = await client.post("/v1/pvs", headers=WRITE_HEADERS, json={"setpointAddress": "GONE:SP", "tags": [tag]})
+    pid = r.json()["id"]
+    sid = await _snapshot_with_values(db_session, "before", {pid: 1.5})
+
+    assert (await client.delete(f"/v1/pvs/{pid}", headers=WRITE_HEADERS)).status_code == 200
+
+    assert await _value_rows(db_session, sid) == 1
+    r = await client.get(f"/v1/snapshots/{sid}", headers=READ_HEADERS)
+    assert r.status_code == 200
+    [value] = r.json()["pvValues"]
+    assert value["pvId"] == pid and value["setpointName"] == "GONE:SP"
+    assert value["setpointValue"]["value"] == 1.5
+    assert [t["name"] for t in value["tags"]] == ["kept"]
+    db_session.expire_all()
+    assert (await db_session.get(Pv, pid)).deleted_at is not None
+
+
+async def test_deleted_pv_leaves_every_pv_listing(client: AsyncClient, sample_pv: dict):
+    pid = sample_pv["id"]
+    assert (await client.delete(f"/v1/pvs/{pid}", headers=WRITE_HEADERS)).status_code == 200
+
+    assert (await client.get("/v1/pvs", headers=READ_HEADERS)).json() == []
+    paged = (await client.get("/v1/pvs/paged", headers=READ_HEADERS)).json()
+    assert paged["results"] == [] and paged["totalCount"] == 0
+    filtered = (await client.get("/v1/pvs/search", headers=READ_HEADERS)).json()
+    assert filtered["results"] == [] and filtered["totalCount"] == 0
+    assert (await client.get("/v1/pvs/devices", headers=READ_HEADERS)).json() == []
+    r = await client.put(f"/v1/pvs/{pid}", headers=WRITE_HEADERS, json={"description": "x"})
+    assert r.status_code == 404
+    r = await client.post("/v1/pvs/meta", headers=WRITE_HEADERS, json={"pvName": "TEST:PV:001:SP"})
+    assert r.status_code == 404
+
+
+async def test_meta_pv_still_blocks_delete(client: AsyncClient, sample_pv: dict):
+    pid = sample_pv["id"]
+    await client.post("/v1/pvs/meta", headers=WRITE_HEADERS, json={"pvName": "TEST:PV:001:SP"})
+
+    r = await client.delete(f"/v1/pvs/{pid}", headers=WRITE_HEADERS)
+    assert r.status_code == 400 and "meta-PV" in r.json()["detail"]
+
+    assert (await client.delete(f"/v1/pvs/meta/{pid}", headers=WRITE_HEADERS)).status_code == 204
+    assert (await client.delete(f"/v1/pvs/{pid}", headers=WRITE_HEADERS)).status_code == 200
+
+
+@pytest.mark.parametrize(("deleted", "status", "code"), [(False, 403, "not_owner"), (True, 404, "pv_not_found")])
+async def test_a_meta_pv_marker_names_only_live_owners(
+    client: AsyncClient, as_instance, deleted: bool, status: int, code: str
+):
+    # On a mirror the address may belong only to an arm's PV. A live one is the arm's to
+    # mark; a deleted one can't be marked anywhere, so nobody is named.
+    with as_instance("arm2"):
+        theirs = (await client.post("/v1/pvs", headers=WRITE_HEADERS, json={"setpointAddress": "THEIRS:META"})).json()
+        if deleted:
+            assert (await client.delete(f"/v1/pvs/{theirs['id']}", headers=WRITE_HEADERS)).status_code == 200
+
+    r = await client.post("/v1/pvs/meta", headers=WRITE_HEADERS, json={"pvName": "THEIRS:META"})
+
+    assert (r.status_code, r.json()["code"]) == (status, code), r.text
+
+
+@pytest.mark.parametrize(
+    "addresses",
+    [
+        {"setpointAddress": "BACK:SP", "readbackAddress": "BACK:RB"},
+        {"readbackAddress": "BACK:RB"},
+        {"configAddress": "BACK:CFG"},
+    ],
+    ids=["setpoint", "readback", "config"],
+)
+async def test_registering_a_deleted_pv_again_restores_its_row(
+    client: AsyncClient, db_session: AsyncSession, sample_tag_group: dict, addresses: dict
+):
+    old_tag = await _new_tag(client, sample_tag_group["id"], "old")
+    new_tag = await _new_tag(client, sample_tag_group["id"], "new")
+    first = (
+        await client.post(
+            "/v1/pvs", headers=WRITE_HEADERS, json={**addresses, "device": "D1", "absTolerance": 0.5, "tags": [old_tag]}
+        )
+    ).json()
+    sid = await _snapshot_with_values(db_session, "before", {first["id"]: 2.0})
+    assert (await client.delete(f"/v1/pvs/{first['id']}", headers=WRITE_HEADERS)).status_code == 200
+
+    r = await client.post("/v1/pvs", headers=WRITE_HEADERS, json={**addresses, "device": "D2", "tags": [new_tag]})
+
+    assert r.status_code == 200, r.text
+    again = r.json()
+    assert again["id"] == first["id"]
+    assert again["createdDate"] == first["createdDate"]
+    assert (again["device"], again["absTolerance"]) == ("D2", 0.0)
+    assert [t["name"] for t in again["tags"]] == ["new"]
+    assert [p["id"] for p in (await client.get("/v1/pvs", headers=READ_HEADERS)).json()] == [first["id"]]
+    [value] = (await client.get(f"/v1/snapshots/{sid}", headers=READ_HEADERS)).json()["pvValues"]
+    assert value["pvId"] == first["id"]
+
+    # Once restored it is a live PV again, so registering it a third time conflicts.
+    assert (await client.post("/v1/pvs", headers=WRITE_HEADERS, json=addresses)).status_code == 409
+
+
+@pytest.mark.parametrize("bulk", [False, True], ids=["single", "bulk"])
+@pytest.mark.parametrize(
+    "addresses",
+    [{"setpointAddress": "THEIRS:SP"}, {"readbackAddress": "THEIRS:RB"}, {"configAddress": "THEIRS:CFG"}],
+    ids=["setpoint", "readback", "config"],
+)
+async def test_another_owners_deleted_pv_is_never_brought_back(
+    client: AsyncClient, db_session: AsyncSession, as_instance, addresses: dict, bulk: bool
+):
+    # A mirror holds its arms' rows, deleted ones included. Registering the same address
+    # there makes the mirror's own PV and leaves the arm's row as the arm left it.
+    with as_instance("arm2"):
+        theirs = (await client.post("/v1/pvs", headers=WRITE_HEADERS, json=addresses)).json()
+        assert (await client.delete(f"/v1/pvs/{theirs['id']}", headers=WRITE_HEADERS)).status_code == 200
+
+    if bulk:
+        r = await client.post("/v1/pvs/multi", headers=WRITE_HEADERS, json=[addresses])
+        [ours] = r.json()
+    else:
+        r = await client.post("/v1/pvs", headers=WRITE_HEADERS, json=addresses)
+        ours = r.json()
+
+    assert r.status_code == 200, r.text
+    assert ours["id"] != theirs["id"] and ours["ownerInstance"] == "arm1"
+    rows = await db_session.execute(
+        select(Pv.id, Pv.owner_instance, Pv.deleted_at.is_not(None)).order_by(Pv.owner_instance)
+    )
+    assert [tuple(row) for row in rows] == [(ours["id"], "arm1", False), (theirs["id"], "arm2", True)]
+
+
+async def test_bulk_registration_restores_deleted_rows_in_input_order(client: AsyncClient):
+    gone = (await client.post("/v1/pvs", headers=WRITE_HEADERS, json={"readbackAddress": "BULK:GONE:RB"})).json()
+    kept = (await client.post("/v1/pvs", headers=WRITE_HEADERS, json={"setpointAddress": "BULK:KEPT:SP"})).json()
+    assert (await client.delete(f"/v1/pvs/{gone['id']}", headers=WRITE_HEADERS)).status_code == 200
+
+    r = await client.post(
+        "/v1/pvs/multi",
+        headers=WRITE_HEADERS,
+        json=[
+            {"setpointAddress": "BULK:NEW1:SP"},
+            {"readbackAddress": "BULK:GONE:RB", "description": "back"},
+            {"setpointAddress": "BULK:NEW2:SP"},
+        ],
+    )
+
+    assert r.status_code == 200, r.text
+    rows = r.json()
+    assert [p["setpointAddress"] or p["readbackAddress"] for p in rows] == [
+        "BULK:NEW1:SP",
+        "BULK:GONE:RB",
+        "BULK:NEW2:SP",
+    ]
+    assert rows[1]["id"] == gone["id"] and rows[1]["description"] == "back"
+    assert len({p["id"] for p in rows} | {kept["id"]}) == 4
+    # A live PV in the import is still refused.
+    r = await client.post("/v1/pvs/multi", headers=WRITE_HEADERS, json=[{"setpointAddress": "BULK:KEPT:SP"}])
+    assert r.status_code == 409
+
+
+# --- snapshots ---------------------------------------------------------------- #
+
+
+async def test_deleted_snapshot_keeps_its_values_but_leaves_the_api(
+    client: AsyncClient, db_session: AsyncSession, sample_pv: dict, enqueued: list
+):
+    pid = sample_pv["id"]
+    other = await _snapshot_with_values(db_session, "other", {pid: 1.0})
+    sid = await _snapshot_with_values(db_session, "doomed", {pid: 2.0})
+
+    assert (await client.delete(f"/v1/snapshots/{sid}", headers=WRITE_HEADERS)).status_code == 200
+
+    assert await _value_rows(db_session, sid) == 1
+    listing = (await client.get("/v1/snapshots", headers=READ_HEADERS)).json()
+    assert [s["id"] for s in listing["results"]] == [other] and listing["totalCount"] == 1
+    assert (await client.get(f"/v1/snapshots/{sid}", headers=READ_HEADERS)).status_code == 404
+    r = await client.put(f"/v1/snapshots/{sid}", headers=WRITE_HEADERS, json={"title": "x"})
+    assert r.status_code == 404
+    assert (await client.post(f"/v1/snapshots/{sid}/restore", headers=WRITE_HEADERS)).status_code == 404
+    assert enqueued == []
+    r = await client.get(f"/v1/snapshots/{other}/compare/{sid}", headers=READ_HEADERS)
+    assert r.status_code == 404
+    assert (await client.delete(f"/v1/snapshots/{sid}", headers=WRITE_HEADERS)).status_code == 404
+
+
+async def test_compare_keeps_a_deleted_pvs_tolerance(db_session: AsyncSession):
+    pv = Pv(setpoint_address="TOL:SP", abs_tolerance=0.5)
+    db_session.add(pv)
+    await db_session.flush()
+    first = await _snapshot_with_values(db_session, "a", {pv.id: 1.0})
+    second = await _snapshot_with_values(db_session, "b", {pv.id: 1.2})
+    assert await PvService(db_session).delete(pv.id)
+
+    result = await SnapshotService(db_session).compare_snapshots(first, second)
+
+    assert (result.match_count, result.difference_count) == (1, 0)
+
+
+async def test_restore_of_a_deleted_snapshot_writes_nothing(db_session: AsyncSession):
+    pv = Pv(setpoint_address="R:SP")
+    db_session.add(pv)
+    await db_session.flush()
+    sid = await _snapshot_with_values(db_session, "queued", {pv.id: 3.0})
+    io = FakeEpicsIO()
+    svc = SnapshotService(db_session, io, restore_hooks=[_NoHook()])
+    assert await svc.delete_snapshot(sid)
+
+    result = await svc.restore_snapshot(sid)
+
+    assert result.total_pvs == 0 and io.writes == {}
+
+
+async def test_restore_never_writes_a_deleted_pv(db_session: AsyncSession):
+    live, gone = Pv(setpoint_address="LIVE:SP"), Pv(setpoint_address="GONE:SP")
+    db_session.add_all([live, gone])
+    await db_session.flush()
+    sid = await _snapshot_with_values(db_session, "both", {live.id: 1.0, gone.id: 2.0})
+    assert await PvService(db_session).delete(gone.id)
+    io = FakeEpicsIO()
+    svc = SnapshotService(db_session, io, restore_hooks=[_NoHook()])
+
+    result = await svc.restore_snapshot(sid)
+    named = await svc.restore_snapshot(sid, RestoreRequestDTO(pv_ids=[gone.id]))
+
+    assert io.writes == {"LIVE:SP": 1.0}
+    assert result.total_pvs == 1 and named.total_pvs == 0
+
+
+async def test_capture_skips_deleted_pvs(db_session: AsyncSession):
+    live, gone = Pv(setpoint_address="CAP:LIVE"), Pv(setpoint_address="CAP:GONE")
+    db_session.add_all([live, gone])
+    await db_session.flush()
+    assert await PvService(db_session).delete(gone.id)
+    io = FakeEpicsIO({"CAP:LIVE": _ev(1.0), "CAP:GONE": _ev(2.0)})
+
+    summary = await SnapshotService(db_session, io, restore_hooks=[_NoHook()]).create_snapshot(
+        NewSnapshotDTO(title="after delete")
+    )
+
+    assert summary.pv_count == 1
+
+
+# --- concurrent requests -------------------------------------------------------- #
+
+
+@asynccontextmanager
+async def _race(test_engine, first_call, second_call):
+    """Run ``first_call`` in one session, then start ``second_call`` in another.
+
+    Yields once the second is shown to be waiting on the first's row lock, with a
+    ``commit`` that finishes the first and returns the second's outcome. Both sessions
+    are rolled back and closed however the test ends, so no lock outlives it.
+    """
+    maker = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    first, second = maker(), maker()
+    task = None
+    try:
+        await first_call(first)
+        task = asyncio.create_task(second_call(second))
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), 0.5)
+
+        async def commit():
+            await first.commit()
+            return await asyncio.gather(task, return_exceptions=True)
+
+        yield commit
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        for session in (second, first):
+            await session.rollback()
+            await session.close()
+
+
+async def _deleted_readback_pv(db_session: AsyncSession, address: str) -> Pv:
+    pv = Pv(readback_address=address)
+    db_session.add(pv)
+    await db_session.commit()
+    assert await PvService(db_session).delete(pv.id)
+    await db_session.commit()
+    return pv
+
+
+@pytest.mark.parametrize("bulk", [False, True], ids=["single", "bulk"])
+async def test_two_registrations_of_a_deleted_pv_bring_it_back_once(test_engine, db_session, bulk):
+    # A readback-only PV has no unique address, so only the row lock stops a duplicate.
+    pv = await _deleted_readback_pv(db_session, "RACE:RB")
+
+    async def register(session, description):
+        data = NewPVElementDTO(readback_address="RACE:RB", description=description)
+        service = PvService(session)
+        return await (service.create_many([data]) if bulk else service.create(data))
+
+    async with _race(test_engine, lambda s: register(s, "first"), lambda s: register(s, "second")) as commit:
+        [outcome] = await commit()
+
+    assert isinstance(outcome, PvAlreadyExists)
+    rows = await db_session.execute(
+        select(Pv.id, Pv.description, Pv.deleted_at).where(Pv.readback_address == "RACE:RB")
+    )
+    assert [tuple(row) for row in rows] == [(pv.id, "first", None)]
+
+
+async def test_a_delete_in_progress_keeps_a_meta_pv_marker_off_the_pv(test_engine, db_session):
+    pv = Pv(setpoint_address="RACE:META:SP")
+    db_session.add(pv)
+    await db_session.commit()
+
+    async with _race(
+        test_engine,
+        lambda s: PvService(s).delete(pv.id),
+        lambda s: PvService(s).add_meta_pv("RACE:META:SP", "Meta"),
+    ) as commit:
+        [outcome] = await commit()
+
+    assert isinstance(outcome, PvNotFound)
+
+
+async def test_a_meta_pv_marker_in_progress_blocks_the_delete(test_engine, db_session):
+    pv = Pv(setpoint_address="RACE:META2:SP")
+    db_session.add(pv)
+    await db_session.commit()
+
+    async with _race(
+        test_engine,
+        lambda s: PvService(s).add_meta_pv("RACE:META2:SP", "Meta"),
+        lambda s: PvService(s).delete(pv.id),
+    ) as commit:
+        [outcome] = await commit()
+
+    assert isinstance(outcome, BadRequest) and "meta-PV" in outcome.detail
+    assert await db_session.scalar(select(Pv.deleted_at).where(Pv.id == pv.id)) is None
