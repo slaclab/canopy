@@ -145,6 +145,36 @@ async def test_registering_a_deleted_pv_again_restores_its_row(
     assert (await client.post("/v1/pvs", headers=WRITE_HEADERS, json=addresses)).status_code == 409
 
 
+@pytest.mark.parametrize("bulk", [False, True], ids=["single", "bulk"])
+@pytest.mark.parametrize(
+    "addresses",
+    [{"setpointAddress": "THEIRS:SP"}, {"readbackAddress": "THEIRS:RB"}, {"configAddress": "THEIRS:CFG"}],
+    ids=["setpoint", "readback", "config"],
+)
+async def test_another_owners_deleted_pv_is_never_brought_back(
+    client: AsyncClient, db_session: AsyncSession, as_instance, addresses: dict, bulk: bool
+):
+    # A mirror holds its arms' rows, deleted ones included. Registering the same address
+    # there makes the mirror's own PV and leaves the arm's row as the arm left it.
+    with as_instance("arm2"):
+        theirs = (await client.post("/v1/pvs", headers=WRITE_HEADERS, json=addresses)).json()
+        assert (await client.delete(f"/v1/pvs/{theirs['id']}", headers=WRITE_HEADERS)).status_code == 200
+
+    if bulk:
+        r = await client.post("/v1/pvs/multi", headers=WRITE_HEADERS, json=[addresses])
+        [ours] = r.json()
+    else:
+        r = await client.post("/v1/pvs", headers=WRITE_HEADERS, json=addresses)
+        ours = r.json()
+
+    assert r.status_code == 200, r.text
+    assert ours["id"] != theirs["id"] and ours["ownerInstance"] == "arm1"
+    rows = await db_session.execute(
+        select(Pv.id, Pv.owner_instance, Pv.deleted_at.is_not(None)).order_by(Pv.owner_instance)
+    )
+    assert [tuple(row) for row in rows] == [(ours["id"], "arm1", False), (theirs["id"], "arm2", True)]
+
+
 async def test_bulk_registration_restores_deleted_rows_in_input_order(client: AsyncClient):
     gone = (await client.post("/v1/pvs", headers=WRITE_HEADERS, json={"readbackAddress": "BULK:GONE:RB"})).json()
     kept = (await client.post("/v1/pvs", headers=WRITE_HEADERS, json={"setpointAddress": "BULK:KEPT:SP"})).json()
