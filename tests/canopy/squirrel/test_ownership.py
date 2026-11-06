@@ -123,6 +123,15 @@ async def test_an_import_has_one_owner(client, db_session, as_instance):
     _refused(await client.post("/v1/pvs/multi", headers=WRITE_HEADERS, json=mixed), "owner_mismatch", 409)
 
 
+async def test_the_owner_parameter_on_an_import(client):
+    rows = [{"setpointAddress": "I1:SP"}, {"setpointAddress": "I2:SP"}]
+
+    _refused(await client.post("/v1/pvs/multi?owner=arm2", headers=WRITE_HEADERS, json=rows), "not_owner", 403)
+    mine = await client.post("/v1/pvs/multi?owner=arm1", headers=WRITE_HEADERS, json=rows)
+    assert mine.status_code == 200, mine.text
+    assert {pv["ownerInstance"] for pv in mine.json()} == {"arm1"}
+
+
 async def test_an_import_checks_duplicates_against_its_own_owner(client, as_instance):
     with as_instance("arm2"):
         await _pv(client, "IMPORTED:SP")
