@@ -50,6 +50,9 @@ class PVElementDTO(PVBase):
     """Full PV response DTO."""
 
     id: str
+    # The instance that registered the PV and alone writes it (``canopy.core.ownership``).
+    # On a mirror the same setpoint address can appear once per owner.
+    owner_instance: str
     tags: list[TagDTO] = []
     facilities: list[str] = []  # slugs
     created_date: datetime

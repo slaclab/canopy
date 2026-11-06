@@ -382,44 +382,62 @@ class PvRepository(BaseRepository[Pv]):
         result = await self.session.execute(self._locked(query) if for_update else query)
         return result.scalar_one_or_none()
 
-    async def find_by_address(self, address: str, *, for_update: bool = False) -> Pv | None:
-        """Find a live PV by any of its addresses (setpoint, readback, or config); locked with ``for_update``."""
+    @staticmethod
+    def _any_address(address: str) -> ColumnElement[bool]:
+        return or_(Pv.setpoint_address == address, Pv.readback_address == address, Pv.config_address == address)
+
+    async def owners_by_address(self, address: str) -> set[str]:
+        """The owners of the live PVs holding ``address`` as any of their addresses."""
+        result = await self.session.execute(
+            select(Pv.owner_instance).where(self._any_address(address), Pv.deleted_at.is_(None)).distinct()
+        )
+        return set(result.scalars().all())
+
+    async def find_by_address(self, address: str, *, owner: str, for_update: bool = False) -> Pv | None:
+        """Find ``owner``'s live PV by any of its addresses (setpoint, readback, or config).
+
+        Locked with ``for_update``.
+        """
         query = (
             select(Pv)
             .options(selectinload(Pv.tags).selectinload(Tag.group))
-            .where(Pv.deleted_at.is_(None))
-            .where(or_(Pv.setpoint_address == address, Pv.readback_address == address, Pv.config_address == address))
+            .where(self._any_address(address), Pv.owner_instance == owner, Pv.deleted_at.is_(None))
         )
         result = await self.session.execute(self._locked(query) if for_update else query)
         return result.scalar_one_or_none()
 
-    async def _find_by_identity(self, kind: str, address: str, include_deleted: bool, for_update: bool) -> Pv | None:
+    async def _find_by_identity(
+        self, kind: str, address: str, owner: str, include_deleted: bool, for_update: bool
+    ) -> Pv | None:
         query = (
             select(Pv)
             .options(selectinload(Pv.tags).selectinload(Tag.group))
-            .where(self._identity_filter(kind, [address]))
+            .where(self._identity_filter(kind, [address]), Pv.owner_instance == owner)
         )
         if not include_deleted:
             query = query.where(Pv.deleted_at.is_(None))
-        # One PV at most holds an identity, deleted or not; a live one would come first.
+        # One of an owner's PVs at most holds an identity, deleted or not; a live one would come first.
         query = query.order_by(Pv.deleted_at.is_not(None)).limit(1)
         result = await self.session.execute(self._locked(query) if for_update else query)
         return result.scalars().first()
 
     async def find_by_setpoint(
-        self, setpoint_address: str, *, include_deleted: bool = False, for_update: bool = False
+        self, setpoint_address: str, *, owner: str, include_deleted: bool = False, for_update: bool = False
     ) -> Pv | None:
-        return await self._find_by_identity("setpoint", setpoint_address, include_deleted, for_update)
+        """``owner``'s PV with this setpoint address: setpoint addresses are unique per owner."""
+        return await self._find_by_identity("setpoint", setpoint_address, owner, include_deleted, for_update)
 
     async def find_by_readback_without_setpoint(
-        self, readback_address: str, *, include_deleted: bool = False, for_update: bool = False
+        self, readback_address: str, *, owner: str, include_deleted: bool = False, for_update: bool = False
     ) -> Pv | None:
-        """Find a setpoint-less PV by its readback address.
+        """Find ``owner``'s setpoint-less PV by its readback address.
 
         Parameters
         ----------
         readback_address : str
             Readback address to match.
+        owner : str
+            The owner whose PVs to search.
         include_deleted : bool
             Also match a deleted PV.
         for_update : bool
@@ -431,17 +449,19 @@ class PvRepository(BaseRepository[Pv]):
             A PV whose ``setpoint_address`` is NULL and whose ``readback_address`` equals
             ``readback_address``, or ``None`` when no such PV exists.
         """
-        return await self._find_by_identity("readback", readback_address, include_deleted, for_update)
+        return await self._find_by_identity("readback", readback_address, owner, include_deleted, for_update)
 
     async def find_by_config_only(
-        self, config_address: str, *, include_deleted: bool = False, for_update: bool = False
+        self, config_address: str, *, owner: str, include_deleted: bool = False, for_update: bool = False
     ) -> Pv | None:
-        """Find a config-only PV by its config address.
+        """Find ``owner``'s config-only PV by its config address.
 
         Parameters
         ----------
         config_address : str
             Config address to match.
+        owner : str
+            The owner whose PVs to search.
         include_deleted : bool
             Also match a deleted PV.
         for_update : bool
@@ -453,10 +473,10 @@ class PvRepository(BaseRepository[Pv]):
             A PV whose ``setpoint_address`` and ``readback_address`` are both NULL and whose
             ``config_address`` equals ``config_address``, or ``None`` when no such PV exists.
         """
-        return await self._find_by_identity("config", config_address, include_deleted, for_update)
+        return await self._find_by_identity("config", config_address, owner, include_deleted, for_update)
 
-    async def _existing_identities(self, kind: str, addresses: list[str]) -> set[str]:
-        """The subset of ``addresses`` already identifying a live PV as ``kind``."""
+    async def _existing_identities(self, kind: str, addresses: list[str], owner: str) -> set[str]:
+        """The subset of ``addresses`` already identifying one of ``owner``'s live PVs as ``kind``."""
         if not addresses:
             return set()
         column = getattr(Pv, f"{kind}_address")
@@ -464,48 +484,56 @@ class PvRepository(BaseRepository[Pv]):
         for i in range(0, len(addresses), PARAM_BATCH_SIZE):
             batch = addresses[i : i + PARAM_BATCH_SIZE]
             result = await self.session.execute(
-                select(column).where(self._identity_filter(kind, batch), Pv.deleted_at.is_(None))
+                select(column).where(
+                    self._identity_filter(kind, batch), Pv.owner_instance == owner, Pv.deleted_at.is_(None)
+                )
             )
             existing.update({row[0] for row in result.all() if row[0]})
         return existing
 
-    async def get_existing_setpoints(self, setpoint_addresses: list[str]) -> set[str]:
-        """Return the subset of ``setpoint_addresses`` held by a live PV.
+    async def get_existing_setpoints(self, setpoint_addresses: list[str], *, owner: str) -> set[str]:
+        """Return the subset of ``setpoint_addresses`` held by one of ``owner``'s live PV.
 
         Parameters
         ----------
         setpoint_addresses : list[str]
             Setpoint addresses to look up.
+        owner : str
+            The owner whose PVs to search.
 
         Returns
         -------
         set[str]
             The addresses already registered as a PV setpoint.
         """
-        return await self._existing_identities("setpoint", setpoint_addresses)
+        return await self._existing_identities("setpoint", setpoint_addresses, owner)
 
-    async def get_existing_readbacks_without_setpoint(self, readback_addresses: list[str]) -> set[str]:
-        """Return the subset of ``readback_addresses`` already held by a live setpoint-less PV.
+    async def get_existing_readbacks_without_setpoint(self, readback_addresses: list[str], *, owner: str) -> set[str]:
+        """Return the subset of ``readback_addresses`` already held by one of ``owner``'s live setpoint-less PV.
 
         Parameters
         ----------
         readback_addresses : list[str]
             Readback addresses to look up.
+        owner : str
+            The owner whose PVs to search.
 
         Returns
         -------
         set[str]
             The addresses carried by an existing PV whose ``setpoint_address`` is NULL.
         """
-        return await self._existing_identities("readback", readback_addresses)
+        return await self._existing_identities("readback", readback_addresses, owner)
 
-    async def get_existing_config_only(self, config_addresses: list[str]) -> set[str]:
-        """Return the subset of ``config_addresses`` already held by a live config-only PV.
+    async def get_existing_config_only(self, config_addresses: list[str], *, owner: str) -> set[str]:
+        """Return the subset of ``config_addresses`` already held by one of ``owner``'s live config-only PV.
 
         Parameters
         ----------
         config_addresses : list[str]
             Config addresses to look up.
+        owner : str
+            The owner whose PVs to search.
 
         Returns
         -------
@@ -513,10 +541,10 @@ class PvRepository(BaseRepository[Pv]):
             The addresses carried by an existing PV whose ``setpoint_address`` and
             ``readback_address`` are both NULL.
         """
-        return await self._existing_identities("config", config_addresses)
+        return await self._existing_identities("config", config_addresses, owner)
 
-    async def lock_by_identity(self, kind: str, addresses: list[str]) -> dict[str, Pv]:
-        """Lock the PVs, live or deleted, whose identifying address of ``kind`` is one of ``addresses``.
+    async def lock_by_identity(self, kind: str, addresses: list[str], *, owner: str) -> dict[str, Pv]:
+        """Lock ``owner``'s PVs, live or deleted, whose identifying address of ``kind`` is one of ``addresses``.
 
         The rows stay locked ``FOR UPDATE`` until the transaction ends, taken in id order
         so two imports naming the same PVs lock them in the same order and can't deadlock.
@@ -529,6 +557,8 @@ class PvRepository(BaseRepository[Pv]):
             Identity kind: ``"setpoint"``, ``"readback"`` or ``"config"``.
         addresses : list[str]
             Addresses to look up.
+        owner : str
+            The owner whose PVs to lock; identities are unique per owner.
 
         Returns
         -------
@@ -541,7 +571,7 @@ class PvRepository(BaseRepository[Pv]):
             query = (
                 select(Pv)
                 .options(selectinload(Pv.tags).selectinload(Tag.group))
-                .where(self._identity_filter(kind, batch))
+                .where(self._identity_filter(kind, batch), Pv.owner_instance == owner)
                 .order_by(Pv.id)
             )
             for pv in (await self.session.execute(self._locked(query))).scalars():
@@ -614,16 +644,19 @@ class PvRepository(BaseRepository[Pv]):
         return pvs, next_token, total_count
 
     async def get_all_addresses(
-        self, facility_ids: set[str] | None = None
+        self, facility_ids: set[str] | None = None, *, owner: str | None = None
     ) -> list[tuple[str, str | None, str | None, str | None]]:
         """All live ``(id, setpoint, readback, config)`` tuples — the snapshot-capture input.
 
         ``facility_ids`` limits it to PVs assigned to any of them; unassigned PVs are
-        excluded. ``None`` returns every live PV.
+        excluded. ``None`` returns every live PV. ``owner`` limits it to that owner's PVs,
+        which a capture needs on a mirror holding several owners' rows.
         """
         query = select(Pv.id, Pv.setpoint_address, Pv.readback_address, Pv.config_address).where(
             Pv.deleted_at.is_(None)
         )
+        if owner is not None:
+            query = query.where(Pv.owner_instance == owner)
         if facility_ids is not None:
             pvs_in_facility = select(pv_facility.c.pv_id).where(pv_facility.c.facility_id.in_(facility_ids)).distinct()
             query = query.where(Pv.id.in_(pvs_in_facility))
@@ -778,8 +811,11 @@ class TagGroupRepository(BaseRepository[TagGroup]):
         )
         return result.scalar_one_or_none()
 
-    async def find_by_name(self, name: str) -> TagGroup | None:
-        result = await self.session.execute(select(TagGroup).where(func.lower(TagGroup.name) == name.lower()))
+    async def find_by_name(self, name: str, *, owner: str) -> TagGroup | None:
+        """``owner``'s group with this name, compared case-insensitively. Names are unique per owner."""
+        result = await self.session.execute(
+            select(TagGroup).where(func.lower(TagGroup.name) == name.lower(), TagGroup.owner_instance == owner)
+        )
         return result.scalar_one_or_none()
 
     async def get_all_with_counts(self) -> list[tuple[TagGroup, int]]:

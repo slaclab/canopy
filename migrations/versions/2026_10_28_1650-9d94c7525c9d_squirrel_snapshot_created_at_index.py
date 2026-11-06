@@ -1,7 +1,7 @@
 """squirrel: index snapshot (created_at, id)
 
 Revision ID: 9d94c7525c9d
-Revises: d4f8a1c6b209
+Revises: 89e21441c63c
 Create Date: 2026-10-28 16:50:47.726175
 
 """
@@ -12,7 +12,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "9d94c7525c9d"
-down_revision: str | None = "d4f8a1c6b209"
+down_revision: str | None = "89e21441c63c"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

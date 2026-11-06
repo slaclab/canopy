@@ -287,3 +287,26 @@ async def test_access_requires_auth_and_core_module_access(facilities_client, se
     r = facilities_client.get("/v1/facilities/access", headers={"X-API-Key": "test-squirrel-only"})
     assert r.status_code == 403
     assert r.json()["code"] == "insufficient_module_access"
+
+
+async def test_another_owners_facility_answers_not_owner(
+    facilities_client, session, session_maker, fake_keys, as_instance
+):
+    with as_instance("arm2"):
+        await _seed_facility(session, "remote")
+
+    r = facilities_client.put("/v1/facilities/remote", json={"name": "Renamed"}, headers=ADMIN_HEADERS)
+
+    assert r.status_code == 403, r.text
+    assert r.json()["code"] == "not_owner"
+    listed = facilities_client.get("/v1/facilities", headers=READ_HEADERS).json()
+    assert [(f["slug"], f["ownerInstance"]) for f in listed] == [("remote", "arm2")]
+
+
+async def test_a_root_facility_for_another_owner_is_refused(facilities_client, session_maker, fake_keys):
+    r = facilities_client.post(
+        "/v1/facilities?owner=arm2", json={"slug": "there", "name": "There"}, headers=ADMIN_HEADERS
+    )
+
+    assert r.status_code == 403, r.text
+    assert r.json()["code"] == "not_owner"
