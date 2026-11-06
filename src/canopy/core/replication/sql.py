@@ -9,13 +9,17 @@ that leaves the CLI goes through ``redact`` first.
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 from decimal import Decimal
 from datetime import datetime
-from urllib.parse import unquote
+from urllib.parse import quote, unquote, urlencode
 from collections.abc import Mapping, Iterable
 
 import asyncpg
 from sqlalchemy.engine import make_url
+
+if TYPE_CHECKING:
+    from canopy.core.replication.registry import ReplicationRegistry
 
 _REDACTED = "***"
 
@@ -68,6 +72,57 @@ def quote_literal(value: str) -> str:
 def asyncpg_dsn(database_url: str) -> str:
     """Turn the app's SQLAlchemy URL (``postgresql+asyncpg://...``) into a DSN asyncpg accepts."""
     return make_url(database_url).set(drivername="postgresql").render_as_string(hide_password=False)
+
+
+_CONNINFO_PAIR = re.compile(r"(\w+)\s*=\s*('(?:[^'\\]|\\.)*'|\S+)")
+
+
+def conninfo_as_uri(conninfo: str) -> str:
+    """A libpq connection string as a URI, the one form asyncpg reads.
+
+    An arm's connection string may be key=value (``host=... dbname=...``) or a URI;
+    Postgres takes either for a subscription, and this lets the CLI open the same
+    connection itself. Keys other than host, port, dbname, user and password become
+    query parameters (``sslmode``, ``sslrootcert`` and the like).
+    """
+    if "://" in conninfo:
+        return conninfo
+    pairs = {}
+    for key, value in _CONNINFO_PAIR.findall(conninfo):
+        if len(value) >= 2 and value[0] == value[-1] == "'":
+            value = re.sub(r"\\(.)", r"\1", value[1:-1])
+        pairs[key] = value
+    user, password = pairs.pop("user", ""), pairs.pop("password", None)
+    credentials = quote(user, safe="") + (f":{quote(password, safe='')}" if password is not None else "")
+    host = pairs.pop("host", "")
+    port = f":{pairs.pop('port')}" if "port" in pairs else ""
+    database = quote(pairs.pop("dbname", ""), safe="")
+    query = f"?{urlencode(pairs)}" if pairs else ""
+    return f"postgresql://{credentials}{'@' if credentials else ''}{host}{port}/{database}{query}"
+
+
+def owner_join(registry: ReplicationRegistry, table: str, *, alias: str) -> tuple[str, str]:
+    """SQL that finds the owner of each row of ``table``, aliased ``alias``.
+
+    Returns ``(join_sql, owner_sql)``: the joins from ``table`` up its owner chain,
+    and the column holding the owner. A root needs no join; a child joins one parent
+    per hop, aliased ``<alias>_o1``, ``<alias>_o2``, … so several tables can share a
+    query. Filter one owner's rows with ``FROM <table> <alias> <join_sql> WHERE
+    <owner_sql> = $1``, or look a row's owner up with ``SELECT <owner_sql> …``.
+
+    Raises
+    ------
+    ValueError
+        When ``table`` has no owner path in ``registry``.
+    """
+    joins = []
+    current = alias
+    for hop, (parent, key) in enumerate(registry.owner_chain(table), start=1):
+        parent_alias = f"{alias}_o{hop}"
+        joins.append(f"JOIN {qualified(parent)} {parent_alias} ON {parent_alias}.id = {current}.{quote_ident(key)}")
+        current = parent_alias
+    column = registry.owner_paths[registry.owner_root(table)].column
+    return " ".join(joins), f"{current}.{quote_ident(column)}"
 
 
 # --------------------------------------------------------------------------- #
@@ -282,11 +337,16 @@ async def require_confined(
         )
 
 
-async def non_empty(conn: asyncpg.Connection, tables: Iterable[str]) -> list[str]:
-    """Those of ``tables`` holding at least one row, sorted."""
+async def tables_with_rows_of(
+    conn: asyncpg.Connection, registry: ReplicationRegistry, tables: Iterable[str], owner: str
+) -> list[str]:
+    """Those of ``tables`` holding at least one row owned by ``owner``, sorted."""
     found = []
     for name in sorted(tables):
-        if await conn.fetchval(f"SELECT EXISTS (SELECT 1 FROM {qualified(name)})"):
+        join_sql, owner_sql = owner_join(registry, name, alias="t")
+        if await conn.fetchval(
+            f"SELECT EXISTS (SELECT 1 FROM {qualified(name)} t {join_sql} WHERE {owner_sql} = $1)", owner
+        ):
             found.append(name)
     return found
 

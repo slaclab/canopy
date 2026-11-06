@@ -13,11 +13,12 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.dialects.postgresql import JSONB
 
 from canopy.core.db import Base, UUIDMixin, TimestampMixin
+from canopy.core.ownership import OwnedMixin
 
 MAGPIE_SCHEMA = "magpie"
 
 
-class Config(UUIDMixin, TimestampMixin, Base):
+class Config(UUIDMixin, TimestampMixin, OwnedMixin, Base):
     """A stored config for a consuming app.
 
     ``id`` (UUID) is the internal primary key; ``slug`` is the short, unguessable
@@ -25,6 +26,7 @@ class Config(UUIDMixin, TimestampMixin, Base):
     globally unique. ``app`` tags the owning consumer so a caller can only resolve
     its own app's configs. ``data`` is an opaque JSONB blob — magpie neither
     defines nor validates its internal shape; the consuming app owns that.
+    ``owner_instance`` is the instance that created it (``canopy.core.ownership``).
     """
 
     __tablename__ = "config"
