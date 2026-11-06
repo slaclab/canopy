@@ -221,3 +221,15 @@ async def test_a_head_subscribes_one_arm_until_rows_carry_their_owner(octopus: O
     # An arm taken out of the settings leaves its subscription behind, reported as unexpected.
     remaining = ArmsConfig(arms={second: o.arms_config.arms[second]}).arms
     assert (await subscriber_status(o.head.admin, arms=remaining))["unexpected"] == [subscription_name(first)]
+
+
+@pytest.mark.parametrize("bare_octopus", [2], indirect=True)
+async def test_bare_octopus_has_its_roles_and_no_tables(bare_octopus: Octopus):
+    o = bare_octopus
+    for conn in (o.head.conn, *(arm.admin for arm in o.arms.values())):
+        assert not await conn.fetchval(
+            "SELECT count(*) FROM pg_tables WHERE schemaname = ANY($1::text[])", REGISTRY.schemas
+        )
+    # The head's owner can create the schema itself and subscribe, as in production.
+    assert await o.head.conn.fetchval("SELECT pg_has_role(current_user, 'pg_create_subscription', 'MEMBER')")
+    assert await o.head.conn.fetchval("SELECT has_database_privilege(current_database(), 'CREATE')")

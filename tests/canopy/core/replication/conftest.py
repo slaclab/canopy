@@ -17,6 +17,7 @@ servers, for the end-to-end tests. Opt-in: it skips unless the
 import os
 import asyncio
 from uuid import uuid4
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import pytest
@@ -197,15 +198,13 @@ class Octopus:
         return next(iter(self.arms.values()))
 
 
-@pytest_asyncio.fixture
-async def octopus(request):
-    """Arms and a head on their own servers, each with every table built.
+@asynccontextmanager
+async def _topology(count: int, *, schema: bool):
+    """``count`` arms and a head, with every table built when ``schema`` is set.
 
-    Parametrize it indirectly with the number of arms (1 or 2; 2 by default). Every
-    database, role and arm name is fresh per test; teardown drops the head's
-    subscriptions (and so their slots on the arms), the databases and the roles.
+    Every database, role and arm name is fresh; on exit the head's subscriptions
+    (and so their slots on the arms), the databases and the roles are dropped.
     """
-    count = getattr(request, "param", 2)
     servers = ARM_SERVERS[:count]
     if not HEAD_SERVER or not all(admin and conninfo for admin, conninfo in servers):
         pytest.skip(
@@ -226,7 +225,8 @@ async def octopus(request):
         await head_server.execute(f'CREATE ROLE "{app}" LOGIN')
         await head_server.execute(f'CREATE DATABASE "{head_db}" OWNER "{owner}"')
         head_dsn = server_dsn(HEAD_SERVER, database=head_db, user=owner, password=owner_pw)
-        await build_schema(head_dsn)
+        if schema:
+            await build_schema(head_dsn)
 
         arms: dict[str, ArmSide] = {}
         for index, (admin, conninfo) in enumerate(servers, start=1):
@@ -237,7 +237,8 @@ async def octopus(request):
             await arm_server.execute(f"CREATE ROLE \"{replicator}\" REPLICATION LOGIN PASSWORD '{replicator_pw}'")
             await arm_server.execute(f'CREATE ROLE "{reader}" LOGIN')
             arm_dsn = server_dsn(admin, database=arm_db)
-            await build_schema(arm_dsn)
+            if schema:
+                await build_schema(arm_dsn)
             arms[name] = ArmSide(
                 name=name,
                 admin=await asyncpg.connect(arm_dsn),
@@ -279,6 +280,28 @@ async def octopus(request):
         await head_server.execute(f'DROP DATABASE IF EXISTS "{head_db}" WITH (FORCE)')
         await drop_roles(head_server, [owner, app])
         await head_server.close()
+
+
+@pytest_asyncio.fixture
+async def octopus(request):
+    """Arms and a head on their own servers, each with every table built.
+
+    Parametrize it indirectly with the number of arms (1 or 2; 2 by default).
+    """
+    async with _topology(getattr(request, "param", 2), schema=True) as topology:
+        yield topology
+
+
+@pytest_asyncio.fixture
+async def bare_octopus(request):
+    """``octopus`` with empty databases, for tests that build the schema with Alembic.
+
+    The roles and databases are the same: the head's database belongs to its owner
+    role, so a migration run as that role (``head.dsn``) owns what it creates, as in
+    production. Parametrize it indirectly with the number of arms, like ``octopus``.
+    """
+    async with _topology(getattr(request, "param", 2), schema=False) as topology:
+        yield topology
 
 
 async def copied(octopus: Octopus, arm: str) -> bool:
