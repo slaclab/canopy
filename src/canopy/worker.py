@@ -87,11 +87,11 @@ FUNCTIONS = [ping, convert_batch, create_snapshot_task, restore_snapshot_task]
 
 
 def worker_cron_jobs(role: str) -> list:
-    """Scheduled tasks for an instance ``role``: pruning, on a primary only.
+    """Scheduled tasks for an instance ``role``: pruning, on a primary (an arm) only.
 
     ``unique`` makes one worker run each tick when several share the queue. The job
-    itself does nothing unless ``CANOPY_PRUNE__ENABLED``; a mirror never registers it,
-    since it holds the history the primary prunes.
+    itself does nothing unless ``CANOPY_PRUNE__ENABLED``; a mirror (a head) never
+    registers it, since it holds the history its arms prune, and its own rows too.
     """
     if role != "primary":
         return []

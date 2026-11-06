@@ -1,6 +1,6 @@
-"""Remove old snapshots from a primary whose history mirror keeps them.
+"""Remove old snapshots from an arm whose history head keeps them.
 
-Runs on a primary's worker as an Arq cron job (``prune_snapshots``), off unless
+Runs on an arm's worker (``CANOPY_ROLE=primary``) as an Arq cron job (``prune_snapshots``), off unless
 ``CANOPY_PRUNE__ENABLED`` and a dry run until ``CANOPY_PRUNE__DRY_RUN`` is off.
 A snapshot is pruned once it is older than ``CANOPY_WINDOW_DAYS`` and not retained,
 deleted or not: its values first, then its row, one snapshot per transaction. The
@@ -8,8 +8,8 @@ replication gate (``canopy.core.replication.gate``) is checked before each snaps
 and the run stops at the first failed check.
 
 The deletes are plain SQL, never ``SnapshotService.delete_snapshot`` (which only
-marks a snapshot deleted, and would reach the mirror as an update). They reach the
-mirror not at all: both tables are ``time_series`` in the replication registry,
+marks a snapshot deleted, and would reach the head as an update). They reach the
+head not at all: both tables are ``time_series`` in the replication registry,
 whose split-layout publication carries no deletes, and the gate refuses to run
 while any publication carrying them does.
 
@@ -88,7 +88,7 @@ async def prune(
     Parameters
     ----------
     session_maker : async_sessionmaker[AsyncSession]
-        Sessions on the primary; each snapshot is deleted in a transaction of its own.
+        Sessions on the arm; each snapshot is deleted in a transaction of its own.
     window_days : int | None
         Days of snapshots to keep (``CANOPY_WINDOW_DAYS``). The gate fails without it.
     config : PruneConfig
@@ -175,7 +175,7 @@ async def prune_snapshots(ctx: dict) -> dict:
         return {"enabled": False}
     settings = get_settings()
     if settings.role != "primary":
-        # A mirror holds the history a primary prunes, its own rows included, and
+        # A head holds the history its arms prune, and its own rows too, and
         # never registers this job; this guards a job queued here some other way.
         logger.error("Prune runs only on a primary, and this instance is a %s; nothing deleted", settings.role)
         return {"enabled": True, "refused": f"CANOPY_ROLE={settings.role}; prune runs only on a primary"}
