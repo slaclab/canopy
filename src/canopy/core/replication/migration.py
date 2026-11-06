@@ -1,11 +1,11 @@
 """Which side of replication a migration runs on, for steps that belong to one side only.
 
 A history head runs the same Alembic tree as each of its arms, and migrates before
-every one of them, so most migrations run on all of them. A few steps must not:
+every one of them, so most migrations run on all of them. Data steps run everywhere
+too, each on the rows the instance being migrated owns
+(``owner_instance = canopy.core.ownership.local_instance()``). A few steps belong to
+one side only:
 
-* Data steps (INSERT, UPDATE or DELETE on a replicated table) run on the publishers
-  (the arms) only. Replication carries each arm's result to the head; an INSERT run on
-  the head as well stops apply with a duplicate key.
 * Indexes that only history queries need run on the subscriber (the head) only, and
   stay out of ``Base.metadata`` so ``alembic check`` on an arm still passes.
 * A dropped column or table leaves the publishers (the arms) first and the subscriber
@@ -18,11 +18,11 @@ every one of them, so most migrations run on all of them. A few steps must not:
 ``migrations/env.py`` records the side from ``CANOPY_ROLE``: a ``primary`` (an arm)
 is a publisher and a ``mirror`` (a head) the subscriber. Use it as::
 
-    from canopy.core.replication.migration import on_publisher
+    from canopy.core.replication.migration import on_subscriber
 
     def upgrade() -> None:
-        if on_publisher():
-            op.execute("UPDATE squirrel.pv SET ...")
+        if on_subscriber():
+            op.create_index(...)
 
 The rules are in ``CONTRIBUTING.md`` ("Database Migrations").
 """

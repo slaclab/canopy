@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from canopy.core.ownership import require_owned, local_instance, require_create_owner
 from canopy.squirrel.errors import TagAlreadyExists, TagGroupAlreadyExists
 from canopy.squirrel.data.models import Tag, TagGroup
 from canopy.squirrel.schemas.tag import (
@@ -29,6 +30,7 @@ class TagService:
     def _group_to_dto(self, group: TagGroup) -> TagGroupDTO:
         return TagGroupDTO(
             id=group.id,
+            owner_instance=group.owner_instance,
             name=group.name,
             description=group.description,
             tags=[TagDTO(id=t.id, name=t.name, description=t.description) for t in group.tags],
@@ -39,7 +41,13 @@ class TagService:
     async def get_all_groups_summary(self) -> list[TagGroupSummaryDTO]:
         groups_with_counts = await self.group_repo.get_all_with_counts()
         return [
-            TagGroupSummaryDTO(id=group.id, name=group.name, description=group.description, tag_count=count)
+            TagGroupSummaryDTO(
+                id=group.id,
+                owner_instance=group.owner_instance,
+                name=group.name,
+                description=group.description,
+                tag_count=count,
+            )
             for group, count in groups_with_counts
         ]
 
@@ -47,8 +55,10 @@ class TagService:
         group = await self.group_repo.get_with_tags(group_id)
         return self._group_to_dto(group) if group else None
 
-    async def create_group(self, data: TagGroupCreate) -> TagGroupDTO:
-        existing = await self.group_repo.find_by_name(data.name)
+    async def create_group(self, data: TagGroupCreate, owner: str | None = None) -> TagGroupDTO:
+        """Create a group, owned by ``owner`` or this instance. Names are unique per owner."""
+        require_create_owner(None, owner, f"Tag group '{data.name}'")
+        existing = await self.group_repo.find_by_name(data.name, owner=local_instance())
         if existing:
             raise TagGroupAlreadyExists(f"Tag group with name '{data.name}' already exists")
         group = TagGroup(name=data.name, description=data.description)
@@ -59,8 +69,9 @@ class TagService:
         group = await self.group_repo.get_with_tags(group_id)
         if not group:
             return None
+        require_owned(group.owner_instance, f"Tag group {group_id}")
         if data.name is not None:
-            existing = await self.group_repo.find_by_name(data.name)
+            existing = await self.group_repo.find_by_name(data.name, owner=group.owner_instance)
             if existing and existing.id != group_id:
                 raise TagGroupAlreadyExists(f"Tag group with name '{data.name}' already exists")
             group.name = data.name
@@ -73,6 +84,7 @@ class TagService:
         group = await self.group_repo.get_by_id(group_id)
         if not group:
             return False
+        require_owned(group.owner_instance, f"Tag group {group_id}")
         # NOTE: ``force`` is currently a no-op — a populated group is always deleted (its
         # tags cascade) regardless of the flag. This matches the source, where the guard was
         # never implemented either (``# TODO: Check if tags are in use (if not force)``). The
@@ -92,6 +104,7 @@ class TagService:
         group = await self.group_repo.get_with_tags(group_id)
         if not group:
             return None, False
+        require_owned(group.owner_instance, f"Tag group {group_id}")
 
         existing = await self.tag_repo.find_by_group_and_name(group_id, data.name)
         if existing:
@@ -112,6 +125,7 @@ class TagService:
         tag = await self.tag_repo.get_by_id(tag_id)
         if not tag or tag.group_id != group_id:
             return None
+        require_owned(tag.group.owner_instance, f"Tag group {group_id}")
         if data.name is not None:
             existing = await self.tag_repo.find_by_group_and_name(group_id, data.name)
             if existing and existing.id != tag_id:
@@ -126,5 +140,6 @@ class TagService:
         tag = await self.tag_repo.get_by_id(tag_id)
         if not tag or tag.group_id != group_id:
             return None
+        require_owned(tag.group.owner_instance, f"Tag group {group_id}")
         await self.tag_repo.delete(tag)
         return await self.get_group_by_id(group_id)

@@ -16,6 +16,9 @@ class MetaPVDTO(CanopyModel):
 
 class DisplayMetaPVDTO(MetaPVDTO):
     pv_name: str
+    # The owner of the PV the marker follows (``canopy.core.ownership``). On a mirror two
+    # owners' meta-PVs can share an address.
+    owner_instance: str
 
 
 class UpdateMetaPVDTO(CanopyModel):

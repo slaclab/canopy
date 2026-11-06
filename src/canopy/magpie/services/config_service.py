@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.core.errors import BadRequest
 from canopy.magpie.errors import ConfigSlugConflict
+from canopy.core.ownership import require_owned, require_create_owner
 from canopy.magpie.data.models import Config
 from canopy.contracts.pagination import PagedResult
 from canopy.magpie.schemas.config import (
@@ -65,6 +66,7 @@ class ConfigService:
     def _to_dto(self, config: Config) -> ConfigDTO:
         return ConfigDTO(
             id=config.id,
+            owner_instance=config.owner_instance,
             app=config.app,
             slug=config.slug,
             name=config.name,
@@ -94,7 +96,9 @@ class ConfigService:
         if len(json.dumps(data, ensure_ascii=False).encode("utf-8")) > MAX_DATA_BYTES:
             raise BadRequest(f"Config data exceeds the {MAX_DATA_BYTES // 1024} KB limit")
 
-    async def create(self, app: str, data: NewConfigDTO) -> ConfigDTO:
+    async def create(self, app: str, data: NewConfigDTO, owner: str | None = None) -> ConfigDTO:
+        """Store a config, owned by ``owner`` or this instance."""
+        require_create_owner(None, owner, f"A {app} config")
         self._check_data(data.data)
         _check_text(data.name, "name")
         _check_text(data.description, "description")
@@ -191,6 +195,7 @@ class ConfigService:
         config = await self._get_for_app(app, slug)
         if config is None:
             return None
+        require_owned(config.owner_instance, f"Config {slug}")
         if data.data is not None:
             self._check_data(data.data)
             config.data = data.data
@@ -207,5 +212,6 @@ class ConfigService:
         config = await self._get_for_app(app, slug)
         if config is None:
             return False
+        require_owned(config.owner_instance, f"Config {slug}")
         await self.repo.delete(config)
         return True

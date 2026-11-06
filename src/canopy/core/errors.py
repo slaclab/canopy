@@ -30,7 +30,8 @@ class ErrorCode(StrEnum):
     API_KEY_NOT_FOUND = auto()
     API_KEY_SELF_DEACTIVATION = auto()
     KEY_STORE_UNAVAILABLE = auto()
-    READ_ONLY_INSTANCE = auto()
+    NOT_OWNER = auto()
+    OWNER_MISMATCH = auto()
 
     # Mole
     ARCHIVER_NOT_CONFIGURED = auto()
@@ -252,16 +253,27 @@ class FacilityCycle(CanopyError):
     error_code = ErrorCode.FACILITY_CYCLE
 
 
-class ReadOnlyInstance(CanopyError):
-    """Refused a write or admin request because this instance is a read-only mirror.
+class NotOwner(CanopyError):
+    """Refused a write to a row another instance owns, or a create it would own.
 
-    Distinct from `InsufficientWriteAccess`: no key would succeed here, so a
-    client should send the request to the primary (or hide the control) rather
-    than ask for a different key.
+    Every row of an owned table records the instance that created it
+    (``owner_instance``), and only that instance writes it. The detail names the
+    owner, the instance to send the write to.
     """
 
     status_code = 403
-    error_code = ErrorCode.READ_ONLY_INSTANCE
+    error_code = ErrorCode.NOT_OWNER
+
+
+class OwnerMismatch(CanopyError):
+    """Refused a request that links rows of different owners.
+
+    A PV's facilities and tags, a snapshot's facility and PVs, and a facility's
+    parent all share one owner. Sending the request elsewhere can't help.
+    """
+
+    status_code = 409
+    error_code = ErrorCode.OWNER_MISMATCH
 
 
 def register_canopy_error_handler(app: FastAPI) -> None:

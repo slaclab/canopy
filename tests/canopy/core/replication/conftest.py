@@ -213,6 +213,14 @@ class Octopus:
         """The first arm: the only one in a one-arm test."""
         return next(iter(self.arms.values()))
 
+    async def connect_arm(self, name: str) -> asyncpg.Connection:
+        """An arm's database from here, for the commands' checks that read an arm.
+
+        The arms' connection strings name each server as the head's server sees it,
+        which isn't reachable from the test process.
+        """
+        return await asyncpg.connect(self.arms[name].dsn)
+
 
 @asynccontextmanager
 async def _topology(count: int, *, schema: bool):
@@ -325,3 +333,60 @@ async def copied(octopus: Octopus, arm: str) -> bool:
     status = await subscriber_status(octopus.head.admin, arms=octopus.arms_config.arms, only=arm)
     sub = status["subscriptions"][0]
     return sub["exists"] and sub["tables_ready"] == len(REGISTRY.replicated) and not sub["tables_not_ready"]
+
+
+async def seed_rows(conn: asyncpg.Connection, owner: str, *, slug: str | None = None) -> dict[str, str]:
+    """One row in every replicated table, all owned by ``owner``; returns their ids.
+
+    The PV's setpoint address and the tag group's name are the same for every owner
+    (both are unique per owner); facility and Magpie slugs, unique everywhere, are
+    ``slug`` (``owner`` by default).
+    """
+    slug = slug or owner
+    ids = {name: str(uuid4()) for name in ("facility", "group", "tag_a", "tag_b", "pv", "snapshot", "value", "config")}
+    await conn.execute(
+        "INSERT INTO core.facility (id, slug, name, owner_instance) VALUES ($1, $2, 'Facility', $3)",
+        ids["facility"],
+        f"fac_{slug}",
+        owner,
+    )
+    await conn.execute(
+        "INSERT INTO squirrel.tag_group (id, name, owner_instance) VALUES ($1, 'Area', $2)", ids["group"], owner
+    )
+    await conn.execute(
+        "INSERT INTO squirrel.tag (id, name, group_id) VALUES ($1, 'Injector', $3), ($2, 'Linac', $3)",
+        ids["tag_a"],
+        ids["tag_b"],
+        ids["group"],
+    )
+    await conn.execute(
+        "INSERT INTO squirrel.pv (id, setpoint_address, device, owner_instance) "
+        "VALUES ($1, 'SIM:PV:1:SETPOINT', 'SIM:DEV:1', $2)",
+        ids["pv"],
+        owner,
+    )
+    await conn.execute("INSERT INTO squirrel.pv_tag (pv_id, tag_id) VALUES ($1, $2)", ids["pv"], ids["tag_a"])
+    await conn.execute(
+        "INSERT INTO squirrel.pv_facility (pv_id, facility_id) VALUES ($1, $2)", ids["pv"], ids["facility"]
+    )
+    await conn.execute("INSERT INTO squirrel.meta_pv (pv_id, display_name) VALUES ($1, 'Meta')", ids["pv"])
+    await conn.execute(
+        "INSERT INTO squirrel.snapshot (id, title, facility_id, owner_instance) VALUES ($1, 'Before', $2, $3)",
+        ids["snapshot"],
+        ids["facility"],
+        owner,
+    )
+    await conn.execute(
+        "INSERT INTO squirrel.snapshot_value (id, snapshot_id, pv_id, pv_name, setpoint_value) "
+        """VALUES ($1, $2, $3, 'SIM:PV:1:SETPOINT', '{"value": 1.0}')""",
+        ids["value"],
+        ids["snapshot"],
+        ids["pv"],
+    )
+    await conn.execute(
+        "INSERT INTO magpie.config (id, slug, app, data, owner_instance) VALUES ($1, $2, 'trace', '{}', $3)",
+        ids["config"],
+        f"cfg_{slug}"[:16],
+        owner,
+    )
+    return ids
