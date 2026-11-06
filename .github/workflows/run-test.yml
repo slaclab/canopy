@@ -66,10 +66,10 @@ jobs:
         include-hidden-files: true
 
   # The tests build their tables with create_all, so this job runs the migration tree
-  # itself, as a deploy does: on an empty database as a primary, where `alembic check`
-  # must then find the models and the migrations in agreement, and as a history mirror.
-  # The order a mirror and its primary migrate in is tested in tests-linux
-  # (tests/canopy/core/replication/test_migration_order.py).
+  # itself, as a deploy does: on an empty database as an arm (a primary), where
+  # `alembic check` must then find the models and the migrations in agreement, and as a
+  # history head (a mirror). The order a head and its arms migrate in is tested in
+  # tests-linux (tests/canopy/core/replication/test_migration_order.py).
   migrations:
     runs-on: ubuntu-latest
     services:
@@ -99,23 +99,28 @@ jobs:
     - name: Install dependencies
       run: uv sync --group dev
 
-    - name: Migrate a primary
+    - name: Migrate an arm
       run: uv run alembic upgrade head
       env:
+        CANOPY_ROLE: primary
+        CANOPY_INSTANCE: arm1
         CANOPY_DATABASE_URL: postgresql+asyncpg://canopy:canopy@localhost:5432/canopy
 
     - name: Check the models match the migrations
       run: uv run alembic check
       env:
+        CANOPY_ROLE: primary
+        CANOPY_INSTANCE: arm1
         CANOPY_DATABASE_URL: postgresql+asyncpg://canopy:canopy@localhost:5432/canopy
 
-    - name: Migrate a history mirror
+    - name: Migrate a history head
       run: |
-        docker exec ${{ job.services.postgres.id }} createdb -U canopy canopy_mirror
+        docker exec ${{ job.services.postgres.id }} createdb -U canopy canopy_head
         uv run alembic upgrade head
       env:
         CANOPY_ROLE: mirror
-        CANOPY_DATABASE_URL: postgresql+asyncpg://canopy:canopy@localhost:5432/canopy_mirror
+        CANOPY_INSTANCE: head
+        CANOPY_DATABASE_URL: postgresql+asyncpg://canopy:canopy@localhost:5432/canopy_head
 
   # Windows/macOS runners can't run service containers, so skip those tests (their conftest
   # skips when Postgres is unreachable)
