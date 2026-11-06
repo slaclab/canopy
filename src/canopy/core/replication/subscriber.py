@@ -18,7 +18,7 @@ executes a bare statement.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Callable, Awaitable
 
 import asyncpg
 
@@ -28,8 +28,8 @@ from canopy.core.replication.sql import (
     ReplicationError,
     redact,
     jsonable,
-    non_empty,
     qualified,
+    owner_join,
     quote_ident,
     role_exists,
     is_superuser,
@@ -37,9 +37,11 @@ from canopy.core.replication.sql import (
     table_owners,
     quote_literal,
     tables_present,
+    conninfo_as_uri,
     schemas_present,
     require_confined,
     owner_memberships,
+    tables_with_rows_of,
 )
 from canopy.core.replication.config import ReplicationConfig
 from canopy.core.replication.registry import EXCLUDED, REGISTRY, ReplicationRegistry
@@ -147,16 +149,88 @@ def _warn_on_drift(sub: asyncpg.Record, registry: ReplicationRegistry) -> None:
         )
 
 
-async def _require_empty(conn: asyncpg.Connection, tables: list[str], action: str) -> None:
-    """Refuse ``action`` when any of ``tables`` already has rows.
+ArmConnector = Callable[[str], Awaitable[asyncpg.Connection]]
 
-    The initial copy into a non-empty table fails on duplicate keys, leaves the table
-    stuck mid-copy and keeps a slot on the primary that holds WAL until someone drops it.
+
+def _arm_connector(arms: Mapping[str, Arm]) -> ArmConnector:
+    """Open a connection to an arm with its own connection string, as the subscription will."""
+
+    async def connect(arm: str) -> asyncpg.Connection:
+        dsn = arms[arm].publisher_dsn
+        if dsn is None or not dsn.get_secret_value():
+            raise Refused(f"set CANOPY_ARMS__<arm>__PUBLISHER_DSN (from a secret) for {arm}")
+        return await asyncpg.connect(
+            conninfo_as_uri(dsn.get_secret_value()), server_settings={"application_name": "canopy-replication"}
+        )
+
+    return connect
+
+
+async def _require_unowned(
+    conn: asyncpg.Connection, registry: ReplicationRegistry, tables: list[str], arm: str, action: str
+) -> None:
+    """Refuse ``action`` when the head already holds rows ``arm`` owns in any of ``tables``.
+
+    The initial copy brings every row the arm has, so a row of the arm's already here
+    is a duplicate key: the copy fails, the table sticks mid-copy, and the slot on the
+    arm holds WAL until someone drops it. Rows of the head's own, or of other arms,
+    are expected and don't block it.
     """
-    if occupied := await non_empty(conn, tables):
+    if occupied := await tables_with_rows_of(conn, registry, tables, arm):
         raise Refused(
-            f"{action} would copy into tables that already have rows: {', '.join(occupied)}. "
-            "Empty them first (the copy would fail on duplicate keys and leave a slot holding WAL on the primary)"
+            f"{action} for arm {arm} would copy into tables that already hold that arm's rows: {', '.join(occupied)}. "
+            "Remove them first, or re-seed the arm (the copy would fail on duplicate keys and leave a slot "
+            "holding WAL on the arm)"
+        )
+
+
+async def _require_no_shared_key_clash(
+    conn: asyncpg.Connection,
+    connect: ArmConnector,
+    registry: ReplicationRegistry,
+    tables: list[str],
+    arm: str,
+    action: str,
+) -> None:
+    """Refuse ``action`` when ``arm`` holds a value of a key unique across owners that the head already has.
+
+    Facility and Magpie slugs are unique everywhere, so an arm's row whose slug the
+    head already holds (for its own row or another arm's) would stop the copy, and
+    then replication from that arm. Only keys of ``tables`` are checked: those are
+    the tables this run copies. A clash that streams in later shows as an apply error.
+
+    Raises
+    ------
+    Refused
+        On any clash, naming each value and the owner of the row already here.
+    OSError, asyncpg.PostgresError
+        The arm can't be read.
+    """
+    keyed = [(table, column) for table in tables for column in registry.shared_keys.get(table, ())]
+    if not keyed:
+        return
+    clashes = []
+    arm_conn = await connect(arm)
+    try:
+        for table, column in keyed:
+            # Every row the arm publishes is copied, whoever it names as owner.
+            theirs = [row[0] for row in await arm_conn.fetch(f"SELECT {quote_ident(column)} FROM {qualified(table)}")]
+            if not theirs:
+                continue
+            join_sql, owner_sql = owner_join(registry, table, alias="t")
+            rows = await conn.fetch(
+                f"SELECT t.{quote_ident(column)} AS value, {owner_sql} AS owner FROM {qualified(table)} t {join_sql} "
+                f"WHERE {owner_sql} <> $1 AND t.{quote_ident(column)} = ANY($2::text[]) ORDER BY 1",
+                arm,
+                theirs,
+            )
+            clashes += [f"{table}.{column} {row['value']!r} (here, owned by {row['owner']})" for row in rows]
+    finally:
+        await arm_conn.close()
+    if clashes:
+        raise Refused(
+            f"{action} for arm {arm} would copy keys that must be unique and are already taken: {'; '.join(clashes)}. "
+            "Rename one of each pair first; the copy would stop on the clash"
         )
 
 
@@ -168,6 +242,7 @@ async def subscribe(
     arms: Mapping[str, Arm],
     only: str | None = None,
     registry: ReplicationRegistry = REGISTRY,
+    connect_arm: ArmConnector | None = None,
 ) -> dict:
     """Create the head's subscription to each arm, copying every table the arm publishes.
 
@@ -177,9 +252,11 @@ async def subscribe(
     fails for one arm is reported and the others still go ahead. Doesn't wait for
     the initial copies; ``status`` shows their progress.
 
-    Until rows carry their owner, a head subscribes to one arm: a second arm's copy
-    would land in tables that already hold the first arm's rows, and the checks
-    that tell those apart arrive with the owner column.
+    Before copying, each arm is checked two ways. The head must hold none of the
+    arm's own rows yet (its own rows and other arms' are expected). And none of the
+    arm's values of a key unique across owners (facility and Magpie slugs) may
+    already be taken here. An arm that can't be reached for the second check is
+    reported and skipped.
 
     Run it as the role that owns the tables, granted ``pg_create_subscription``:
     Postgres 16 applies changes as each table's owner, which then needs no superuser.
@@ -199,7 +276,10 @@ async def subscribe(
     only : str | None
         Subscribe to this arm only.
     registry : ReplicationRegistry
-        Publications to subscribe to, and the tables that must be empty first.
+        Publications to subscribe to, and the tables and owner paths the checks use.
+    connect_arm : ArmConnector | None
+        Opens a connection to an arm for the key check; by default with the arm's own
+        ``publisher_dsn``, the way the subscription connects.
 
     Returns
     -------
@@ -211,11 +291,11 @@ async def subscribe(
     ------
     Refused
         Wrong role, no arm (or an unknown one), an arm without a ``publisher_dsn`` or
-        with the head's name, Postgres older than 16, insufficient privileges, a
-        second arm, or a replicated table that already has rows. Nothing was created.
+        with the head's name, Postgres older than 16, insufficient privileges, rows
+        of the arm already here, or a key clash. Nothing was created.
     ReplicationError
-        ``CREATE SUBSCRIPTION`` failed for at least one arm (messages redacted); the
-        others were created.
+        An arm couldn't be reached for its check, or ``CREATE SUBSCRIPTION`` failed
+        for it (messages redacted); the other arms were created.
     """
     require_role("subscribe", "mirror", role)
     selected = _selected_arms(arms, only, head)
@@ -241,15 +321,24 @@ async def subscribe(
     if not to_create:
         return {"subscriptions": _in_order(results, selected)}
 
-    if len(set(existing) | {subscription_name(arm) for arm in to_create}) > 1:
-        raise Refused(
-            "a head subscribes to one arm until rows carry their owner: a second arm's copy would land in "
-            "tables that already hold the first arm's rows"
-        )
     present = await tables_present(conn, registry.schemas)
     if missing := sorted(set(registry.replicated) - present):
         logger.info("Not in this database yet, not copied: %s", ", ".join(missing))
-    await _require_empty(conn, sorted(set(registry.replicated) & present), "subscribe")
+    copied = sorted(set(registry.replicated) & present)
+    connect = connect_arm or _arm_connector(arms)
+    secrets = [arms[arm].publisher_dsn.get_secret_value() for arm in to_create]
+    failures = []
+    checked = []
+    for arm in to_create:
+        await _require_unowned(conn, registry, copied, arm, "subscribe")
+        try:
+            await _require_no_shared_key_clash(conn, connect, registry, copied, arm, "subscribe")
+        except (OSError, asyncpg.PostgresError) as exc:
+            message = redact(str(exc), secrets)
+            logger.error("Arm %s: can't read it to check its unique keys: %s", arm, message)
+            failures.append(f"{arm}: can't read it to check its unique keys: {message}")
+            continue
+        checked.append(arm)
 
     superuser = await is_superuser(conn)
     if not superuser and not await conn.fetchval(
@@ -271,8 +360,7 @@ async def subscribe(
         )
 
     publications = ", ".join(quote_ident(p.name) for p in registry.publications)
-    failures = []
-    for arm in to_create:
+    for arm in checked:
         name = subscription_name(arm)
         dsn = arms[arm].publisher_dsn.get_secret_value()
         try:
@@ -290,7 +378,7 @@ async def subscribe(
         logger.info("Created subscription %s; initial copy of %d tables started", name, len(tables))
         results.append({"arm": arm, "name": name, "created": True, "tables": tables})
     if failures:
-        raise ReplicationError(f"CREATE SUBSCRIPTION failed for {'; '.join(failures)}")
+        raise ReplicationError(f"subscribe failed for {'; '.join(failures)}")
     return {"subscriptions": _in_order(results, selected)}
 
 
@@ -301,12 +389,15 @@ async def refresh(
     arms: Mapping[str, Arm],
     only: str | None = None,
     registry: ReplicationRegistry = REGISTRY,
+    connect_arm: ArmConnector | None = None,
 ) -> dict:
     """Pick up tables each arm has started publishing, with their initial copy.
 
     Each arm is refreshed on its own: one that can't be reached is reported and the
     others still go ahead. An arm without a subscription yet gets a notice, not an
     error: the first deploy's migration Job runs before the one-time ``subscribe``.
+    Tables about to get their initial copy get ``subscribe``'s two checks first:
+    none of the arm's rows here yet, and no clash on a key unique across owners.
 
     Returns
     -------
@@ -318,9 +409,11 @@ async def refresh(
     ------
     Refused
         Wrong role, no arm (or an unknown one), or a table about to get its initial
-        copy already has rows. Nothing was refreshed.
+        copy already holds the arm's rows or clashes on a unique key. Nothing was
+        refreshed.
     ReplicationError
-        The refresh failed for at least one arm; the others were refreshed.
+        The refresh failed for at least one arm, or one couldn't be reached for its
+        check; the others were refreshed.
     """
     require_role("refresh", "mirror", role)
     selected = _selected_arms(arms, only)
@@ -328,6 +421,9 @@ async def refresh(
     _warn_on_unexpected(existing, arms)
     present = await tables_present(conn, registry.schemas)
 
+    connect = connect_arm or _arm_connector(arms)
+    secrets = [a.publisher_dsn.get_secret_value() for a in arms.values() if a.publisher_dsn]
+    failures = []
     pending = []
     results = []
     for arm in selected:
@@ -339,16 +435,23 @@ async def refresh(
         sub = await _subscription(conn, name)
         _warn_on_drift(sub, registry)
         before = await _subscribed_tables(conn, sub["oid"])
-        await _require_empty(conn, sorted((set(registry.replicated) & present) - set(before)), "refresh")
+        new = sorted((set(registry.replicated) & present) - set(before))
+        await _require_unowned(conn, registry, new, arm, "refresh")
+        try:
+            await _require_no_shared_key_clash(conn, connect, registry, new, arm, "refresh")
+        except (OSError, asyncpg.PostgresError) as exc:
+            message = redact(str(exc), secrets)
+            logger.error("Arm %s: can't read it to check its unique keys: %s", arm, message)
+            failures.append(f"{arm}: can't read it to check its unique keys: {message}")
+            continue
         pending.append((arm, name, sub, before))
 
-    failures = []
     for arm, name, sub, before in pending:
         try:
             await conn.execute(f"ALTER SUBSCRIPTION {quote_ident(name)} REFRESH PUBLICATION WITH (copy_data = true)")
         except asyncpg.PostgresError as exc:
-            logger.error("Arm %s: refresh failed: %s", arm, redact(str(exc)))
-            failures.append(f"{arm}: {redact(str(exc))}")
+            logger.error("Arm %s: refresh failed: %s", arm, redact(str(exc), secrets))
+            failures.append(f"{arm}: {redact(str(exc), secrets)}")
             continue
         after = await _subscribed_tables(conn, sub["oid"])
         added, removed = sorted(set(after) - set(before)), sorted(set(before) - set(after))
@@ -364,30 +467,70 @@ async def refresh(
     return {"subscriptions": _in_order(results, selected)}
 
 
+_POLICIES = ("canopy_read", "canopy_insert", "canopy_update", "canopy_delete")
+
+
+async def _limit_writes_to_the_head(conn: asyncpg.Connection, table: str, column: str, app: str, head: str) -> None:
+    """Row-level security on one root table: the app role reads every row, writes only the head's.
+
+    Enabled, not forced: the table's owner, which applies every arm's changes,
+    isn't bound by it. Policies are dropped and created again, so a renamed app role
+    or head is picked up. An UPDATE or DELETE of an arm's row matches no row, and an
+    INSERT of one is an error.
+    """
+    name, ident, own = qualified(table), quote_ident(app), f"{quote_ident(column)} = {quote_literal(head)}"
+    await conn.execute(f"ALTER TABLE {name} ENABLE ROW LEVEL SECURITY")
+    await conn.execute(f"ALTER TABLE {name} NO FORCE ROW LEVEL SECURITY")
+    for policy in _POLICIES:
+        await conn.execute(f"DROP POLICY IF EXISTS {quote_ident(policy)} ON {name}")
+    await conn.execute(f"CREATE POLICY canopy_read ON {name} FOR SELECT TO {ident} USING (true)")
+    await conn.execute(f"CREATE POLICY canopy_insert ON {name} FOR INSERT TO {ident} WITH CHECK ({own})")
+    await conn.execute(f"CREATE POLICY canopy_update ON {name} FOR UPDATE TO {ident} USING ({own}) WITH CHECK ({own})")
+    await conn.execute(f"CREATE POLICY canopy_delete ON {name} FOR DELETE TO {ident} USING ({own})")
+
+
 async def grants(
-    conn: asyncpg.Connection, *, role: str, config: ReplicationConfig, registry: ReplicationRegistry = REGISTRY
+    conn: asyncpg.Connection,
+    *,
+    role: str,
+    head: str,
+    config: ReplicationConfig,
+    registry: ReplicationRegistry = REGISTRY,
 ) -> dict:
-    """Give the mirror's app role read access to replicated tables and read-write on local ones.
+    """Let the head's app role read every row and write only the head's own.
 
-    In one transaction: USAGE on the registry's schemas; on replicated tables every
-    privilege revoked, then SELECT; SELECT, INSERT, UPDATE and DELETE on local tables
-    (DB-key auth writes ``core.api_key.last_used_at``, and key management writes keys);
-    and default privileges, for each owner of the registered tables, so a table a
-    later migration creates is readable at once. Run it after ``alembic upgrade head``,
-    as the tables' owner, so a new local table also gets its write grant.
+    A head holds its arms' rows and its own in the same tables, and its API writes
+    its own rows (decision: a mirror writes only what it owns). In one transaction:
 
-    Afterwards the app role must be able to write no replicated table, counting what
-    it inherits from other roles or PUBLIC: a write there would diverge from the
-    primary or break replication. ``grants`` refuses rather than change those shared
-    grants, and the refusal rolls back its own.
+    - USAGE on the registry's schemas;
+    - on replicated tables, every privilege revoked, then SELECT, INSERT, UPDATE and
+      DELETE;
+    - on each root table (one that names its row's owner), row-level security: the
+      app role reads every row and may insert, update or delete only rows whose
+      owner is ``head``;
+    - SELECT, INSERT, UPDATE and DELETE on local tables (DB-key auth writes
+      ``core.api_key.last_used_at``, and key management writes keys);
+    - default privileges, for each owner of the registered tables, so a table a later
+      migration creates is readable at once.
+
+    With row-level security on, a role other than the tables' owner, a superuser or
+    the app role sees no rows of the root tables; give any other reader its own
+    policy. Child tables (a snapshot's values, a PV's tags and facilities, a tag
+    group's tags) get plain grants: the head writes values by ``COPY``, which row-level
+    security refuses. The services check a child's owner through its parent, and
+    the drift check catches what they miss. Run ``grants`` after ``alembic upgrade
+    head``, as the tables' owner, so a new table gets its grants too.
+
+    Afterwards the app role must hold nothing more, counting what it inherits from
+    other roles or PUBLIC. ``grants`` refuses rather than change those shared grants,
+    and the refusal rolls back its own.
 
     Raises
     ------
     Refused
-        Wrong role; the app role doesn't exist; it is a superuser, owns a registered
-        table or belongs to a role that does (grants can't limit it, and a revoke would
-        strip an owner's own rights); or, after the grants, it can still do more than
-        read replicated tables and read and write local ones.
+        Wrong role; the app role doesn't exist; it is a superuser, bypasses row-level
+        security, owns a registered table or belongs to a role that does (none of
+        which a policy can limit); or, after the grants, it holds more than they give.
     """
     require_role("grants", "mirror", role)
     app = config.app_role
@@ -395,6 +538,8 @@ async def grants(
         raise Refused(f"app role {app} doesn't exist; create it first (CANOPY_REPLICATION__APP_ROLE names it)")
     if await is_superuser(conn, app):
         raise Refused(f"app role {app} is a superuser, so grants can't limit it")
+    if await conn.fetchval("SELECT rolbypassrls FROM pg_roles WHERE rolname = $1", app):
+        raise Refused(f"app role {app} has BYPASSRLS, so it could write the arms' rows; remove it")
     present = await tables_present(conn, registry.schemas)
     registered = sorted(set(registry.tables) & present)
     owners = await table_owners(conn, registered)
@@ -409,16 +554,20 @@ async def grants(
         logger.warning("Unclassified tables, left to default privileges: %s", ", ".join(unclassified))
 
     replicated = sorted(set(registry.replicated) & present)
+    roots = [table for table in replicated if not registry.owner_chain(table)]
     local = sorted(set(registry.local) & present)
     schemas = await schemas_present(conn, registry.schemas)
     ident = quote_ident(app)
+    read_write = {"SELECT", "INSERT", "UPDATE", "DELETE"}
     async with conn.transaction():
         if schemas:
             await conn.execute(f"GRANT USAGE ON SCHEMA {', '.join(quote_ident(s) for s in schemas)} TO {ident}")
         if replicated:
             tables = ", ".join(qualified(t) for t in replicated)
             await conn.execute(f"REVOKE ALL ON TABLE {tables} FROM {ident}")
-            await conn.execute(f"GRANT SELECT ON TABLE {tables} TO {ident}")
+            await conn.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {tables} TO {ident}")
+        for table in roots:
+            await _limit_writes_to_the_head(conn, table, registry.owner_paths[table].column, app, head)
         if local:
             await conn.execute(
                 f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {', '.join(qualified(t) for t in local)} TO {ident}"
@@ -429,21 +578,26 @@ async def grants(
                 f"IN SCHEMA {', '.join(quote_ident(s) for s in schemas)} GRANT SELECT ON TABLES TO {ident}"
             )
         # Unclassified tables keep the SELECT that default privileges give them.
-        read_write = {"SELECT", "INSERT", "UPDATE", "DELETE"}
         await require_confined(
             conn,
             app,
             tables=present,
-            allowed={table: (read_write if table in local else {"SELECT"}) for table in present},
+            allowed={table: (read_write if table in registry.tables else {"SELECT"}) for table in present},
             command="grants",
-            policy="SELECT on replicated tables and read-write on local ones",
+            policy="read-write on registered tables (rows of other owners blocked by row-level security)",
         )
     logger.info(
-        "Granted %s: SELECT on %d replicated tables, read-write on %s", app, len(replicated), ", ".join(local) or "none"
+        "Granted %s: read-write on %d replicated tables (writes to %s's rows only on %s) and on %s",
+        app,
+        len(replicated),
+        head,
+        ", ".join(roots) or "none",
+        ", ".join(local) or "no local tables",
     )
     return {
         "role": app,
         "replicated": replicated,
+        "row_security": roots,
         "local": local,
         "default_privileges_for": sorted(set(owners.values())),
     }
