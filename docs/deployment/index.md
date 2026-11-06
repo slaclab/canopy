@@ -31,12 +31,12 @@ essentials:
 | `CANOPY_EPICS__BACKEND` | `simulation` (default) or `epics`. **Production must set `epics`** |
 | `EPICS_CA_ADDR_LIST`, `EPICS_PVA_ADDR_LIST`, ... | Standard EPICS network discovery variables (only with the `epics` backend) |
 | `CANOPY_DATABASE_URL` | Postgres, asyncpg driver: `postgresql+asyncpg://user:pass@host:port/db` |
-| `CANOPY_REDIS_URL` | Redis: `redis://[:password@]host:port/0`. One per instance: a primary and its mirror must not share a queue (give them separate Redis servers or database numbers), since a mirror's worker has no snapshot tasks and fails any primary job it takes |
+| `CANOPY_REDIS_URL` | Redis: `redis://[:password@]host:port/0`. One per instance: two instances must not share a queue (give them separate Redis servers or database numbers), or one instance's worker runs the other's jobs against its own database |
 | `CANOPY_DEBUG` | Verbose errors in responses; keep `false` in production |
 | `CANOPY_LOG_LEVEL` | Root log level for the API and worker (`DEBUG`, `INFO`, `WARNING`, ...). Default `INFO`; an unknown name falls back to `INFO` |
 | `CANOPY_SQUIRREL__RESTORE_HOOKS` | Extra writes Squirrel makes during a snapshot restore, such as magnet trims. Empty means none. Must reach the **worker**, which performs restores. See [Restore hooks](../squirrel/restore_hooks.md) |
-| `CANOPY_ROLE` | `primary` (default) or `mirror`. A mirror is a read-only copy of a primary's database: write and admin routes return 403 `read_only_instance` (API-key management still works, since keys are local to each instance), and the worker runs only `ping` and batch conversion. Set it on both the API and the worker |
-| `CANOPY_INSTANCE` | **Required.** This instance's name: lowercase letters, digits and underscores, at most 48 (e.g. `arm1`). Choose it once; it is permanent once the instance holds data. Set it on the API, the worker and every `alembic` run. Reported by `GET /v1/instance` |
+| `CANOPY_ROLE` | `primary` (default) or `mirror`: which side of history replication this instance's database is on. A primary holds only rows it owns, publishes them and may prune. A mirror (the head) subscribes to its arms and holds their rows beside its own, and never prunes. Either way an instance writes only rows it owns (see [Row owners](#row-owners)); a mirror meant to stay read-only gives its users read keys only. Set it on the API, the worker and every `alembic` run |
+| `CANOPY_INSTANCE` | **Required.** This instance's name: lowercase letters, digits and underscores, at most 48 (e.g. `arm1`). It is stamped on every row the instance creates, so it is permanent once the instance holds data: on a primary, `alembic` refuses to run when the database holds rows stamped with another name. Set it on the API, the worker and every `alembic` run. Reported by `GET /v1/instance` |
 | `CANOPY_HISTORY_URL`, `CANOPY_WINDOW_DAYS` | Optional. Reported by `GET /v1/instance` with the role, the instance name and the Alembic head shipped in the image: the URL of the instance's read-only history copy, and how many days of history it keeps (a whole number of at least 1; unset means all). A blank value counts as unset |
 | `CANOPY_<MODULE>__<FIELD>` | Per-module tuning (e.g. `CANOPY_VOLE__GLOBAL_BYTES_MAX`) |
 
@@ -63,6 +63,32 @@ restart.
 
 See [API keys](api-keys.md) for the provisioning, rotation, and revocation
 runbook.
+
+## Row owners
+
+Every facility, PV, snapshot, tag group and Magpie config records the instance that
+created it, in `owner_instance` (`ownerInstance` on the wire). It is set on insert
+from `CANOPY_INSTANCE` and never changes; a mirror receives it with each arm's rows.
+A snapshot's values, a PV's tags, facilities and meta-PV marker, and a tag group's
+tags follow their parent.
+
+An instance writes only rows it owns:
+
+- Editing or deleting another instance's row answers `403 not_owner`, naming the
+  owner to send it to.
+- A new row belongs to the owner of what it's created in: a facility's parent, a
+  PV's facilities, a snapshot's facility, a tag's group. A create with none of those
+  (a root facility, a tag group, a Magpie config, a PV or snapshot with no facility)
+  belongs to this instance, or to the instance named with `?owner=`. A create this
+  instance wouldn't own answers `403 not_owner`.
+- A request that links rows of different owners (a PV with another owner's tag or
+  facility, a facility under another owner's parent, an import whose rows span
+  owners) answers `409 owner_mismatch`.
+- A snapshot with no facility captures only this instance's PVs.
+
+Facility slugs and Magpie slugs are unique everywhere. A PV's setpoint address and
+a tag group's name are unique per owner, so a mirror can hold the same PV or group
+name once for each arm; `ownerInstance` tells them apart.
 
 ## Database migrations
 
