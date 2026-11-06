@@ -143,7 +143,7 @@ its Job also runs `heartbeat --arm <arm>` last, as described under [Prune](#prun
 
 Back up the head like a primary, with base backups and WAL archiving. Each arm's rows
 can be copied again from that arm, but the head's own rows exist only in its database
-and its backups.
+and its backups, and so do snapshots waiting in its outbox for an arm.
 
 ### Metrics and alerts
 
@@ -151,7 +151,9 @@ Each side's `/metrics` reports its half of replication: an arm's slot, and the h
 subscription to each arm (labelled `arm`). `/health/ready` checks the database. The
 gauges, and the alert rules shipped in `docker/observability`, are listed under
 [Replication](../observability/metrics.md#replication). The lag to watch is each
-arm's `canopy_replication_slot_lag_bytes`; the head can't measure its own.
+arm's `canopy_replication_slot_lag_bytes`; the head can't measure its own. A head
+that forwards to arms also reports its snapshot outbox per arm, under
+[Snapshot outbox](../observability/metrics.md#snapshot-outbox).
 
 ### Drift check
 
@@ -431,8 +433,9 @@ The capture job's result names the arm: `{"type": "snapshot", "id", "arm"}`, wit
 values the arm left out under `skipped`. It waits up to `CANOPY_FORWARD__TIMEOUT_S`
 (30 s) for the snapshot to come back; one that takes longer is saved on the arm all
 the same. The captured import is idempotent on the id, so sending a bundle again
-saves nothing twice. When the arm can't be reached, the job fails with
-`primary_unavailable`, or with the arm's refusal.
+saves nothing twice. When the arm refuses the snapshot (its facility is gone there,
+say), the job fails with the arm's reason. When it can't be reached, the snapshot
+waits in the head's outbox instead (below).
 
 ### When an arm is unreachable
 
@@ -441,6 +444,55 @@ reached; nothing was sent. It fails with 504 when the request went out and no an
 came back; the write may have been applied, so check before sending it again. Reads
 keep working from the head's own copy, and so do writes to the head's own rows and to
 other arms.
+
+Snapshots are the one exception: the machine's state at 14:02 can't be taken again at
+14:30, so a capture for an arm that can't take it is kept on the head and saved there
+later. Every other write to that arm is refused as above.
+
+**The outbox.** The bundle waits in `squirrel.snapshot_outbox`, a local table on the
+head that never replicates. A capture queues when the arm can't be reached, gives no
+answer, answers 5xx, or turns down the head's service key; and also when the arm
+already has snapshots waiting, so the arm gets them in the order they were taken. The
+capture job then completes with the snapshot's id and `delivery`
+(`{"state": "pending", ...}`), and the message "Captured; waiting for *arm*".
+
+**Pending and failed snapshots.** Until its arm has it, the head lists and serves a
+queued snapshot from its bundle, under the same id, with `delivery` set: `pending`
+while it waits (or is saved on the arm and not replicated back yet), `failed` when the
+arm refused it, with the arm's reason. Compare and export work on it. Edit and delete
+are refused with 409 `snapshot_pending`; so is a restore, except where the head has
+`CANOPY_MACHINE_ACCESS=write`, which restores it from its bundle, a failed one too.
+Once the snapshot replicates back, its outbox row goes and it is an ordinary snapshot.
+
+**Delivery.** The head's worker sends each arm's queue oldest first, every
+`CANOPY_SQUIRREL__OUTBOX__INTERVAL_S` seconds and whenever a capture queues. Each
+attempt uses the user's name and facility grant as they were at capture time, and is
+strict: an arm that would save it without some values (a PV moved out of the facility
+meanwhile) refuses it with 409 `import_would_skip`, naming the PVs. A failure that says
+nothing about the snapshot (unreachable, 5xx, the head's key refused) keeps it pending
+and backs off, from `RETRY_INITIAL_S` doubling to `RETRY_MAX_S`; a queued snapshot
+never gives up. A refusal of the snapshot itself (facility gone, PVs moved, id clash)
+marks it failed, and the arm's queue goes on without it.
+
+**Caps.** Each arm's queue holds at most `CANOPY_SQUIRREL__OUTBOX__MAX_SNAPSHOTS`
+snapshots and `MAX_BYTES` bytes, failed rows included. A full snapshot is tens of MB,
+so size `MAX_BYTES` from the head's free disk and its number of arms. While an arm has
+snapshots waiting and its queue is full, a capture for it is refused at once with 503
+`outbox_full`. The arm's API must accept request bodies that large (an ingress in
+front of it often limits them by default).
+
+**Failed snapshots.** On the head, `python -m canopy.squirrel.outbox status` prints
+each arm's queue and every failed snapshot with its reason. Once the cause is fixed,
+`retry <id>...` or `retry --arm <arm>` sends them again at the next run;
+`--allow-skips` lets the arm save one refused with `import_would_skip` without the
+moved PVs' values. A snapshot that can't be saved can be exported
+(`GET /squirrel/v1/snapshots/<id>/export`) and then removed with `discard <id>`,
+which deletes it from the head for good.
+
+The gauges and alert rules are listed under
+[Snapshot outbox](../observability/metrics.md#snapshot-outbox): a snapshot waiting
+over 15 minutes, any failed one, one saved but not back after 30 minutes, a queue over
+80% full or full, and a status that can't be read.
 
 ## Runbooks
 
@@ -502,7 +554,10 @@ or a mistake made on the head itself):
    the restored database holds from that arm, if that's earlier), then `drift-check`.
 
 The head's own rows written after *T* are lost: no arm holds them, only the head's
-backups (see [Backups](#backups)).
+backups (see [Backups](#backups)). So is any snapshot queued in the head's outbox after
+*T*, unless its arm already has it. A snapshot queued before *T* and delivered since
+waits again in the restored outbox; sending it again is harmless, since the arm saves
+nothing twice, and its row goes once the reseed brings the snapshot back.
 
 ### Arm wipe or rebuild
 
