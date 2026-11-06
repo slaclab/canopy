@@ -178,17 +178,22 @@ class SnapshotBundleDTO(CanopyModel):
 
 
 class SkippedValueDTO(CanopyModel):
-    """A bundle value that wasn't imported, because no PV here has its ``pv_id``."""
+    """A bundle value that wasn't imported, because its PV isn't here or can't be imported here."""
 
     pv_id: str
     pv_name: str
 
 
 class SnapshotImportResultDTO(CanopyModel):
-    """The snapshot an import created, and the bundle values it left out."""
+    """The snapshot an import saved, the bundle values it left out, and whether this call saved it.
+
+    ``created`` is false only for a captured import whose snapshot was already here: the
+    answer then describes what was saved before.
+    """
 
     snapshot: SnapshotSummaryDTO
     skipped: list[SkippedValueDTO] = []
+    created: bool = True
 
 
 class RestoreRequestDTO(CanopyModel):
