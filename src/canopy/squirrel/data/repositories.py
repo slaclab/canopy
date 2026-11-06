@@ -767,13 +767,17 @@ class PvRepository(BaseRepository[Pv]):
         if rows:
             await self.session.execute(insert(pv_facility), rows)
 
-    async def get_existing_ids(self, ids: list[str], *, include_deleted: bool = False) -> set[str]:
-        """The subset of ``ids`` that are PVs here, without loading the rows."""
+    async def get_existing_ids(
+        self, ids: list[str], *, include_deleted: bool = False, owner: str | None = None
+    ) -> set[str]:
+        """The subset of ``ids`` that are PVs here, without loading the rows; ``owner``'s only, if given."""
         existing: set[str] = set()
         for i in range(0, len(ids), PARAM_BATCH_SIZE):
             query = select(Pv.id).where(Pv.id.in_(ids[i : i + PARAM_BATCH_SIZE]))
             if not include_deleted:
                 query = query.where(Pv.deleted_at.is_(None))
+            if owner is not None:
+                query = query.where(Pv.owner_instance == owner)
             existing.update((await self.session.execute(query)).scalars())
         return existing
 

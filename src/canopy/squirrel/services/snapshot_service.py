@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.core.config import get_settings
 from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
-from canopy.core.ownership import require_owned, local_instance
+from canopy.core.ownership import require_owned, local_instance, require_create_owner
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.time_parse import to_utc
 from canopy.squirrel.errors import (
@@ -843,14 +843,15 @@ class SnapshotService:
     async def _importable_pv_ids(self, pv_ids: list[str], capture_scope: set[str] | None) -> set[str]:
         """The PV ids of a bundle that an import may keep values for.
 
-        A PV must exist here (deleted PVs included: a mirror replicates its primary's PV
-        rows, ids and all), and the key must be able to restore it (``_pv_in_scope``).
+        A PV must exist here and be this instance's (deleted PVs included: a mirror
+        replicates its arms' PV rows, ids and all, but a snapshot's PVs share its owner,
+        which is the importer), and the key must be able to restore it (``_pv_in_scope``).
         The new snapshot's export shows each value's PV addresses, so a value of a PV the
         key can't see would reveal it. For a bundle with a facility, the PV must also be
         assigned to that facility or one below it (``capture_scope``), as a capture into
         that facility would take it. Every rule is a condition in the loop below.
         """
-        known = await self.pv_repo.get_existing_ids(pv_ids, include_deleted=True)
+        known = await self.pv_repo.get_existing_ids(pv_ids, include_deleted=True, owner=local_instance())
         needs_facilities = self.facility_scope is not None or capture_scope is not None
         assigned = await self.pv_repo.facility_ids_for_many(sorted(known)) if needs_facilities else {}
         importable = set()
@@ -888,14 +889,16 @@ class SnapshotService:
           the PVs or the caller's grant have changed since. ``strict`` refuses a bundle
           that would leave any value out.
 
-        In both modes values are matched to PVs here by ``pv_id``, deleted PVs included:
-        a history mirror replicates its primary's PV rows, ids and all. Each value keeps
-        its capture ``timestamp``. Values whose PV isn't here, that the key couldn't
-        restore, or that isn't assigned to the bundle's facility or one below it are
-        skipped and listed alike, so the answer doesn't reveal another facility's PV. A
-        PV moved out of that facility since the export is skipped too. Nothing is read
-        from EPICS. The snapshot takes the bundle's facility, which the key must be able
-        to write, as it would for a capture; a bundle without one is saved unassigned.
+        In both modes the snapshot belongs to this instance, and values are matched to
+        PVs here by ``pv_id``, deleted PVs included: a history mirror replicates its
+        arms' PV rows, ids and all. Each value keeps its capture ``timestamp``. Values
+        whose PV isn't here or is another instance's, that the key couldn't restore, or
+        that isn't assigned to the bundle's facility or one below it are skipped and
+        listed alike, so the answer doesn't reveal another facility's PV. A PV moved out
+        of that facility since the export is skipped too. Nothing is read from EPICS.
+        The snapshot takes the bundle's facility, which must be this instance's and
+        which the key must be able to write, as it would for a capture; a bundle without
+        one is saved unassigned.
 
         Parameters
         ----------
@@ -920,9 +923,11 @@ class SnapshotService:
         ImportWouldSkip
             With ``strict``, when any value would be skipped.
         SnapshotIdConflict
-            When a captured bundle's id is taken by a snapshot with another facility or time.
+            When a captured bundle's id is taken by a snapshot with another owner, facility or time.
         FacilityNotFound
             When the bundle names a facility this instance doesn't have.
+        NotOwner
+            When the bundle's facility is another instance's.
         InsufficientFacilityAccess
             When the key can't write the bundle's facility.
         """
@@ -937,6 +942,7 @@ class SnapshotService:
             facility = await facilities_gateway.get_by_slug(bundle.facility)
             if facility is None:
                 raise FacilityNotFound(f"Facility '{bundle.facility}' not found")
+            require_create_owner(facility.owner_instance, None, f"Facility '{bundle.facility}'")
             facility_id = facility.id
         self._require_facility_for_create(facility_id, bundle.facility)
 
@@ -1009,7 +1015,7 @@ class SnapshotService:
         created_at: datetime | None = None,
         imported_from: str | None = None,
     ) -> int | None:
-        """Insert a snapshot with a given id, and its values, unless that id is taken.
+        """Insert this instance's snapshot with a given id, and its values, unless that id is taken.
 
         ``created_at`` defaults to now. Returns the number of values written, or ``None``
         when a snapshot with ``snapshot_id`` already exists, in which case nothing is
@@ -1018,6 +1024,9 @@ class SnapshotService:
         """
         fields = {
             "id": snapshot_id,
+            # Set here rather than by the column default, which this statement would fire
+            # too: whatever saves a snapshot here saves it as this instance's.
+            "owner_instance": local_instance(),
             "title": title,
             "description": description,
             "created_by": created_by,
@@ -1038,8 +1047,11 @@ class SnapshotService:
         Raises
         ------
         SnapshotIdConflict
-            When the saved snapshot has another facility or creation time than the bundle.
+            When the saved snapshot is another instance's, or has another facility or
+            creation time than the bundle.
         """
+        if existing.owner_instance != local_instance():
+            raise SnapshotIdConflict(f"Snapshot {existing.id} is already here, owned by '{existing.owner_instance}'")
         facility = await self._facility_slug(existing.facility_id)
         if facility != bundle.facility or existing.created_at != to_utc(bundle.created_date):
             raise SnapshotIdConflict(
