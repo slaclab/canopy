@@ -1,7 +1,7 @@
 """The provisioned Grafana alert rules agree with the gauges Canopy exports.
 
 Every rule file under ``docker/observability/grafana/provisioning/alerting/`` is
-checked: uids are unique, every rule routes by ``severity`` and ``team``, a series
+checked: uids are unique and short enough for Grafana, every rule routes by ``severity`` and ``team``, a series
 that doesn't exist is OK rather than an alert, every metric an expression names is
 one a collector emits for a representative status, and every ``$labels.X`` an
 annotation uses is a label those series carry (or the scrape's ``instance``/``job``).
@@ -100,9 +100,11 @@ def test_there_are_rules():
     assert RULES
 
 
-def test_uids_are_unique():
+def test_uids_are_unique_and_grafana_accepts_them():
+    """Grafana refuses a whole provisioning file, and stops, over a uid longer than 40 characters."""
     uids = [rule["uid"] for _, rule in RULES]
     assert len(uids) == len(set(uids))
+    assert not [uid for uid in uids if len(uid) > 40]
 
 
 @pytest.mark.parametrize(("path", "rule"), RULES, ids=[rule["uid"] for _, rule in RULES])

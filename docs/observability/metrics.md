@@ -199,7 +199,7 @@ against the exported series.
   - `worker-down`: no apply worker for 5 minutes. `receive-stale`: nothing
     received for 5 minutes.
   - `subscription-missing`: an arm in `CANOPY_ARMS` with no subscription for
-    30 minutes. `subscription-unexpected`: a subscription for an arm the head
+    30 minutes. `subscription-unlisted`: a subscription for an arm the head
     doesn't list, for an hour.
 - **On either:** a status that can't be read (`status-down`).
 

@@ -319,7 +319,7 @@ groups:
               conditions:
                 - evaluator: {type: gt, params: [0]}
 
-      - uid: canopy-replication-subscription-unexpected
+      - uid: canopy-replication-subscription-unlisted
         title: Head subscribed to an arm it doesn't list
         condition: C
         for: 1h
