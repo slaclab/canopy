@@ -13,7 +13,7 @@ Later data steps on owned tables run on every instance, filtered to
 ``owner_instance = local_instance()``, rather than on a primary only.
 
 Revision ID: 89e21441c63c
-Revises: d4f8a1c6b209
+Revises: 18ac64c44669
 Create Date: 2026-11-06 12:00:00.000000
 
 """
@@ -27,7 +27,7 @@ from canopy.core.config import get_settings
 
 # revision identifiers, used by Alembic.
 revision: str = "89e21441c63c"
-down_revision: str | None = "d4f8a1c6b209"
+down_revision: str | None = "18ac64c44669"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
