@@ -13,7 +13,7 @@ from httpx import AsyncClient, ASGITransport
 from pytest_httpx import HTTPXMock
 from fastapi.testclient import TestClient
 
-from canopy.core import db
+from canopy.core import db, instance
 from canopy.main import app
 from tests.conftest import READ_HEADERS, WRITE_HEADERS
 from canopy.core.config import Settings, get_settings
@@ -58,13 +58,18 @@ class TestHare:
         assert resp.status_code == 403
         assert resp.json()["code"] == "machine_read_only"
 
-    def test_a_head_refuses_by_default(self, head):
+    def test_a_head_refuses_by_default(self, head, monkeypatch):
+        async def states(session, arms):
+            return dict.fromkeys(arms, "streaming")
+
+        # /v1/instance reads a head's subscriptions from Postgres; this test needs none.
+        monkeypatch.setattr(instance, "arm_states", states)
         with TestClient(app) as client:
             resp = client.put("/hare/v1/pvs/SIM:TEMP", json={"value": 1.0}, headers=WRITE_HEADERS)
-            instance = client.get("/v1/instance", headers=READ_HEADERS)
+            reported = client.get("/v1/instance", headers=READ_HEADERS)
 
         assert resp.json()["code"] == "machine_read_only"
-        assert instance.json()["machineAccess"] == "read"
+        assert reported.json()["machineAccess"] == "read"
 
     def test_a_head_with_write_writes(self, head, access):
         access("write")
