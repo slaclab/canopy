@@ -16,8 +16,8 @@ backstop for an ORM write that a service check missed.
 
 A create's owner is the owner of what it is created in: a facility's parent, a
 PV's facilities, a snapshot's facility, a tag's group. A create with none of those
-belongs to the instance that receives it. A root facility, a PV, a tag group, a
-tag import and a Magpie config also take ``?owner=``, which an instance accepts
+belongs to the instance that receives it. A root facility, a PV, a PV import, a
+tag group, a tag import and a Magpie config also take ``?owner=``, which an instance accepts
 only with its own name; on a mirror, the router forwards a create naming an arm
 before it gets here.
 """

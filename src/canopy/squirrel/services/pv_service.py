@@ -348,13 +348,15 @@ class PvService:
         # id-to-slug round trip and report them straight back.
         return self._to_dto(pv, sorted(set(data.facilities)))
 
-    async def create_many(self, data_list: list[NewPVElementDTO]) -> list[PVElementDTO]:
+    async def create_many(self, data_list: list[NewPVElementDTO], owner: str | None = None) -> list[PVElementDTO]:
         """Register many PVs in one import, all owned by this instance.
 
         Parameters
         ----------
         data_list : list[NewPVElementDTO]
             Wire payloads for the PVs to import.
+        owner : str | None
+            The ``?owner=`` the caller named; only this instance's own name is accepted.
 
         Returns
         -------
@@ -436,7 +438,7 @@ class PvService:
         # One import, one owner: rows naming no facility take the owner the others take.
         facility_owners = await facilities_gateway.owners_by_id(set(ids_by_slug.values()))
         require_create_owner(
-            one_owner(facility_owners.values(), "The imported PVs' facilities"), None, "The imported PVs"
+            one_owner(facility_owners.values(), "The imported PVs' facilities"), owner, "The imported PVs"
         )
 
         existence_lookups = (
