@@ -2,10 +2,22 @@
 
 ``publish`` runs after ``alembic upgrade head`` on every deploy of a primary. It is
 idempotent: a run that finds the publications already right changes nothing.
+
+A primary that will prune old rows switches from the single layout to the split
+one, once, in three steps:
+
+1. ``publish --split`` creates ``canopy_ref`` and ``canopy_ts`` beside ``canopy_history``.
+2. ``switch --arm <this arm>`` on the head moves its subscription to them.
+3. ``publish --split`` again drops ``canopy_history``, but only once the head's
+   walsender is seen streaming the split publications.
+
+From then on, plain ``publish`` keeps the split pair in step. A deploy never
+switches layouts by itself.
 """
 
 from __future__ import annotations
 
+import re
 import logging
 from dataclasses import field, dataclass
 from collections.abc import Mapping
@@ -36,6 +48,86 @@ from canopy.core.replication.registry import (
 logger = logging.getLogger(__name__)
 
 _OPERATIONS = ("insert", "update", "delete", "truncate")
+# The walsender's command text, as pg_stat_activity shows it to a privileged role:
+# START_REPLICATION SLOT "s" LOGICAL 0/0 (proto_version '4', publication_names '"a","b"')
+_PUBLICATION_NAMES = re.compile(r"publication_names '((?:[^']|'')*)'")
+_HEARTBEAT_TABLE = "core.history_heartbeat"
+
+
+async def publication_layout(conn: asyncpg.Connection, registry: ReplicationRegistry = REGISTRY) -> str:
+    """Which publication layout this database has.
+
+    Returns
+    -------
+    str
+        ``"none"`` before the first ``publish``, ``"single"`` with only ``canopy_history``,
+        ``"switching"`` with both layouts during the switch, ``"split"`` after it.
+    """
+    existing = {
+        row["pubname"]
+        for row in await conn.fetch(
+            "SELECT pubname FROM pg_publication WHERE pubname = ANY($1::text[])",
+            [p.name for p in registry.all_publications],
+        )
+    }
+    single = any(p.name in existing for p in registry.publications)
+    split = any(p.name in existing for p in registry.split_publications)
+    return {(False, False): "none", (True, False): "single", (True, True): "switching", (False, True): "split"}[
+        (single, split)
+    ]
+
+
+def walsender_publications(command: str | None) -> list[str] | None:
+    """The publications a walsender streams, read from its ``START_REPLICATION`` command.
+
+    ``None`` when the command isn't visible (``<insufficient privilege>`` for a role
+    without ``pg_read_all_stats``) or names no publications.
+    """
+    if not command or not (match := _PUBLICATION_NAMES.search(command)):
+        return None
+    names = match.group(1).replace("''", "'")
+    return [name.strip().strip('"').replace('""', '"') for name in names.split(",") if name.strip()]
+
+
+async def _subscription_walsenders(conn: asyncpg.Connection) -> list[dict]:
+    """Each history slot here (the head's), whether a walsender holds it, and what it streams."""
+    rows = await conn.fetch(
+        """
+        SELECT s.slot_name, s.active, a.query AS command
+        FROM pg_replication_slots s
+        LEFT JOIN pg_stat_activity a ON a.pid = s.active_pid
+        WHERE s.slot_type = 'logical' AND s.database = current_database()
+          AND s.slot_name LIKE 'canopy\\_history\\_%'
+        ORDER BY s.slot_name
+        """
+    )
+    return [
+        {"slot": row["slot_name"], "active": row["active"], "publications": walsender_publications(row["command"])}
+        for row in rows
+    ]
+
+
+def _not_switched(walsenders: list[dict], registry: ReplicationRegistry) -> list[str]:
+    """Why ``canopy_history`` can't be dropped yet: one reason per history slot not streaming the split pair."""
+    if not walsenders:
+        return ["no history slot exists here, so the head can't be seen to have switched"]
+    split = {p.name for p in registry.split_publications}
+    reasons = []
+    for walsender in walsenders:
+        if not walsender["active"]:
+            reasons.append(f"slot {walsender['slot']} has no walsender (the head isn't connected)")
+        elif walsender["publications"] is None:
+            reasons.append(
+                f"can't read what slot {walsender['slot']} streams; publish needs a superuser or pg_read_all_stats"
+            )
+        elif set(walsender["publications"]) != split:
+            # Exactly the pair: canopy_ts alone would leave history without reference
+            # changes, and canopy_ref alone without new snapshots.
+            reasons.append(
+                f"slot {walsender['slot']} streams {', '.join(walsender['publications'])}, "
+                f"not exactly {', '.join(sorted(split))}"
+            )
+    return reasons
 
 
 @dataclass(frozen=True)
@@ -128,7 +220,7 @@ async def _sync_publication(conn: asyncpg.Connection, publication: Publication, 
     if state.all_tables:
         raise Refused(
             f"publication {publication.name} is FOR ALL TABLES, so it publishes local tables such as core.api_key "
-            f"and can't be altered. Drop it by hand (DROP PUBLICATION {name}) once no mirror streams it, then run "
+            f"and can't be altered. Drop it by hand (DROP PUBLICATION {name}) once no head streams it, then run "
             "publish again"
         )
     created = not state.exists
@@ -163,7 +255,7 @@ async def _sync_publication(conn: asyncpg.Connection, publication: Publication, 
         logger.info("Publication %s: removed %s", publication.name, ", ".join(removed))
     if cleared:
         logger.warning(
-            "Publication %s: cleared row filters or column lists on %s. A mirror that copied them while restricted "
+            "Publication %s: cleared row filters or column lists on %s. A head that copied them while restricted "
             "holds only part of them; re-seed those tables there",
             publication.name,
             ", ".join(cleared),
@@ -188,6 +280,15 @@ async def _sync_publication(conn: asyncpg.Connection, publication: Publication, 
     }
 
 
+async def _grant_heartbeat(conn: asyncpg.Connection, role: str, present: set[str]) -> None:
+    """Leave ``role`` able to read and write ``core.history_heartbeat`` and no other registry table."""
+    ident = quote_ident(role)
+    await conn.execute(f"GRANT USAGE ON SCHEMA core TO {ident}")
+    await conn.execute(f"REVOKE ALL ON TABLE {', '.join(qualified(t) for t in sorted(present))} FROM {ident}")
+    await conn.execute(f"GRANT SELECT, INSERT, UPDATE ON TABLE {qualified(_HEARTBEAT_TABLE)} TO {ident}")
+    logger.info("Role %s: may write %s only", role, _HEARTBEAT_TABLE)
+
+
 async def _grant_published(conn: asyncpg.Connection, role: str, published: list[str], present: set[str]) -> None:
     """Leave ``role`` with SELECT on exactly ``published`` among the tables in the registry's schemas."""
     ident = quote_ident(role)
@@ -199,7 +300,12 @@ async def _grant_published(conn: asyncpg.Connection, role: str, published: list[
 
 
 async def publish(
-    conn: asyncpg.Connection, *, role: str, config: ReplicationConfig, registry: ReplicationRegistry = REGISTRY
+    conn: asyncpg.Connection,
+    *,
+    role: str,
+    config: ReplicationConfig,
+    registry: ReplicationRegistry = REGISTRY,
+    split: bool = False,
 ) -> dict:
     """Create or update the registry's publications and the replication roles' grants.
 
@@ -209,10 +315,15 @@ async def publish(
     column lists and schemas published whole are replaced by the plain table list.
     The replicator and reader roles get SELECT on exactly the published tables
     (every other table in those schemas is revoked, so neither can read API-key
-    hashes); a role that doesn't exist yet is skipped with a notice, and the next
-    run grants it. Afterwards each role must be able to do no more than that,
-    counting what it inherits from other roles or PUBLIC; ``publish`` refuses rather
-    than change those shared grants.
+    hashes), and the heartbeat role may write ``core.history_heartbeat`` only; a
+    role that doesn't exist yet is skipped with a notice, and the next run grants
+    it. Afterwards each role must be able to do no more than that, counting what it
+    inherits from other roles or PUBLIC; ``publish`` refuses rather than change
+    those shared grants.
+
+    Keeps whichever layout the database has. ``split`` moves to the split layout:
+    the first run creates the split pair beside ``canopy_history``; a later run, once
+    the head streams the split pair, drops ``canopy_history``.
 
     Parameters
     ----------
@@ -224,21 +335,25 @@ async def publish(
         Names of the replicator and reader roles.
     registry : ReplicationRegistry
         Table classes and publications to apply.
+    split : bool
+        Move to the split layout (``--split``).
 
     Returns
     -------
     dict
-        Per publication, what changed; per role, ``"granted"`` or ``"absent"``; and the
-        registered tables that don't exist here.
+        The ``layout`` afterwards; per publication, what changed; per role,
+        ``"granted"`` or ``"absent"``; the registered tables that don't exist here;
+        and, when this run dropped ``canopy_history``, the WAL position just after.
 
     Raises
     ------
     Refused
         On a mirror; when the registry's schemas hold a table it doesn't classify (a
         table history would silently miss); when a publication is ``FOR ALL TABLES``;
-        or when the replicator or reader role can reach more than SELECT on the
-        published tables (as a superuser, through a table owner, another role or
-        PUBLIC). Nothing is changed.
+        when the replicator, reader or heartbeat role can reach more than its share
+        (as a superuser, through a table owner, another role or PUBLIC); or, for
+        ``split`` with both layouts present, when the head isn't yet streaming the
+        split pair. Nothing is changed.
     """
     require_role("publish", "primary", role)
     present = await tables_present(conn, registry.schemas)
@@ -254,13 +369,32 @@ async def publish(
     if (wal_level := await conn.fetchval("SHOW wal_level")) != "logical":
         logger.warning("wal_level is %s; a subscription can't stream changes until it is logical", wal_level)
 
+    layout = await publication_layout(conn, registry)
+    drop_single = split and layout == "switching"
+    if drop_single and (reasons := _not_switched(await _subscription_walsenders(conn), registry)):
+        names = ", ".join(p.name for p in registry.publications)
+        raise Refused(
+            f"{names} is still needed: {'; '.join(reasons)}. Run `switch --arm <this arm>` on the "
+            "head, then `publish --split` here again"
+        )
+    if split or layout in ("switching", "split"):
+        publications = registry.split_publications + (
+            () if layout in ("none", "split") or drop_single else registry.publications
+        )
+    else:
+        publications = registry.publications
+
     result: dict = {"publications": {}, "roles": {}, "missing": missing}
     async with conn.transaction():
         published: set[str] = set()
-        for publication in registry.publications:
+        for publication in publications:
             desired = [t for t in registry.published(publication) if t in present]
             published.update(desired)
             result["publications"][publication.name] = await _sync_publication(conn, publication, desired)
+        if drop_single:
+            for publication in registry.publications:
+                await conn.execute(f"DROP PUBLICATION {quote_ident(publication.name)}")
+                result["publications"][publication.name] = {"dropped": True}
         for grantee in (config.replicator_role, config.reader_role):
             if not await role_exists(conn, grantee):
                 logger.info("Role %s doesn't exist yet; no grants made for it", grantee)
@@ -276,6 +410,33 @@ async def publish(
                     policy="SELECT on the published tables",
                 )
                 result["roles"][grantee] = "granted"
+        if not await role_exists(conn, config.heartbeat_role):
+            logger.info("Role %s doesn't exist yet; no grants made for it", config.heartbeat_role)
+            result["roles"][config.heartbeat_role] = "absent"
+        elif _HEARTBEAT_TABLE in present:
+            await _grant_heartbeat(conn, config.heartbeat_role, present)
+            await require_confined(
+                conn,
+                config.heartbeat_role,
+                tables=present,
+                allowed={_HEARTBEAT_TABLE: {"SELECT", "INSERT", "UPDATE"}},
+                command="publish",
+                policy=f"read-write on {_HEARTBEAT_TABLE}",
+            )
+            result["roles"][config.heartbeat_role] = "granted"
+    if drop_single:
+        result["dropped_at_lsn"] = await conn.fetchval("SELECT pg_current_wal_lsn()::text")
+        logger.info(
+            "Dropped %s at %s; the split layout is complete",
+            ", ".join(p.name for p in registry.publications),
+            result["dropped_at_lsn"],
+        )
+    elif split and layout != "split":
+        logger.info(
+            "Split publications are in place. Next: run `switch --arm <this arm>` on the head, then "
+            "`publish --split` here again"
+        )
+    result["layout"] = await publication_layout(conn, registry)
     return result
 
 
@@ -287,18 +448,29 @@ async def publisher_status(
     Returns
     -------
     dict
-        ``wal_level`` and the current WAL position; each publication against the
-        registry (``missing``: registered and present but not published;
-        ``unexpected``: published but not registered; ``restricted``: tables published
-        only in part, by a row filter or column list, keyed like ``tables``; ``schemas``
-        published whole; ``all_tables``); whether the replication roles
-        exist; and every logical slot in this database, with the WAL it retains.
-        Slots named ``pg_<oid>_sync_...`` belong to an initial table copy and are
-        normally short-lived; one that stays inactive is holding WAL for a failed copy.
+        ``wal_level`` and the current WAL position; the publication ``layout`` (see
+        ``publication_layout``) and each publication it uses against the registry
+        (``missing``: registered and present but not published; ``unexpected``:
+        published but not registered; ``restricted``: tables published only in part,
+        by a row filter or column list, keyed like ``tables``; ``schemas`` published
+        whole; ``all_tables``); whether the replication roles exist; and every logical
+        slot in this database, with the WAL it retains. Slots named ``pg_<oid>_sync_...``
+        belong to an initial table copy and are normally short-lived; one that stays
+        inactive is holding WAL for a failed copy. For a slot a walsender holds: the
+        publications it streams and when the walsender started (both ``None`` when this
+        role may not see them), its flush lag (``None`` once caught up and idle) and the
+        age of the head's last reply, in seconds.
     """
     present = await tables_present(conn, registry.schemas)
+    layout = await publication_layout(conn, registry)
     publications = []
-    for publication in registry.publications:
+    in_use = {
+        "none": registry.publications,
+        "single": registry.publications,
+        "switching": registry.all_publications,
+        "split": registry.split_publications,
+    }[layout]
+    for publication in in_use:
         desired = {t for t in registry.published(publication) if t in present}
         state = await publication_state(conn, publication.name)
         publications.append(
@@ -325,19 +497,31 @@ async def publisher_status(
                pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn) AS retained_bytes,
                pg_wal_lsn_diff(pg_current_wal_lsn(), s.confirmed_flush_lsn) AS lag_bytes,
                st.spill_bytes, st.stream_bytes,
-               r.state AS walsender_state, r.reply_time AS walsender_reply_time
+               r.state AS walsender_state, r.reply_time AS walsender_reply_time,
+               extract(epoch FROM r.flush_lag)::float8 AS walsender_flush_lag_s,
+               extract(epoch FROM clock_timestamp() - r.reply_time)::float8 AS walsender_reply_age_s,
+               a.backend_start AS walsender_started_at,
+               a.query AS walsender_command
         FROM pg_replication_slots s
         LEFT JOIN pg_stat_replication_slots st ON st.slot_name = s.slot_name
         LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid
+        LEFT JOIN pg_stat_activity a ON a.pid = s.active_pid
         WHERE s.slot_type = 'logical' AND s.database = current_database()
         ORDER BY s.slot_name
         """
     )
+    slot_rows = []
+    for row in slots:
+        slot = jsonable(row)
+        slot["walsender_publications"] = walsender_publications(slot.pop("walsender_command"))
+        slot_rows.append(slot)
+    roles = (config.replicator_role, config.reader_role, config.heartbeat_role)
     return {
         "side": "publisher",
         "wal_level": await conn.fetchval("SHOW wal_level"),
         "current_lsn": await conn.fetchval("SELECT pg_current_wal_lsn()::text"),
+        "layout": layout,
         "publications": publications,
-        "roles": {name: await role_exists(conn, name) for name in (config.replicator_role, config.reader_role)},
-        "slots": [jsonable(row) for row in slots],
+        "roles": {name: await role_exists(conn, name) for name in roles},
+        "slots": slot_rows,
     }

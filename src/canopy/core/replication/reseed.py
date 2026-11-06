@@ -17,7 +17,9 @@ the head's own are never read, written or deleted:
   parent.
 
 It runs with that arm's subscription disabled, creating it disabled and without the
-initial copy when there is none. The hand-over:
+initial copy when there is none. A subscription it creates reads the arm's split pair
+(``canopy_ref``, ``canopy_ts``) once the arm has it, else ``canopy_history``. The
+hand-over:
 
 1. Take ``B = pg_current_xact_id()`` on the arm and wait until no lower xid is
    still running. Read ``x0 = pg_current_wal_insert_lsn()``. Open a repeatable-read
@@ -87,6 +89,7 @@ from canopy.core.replication.drift import (
     table_columns,
 )
 from canopy.core.replication.registry import REGISTRY, TableClass, ReplicationRegistry
+from canopy.core.replication.publisher import publication_layout
 from canopy.core.replication.subscriber import (
     subscribe,
     _subscription,
@@ -584,7 +587,12 @@ async def reseed(
     sub = await _subscription(mirror, name)
     created = sub is None
     if created:
-        await subscribe(mirror, role=role, head=head, arms=arms, only=arm, registry=registry, copy_data=False)
+        # pg_publication is readable by the reader. An arm that has created the split
+        # pair is moving to it, or has moved, so a new subscription starts on the pair.
+        split = await publication_layout(primary, registry) in ("switching", "split")
+        await subscribe(
+            mirror, role=role, head=head, arms=arms, only=arm, registry=registry, copy_data=False, split=split
+        )
         sub = await _subscription(mirror, name)
     elif sub["subenabled"]:
         raise Refused(f"subscription {name} is enabled; disable it first (ALTER SUBSCRIPTION {name} DISABLE)")
@@ -653,6 +661,7 @@ async def reseed(
         "arm": arm,
         "subscription": name,
         "created": created,
+        "publications": list(sub["subpublications"]),
         "since": since.isoformat(),
         "cut_lsn": x0,
         "cut_attempts": attempts,
