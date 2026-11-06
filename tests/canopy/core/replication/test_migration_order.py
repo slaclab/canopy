@@ -98,7 +98,12 @@ def _script() -> ScriptDirectory:
 
 
 def revisions() -> list[str]:
-    """Every revision of the shipped migration tree, oldest first."""
+    """Every revision of the shipped migration tree, oldest first.
+
+    In Alembic's own order, each revision after all its ancestors. The walks upgrade to
+    each one by name, never by ``+1``, so a branch is climbed one side after the other
+    (``alembic_version`` holds both heads in between) and joined at its merge revision.
+    """
     return [revision.revision for revision in reversed(list(_script().walk_revisions()))]
 
 
