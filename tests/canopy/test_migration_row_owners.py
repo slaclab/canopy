@@ -18,7 +18,7 @@ _TEST_DATABASE_URL = (
 )
 _DSN = _TEST_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
 
-_BEFORE = "d4f8a1c6b209"
+_BEFORE = "18ac64c44669"
 _ROW_OWNERS = "89e21441c63c"
 _OWNED = ["core.facility", "squirrel.pv", "squirrel.snapshot", "squirrel.tag_group", "magpie.config"]
 
