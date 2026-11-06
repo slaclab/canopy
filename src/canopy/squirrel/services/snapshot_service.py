@@ -7,7 +7,7 @@ import math
 import base64
 import logging
 import binascii
-from uuid import UUID
+from uuid import UUID, uuid4
 from typing import Any, Literal
 from datetime import UTC, datetime
 from dataclasses import asdict, dataclass
@@ -16,11 +16,17 @@ from collections.abc import Callable
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from canopy.core.config import get_settings
 from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
-from canopy.core.ownership import require_owned, local_instance
+from canopy.core.ownership import require_owned, local_instance, require_create_owner
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.time_parse import to_utc
-from canopy.squirrel.errors import SnapshotNotFound
+from canopy.squirrel.errors import (
+    ImportWouldSkip,
+    NothingToImport,
+    SnapshotNotFound,
+    SnapshotIdConflict,
+)
 from canopy.contracts.pagination import PagedResult
 from canopy.squirrel.data.models import Snapshot
 from canopy.squirrel.restore_hooks import (
@@ -30,16 +36,21 @@ from canopy.squirrel.restore_hooks import (
 )
 from canopy.squirrel.pv_cache.reader import PVCacheReader
 from canopy.squirrel.schemas.snapshot import (
+    BUNDLE_FORMAT,
     PVValueDTO,
     TagInfoDTO,
     SnapshotDTO,
     EpicsValueDTO,
+    BundleValueDTO,
     MetaPVValueDTO,
     NewSnapshotDTO,
+    SkippedValueDTO,
     RestoreResultDTO,
     RestoreRequestDTO,
+    SnapshotBundleDTO,
     SnapshotSummaryDTO,
     ComparisonResultDTO,
+    SnapshotImportResultDTO,
 )
 from canopy.squirrel.adapters.epics_io import EpicsIO
 from canopy.squirrel.data.repositories import (
@@ -53,6 +64,21 @@ from canopy.squirrel.services.bulk_insert import bulk_insert_snapshot_values
 logger = logging.getLogger(__name__)
 
 PRIMARY_PHASE = "Setpoints"
+
+# Title prefix of a snapshot created by ``import_bundle``.
+IMPORTED_TITLE_PREFIX = "Restored from history: "
+# How many skipped PVs a strict import's refusal names; it gives the total too.
+_SKIPPED_NAMED = 20
+
+
+def _describe_skipped(skipped: list[SkippedValueDTO]) -> str:
+    """A strict import's refusal: how many values would be skipped, and the first PVs."""
+    named = ", ".join(f"{value.pv_name} ({value.pv_id})" for value in skipped[:_SKIPPED_NAMED])
+    more = f" and {len(skipped) - _SKIPPED_NAMED} more" if len(skipped) > _SKIPPED_NAMED else ""
+    return (
+        f"{len(skipped)} value(s) would be skipped, since their PVs can't be imported here: {named}{more}. "
+        "Nothing was saved"
+    )
 
 
 @dataclass
@@ -317,6 +343,37 @@ class SnapshotService:
         if facility_id not in self.facility_scope:
             raise SnapshotNotFound("Snapshot not found")
 
+    def _require_facility_for_create(self, facility_id: str | None, slug: str | None) -> None:
+        """Gate the facility of a *new* snapshot, as the capture route does.
+
+        A restricted key must name a facility it holds: minting an unassigned snapshot
+        would create data it couldn't reach again. Unlike ``_require_facility_write``,
+        an out-of-scope facility is a 403 naming it, since the caller named it.
+        """
+        if self.facility_scope is None:
+            return
+        if facility_id is None:
+            raise InsufficientFacilityAccess("API key is scoped to specific facilities; 'facility' is required")
+        if facility_id not in self.facility_scope:
+            raise InsufficientFacilityAccess(f"API key is not scoped to facility: {slug}")
+
+    async def _summary(self, snapshot: Snapshot, *, pv_count: int) -> SnapshotSummaryDTO:
+        """``snapshot`` as a summary holding ``pv_count`` values."""
+        meta_pvs = [pv.pv_id for pv in await self.meta_pv_repo.get(active=True)]
+        return SnapshotSummaryDTO(
+            id=snapshot.id,
+            owner_instance=snapshot.owner_instance,
+            title=snapshot.title,
+            description=snapshot.description,
+            created_date=snapshot.created_at,
+            created_by=snapshot.created_by,
+            pv_count=pv_count,
+            facility=await self._facility_slug(snapshot.facility_id),
+            retain=snapshot.retain,
+            imported_from=snapshot.imported_from,
+            meta_pvs=await self._get_meta_pv_values_for_snapshot(snapshot.id, meta_pvs),
+        )
+
     async def _facility_slug(self, facility_id: str | None) -> str | None:
         """A stored facility id as the slug reported on the wire."""
         if facility_id is None:
@@ -330,6 +387,15 @@ class SnapshotService:
         cannot reach the snapshot's facility. An unassigned row is in scope only for an
         unrestricted key, matching ``list_snapshots``'s filter."""
         return self.facility_scope is None or (facility_id is not None and facility_id in self.facility_scope)
+
+    def _pv_in_scope(self, pv_facility_ids: set[str]) -> bool:
+        """Whether the key may restore, or import, a value of a PV assigned to ``pv_facility_ids``.
+
+        An unrestricted key may use any PV. A restricted key needs one shared facility; an
+        unassigned PV has none to share, and facility-filtered reads hide it from such a
+        key too.
+        """
+        return self.facility_scope is None or bool(pv_facility_ids & self.facility_scope)
 
     async def list_snapshots(
         self,
@@ -414,6 +480,8 @@ class SnapshotService:
                     created_by=snap.created_by,
                     pv_count=counts.get(snap.id, 0),
                     facility=slug_by_id.get(snap.facility_id),
+                    retain=snap.retain,
+                    imported_from=snap.imported_from,
                     meta_pvs=await self._get_meta_pv_values_for_snapshot(snap.id, meta_pvs),
                 )
             )
@@ -485,6 +553,8 @@ class SnapshotService:
             created_by=snapshot.created_by,
             pv_count=total_count,
             facility=await self._facility_slug(snapshot.facility_id),
+            retain=snapshot.retain,
+            imported_from=snapshot.imported_from,
             pv_values=pv_values,
             meta_pvs=await self._get_meta_pv_values_for_snapshot(snapshot.id, meta_pvs),
         )
@@ -494,8 +564,9 @@ class SnapshotService:
         snapshot_id: str,
         title: str | None = None,
         description: str | None = None,
+        retain: bool | None = None,
     ) -> SnapshotSummaryDTO | None:
-        """Update a snapshot's title and/or description."""
+        """Update a snapshot's title, description and/or ``retain`` flag; ``None`` keeps a field."""
         # Read before writing: the facility gate needs the row's `facility_id`, and a
         # refused write must not have already landed.
         existing = await self.snapshot_repo.get_by_id(snapshot_id)
@@ -503,23 +574,13 @@ class SnapshotService:
             return None
         require_owned(existing.owner_instance, f"Snapshot {snapshot_id}")
         await self._require_facility_write(existing.facility_id, "this snapshot")
-        snapshot = await self.snapshot_repo.update_metadata(snapshot_id, title=title, description=description)
+        snapshot = await self.snapshot_repo.update_metadata(
+            snapshot_id, title=title, description=description, retain=retain
+        )
         if not snapshot:
             return None
 
-        pv_count = await self.snapshot_repo.get_value_count(snapshot.id)
-        meta_pvs = [pv.pv_id for pv in await self.meta_pv_repo.get(active=True)]
-        return SnapshotSummaryDTO(
-            id=snapshot.id,
-            owner_instance=snapshot.owner_instance,
-            title=snapshot.title,
-            description=snapshot.description,
-            created_date=snapshot.created_at,
-            created_by=snapshot.created_by,
-            pv_count=pv_count,
-            facility=await self._facility_slug(snapshot.facility_id),
-            meta_pvs=await self._get_meta_pv_values_for_snapshot(snapshot.id, meta_pvs),
-        )
+        return await self._summary(snapshot, pv_count=await self.snapshot_repo.get_value_count(snapshot.id))
 
     async def create_snapshot(
         self,
@@ -695,6 +756,8 @@ class SnapshotService:
             created_by=snapshot.created_by,
             pv_count=count,
             facility=await self._facility_slug(snapshot.facility_id),
+            retain=snapshot.retain,
+            imported_from=snapshot.imported_from,
             meta_pvs=await self._get_meta_pv_values_for_snapshot(snapshot.id, meta_pvs),
         )
 
@@ -724,11 +787,288 @@ class SnapshotService:
         allowed, skipped = [], []
         for pv_id in candidate_ids:
             assigned = by_pv.get(pv_id, set())
-            # Same rule as `_require_facility_write`: a restricted key needs one shared
-            # facility; an unassigned PV has none to share, so it is skipped rather than
-            # let through — a restore is a real EPICS setpoint write, not a filtered read.
-            (allowed if assigned & self.facility_scope else skipped).append(pv_id)
+            # An unassigned PV is skipped rather than let through: a restore is a real EPICS
+            # setpoint write, not a filtered read.
+            (allowed if self._pv_in_scope(assigned) else skipped).append(pv_id)
         return allowed, skipped
+
+    async def export_bundle(self, snapshot_id: str) -> SnapshotBundleDTO | None:
+        """A live snapshot with all its values, for another instance to import.
+
+        Each value carries its PV's addresses, read from the PV row even when the PV
+        has been deleted since the capture.
+
+        Parameters
+        ----------
+        snapshot_id : str
+            The snapshot to export.
+
+        Returns
+        -------
+        SnapshotBundleDTO | None
+            The bundle, or ``None`` when no live snapshot has ``snapshot_id`` or the key
+            can't reach its facility (the same rule as ``get_by_id``).
+        """
+        snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
+        if snapshot is None or not self._in_facility_scope(snapshot.facility_id):
+            return None
+        values = [
+            BundleValueDTO(
+                pv_id=row.pv_id,
+                pv_name=row.pv_name,
+                setpoint_address=row.setpoint_address,
+                readback_address=row.readback_address,
+                config_address=row.config_address,
+                setpoint_value=_parse_jsonb(row.setpoint_value),
+                readback_value=_parse_jsonb(row.readback_value),
+                status=row.status,
+                severity=row.severity,
+                timestamp=row.timestamp,
+            )
+            for row in await self.value_repo.get_export_rows(snapshot_id)
+        ]
+        return SnapshotBundleDTO(
+            format=BUNDLE_FORMAT,
+            version=1,
+            source_instance=get_settings().instance,
+            id=snapshot.id,
+            title=snapshot.title,
+            description=snapshot.description,
+            created_date=snapshot.created_at,
+            created_by=snapshot.created_by,
+            facility=await self._facility_slug(snapshot.facility_id),
+            values=values,
+        )
+
+    async def _importable_pv_ids(self, pv_ids: list[str], capture_scope: set[str] | None) -> set[str]:
+        """The PV ids of a bundle that an import may keep values for.
+
+        A PV must exist here and be this instance's (deleted PVs included: a mirror
+        replicates its arms' PV rows, ids and all, but a snapshot's PVs share its owner,
+        which is the importer), and the key must be able to restore it (``_pv_in_scope``).
+        The new snapshot's export shows each value's PV addresses, so a value of a PV the
+        key can't see would reveal it. For a bundle with a facility, the PV must also be
+        assigned to that facility or one below it (``capture_scope``), as a capture into
+        that facility would take it. Every rule is a condition in the loop below.
+        """
+        known = await self.pv_repo.get_existing_ids(pv_ids, include_deleted=True, owner=local_instance())
+        needs_facilities = self.facility_scope is not None or capture_scope is not None
+        assigned = await self.pv_repo.facility_ids_for_many(sorted(known)) if needs_facilities else {}
+        importable = set()
+        for pv_id in known:
+            facility_ids = assigned.get(pv_id, set())
+            if not self._pv_in_scope(facility_ids):
+                continue
+            if capture_scope is not None and not facility_ids & capture_scope:
+                continue
+            importable.add(pv_id)
+        return importable
+
+    async def import_bundle(
+        self,
+        bundle: SnapshotBundleDTO,
+        *,
+        captured: bool = False,
+        created_by: str | None = None,
+        strict: bool = False,
+    ) -> SnapshotImportResultDTO:
+        """Save a snapshot from a bundle exported or captured by another instance.
+
+        Two modes:
+
+        * **History** (the default): bring an old snapshot back, typically from a history
+          mirror, so it can be restored here. The snapshot gets a new id and today's
+          creation time, so pruning treats it as recent; its title is marked "Restored
+          from history" and ``imported_from`` records the bundle's id.
+        * **Captured**: save a snapshot another instance captured for this one, keeping
+          the bundle's id, creation time, title and description, with ``created_by`` as
+          the author; ``imported_from`` stays empty. It is idempotent on the id: if a
+          snapshot with that id is already here (deleted or not), with the same facility
+          and creation time, nothing is written and the answer has ``created`` false.
+          That is checked first, so a resend is answered from what was saved even if
+          the PVs or the caller's grant have changed since. ``strict`` refuses a bundle
+          that would leave any value out.
+
+        In both modes the snapshot belongs to this instance, and values are matched to
+        PVs here by ``pv_id``, deleted PVs included: a history mirror replicates its
+        arms' PV rows, ids and all. Each value keeps its capture ``timestamp``. Values
+        whose PV isn't here or is another instance's, that the key couldn't restore, or
+        that isn't assigned to the bundle's facility or one below it are skipped and
+        listed alike, so the answer doesn't reveal another facility's PV. A PV moved out
+        of that facility since the export is skipped too. Nothing is read from EPICS.
+        The snapshot takes the bundle's facility, which must be this instance's and
+        which the key must be able to write, as it would for a capture; a bundle without
+        one is saved unassigned.
+
+        Parameters
+        ----------
+        bundle : SnapshotBundleDTO
+            The exported or captured snapshot.
+        captured : bool
+            Save it under its own id and time rather than as a new copy.
+        created_by : str | None
+            The author recorded for a captured snapshot; required with ``captured``.
+        strict : bool
+            Refuse, saving nothing, when any value would be skipped.
+
+        Returns
+        -------
+        SnapshotImportResultDTO
+            The snapshot's summary, the values left out, and whether this call saved it.
+
+        Raises
+        ------
+        NothingToImport
+            When the bundle has values and none of their PVs can be imported here.
+        ImportWouldSkip
+            With ``strict``, when any value would be skipped.
+        SnapshotIdConflict
+            When a captured bundle's id is taken by a snapshot with another owner, facility or time.
+        FacilityNotFound
+            When the bundle names a facility this instance doesn't have.
+        NotOwner
+            When the bundle's facility is another instance's.
+        InsufficientFacilityAccess
+            When the key can't write the bundle's facility.
+        """
+        if captured:
+            if not created_by:
+                raise ValueError("a captured import records its author; pass created_by")
+            if (existing := await self.snapshot_repo.get_by_id(str(bundle.id), include_deleted=True)) is not None:
+                return await self._already_saved(existing, bundle)
+
+        facility_id = None
+        if bundle.facility is not None:
+            facility = await facilities_gateway.get_by_slug(bundle.facility)
+            if facility is None:
+                raise FacilityNotFound(f"Facility '{bundle.facility}' not found")
+            require_create_owner(facility.owner_instance, None, f"Facility '{bundle.facility}'")
+            facility_id = facility.id
+        self._require_facility_for_create(facility_id, bundle.facility)
+
+        capture_scope = await facilities_gateway.descendant_ids(facility_id) if facility_id is not None else None
+        known = await self._importable_pv_ids(sorted({str(value.pv_id) for value in bundle.values}), capture_scope)
+        rows: list[dict] = []
+        skipped: list[SkippedValueDTO] = []
+        for value in bundle.values:
+            pv_id = str(value.pv_id)
+            if pv_id not in known:
+                skipped.append(SkippedValueDTO(pv_id=pv_id, pv_name=value.pv_name))
+                continue
+            rows.append(
+                {
+                    "pv_id": pv_id,
+                    "pv_name": value.pv_name,
+                    "setpoint_value": value.setpoint_value,
+                    "readback_value": value.readback_value,
+                    "status": value.status,
+                    "severity": value.severity,
+                    # JSON may carry a naive time; COPY needs an aware one for timestamptz.
+                    "timestamp": to_utc(value.timestamp) if value.timestamp else None,
+                }
+            )
+        if bundle.values and not rows:
+            raise NothingToImport("None of the bundle's PVs can be imported on this instance; nothing to import")
+        if strict and skipped:
+            raise ImportWouldSkip(_describe_skipped(skipped))
+
+        if captured:
+            snapshot_id = str(bundle.id)
+            fields = {
+                "title": bundle.title,
+                "description": bundle.description,
+                "created_by": created_by,
+                "created_at": to_utc(bundle.created_date),
+            }
+        else:
+            snapshot_id = str(uuid4())
+            fields = {
+                "title": f"{IMPORTED_TITLE_PREFIX}{bundle.title}"[:255],
+                "description": bundle.description,
+                "created_by": bundle.created_by,
+                "imported_from": str(bundle.id),
+            }
+        count = await self._save_snapshot(snapshot_id, facility_id=facility_id, rows=rows, **fields)
+        if count is None:
+            # Another delivery of the same captured snapshot saved it first.
+            existing = await self.snapshot_repo.get_by_id(snapshot_id, include_deleted=True)
+            return await self._already_saved(existing, bundle)
+        logger.info(
+            "Imported snapshot %s%s (%d values, %d skipped)",
+            bundle.id,
+            "" if captured else f" as {snapshot_id}",
+            count,
+            len(skipped),
+        )
+        snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
+        return SnapshotImportResultDTO(snapshot=await self._summary(snapshot, pv_count=count), skipped=skipped)
+
+    async def _save_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        title: str,
+        description: str | None,
+        created_by: str | None,
+        facility_id: str | None,
+        rows: list[dict],
+        created_at: datetime | None = None,
+        imported_from: str | None = None,
+    ) -> int | None:
+        """Insert this instance's snapshot with a given id, and its values, unless that id is taken.
+
+        ``created_at`` defaults to now. Returns the number of values written, or ``None``
+        when a snapshot with ``snapshot_id`` already exists, in which case nothing is
+        written. Two calls for one id can't both write: the second waits on the first's
+        primary key, then finds it taken.
+        """
+        fields = {
+            "id": snapshot_id,
+            # Set here rather than by the column default, which this statement would fire
+            # too: whatever saves a snapshot here saves it as this instance's.
+            "owner_instance": local_instance(),
+            "title": title,
+            "description": description,
+            "created_by": created_by,
+            "facility_id": facility_id,
+            "imported_from": imported_from,
+        }
+        if created_at is not None:
+            fields["created_at"] = created_at
+        if not await self.snapshot_repo.insert_unless_taken(fields):
+            return None
+        for row in rows:
+            row["snapshot_id"] = snapshot_id
+        return await bulk_insert_snapshot_values(self.session, rows)
+
+    async def _already_saved(self, existing: Snapshot, bundle: SnapshotBundleDTO) -> SnapshotImportResultDTO:
+        """The answer to a captured import whose id is already here: what was saved, unchanged.
+
+        Raises
+        ------
+        SnapshotIdConflict
+            When the saved snapshot is another instance's, or has another facility or
+            creation time than the bundle.
+        """
+        if existing.owner_instance != local_instance():
+            raise SnapshotIdConflict(f"Snapshot {existing.id} is already here, owned by '{existing.owner_instance}'")
+        facility = await self._facility_slug(existing.facility_id)
+        if facility != bundle.facility or existing.created_at != to_utc(bundle.created_date):
+            raise SnapshotIdConflict(
+                f"Snapshot {existing.id} is already saved here with facility {facility or 'none'} and creation time "
+                f"{existing.created_at.isoformat()}, not this bundle's {bundle.facility or 'none'} and "
+                f"{to_utc(bundle.created_date).isoformat()}"
+            )
+        saved = await self.snapshot_repo.get_value_pv_ids(existing.id)
+        skipped = [
+            SkippedValueDTO(pv_id=str(value.pv_id), pv_name=value.pv_name)
+            for value in bundle.values
+            if str(value.pv_id) not in saved
+        ]
+        logger.info("Snapshot %s is already saved; nothing imported", existing.id)
+        return SnapshotImportResultDTO(
+            snapshot=await self._summary(existing, pv_count=len(saved)), skipped=skipped, created=False
+        )
 
     async def restore_snapshot(
         self,

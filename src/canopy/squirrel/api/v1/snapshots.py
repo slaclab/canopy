@@ -2,8 +2,8 @@
 
 Create and restore are long-running EPICS I/O, so they enqueue an Arq job and return a
 ``JobCreatedDTO`` for the client to poll at ``/jobs/v1/{id}`` — the worker holds the EPICS
-connector. Everything else (list / get / update / delete / compare) runs inline against the
-request session.
+connector. Everything else (list / get / update / delete / compare, and export / import of a
+snapshot bundle) runs inline against the request session.
 """
 
 from typing import Annotated
@@ -25,9 +25,11 @@ from canopy.squirrel.schemas.snapshot import (
     SnapshotDTO,
     NewSnapshotDTO,
     RestoreRequestDTO,
+    SnapshotBundleDTO,
     UpdateSnapshotDTO,
     SnapshotSummaryDTO,
     ComparisonResultDTO,
+    SnapshotImportResultDTO,
 )
 
 router = APIRouter(prefix="/snapshots", tags=["Snapshots"])
@@ -170,6 +172,21 @@ async def create_snapshot(
     return JobCreatedDTO(job_id=job_id, status_url=f"/jobs/v1/{job_id}")
 
 
+@router.post("/import", dependencies=[Security(require_write_access)])
+async def import_snapshot(bundle: SnapshotBundleDTO, service: SnapshotServiceDep) -> SnapshotImportResultDTO:
+    """Create a new snapshot from a bundle exported by ``GET /snapshots/{id}/export``.
+
+    Meant for bringing a snapshot back from a history mirror so it can be restored here.
+    The new snapshot has a new id, today's creation time, a "Restored from history" title
+    and ``importedFrom`` set to the bundle's id. A value is kept only when its PV exists
+    here, the key could restore it, and, for a bundle with a facility, the PV is assigned
+    to that facility or one below it, as for a capture. A PV moved out of the facility
+    since the export is therefore left out. Values left out are listed in ``skipped``;
+    nothing is read from or written to EPICS.
+    """
+    return await service.import_bundle(bundle)
+
+
 @router.get("/{snapshot_id}", dependencies=[Security(require_read_access)])
 async def get_snapshot(
     snapshot_id: str,
@@ -185,15 +202,29 @@ async def get_snapshot(
     return snapshot
 
 
+@router.get("/{snapshot_id}/export", dependencies=[Security(require_read_access)])
+async def export_snapshot(snapshot_id: str, service: SnapshotServiceDep) -> SnapshotBundleDTO:
+    """Export a snapshot with all its values, for ``POST /snapshots/import`` on another instance."""
+    snapshot_id = require_uuid(snapshot_id, SnapshotNotFound, f"Snapshot {snapshot_id} not found")
+    bundle = await service.export_bundle(snapshot_id)
+    if bundle is None:
+        raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
+    return bundle
+
+
+# PUT is kept for existing clients; both apply only the fields sent.
+@router.patch("/{snapshot_id}", dependencies=[Security(require_write_access)])
 @router.put("/{snapshot_id}", dependencies=[Security(require_write_access)])
 async def update_snapshot(
     snapshot_id: str,
     data: UpdateSnapshotDTO,
     service: SnapshotServiceDep,
 ) -> SnapshotSummaryDTO:
-    """Update a snapshot's title and/or description."""
+    """Update a snapshot's title, description and/or ``retain`` flag (kept by pruning)."""
     snapshot_id = require_uuid(snapshot_id, SnapshotNotFound, f"Snapshot {snapshot_id} not found")
-    snapshot = await service.update_snapshot_metadata(snapshot_id, title=data.title, description=data.description)
+    snapshot = await service.update_snapshot_metadata(
+        snapshot_id, title=data.title, description=data.description, retain=data.retain
+    )
     if not snapshot:
         raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
     return snapshot
