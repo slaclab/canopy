@@ -1,89 +1,143 @@
-"""A forward instance sending writes to its primary (mocked with ``httpx_mock``).
+"""A history head sending writes to their owners (arm1 mocked with ``httpx_mock``).
 
-The primary is ``https://primary.example.org`` (``forward_role``); keys here are
-fakes bound to this instance's registry, and the service key is ``service-token``.
+The owner lookup is stubbed here (``owner``), so these need no database;
+``test_owners.py`` covers the lookup itself and ``test_head.py`` the two together.
+Keys are fakes bound to the head's registry.
 """
 
 import json
-from uuid import uuid4
 from urllib.parse import unquote
 
 import httpx
 import pytest
-import pytest_asyncio
-from httpx import AsyncClient, ASGITransport
-from sqlalchemy import text
 from pytest_httpx import HTTPXMock
 from fastapi.testclient import TestClient
 
-from canopy.core import db, security
 from canopy.main import app
 from canopy.core.config import get_settings
 from canopy.core.modules import WILDCARD
 from canopy.core.security import APIKey
-from canopy.core.forwarding import middleware
-from canopy.core.forwarding.routes import FACILITY, FORWARDABLE
+from canopy.core.forwarding import owners, middleware
 
-from ..test_read_only_instance import FakeRegistry, _concrete
+from .conftest import ARM1, ARM1_SERVICE_KEY
 
-PRIMARY = "https://primary.example.org"
-WRITER = APIKey(token="writer", read=True, write=True, modules=frozenset({WILDCARD}), name="console")
+WRITER = APIKey(
+    token="writer", read=True, write=True, modules=frozenset({WILDCARD}), facilities=frozenset({"a"}), name="console"
+)
 READER = APIKey(token="reader", read=True, write=False, modules=frozenset({WILDCARD}), name="viewer")
 MAGPIE_ONLY = APIKey(token="magpie", read=True, write=True, modules=frozenset({"magpie"}), name="configs")
 OPERATOR = APIKey(token="operator", read=True, write=True, modules=frozenset({WILDCARD}), name="opérateur")
+ADMIN = APIKey(token="admin", read=True, write=True, admin=True, modules=frozenset({WILDCARD}), name="ops")
+HIERARCHY = APIKey(
+    token="hierarchy",
+    read=True,
+    write=True,
+    admin=True,
+    modules=frozenset({WILDCARD}),
+    facilities=frozenset({WILDCARD}),
+    name="ops-all",
+)
 SNAPSHOT_ID = "6f1c2c1e-0d4b-4c43-9a55-2f0d7a3c9b10"
 
 
 @pytest.fixture
-def client(forward_role):
-    previous = security._registry
-    security.bind_key_registry(FakeRegistry(WRITER, READER, MAGPIE_ONLY, OPERATOR))
-    yield TestClient(app, raise_server_exceptions=False)
-    security._registry = previous
+def owner(monkeypatch):
+    """Stub the owner lookup: ``owner("arm1")``; records each call's route and arguments."""
+    calls = []
+
+    def _set(name: str | None):
+        async def owner_of(route, params, body, *, requested, local):
+            calls.append({"route": route.path, "params": params, "body": body, "requested": requested})
+            return name
+
+        monkeypatch.setattr(owners, "owner_of", owner_of)
+        return calls
+
+    return _set
+
+
+@pytest.fixture
+def client(head, bind_keys):
+    bind_keys(WRITER, READER, MAGPIE_ONLY, OPERATOR, ADMIN, HIERARCHY)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+@pytest.fixture
+def jobs(monkeypatch):
+    remembered = {}
+
+    async def remember(job_id: str, arm: str) -> None:
+        remembered[job_id] = arm
+
+    for layer in _middleware_stack():
+        monkeypatch.setattr(layer, "remember_job", remember)
+    return remembered
+
+
+def _middleware_stack():
+    stack = app.middleware_stack or app.build_middleware_stack()
+    app.middleware_stack = stack
+    found, layer = [], stack
+    while layer is not None:
+        if isinstance(layer, middleware.ForwardingMiddleware):
+            found.append(layer)
+        layer = getattr(layer, "app", None)
+    return found
 
 
 def _as(key: APIKey, **extra: str) -> dict[str, str]:
     return {"X-API-Key": key.token, **extra}
 
 
-FACILITY_ROUTES = [route for route in FORWARDABLE if route.route_class is FACILITY]
+def test_an_arms_write_goes_there_as_the_heads_service_key(client, owner, httpx_mock: HTTPXMock):
+    owner("arm1")
+    httpx_mock.add_response(method="DELETE", url=f"{ARM1}/squirrel/v1/snapshots/{SNAPSHOT_ID}", json=True)
 
-
-@pytest.mark.parametrize("route", FACILITY_ROUTES, ids=lambda r: f"{r.method} {r.path}")
-def test_facility_writes_go_to_the_primary_as_the_service_key(client, httpx_mock: HTTPXMock, route):
-    path = _concrete(route.path)
-    httpx_mock.add_response(method=route.method, url=PRIMARY + path, json={"ok": True})
-
-    resp = client.request(route.method, path, headers=_as(WRITER))
+    resp = client.delete(f"/squirrel/v1/snapshots/{SNAPSHOT_ID}", headers=_as(WRITER))
 
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"ok": True}
     sent = httpx_mock.get_request()
-    assert sent.headers["X-API-Key"] == "service-token"
-    assert sent.headers["X-Canopy-On-Behalf-Of"] == "console@site_a"
-    assert json.loads(sent.headers["X-Canopy-On-Behalf-Of-Facilities"]) == []
+    assert sent.headers["X-API-Key"] == ARM1_SERVICE_KEY
+    assert sent.headers["X-Canopy-On-Behalf-Of"] == "console@head"
+    assert json.loads(sent.headers["X-Canopy-On-Behalf-Of-Facilities"]) == ["a"]
 
 
-def test_only_the_body_query_and_content_headers_go_on(client, httpx_mock: HTTPXMock):
+def test_the_lookup_gets_the_path_parameters_body_and_owner_param(client, owner, httpx_mock: HTTPXMock):
+    calls = owner("arm1")
+    httpx_mock.add_response(method="POST", url=f"{ARM1}/squirrel/v1/pvs?owner=arm1", json={"id": "p1"})
+
+    resp = client.post("/squirrel/v1/pvs?owner=arm1", json={"setpointAddress": "SIM:1"}, headers=_as(WRITER))
+
+    assert resp.status_code == 200, resp.text
+    assert calls == [
+        {"route": "/squirrel/v1/pvs", "params": {}, "body": {"setpointAddress": "SIM:1"}, "requested": "arm1"}
+    ]
+    assert json.loads(httpx_mock.get_request().content) == {"setpointAddress": "SIM:1"}
+
+
+def test_the_owner_param_is_read_only_where_the_route_takes_it(client, owner, httpx_mock: HTTPXMock):
+    calls = owner("arm1")
+    httpx_mock.add_response(method="PUT", json={})
+
+    client.put("/squirrel/v1/pvs/p1?owner=arm2", json={}, headers=_as(WRITER))
+
+    assert calls[0]["requested"] is None
+
+
+def test_only_the_body_query_and_content_headers_go_on(client, owner, httpx_mock: HTTPXMock):
+    owner("arm1")
     httpx_mock.add_response(
         method="PUT",
-        url=f"{PRIMARY}/squirrel/v1/pvs/pv-1?dryRun=true",
+        url=f"{ARM1}/squirrel/v1/pvs/pv-1?dryRun=true",
         status_code=201,
         json={"id": "pv-1"},
-        headers={"Set-Cookie": "primary=1", "X-Canopy-Something": "kept"},
+        headers={"Set-Cookie": "arm=1", "X-Canopy-Something": "kept"},
     )
 
     resp = client.put(
         "/squirrel/v1/pvs/pv-1?dryRun=true",
         json={"description": "new"},
-        headers=_as(
-            WRITER,
-            **{
-                "X-Canopy-On-Behalf-Of": "someone-else",
-                "X-Canopy-On-Behalf-Of-Facilities": '["*"]',
-                "Cookie": "sso=secret",
-            },
-        ),
+        headers=_as(WRITER, Cookie="sso=secret"),
     )
 
     assert resp.status_code == 201
@@ -93,124 +147,185 @@ def test_only_the_body_query_and_content_headers_go_on(client, httpx_mock: HTTPX
     sent = httpx_mock.get_request()
     assert json.loads(sent.content) == {"description": "new"}
     assert sent.headers["content-type"] == "application/json"
-    assert sent.headers["X-Canopy-On-Behalf-Of"] == "console@site_a"
-    # The caller's own grant (none), not the one it claimed.
-    assert json.loads(sent.headers["X-Canopy-On-Behalf-Of-Facilities"]) == []
     assert "cookie" not in sent.headers
-    assert sent.headers["X-API-Key"] == "service-token"
 
 
-def test_a_non_ascii_name_travels_percent_encoded(client, httpx_mock: HTTPXMock):
-    httpx_mock.add_response(method="POST", url=f"{PRIMARY}/squirrel/v1/pvs", json={})
+def test_a_non_ascii_name_travels_percent_encoded(client, owner, httpx_mock: HTTPXMock):
+    owner("arm1")
+    httpx_mock.add_response(method="POST", url=f"{ARM1}/squirrel/v1/tags", json={})
 
-    resp = client.post("/squirrel/v1/pvs", json={}, headers=_as(OPERATOR))
+    resp = client.post("/squirrel/v1/tags", json={"name": "Area"}, headers=_as(OPERATOR))
 
     assert resp.status_code == 200, resp.text
     sent = httpx_mock.get_request().headers["X-Canopy-On-Behalf-Of"]
-    assert sent == "op%C3%A9rateur@site_a"
-    assert unquote(sent) == "opérateur@site_a"
+    assert sent == "op%C3%A9rateur@head"
+    assert unquote(sent) == "opérateur@head"
 
 
-def test_the_primarys_errors_come_back_as_they_are(client, httpx_mock: HTTPXMock):
-    httpx_mock.add_response(
-        method="DELETE", url=f"{PRIMARY}/squirrel/v1/pvs/nope", status_code=404, json={"code": "pv_not_found"}
-    )
+def test_the_arms_errors_come_back_as_they_are(client, owner, httpx_mock: HTTPXMock):
+    owner("arm1")
+    httpx_mock.add_response(method="DELETE", status_code=403, json={"code": "insufficient_facility_access"})
 
-    resp = client.delete("/squirrel/v1/pvs/nope", headers=_as(WRITER))
+    resp = client.delete("/squirrel/v1/pvs/p1", headers=_as(WRITER))
 
-    assert resp.status_code == 404
-    assert resp.json() == {"code": "pv_not_found"}
-
-
-def test_the_root_path_is_not_sent_to_the_primary(forward_role, httpx_mock: HTTPXMock):
-    previous = security._registry
-    security.bind_key_registry(FakeRegistry(WRITER))
-    try:
-        httpx_mock.add_response(method="POST", url=f"{PRIMARY}/squirrel/v1/pvs", json={})
-        client = TestClient(app, root_path="/canopy", raise_server_exceptions=False)
-
-        # As uvicorn --root-path sends it: the prefix is part of the path.
-        assert client.post("/canopy/squirrel/v1/pvs", json={}, headers=_as(WRITER)).status_code == 200
-    finally:
-        security._registry = previous
+    assert resp.status_code == 403
+    assert resp.json() == {"code": "insufficient_facility_access"}
 
 
-class TestRefusedHere:
-    """Answered by this instance without a request to the primary (``httpx_mock`` fails on any)."""
+def test_a_magpie_key_forwards_magpie_writes(client, owner, httpx_mock: HTTPXMock):
+    owner("arm1")
+    httpx_mock.add_response(method="DELETE", url=f"{ARM1}/magpie/v1/configs/trace/abc", json=True)
 
-    def test_no_key(self, client):
-        assert client.post("/squirrel/v1/pvs", json={}).json()["code"] == "invalid_api_key"
-        assert client.post("/squirrel/v1/pvs", json={}, headers={"X-API-Key": "nope"}).status_code == 401
+    assert client.delete("/magpie/v1/configs/trace/abc", headers=_as(MAGPIE_ONLY)).status_code == 200
 
-    def test_read_key(self, client):
-        resp = client.post("/squirrel/v1/pvs", json={}, headers=_as(READER))
+
+def test_a_facility_route_needs_the_hierarchy_gate(client, owner, httpx_mock: HTTPXMock):
+    owner("arm1")
+    httpx_mock.add_response(method="PUT", url=f"{ARM1}/v1/facilities/site-a", json={})
+
+    # Admin, but not over every facility: the app here refuses it, nothing goes to the arm.
+    refused = client.put("/v1/facilities/site-a", json={"name": "A"}, headers=_as(ADMIN))
+    sent = client.put("/v1/facilities/site-a", json={"name": "A"}, headers=_as(HIERARCHY))
+
+    assert refused.status_code == 403
+    assert refused.json()["code"] == "insufficient_facility_access"
+    assert sent.status_code == 200
+    assert len(httpx_mock.get_requests()) == 1
+
+
+def test_the_root_path_is_not_sent_to_the_arm(head, bind_keys, owner, httpx_mock: HTTPXMock):
+    bind_keys(WRITER)
+    owner("arm1")
+    httpx_mock.add_response(method="DELETE", url=f"{ARM1}/squirrel/v1/pvs/p1", json=True)
+    client = TestClient(app, root_path="/canopy", raise_server_exceptions=False)
+
+    # As uvicorn --root-path sends it: the prefix is part of the path.
+    assert client.delete("/canopy/squirrel/v1/pvs/p1", headers=_as(WRITER)).status_code == 200
+
+
+class TestLeftToTheAppHere:
+    """Never sent to an arm (``httpx_mock`` fails the test on any request)."""
+
+    def test_no_key_or_a_bad_one(self, client, owner):
+        owner("arm1")
+
+        assert client.delete("/squirrel/v1/pvs/p1").json()["code"] == "invalid_api_key"
+        assert client.delete("/squirrel/v1/pvs/p1", headers={"X-API-Key": "nope"}).status_code == 401
+
+    def test_a_read_key(self, client, owner):
+        owner("arm1")
+        resp = client.delete("/squirrel/v1/pvs/p1", headers=_as(READER))
 
         assert resp.status_code == 403
         assert resp.json()["code"] == "insufficient_write_access"
 
-    def test_key_for_another_module(self, client):
-        resp = client.post("/squirrel/v1/pvs", json={}, headers=_as(MAGPIE_ONLY))
+    def test_a_key_for_another_module(self, client, owner):
+        owner("arm1")
+        resp = client.delete("/squirrel/v1/pvs/p1", headers=_as(MAGPIE_ONLY))
 
         assert resp.status_code == 403
         assert resp.json()["code"] == "insufficient_module_access"
 
-    def test_shared_tables_without_the_policy(self, client):
-        resp = client.post("/squirrel/v1/tags", json={"name": "Area"}, headers=_as(WRITER))
+    def test_a_caller_naming_someone_else(self, client, owner):
+        owner("arm1")
+        resp = client.delete(
+            "/squirrel/v1/pvs/p1",
+            headers=_as(WRITER, **{"X-Canopy-On-Behalf-Of": "x", "X-Canopy-On-Behalf-Of-Facilities": "[]"}),
+        )
 
         assert resp.status_code == 403
-        assert resp.json() == {"code": "read_only_instance", "detail": security.NOT_FORWARDED_DETAIL}
+        assert resp.json()["code"] == "forwarded_write_refused"
 
-    def test_restore_without_machine_access(self, client):
-        resp = client.post(f"/squirrel/v1/snapshots/{SNAPSHOT_ID}/restore", headers=_as(WRITER))
+    @pytest.fixture
+    def app_here(self, monkeypatch):
+        """Replace the app behind the middleware; returns what it received."""
+        seen = []
 
-        assert resp.json()["code"] == "machine_read_only"
+        async def app_here(scope, receive, send):
+            seen.append(await receive())
+            await send({"type": "http.response.start", "status": 299, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        monkeypatch.setattr(_middleware_stack()[0], "app", app_here)
+        return seen
+
+    @pytest.mark.parametrize("name", ["head", "arm2", "nosuch", None])
+    def test_an_owner_that_isnt_a_forwardable_arm(self, client, owner, app_here, name):
+        owner(name)
+
+        resp = client.post("/squirrel/v1/pvs", json={"setpointAddress": "SIM:1"}, headers=_as(WRITER))
+
+        assert resp.status_code == 299
+        # The body read to find the owner is handed on to the app whole.
+        assert json.loads(app_here[0]["body"]) == {"setpointAddress": "SIM:1"}
+
+    def test_a_captured_import(self, client, owner, app_here):
+        calls = owner("arm1")
+
+        resp = client.post("/squirrel/v1/snapshots/import?mode=captured", json={"x": 1}, headers=_as(WRITER))
+
+        assert calls == []
+        assert resp.status_code == 299
+        assert json.loads(app_here[0]["body"]) == {"x": 1}
+
+    def test_nothing_on_a_head_without_a_forwardable_arm(self, client, owner, monkeypatch):
+        calls = owner("arm1")
+        monkeypatch.delenv("CANOPY_ARMS__ARM1__FORWARD_URL")
+        monkeypatch.delenv("CANOPY_ARMS__ARM1__SERVICE_KEY")
+        monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "host=arm1.example.org")
+
+        client.delete("/squirrel/v1/pvs/p1", headers=_as(WRITER))
+
+        assert calls == []
+
+    def test_nothing_on_a_primary(self, bind_keys, owner):
+        bind_keys(WRITER)
+        calls = owner("arm1")
+
+        TestClient(app, raise_server_exceptions=False).delete("/squirrel/v1/pvs/p1", headers=_as(WRITER))
+
+        assert calls == []
 
 
-def test_shared_tables_with_the_policy(client, httpx_mock: HTTPXMock, monkeypatch):
-    monkeypatch.setenv("CANOPY_FORWARD__ALLOW_SHARED", "true")
-    httpx_mock.add_response(method="POST", url=f"{PRIMARY}/magpie/v1/configs/trace", json={"slug": "abc"})
-
-    resp = client.post("/magpie/v1/configs/trace", json={"data": {}}, headers=_as(MAGPIE_ONLY))
-
-    assert resp.status_code == 200
-    assert httpx_mock.get_request().headers["X-Canopy-On-Behalf-Of"] == "configs@site_a"
-
-
-class TestPrimaryTrouble:
-    def test_unreachable_means_nothing_was_sent(self, client, httpx_mock: HTTPXMock):
+class TestArmTrouble:
+    def test_unreachable_means_nothing_was_sent(self, client, owner, httpx_mock: HTTPXMock):
+        owner("arm1")
         httpx_mock.add_exception(httpx.ConnectError("connection refused"))
 
-        resp = client.post("/squirrel/v1/pvs", json={}, headers=_as(WRITER))
+        resp = client.delete("/squirrel/v1/pvs/p1", headers=_as(WRITER))
 
         assert resp.status_code == 502
         assert resp.json()["code"] == "primary_unavailable"
-        assert "nothing was sent" in resp.json()["detail"]
+        assert "Arm 'arm1' could not be reached; nothing was sent" in resp.json()["detail"]
 
-    def test_no_answer_may_have_been_applied(self, client, httpx_mock: HTTPXMock):
+    def test_no_answer_may_have_been_applied(self, client, owner, httpx_mock: HTTPXMock):
+        owner("arm1")
         httpx_mock.add_exception(httpx.ReadTimeout("timed out"))
 
-        resp = client.post("/squirrel/v1/pvs", json={}, headers=_as(WRITER))
+        resp = client.delete("/squirrel/v1/pvs/p1", headers=_as(WRITER))
 
         assert resp.status_code == 504
         assert resp.json()["code"] == "primary_unavailable"
         assert "may or may not have been applied" in resp.json()["detail"]
 
-    def test_missing_configuration(self, client, monkeypatch):
-        monkeypatch.delenv("CANOPY_FORWARD__SERVICE_KEY")
+    def test_a_capture_is_refused_too(self, client, owner, httpx_mock: HTTPXMock):
+        # Only #86's head-side capture queues; a forwarded capture request doesn't.
+        owner("arm1")
+        httpx_mock.add_exception(httpx.ConnectError("connection refused"))
 
-        resp = client.post("/squirrel/v1/pvs", json={}, headers=_as(WRITER))
+        resp = client.post("/squirrel/v1/snapshots", json={"title": "t", "facility": "a"}, headers=_as(WRITER))
 
         assert resp.status_code == 502
-        assert "CANOPY_FORWARD__SERVICE_KEY" in resp.json()["detail"]
 
-    def test_plain_http_needs_the_override(self, client, httpx_mock: HTTPXMock, monkeypatch):
-        monkeypatch.setenv("CANOPY_FORWARD__PRIMARY_URL", "http://primary.example.org/")
+    def test_plain_http_needs_the_override(self, client, owner, httpx_mock: HTTPXMock, monkeypatch):
+        owner("arm1")
+        monkeypatch.setenv("CANOPY_ARMS__ARM1__FORWARD_URL", "http://arm1.example.org/")
 
-        assert "https" in client.post("/squirrel/v1/pvs", json={}, headers=_as(WRITER)).json()["detail"]
+        assert "https" in client.delete("/squirrel/v1/pvs/p1", headers=_as(WRITER)).json()["detail"]
 
         monkeypatch.setenv("CANOPY_FORWARD__ALLOW_INSECURE_HTTP", "true")
-        httpx_mock.add_response(method="POST", url="http://primary.example.org/squirrel/v1/pvs", json={})
-        assert client.post("/squirrel/v1/pvs", json={}, headers=_as(WRITER)).status_code == 200
+        httpx_mock.add_response(method="DELETE", url="http://arm1.example.org/squirrel/v1/pvs/p1", json=True)
+        assert client.delete("/squirrel/v1/pvs/p1", headers=_as(WRITER)).status_code == 200
 
 
 class TestReadYourWrites:
@@ -219,8 +334,8 @@ class TestReadYourWrites:
         calls = []
 
         def fake_wait(applied: bool):
-            async def wait_until_applied(commit_lsn: str, timeout_s: float) -> bool:
-                calls.append((commit_lsn, timeout_s))
+            async def wait_until_applied(commit_lsn: str, timeout_s: float, *, subscription: str) -> bool:
+                calls.append((commit_lsn, timeout_s, subscription))
                 return applied
 
             monkeypatch.setattr(middleware, "wait_until_applied", wait_until_applied)
@@ -228,145 +343,91 @@ class TestReadYourWrites:
 
         return fake_wait
 
-    def test_applied_in_time(self, client, httpx_mock: HTTPXMock, waited):
+    def test_applied_in_time_on_the_arms_subscription(self, client, owner, httpx_mock: HTTPXMock, waited):
+        owner("arm1")
         calls = waited(True)
         httpx_mock.add_response(json={}, headers={"X-Canopy-Commit-LSN": "0/16B3748"})
 
-        resp = client.post("/squirrel/v1/pvs", json={}, headers=_as(WRITER))
+        resp = client.delete("/squirrel/v1/pvs/p1", headers=_as(WRITER))
 
-        assert calls == [("0/16B3748", 2.0)]
+        assert calls == [("0/16B3748", 2.0, "canopy_history_arm1")]
         assert resp.headers["x-canopy-commit-lsn"] == "0/16B3748"
         assert "x-canopy-replica-stale" not in resp.headers
 
-    def test_not_applied_in_time(self, client, httpx_mock: HTTPXMock, waited):
+    def test_not_applied_in_time(self, client, owner, httpx_mock: HTTPXMock, waited):
+        owner("arm1")
         waited(False)
         httpx_mock.add_response(json={}, headers={"X-Canopy-Commit-LSN": "0/16B3748"})
 
-        resp = client.post("/squirrel/v1/pvs", json={}, headers=_as(WRITER))
+        resp = client.delete("/squirrel/v1/pvs/p1", headers=_as(WRITER))
 
         assert resp.status_code == 200
         assert resp.headers["x-canopy-replica-stale"] == "true"
 
-    def test_a_browser_on_another_origin_can_read_both_headers(self, client, httpx_mock: HTTPXMock, waited):
+    def test_a_browser_on_another_origin_can_read_both_headers(self, client, owner, httpx_mock: HTTPXMock, waited):
+        owner("arm1")
         waited(False)
         httpx_mock.add_response(json={}, headers={"X-Canopy-Commit-LSN": "0/16B3748"})
 
-        resp = client.post("/squirrel/v1/pvs", json={}, headers=_as(WRITER, Origin="https://ui.example.org"))
+        resp = client.delete("/squirrel/v1/pvs/p1", headers=_as(WRITER, Origin="https://ui.example.org"))
 
         exposed = {name.strip().lower() for name in resp.headers["access-control-expose-headers"].split(",")}
         assert {"x-canopy-commit-lsn", "x-canopy-replica-stale"} <= exposed
         assert resp.headers["x-canopy-replica-stale"] == "true"
 
-    def test_no_commit_no_wait(self, client, httpx_mock: HTTPXMock, waited):
+    def test_no_commit_no_wait(self, client, owner, httpx_mock: HTTPXMock, waited, jobs):
+        owner("arm1")
         calls = waited(False)
         httpx_mock.add_response(json={"jobId": "j1", "statusUrl": "/jobs/v1/j1"})
 
-        resp = client.post("/squirrel/v1/snapshots", json={"title": "t"}, headers=_as(WRITER))
+        resp = client.post("/squirrel/v1/snapshots", json={"title": "t", "facility": "a"}, headers=_as(WRITER))
 
         assert calls == []
         assert "x-canopy-replica-stale" not in resp.headers
 
 
 class TestArchivedImmutable:
-    """The age check reads this instance's copy of ``squirrel.snapshot`` (Postgres, ``database``)."""
-
     @pytest.fixture
-    def windowed(self, monkeypatch):
-        monkeypatch.setenv("CANOPY_FORWARD__PRIMARY_WINDOW_DAYS", "30")
+    def live_here(self, monkeypatch):
+        def _set(live: bool):
+            async def snapshot_is_live(snapshot_id: str) -> bool:
+                return live
 
-    @pytest_asyncio.fixture
-    async def http(self, database, forward_role):
-        previous = security._registry
-        security.bind_key_registry(FakeRegistry(WRITER))
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            yield client
-        security._registry = previous
+            monkeypatch.setattr(owners, "snapshot_is_live", snapshot_is_live)
 
-    @staticmethod
-    async def _snapshot(age_days: int, *, retain: bool = False, deleted: bool = False) -> str:
-        snapshot_id = str(uuid4())
-        async with db.get_session_maker()() as session:
-            await session.execute(
-                text(
-                    "INSERT INTO squirrel.snapshot (id, title, created_at, retain, deleted_at) "
-                    "VALUES (CAST(:id AS uuid), 'S', now() - make_interval(days => :age), :retain, "
-                    "CASE WHEN :deleted THEN now() END)"
-                ),
-                {"id": snapshot_id, "age": age_days, "retain": retain, "deleted": deleted},
-            )
-            await session.commit()
-        return snapshot_id
+        return _set
 
-    async def test_older_than_the_window_is_refused_here(self, http, windowed):
-        snapshot_id = await self._snapshot(31)
+    @pytest.mark.parametrize("method", ["PUT", "PATCH", "DELETE"])
+    def test_an_arm_404_for_a_snapshot_still_here_is_history(self, client, owner, live_here, httpx_mock, method):
+        owner("arm1")
+        live_here(True)
+        httpx_mock.add_response(status_code=404, json={"code": "snapshot_not_found", "detail": "gone"})
 
-        resp = await http.put(f"/squirrel/v1/snapshots/{snapshot_id}", json={"title": "x"}, headers=_as(WRITER))
+        resp = client.request(method, f"/squirrel/v1/snapshots/{SNAPSHOT_ID}", json={}, headers=_as(WRITER))
 
         assert resp.status_code == 409
         assert resp.json()["code"] == "archived_immutable"
+        assert "no longer on arm 'arm1'" in resp.json()["detail"]
 
-    @pytest.mark.parametrize("method", ["PATCH", "DELETE"])
-    async def test_every_snapshot_change_is_checked(self, http, windowed, method):
-        snapshot_id = await self._snapshot(400)
+    def test_a_snapshot_deleted_here_too_stays_a_404(self, client, owner, live_here, httpx_mock):
+        owner("arm1")
+        live_here(False)
+        httpx_mock.add_response(status_code=404, json={"code": "snapshot_not_found"})
 
-        resp = await http.request(
-            method, f"/squirrel/v1/snapshots/{snapshot_id}", json={"retain": True}, headers=_as(WRITER)
-        )
-
-        assert resp.json()["code"] == "archived_immutable"
-
-    async def test_an_old_restore_is_refused_here_too(self, http, windowed, monkeypatch):
-        monkeypatch.setenv("CANOPY_MACHINE_ACCESS", "write")
-        get_settings.cache_clear()
-        snapshot_id = await self._snapshot(400)
-
-        resp = await http.post(f"/squirrel/v1/snapshots/{snapshot_id}/restore", headers=_as(WRITER))
-
-        assert resp.json()["code"] == "archived_immutable"
-
-    async def test_inside_the_window_is_forwarded(self, http, httpx_mock: HTTPXMock, windowed):
-        snapshot_id = await self._snapshot(29)
-        httpx_mock.add_response(method="DELETE", url=f"{PRIMARY}/squirrel/v1/snapshots/{snapshot_id}", json=True)
-
-        assert (await http.delete(f"/squirrel/v1/snapshots/{snapshot_id}", headers=_as(WRITER))).status_code == 200
-
-    async def test_a_retained_snapshot_is_still_on_the_primary(self, http, httpx_mock: HTTPXMock, windowed):
-        snapshot_id = await self._snapshot(400, retain=True)
-        httpx_mock.add_response(method="PATCH", url=f"{PRIMARY}/squirrel/v1/snapshots/{snapshot_id}", json={})
-
-        resp = await http.patch(f"/squirrel/v1/snapshots/{snapshot_id}", json={"title": "x"}, headers=_as(WRITER))
-
-        assert resp.status_code == 200
-
-    @pytest.mark.parametrize("state", ["deleted", "missing", "not-a-uuid"])
-    async def test_left_for_the_primary_to_answer(self, http, httpx_mock: HTTPXMock, windowed, state):
-        snapshot_id = {
-            "deleted": await self._snapshot(400, deleted=True),
-            "missing": str(uuid4()),
-            "not-a-uuid": "latest",
-        }[state]
-        httpx_mock.add_response(method="DELETE", status_code=404, json={"code": "snapshot_not_found"})
-
-        resp = await http.delete(f"/squirrel/v1/snapshots/{snapshot_id}", headers=_as(WRITER))
+        resp = client.delete(f"/squirrel/v1/snapshots/{SNAPSHOT_ID}", headers=_as(WRITER))
 
         assert resp.json() == {"code": "snapshot_not_found"}
 
-    async def test_no_window_no_check(self, http, httpx_mock: HTTPXMock):
-        snapshot_id = await self._snapshot(400)
-        httpx_mock.add_response(method="DELETE", json=True)
+    def test_only_a_snapshots_404(self, client, owner, live_here, httpx_mock):
+        owner("arm1")
+        live_here(True)
+        httpx_mock.add_response(status_code=404, json={"code": "pv_not_found"})
 
-        assert (await http.delete(f"/squirrel/v1/snapshots/{snapshot_id}", headers=_as(WRITER))).status_code == 200
-
-    async def test_an_import_is_never_checked(self, http, httpx_mock: HTTPXMock, windowed):
-        httpx_mock.add_response(method="POST", url=f"{PRIMARY}/squirrel/v1/snapshots/import", json={})
-
-        resp = await http.post("/squirrel/v1/snapshots/import", json={"id": str(uuid4())}, headers=_as(WRITER))
-
-        assert resp.status_code == 200
+        assert client.delete("/squirrel/v1/pvs/p1", headers=_as(WRITER)).json() == {"code": "pv_not_found"}
 
 
-class TestJobStatus:
-    """A forwarded snapshot capture's job runs on the primary; polling it here asks the primary."""
+class TestJobs:
+    """A job a forwarded write started runs on its arm; polling it here asks that arm."""
 
     @pytest.fixture
     def no_local_job(self, monkeypatch):
@@ -375,41 +436,61 @@ class TestJobStatus:
 
         monkeypatch.setattr("canopy.jobs.gateway.get_status", get_status)
 
-    def test_a_job_this_instance_lacks_is_asked_of_the_primary(self, client, httpx_mock: HTTPXMock, no_local_job):
+    @pytest.fixture
+    def job_on(self, monkeypatch):
+        def _set(arm: str | None):
+            async def get_forwarded_job_arm(job_id):
+                return arm
+
+            monkeypatch.setattr("canopy.jobs.gateway.get_forwarded_job_arm", get_forwarded_job_arm)
+
+        return _set
+
+    def test_a_forwarded_job_is_remembered(self, client, owner, httpx_mock: HTTPXMock, jobs):
+        owner("arm1")
+        httpx_mock.add_response(json={"jobId": "r1", "statusUrl": "/jobs/v1/r1"})
+
+        resp = client.post(f"/squirrel/v1/snapshots/{SNAPSHOT_ID}/restore", json={}, headers=_as(WRITER))
+
+        assert resp.json()["jobId"] == "r1"
+        assert jobs == {"r1": "arm1"}
+
+    def test_an_answer_without_a_job_isnt(self, client, owner, httpx_mock: HTTPXMock, jobs):
+        owner("arm1")
+        httpx_mock.add_response(status_code=409, json={"jobId": "x", "code": "conflict"})
+
+        client.post(f"/squirrel/v1/snapshots/{SNAPSHOT_ID}/restore", json={}, headers=_as(WRITER))
+
+        assert jobs == {}
+
+    def test_polling_asks_the_arm(self, client, httpx_mock: HTTPXMock, no_local_job, job_on):
+        job_on("arm1")
         httpx_mock.add_response(
-            method="GET", url=f"{PRIMARY}/jobs/v1/j1", json={"id": "j1", "status": "running", "progress": 40}
+            method="GET", url=f"{ARM1}/jobs/v1/j1", json={"id": "j1", "status": "running", "progress": 40}
         )
-
-        resp = client.get("/jobs/v1/j1", headers=_as(READER))
-
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["status"] == "running"
-        sent = httpx_mock.get_request()
-        assert sent.headers["X-API-Key"] == "service-token"
-        assert sent.headers["X-Canopy-On-Behalf-Of"] == "viewer@site_a"
-
-    def test_a_non_ascii_caller_can_poll(self, client, httpx_mock: HTTPXMock, no_local_job):
-        httpx_mock.add_response(method="GET", url=f"{PRIMARY}/jobs/v1/j1", json={"id": "j1", "status": "running"})
 
         resp = client.get("/jobs/v1/j1", headers=_as(OPERATOR))
 
         assert resp.status_code == 200, resp.text
-        assert httpx_mock.get_request().headers["X-Canopy-On-Behalf-Of"] == "op%C3%A9rateur@site_a"
+        assert resp.json()["status"] == "running"
+        sent = httpx_mock.get_request()
+        assert sent.headers["X-API-Key"] == ARM1_SERVICE_KEY
+        assert sent.headers["X-Canopy-On-Behalf-Of"] == "op%C3%A9rateur@head"
 
-    def test_unknown_on_the_primary_too(self, client, httpx_mock: HTTPXMock, no_local_job):
-        httpx_mock.add_response(method="GET", url=f"{PRIMARY}/jobs/v1/j2", status_code=404, json={})
+    def test_unknown_on_the_arm_too(self, client, httpx_mock: HTTPXMock, no_local_job, job_on):
+        job_on("arm1")
+        httpx_mock.add_response(method="GET", url=f"{ARM1}/jobs/v1/j2", status_code=404, json={})
 
-        resp = client.get("/jobs/v1/j2", headers=_as(READER))
+        assert client.get("/jobs/v1/j2", headers=_as(READER)).json()["code"] == "job_not_found"
 
-        assert resp.status_code == 404
-        assert resp.json()["code"] == "job_not_found"
+    @pytest.mark.parametrize("arm", [None, "arm2"])
+    def test_a_job_not_forwarded_here_is_a_404(self, client, no_local_job, job_on, arm):
+        job_on(arm)
 
-    def test_a_mirror_never_asks(self, mirror_role, no_local_job):
-        previous = security._registry
-        security.bind_key_registry(FakeRegistry(READER))
-        try:
-            resp = TestClient(app).get("/jobs/v1/j3", headers=_as(READER))
-        finally:
-            security._registry = previous
+        assert client.get("/jobs/v1/j3", headers=_as(READER)).status_code == 404
 
-        assert resp.status_code == 404
+    def test_a_primary_never_asks(self, bind_keys, no_local_job, job_on):
+        bind_keys(READER)
+        job_on("arm1")
+
+        assert TestClient(app).get("/jobs/v1/j3", headers=_as(READER)).status_code == 404

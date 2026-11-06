@@ -1,22 +1,23 @@
-"""The checks a primary passes before deleting old rows that only its history mirror will keep.
+"""The checks an arm passes before deleting old rows that only its history head will keep.
 
-A primary that prunes old snapshots relies on its history mirror holding them. The
-prune job calls ``check_prune_gate`` before each snapshot it deletes; one failed
-check stops the run, and the job reports every check that failed, by name:
+An arm (a primary) that prunes old snapshots relies on its history head holding them.
+The head's subscription to it, and its slot here, are ``canopy_history_<arm>``, named
+after this arm's ``CANOPY_INSTANCE``. The prune job calls ``check_prune_gate`` before
+each snapshot it deletes; one failed check stops the run, and the job reports every
+check that failed, by name:
 
-``instance_set``, ``window_set``
-    ``CANOPY_INSTANCE`` names the mirror's slot; ``CANOPY_WINDOW_DAYS`` says how much
-    the primary keeps.
+``window_set``
+    ``CANOPY_WINDOW_DAYS`` says how much the arm keeps.
 ``no_delete_publication``
     No publication carrying a pruned table publishes deletes (or truncates). This is
-    what keeps a prune delete off the mirror: decoded under any publication set, it
-    is either filtered out or, if the mirror still asks for a dropped publication,
+    what keeps a prune delete off the head: decoded under any publication set, it
+    is either filtered out or, if the head still asks for a dropped publication,
     stops replication before it is applied.
 ``slot_active``
-    The mirror's slot exists and a walsender holds it.
+    The head's slot exists and a walsender holds it.
 ``streams_split``
     That walsender streams both split publications, and between them they carry
-    every pruned table whole, with no row filter or column list: the mirror has
+    every pruned table whole, with no row filter or column list: the head has
     switched to the split layout and still receives new rows and reference changes.
 ``no_initial_copy``
     No table's initial copy is running here (no ``pg_<oid>_sync_...`` slot). A copy
@@ -25,13 +26,13 @@ check stops the run, and the job reports every check that failed, by name:
 ``wal_status_reserved``
     The slot's WAL is within ``max_wal_size``, not at risk of being removed.
 ``lag``
-    The mirror's flush lag and the age of its last reply are within ``max_lag_s``.
+    The head's flush lag and the age of its last reply are within ``max_lag_s``.
 ``heartbeat_fresh``, ``heartbeat_ok``
-    The mirror reported its checks within ``heartbeat_max_age_h`` (by this
+    The head reported its checks for this arm within ``heartbeat_max_age_h`` (by this
     database's clock), after its current walsender started, and its backup, WAL
     archive and drift check all passed. A heartbeat from before a rebuilt or
     reconnected subscription doesn't count, and ``heartbeat`` reports the drift
-    check failed while any of the mirror's tables is still copying.
+    check failed while any of the subscription's tables is still copying.
 
 Slot facts come from ``publisher_status``, so the gate and ``status`` read the same
 numbers. Seeing what a walsender streams, and when it started, needs a superuser or
@@ -46,11 +47,10 @@ from collections.abc import Mapping, Sequence
 
 import asyncpg
 
-from canopy.core.replication.sql import Refused
+from canopy.core.arms import subscription_name
 from canopy.core.replication.config import PruneConfig, ReplicationConfig
 from canopy.core.replication.registry import REGISTRY, ReplicationRegistry
 from canopy.core.replication.publisher import publisher_status
-from canopy.core.replication.subscriber import subscription_name
 
 
 @dataclass(frozen=True)
@@ -85,17 +85,17 @@ def evaluate_gate(
     Parameters
     ----------
     slot_name : str
-        The mirror's slot (its subscription's name).
+        The head's slot (its subscription's name).
     tables : Sequence[str]
         The ``schema.table`` names the caller will delete from.
     split_publications : Sequence[str]
-        The split layout's publication names, all of which the mirror must stream.
+        The split layout's publication names, all of which the head must stream.
     status : Mapping
         ``publisher_status`` output.
     delete_publications : Mapping[str, list[str]]
         For each pruned table, the publications that carry it and publish deletes or truncates.
     heartbeat : Mapping | None
-        The mirror's ``core.history_heartbeat`` row (``written_at`` included) plus ``age_h``,
+        The head's ``core.history_heartbeat`` row for this arm (``written_at`` included) plus ``age_h``,
         or ``None`` when it never reported.
     config : PruneConfig
         Lag and heartbeat limits.
@@ -114,9 +114,9 @@ def evaluate_gate(
 
     slot = next((s for s in status["slots"] if s["slot_name"] == slot_name), None)
     if slot is None:
-        failures["slot_active"] = f"no slot {slot_name}; is the mirror subscribed?"
+        failures["slot_active"] = f"no slot {slot_name}; is the head subscribed to this arm?"
     elif not slot["active"]:
-        failures["slot_active"] = f"slot {slot_name} has no walsender; the mirror isn't streaming"
+        failures["slot_active"] = f"slot {slot_name} has no walsender; the head isn't streaming"
     else:
         streamed = slot["walsender_publications"]
         # A table published with a row filter or column list reaches history only in
@@ -131,14 +131,14 @@ def evaluate_gate(
         if streamed is None:
             failures["streams_split"] = "can't see what the walsender streams; needs a superuser or pg_read_all_stats"
         elif absent := sorted(set(split_publications) - set(streamed)):
-            failures["streams_split"] = f"the mirror streams {', '.join(streamed)}, without {', '.join(absent)}"
+            failures["streams_split"] = f"the head streams {', '.join(streamed)}, without {', '.join(absent)}"
         elif missing := sorted(set(tables) - carried):
-            failures["streams_split"] = f"the mirror streams {', '.join(streamed)}, which carry no {', '.join(missing)}"
+            failures["streams_split"] = f"the head streams {', '.join(streamed)}, which carry no {', '.join(missing)}"
         flush_lag, reply_age = slot["walsender_flush_lag_s"], slot["walsender_reply_age_s"]
         if reply_age is None:
-            failures["lag"] = "the mirror hasn't replied to its walsender yet"
+            failures["lag"] = "the head hasn't replied to its walsender yet"
         elif reply_age > config.max_lag_s:
-            failures["lag"] = f"the mirror last replied {reply_age:.0f} s ago (limit {config.max_lag_s:g} s)"
+            failures["lag"] = f"the head last replied {reply_age:.0f} s ago (limit {config.max_lag_s:g} s)"
         elif flush_lag is not None and flush_lag > config.max_lag_s:
             failures["lag"] = f"flush lag is {flush_lag:.0f} s (limit {config.max_lag_s:g} s)"
     if copying := sorted(s["slot_name"] for s in status["slots"] if s["kind"] == "tablesync"):
@@ -160,32 +160,32 @@ def evaluate_gate(
                 "needs a superuser or pg_read_all_stats"
             )
         elif started is not None and heartbeat["written_at"] < datetime.fromisoformat(started):
-            # A rebuilt or reconnected subscription streams anew: what the mirror checked
+            # A rebuilt or reconnected subscription streams anew: what the head checked
             # before doesn't vouch for it, until it reports again.
             failures["heartbeat_fresh"] = f"the last heartbeat is from before the walsender started at {started}"
         if failed := [check for check in ("backup_ok", "wal_archive_ok", "drift_ok") if not heartbeat[check]]:
-            failures["heartbeat_ok"] = f"the mirror reported failed checks: {', '.join(failed)}"
+            failures["heartbeat_ok"] = f"the head reported failed checks: {', '.join(failed)}"
     return GateResult(failures)
 
 
 async def check_prune_gate(
     conn: asyncpg.Connection,
     *,
-    instance: str | None,
+    instance: str,
     window_days: int | None,
     tables: Sequence[str],
     config: PruneConfig,
     replication: ReplicationConfig,
     registry: ReplicationRegistry = REGISTRY,
 ) -> GateResult:
-    """Read the primary's replication state and judge the gate for deleting from ``tables``.
+    """Read the arm's replication state and judge the gate for deleting from ``tables``.
 
     Parameters
     ----------
     conn : asyncpg.Connection
-        Connection to the primary; a superuser, or a role with ``pg_read_all_stats``.
-    instance : str | None
-        ``CANOPY_INSTANCE``, which names the mirror's subscription and slot.
+        Connection to the arm; a superuser, or a role with ``pg_read_all_stats``.
+    instance : str
+        This arm's ``CANOPY_INSTANCE``, which names the head's subscription and slot.
     window_days : int | None
         ``CANOPY_WINDOW_DAYS``.
     tables : Sequence[str]
@@ -200,17 +200,11 @@ async def check_prune_gate(
     Returns
     -------
     GateResult
-        The checks that failed; ``instance_set`` or ``window_set`` alone when a setting is missing.
+        The checks that failed; ``window_set`` alone when the window is unset.
     """
-    preconditions: dict[str, str] = {}
     if not window_days or window_days <= 0:
-        preconditions["window_set"] = "set CANOPY_WINDOW_DAYS to the days of snapshots this primary keeps"
-    try:
-        slot_name = subscription_name(instance)
-    except Refused as exc:
-        preconditions["instance_set"] = str(exc)
-    if preconditions:
-        return GateResult(preconditions)
+        return GateResult({"window_set": "set CANOPY_WINDOW_DAYS to the days of snapshots this arm keeps"})
+    slot_name = subscription_name(instance)
 
     status = await publisher_status(conn, config=replication, registry=registry)
     rows = await conn.fetch(

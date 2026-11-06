@@ -5,7 +5,8 @@ from functools import lru_cache
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-logger = logging.getLogger(__name__)
+INSTANCE_NAME_PATTERN = r"^[a-z0-9_]{1,48}$"
+"""An instance name: ``CANOPY_INSTANCE``, an arm's name and every owner stamp."""
 
 
 class Settings(BaseSettings):
@@ -32,32 +33,27 @@ class Settings(BaseSettings):
         Connections the pool may open beyond ``database_pool_size``.
     redis_url : str
         Redis DSN backing the Arq job queue and per-job progress.
-    role : {"primary", "mirror", "forward"}
-        ``"mirror"`` makes this instance a read-only copy of a primary's data: write
-        and admin routes refuse with ``read_only_instance`` (API-key management
-        excepted) and the worker registers only stateless tasks. ``"forward"`` is a
-        mirror that passes an allowlisted set of writes to its primary
-        (``canopy.core.forwarding``) and refuses the rest the same way.
-    instance : str | None
-        Name of the deployment this process belongs to (e.g. ``"site-a"``), reported
-        by ``GET /v1/instance``.
+    role : {"primary", "mirror"}
+        Which side of history replication this instance's database is on. A
+        ``"primary"`` holds only rows it owns, publishes them and may prune. A
+        ``"mirror"`` (the head) subscribes to its arms and holds their rows beside
+        its own. Either way an instance writes only rows it owns
+        (``canopy.core.ownership``).
+    instance : str
+        This instance's name: lowercase letters, digits and underscores, at most 48
+        (``canopy_history_<name>`` must fit a Postgres identifier). Required, and
+        permanent once the instance holds data. Reported by ``GET /v1/instance``.
     history_url : str | None
         Base URL of the read-only history instance holding this instance's full
         history, reported by ``GET /v1/instance`` so clients can link to it.
     window_days : int | None
         Days of history this instance keeps, at least 1; ``None`` means it keeps
         everything. A blank value, as Helm and compose render an unset one, is ``None``
-        here and for ``instance`` and ``history_url``.
+        here and for ``history_url``.
     accept_forwarded_writes : bool
-        On a primary, trust ``X-Canopy-On-Behalf-Of`` from service keys, so a forward
-        instance's writes are recorded under the user it sent them for. Off by
-        default: the header is then refused from every key.
-    machine_access : {"read", "write"}
-        On a forward instance, ``"write"`` lets it change the machine: a Hare PV
-        write runs here, through this instance's own EPICS gateway, and a snapshot
-        restore is forwarded to the primary. With ``"read"`` (the default) both are
-        refused with ``machine_read_only``. Ignored on other roles: a primary always
-        controls the machine and a mirror never does.
+        On a primary (an arm), trust ``X-Canopy-On-Behalf-Of`` from service keys, so
+        writes a history head forwards are recorded under the user it sent them for.
+        Off by default: the header is then refused from every key.
     """
 
     model_config = SettingsConfigDict(
@@ -93,17 +89,15 @@ class Settings(BaseSettings):
     # Redis — Arq job queue + per-job progress; used by canopy-worker and the jobs module.
     redis_url: str = "redis://localhost:6379/0"
 
-    # Instance role. A "mirror" serves a read-only copy of a primary's database
-    # (fed by Postgres logical replication), so nothing here may write the
-    # replicated tables; a "forward" instance is a mirror that sends selected
-    # writes on to its primary over HTTPS. Reported, with the fields below, by
-    # GET /v1/instance.
-    role: Literal["primary", "mirror", "forward"] = "primary"
-    instance: str | None = None
+    # Instance identity. ``instance`` is stamped on every row this instance
+    # creates (``owner_instance``), so it can't change once the instance holds
+    # data. Reported, with the fields below, by GET /v1/instance.
+    role: Literal["primary", "mirror"] = "primary"
+    instance: str = Field(pattern=INSTANCE_NAME_PATTERN)
     history_url: str | None = None
     window_days: int | None = Field(None, ge=1)
 
-    @field_validator("instance", "history_url", "window_days", mode="before")
+    @field_validator("history_url", "window_days", mode="before")
     @classmethod
     def _blank_is_unset(cls, value: object) -> object:
         """Read a blank value as unset rather than as ``""`` or an unparseable int."""
@@ -111,26 +105,10 @@ class Settings(BaseSettings):
             return None
         return value
 
-    # Primary only: accept writes a forward instance sends on a user's behalf.
+    # Primary (arm) only: accept writes a history head forwards on a user's behalf.
     accept_forwarded_writes: bool = False
     # Forward only: whether machine writes (Hare PUT here, restore on the primary) are allowed.
     machine_access: Literal["read", "write"] = "read"
-
-    @property
-    def is_replica(self) -> bool:
-        """Whether this instance's database is a subscriber's copy (``mirror`` or ``forward``)."""
-        return self.role != "primary"
-
-    @property
-    def machine_writes(self) -> bool:
-        """Whether this instance may change the machine, by itself or through its primary."""
-        return self.role == "primary" or (self.role == "forward" and self.machine_access == "write")
-
-    @model_validator(mode="after")
-    def _warn_on_inert_machine_access(self) -> "Settings":
-        if self.machine_access == "write" and self.role != "forward":
-            logger.warning("CANOPY_MACHINE_ACCESS=write has no effect with CANOPY_ROLE=%s", self.role)
-        return self
 
 
 @lru_cache

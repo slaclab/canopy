@@ -13,8 +13,6 @@ from canopy.core.errors import (
     ErrorCode,
     BadRequest,
     InvalidAPIKey,
-    MachineReadOnly,
-    ReadOnlyInstance,
     KeyStoreUnavailable,
     ForwardedWriteRefused,
     InsufficientReadAccess,
@@ -310,7 +308,7 @@ def _parse_facilities(value: str | None) -> frozenset[str]:
 
 
 def forwarded_for() -> str | None:
-    """The caller a trusted forward instance named for this request, or ``None``.
+    """The caller a trusted history head named for this request, or ``None``.
 
     Set by ``get_api_key``, so only meaningful once the request's key has resolved.
     """
@@ -319,7 +317,7 @@ def forwarded_for() -> str | None:
 
 
 def forwarded_facilities() -> frozenset[str] | None:
-    """The facility grant of the caller a trusted forward instance named, or ``None``.
+    """The facility grant of the caller a trusted history head named, or ``None``.
 
     Set by ``get_api_key`` alongside ``forwarded_for``. Facility gates intersect it
     with the service key's own grant.
@@ -331,13 +329,24 @@ def forwarded_facilities() -> frozenset[str] | None:
 def request_actor(key: APIKeyDep) -> str:
     """Who this request's writes are recorded under (``created_by``).
 
-    The caller a trusted forward instance named in ``X-Canopy-On-Behalf-Of``,
+    The caller a trusted history head named in ``X-Canopy-On-Behalf-Of``,
     else the key's own name. Never a token.
     """
     return forwarded_for() or key.name
 
 
 ActorDep = Annotated[str, Depends(request_actor)]
+
+
+def report_commit_position() -> None:
+    """Answer this forwarded request with ``X-Canopy-Commit-LSN`` even if it writes nothing.
+
+    For a route whose head always waits for the answer to replicate back: a replay
+    that finds its write already committed still gives the head a position to wait
+    for (``core.db._commit_forwarded``). A no-op outside a forwarded request.
+    """
+    if (write := forwarded_write.get()) is not None:
+        write.report_position = True
 
 
 async def get_optional_api_key(token: Annotated[str | None, Security(api_key_header)]) -> APIKey | None:
@@ -366,74 +375,14 @@ def require_read_access(key: APIKeyDep) -> APIKey:
     return key
 
 
-READ_ONLY_DETAIL = "This Canopy instance is a read-only mirror; send writes and admin actions to the primary"
-NOT_FORWARDED_DETAIL = "This Canopy instance forwards only selected writes to its primary, and not this one"
-
-
-def is_read_only_instance() -> bool:
-    """A mirror or a forward instance: its database is a copy, written only by replication."""
-    return get_settings().is_replica
-
-
-def _read_only_detail() -> str:
-    return NOT_FORWARDED_DETAIL if get_settings().role == "forward" else READ_ONLY_DETAIL
-
-
 def require_write_access(key: APIKeyDep) -> APIKey:
-    """Gate for data-plane writes. Refused outright on a mirror, whatever the key.
-
-    The mirror check runs after the key resolves (so a bad token is still a 401)
-    but before the scope check, so a caller learns that no key would succeed here.
-    """
-    if is_read_only_instance():
-        raise ReadOnlyInstance(_read_only_detail())
     if not key.write:
         raise InsufficientWriteAccess("API key does not have write access")
     return key
 
 
-MACHINE_READ_ONLY_DETAIL = (
-    "This Canopy instance has no machine access (CANOPY_MACHINE_ACCESS=read); make machine changes on the primary"
-)
-
-
-def require_machine_write_access(key: APIKeyDep) -> APIKey:
-    """Gate for a write to the machine made by this process (a Hare PV write).
-
-    A primary checks write scope as ``require_write_access`` does, and a mirror
-    refuses as it does. A forward instance runs the write here, through its own
-    gateway, only with ``CANOPY_MACHINE_ACCESS=write``; otherwise
-    ``machine_read_only``. Never forwarded: the primary's own users write there.
-    """
-    settings = get_settings()
-    if settings.role == "forward" and not settings.machine_writes:
-        raise MachineReadOnly(MACHINE_READ_ONLY_DETAIL)
-    if settings.role == "mirror":
-        raise ReadOnlyInstance(READ_ONLY_DETAIL)
-    if not key.write:
-        raise InsufficientWriteAccess("API key does not have write access")
-    return key
-
-
-def require_external_write_access(key: APIKeyDep) -> APIKey:
-    """Gate for a write this process makes to a service outside Canopy (an e-log post).
-
-    It changes nothing replicated and nothing on the machine, so a forward instance
-    makes it itself, as a primary does; a mirror refuses it as it refuses every write.
-    """
-    if get_settings().role == "mirror":
-        raise ReadOnlyInstance(READ_ONLY_DETAIL)
-    if not key.write:
-        raise InsufficientWriteAccess("API key does not have write access")
-    return key
-
-
-def require_local_admin_access(key: APIKeyDep) -> APIKey:
-    """Admin gate for state that is local to each instance, so allowed on a mirror too.
-
-    Today that is key management only: ``core.api_key`` is never replicated, so a
-    mirror mints and revokes its own keys. Every other admin route goes through
-    ``require_admin_access``.
+def require_admin_access(key: APIKeyDep) -> APIKey:
+    """Gate for key management and other operational (not data-plane) actions.
 
     Orthogonal to ``read``/``write``, not a level above them — an admin key that
     cannot itself read a PV is the better credential for a provisioning tool.
@@ -441,21 +390,6 @@ def require_local_admin_access(key: APIKeyDep) -> APIKey:
     if not key.admin:
         raise InsufficientAdminAccess("API key does not have admin access")
     return key
-
-
-def require_admin_access(key: APIKeyDep) -> APIKey:
-    """Gate for operational (not data-plane) actions on replicated or machine state.
-
-    Refused on a mirror like ``require_write_access``; key management, which is
-    instance-local, uses ``require_local_admin_access`` instead.
-    """
-    if is_read_only_instance():
-        raise ReadOnlyInstance(_read_only_detail())
-    return require_local_admin_access(key)
-
-
-AdminKeyDep = Annotated[APIKey, Security(require_admin_access)]
-LocalAdminKeyDep = Annotated[APIKey, Security(require_local_admin_access)]
 
 
 def require_read_or_admin_access(key: APIKeyDep) -> APIKey:
@@ -469,6 +403,9 @@ def require_read_or_admin_access(key: APIKeyDep) -> APIKey:
     if not (key.read or key.admin):
         raise InsufficientReadAccess("API key does not have read or admin access")
     return key
+
+
+AdminKeyDep = Annotated[APIKey, Security(require_admin_access)]
 
 
 def require_wildcard_facility_access(key: AdminKeyDep) -> APIKey:
@@ -493,7 +430,7 @@ def require_wildcard_facility_access(key: AdminKeyDep) -> APIKey:
 ReadKeyDep = Annotated[APIKey, Security(require_read_access)]
 WriteKeyDep = Annotated[APIKey, Security(require_write_access)]
 
-# No WebSocket variant of the admin gates: nothing operational streams.
+# No WebSocket variant of require_admin_access: nothing about key management streams.
 
 # WebSocket variants raise WebSocketException because handshake errors must close the connection, not return JSON.
 
@@ -538,11 +475,6 @@ def ws_require_read_access(key: Annotated[APIKey, Security(ws_get_api_key)]) -> 
 
 
 def ws_require_write_access(key: Annotated[APIKey, Security(ws_get_api_key)]) -> APIKey:
-    if is_read_only_instance():
-        raise WebSocketException(
-            code=status.WS_1008_POLICY_VIOLATION,
-            reason=f"{ErrorCode.READ_ONLY_INSTANCE.value}: read-only mirror",
-        )
     if not key.write:
         raise WebSocketException(
             code=status.WS_1008_POLICY_VIOLATION,

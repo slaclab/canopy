@@ -7,16 +7,30 @@ snapshot bundle) runs inline against the request session.
 """
 
 import logging
-from typing import Annotated
+from typing import Literal, Annotated
 
 from fastapi import Query, Security, APIRouter
 
 from canopy.jobs import gateway as jobs_gateway
-from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
-from canopy.core.security import ActorDep, require_read_access, require_write_access
+from canopy.core.errors import (
+    BadRequest,
+    FacilityNotFound,
+    ForwardedWriteRefused,
+    InsufficientFacilityAccess,
+)
+from canopy.core.security import (
+    ActorDep,
+    WriteKeyDep,
+    forwarded_for,
+    require_read_access,
+    require_write_access,
+    report_commit_position,
+)
 from canopy.contracts.jobs import JobCreatedDTO
+from canopy.core.ownership import OwnerQuery, require_create_owner
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.time_parse import DateTimeBound
+from canopy.core.validation import require_uuid
 from canopy.squirrel.errors import SnapshotNotFound
 from canopy.contracts.pagination import PagedResult
 from canopy.squirrel.dependencies import FacilityScopeDep, SnapshotServiceDep
@@ -30,7 +44,6 @@ from canopy.squirrel.schemas.snapshot import (
     ComparisonResultDTO,
     SnapshotImportResultDTO,
 )
-from canopy.squirrel.api.v1._validation import is_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -136,20 +149,26 @@ async def create_snapshot(
             ),
         ),
     ] = False,
+    owner: OwnerQuery = None,
 ) -> JobCreatedDTO:
-    """Enqueue a snapshot of the facility's PVs (every PV if no facility is given). The
-    worker reads EPICS and persists it.
+    """Enqueue a snapshot of the facility's PVs (every PV this instance owns if no
+    facility is given). The worker reads EPICS and persists it. The snapshot is owned by
+    its facility's owner, else by this instance; ``owner`` accepts only this instance's name.
 
-    ``createdBy`` records the key's name, or the user a forward instance sent the
+    ``createdBy`` records the key's name, or the user a history head forwarded the
     request for.
     """
     # The facility gate has to run *here*, not in the service: nothing of the caller's
     # identity crosses the Arq boundary, and a refused write must not become a queued job.
+    # The owner check too, so a snapshot this instance wouldn't own is refused at once.
     facility_id = None
+    facility_owner = None
     if data.facility is not None:
         facility_id = await facilities_gateway.id_by_slug(data.facility)
         if facility_id is None:
             raise FacilityNotFound(f"Facility '{data.facility}' not found")
+        facility_owner = (await facilities_gateway.owners_by_id({facility_id})).get(facility_id)
+    require_create_owner(facility_owner, owner, f"A snapshot of {data.facility or 'every PV'}")
 
     if key_scope is not None:
         # A facility-restricted key must name a facility it holds. Unlike mutating an
@@ -175,22 +194,57 @@ async def create_snapshot(
 
 @router.post("/import", dependencies=[Security(require_write_access)])
 async def import_snapshot(
-    bundle: SnapshotBundleDTO, service: SnapshotServiceDep, actor: ActorDep
+    bundle: SnapshotBundleDTO,
+    service: SnapshotServiceDep,
+    actor: ActorDep,
+    key: WriteKeyDep,
+    mode: Annotated[
+        Literal["history", "captured"],
+        Query(
+            description=(
+                "history: bring back a snapshot exported from a history copy, as a new snapshot. captured: save "
+                "a snapshot a history head took for this instance, under its own id and time; for the head's "
+                "service key only."
+            ),
+        ),
+    ] = "history",
+    strict: Annotated[
+        bool, Query(description="Refuse, saving nothing, when any of the bundle's values would be left out.")
+    ] = False,
 ) -> SnapshotImportResultDTO:
-    """Create a new snapshot from a bundle exported by ``GET /snapshots/{id}/export``.
+    """Save a snapshot from a bundle.
 
-    Meant for bringing a snapshot back from a history mirror so it can be restored here.
-    The new snapshot has a new id, today's creation time, a "Restored from history" title
-    and ``importedFrom`` set to the bundle's id. A value is kept only when its PV exists
-    here, the key could restore it, and, for a bundle with a facility, the PV is assigned
-    to that facility or one below it, as for a capture. A PV moved out of the facility
-    since the export is therefore left out. Values left out are listed in ``skipped``;
-    nothing is read from or written to EPICS.
+    **History** (the default) brings back a bundle exported by
+    ``GET /snapshots/{id}/export``, typically from a history head, so it can be
+    restored here. The new snapshot has a new id, today's creation time, a "Restored
+    from history" title and ``importedFrom`` set to the bundle's id. ``createdBy`` stays
+    the original snapshot's; who imported it (the key's name, or the user a head
+    forwarded it for) is logged.
 
-    ``createdBy`` stays the original snapshot's; who imported it (the key's name, or the
-    user a forward instance sent it for) is logged.
+    **Captured** saves a snapshot a history head captured for one of this instance's
+    facilities. Only a service key may send it, naming the user it was taken for in
+    ``X-Canopy-On-Behalf-Of``, who becomes its author. It keeps the bundle's id, time,
+    title and description, and is idempotent on the id: a resend answers with
+    ``created`` false and saves nothing. The answer always carries
+    ``X-Canopy-Commit-LSN``, so the head can wait for the snapshot to come back.
+
+    Either way a value is kept only when its PV exists here, the key could restore it,
+    and, for a bundle with a facility, the PV is assigned to that facility or one below
+    it, as for a capture. A PV moved out of the facility since is therefore left out.
+    Values left out are listed in ``skipped``; nothing is read from or written to EPICS.
     """
-    result = await service.import_bundle(bundle)
+    if mode == "captured":
+        if not key.is_service:
+            raise ForwardedWriteRefused("Only a service key may import a captured snapshot")
+        if forwarded_for() is None:
+            raise ForwardedWriteRefused("A captured import names the user it was taken for in X-Canopy-On-Behalf-Of")
+        report_commit_position()
+        result = await service.import_bundle(bundle, captured=True, created_by=actor, strict=strict)
+        logger.info(
+            "Captured snapshot %s %s for %s", bundle.id, "saved" if result.created else "was already saved", actor
+        )
+        return result
+    result = await service.import_bundle(bundle, strict=strict)
     logger.info("Snapshot %s imported as %s for %s", bundle.id, result.snapshot.id, actor)
     return result
 
@@ -203,8 +257,7 @@ async def get_snapshot(
     offset: int = Query(0, ge=0),
 ) -> SnapshotDTO:
     """Get one snapshot with its PV values (values optionally paginated)."""
-    if not is_uuid(snapshot_id):
-        raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
+    snapshot_id = require_uuid(snapshot_id, SnapshotNotFound, f"Snapshot {snapshot_id} not found")
     snapshot = await service.get_by_id(snapshot_id, limit=limit, offset=offset)
     if not snapshot:
         raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
@@ -214,8 +267,7 @@ async def get_snapshot(
 @router.get("/{snapshot_id}/export", dependencies=[Security(require_read_access)])
 async def export_snapshot(snapshot_id: str, service: SnapshotServiceDep) -> SnapshotBundleDTO:
     """Export a snapshot with all its values, for ``POST /snapshots/import`` on another instance."""
-    if not is_uuid(snapshot_id):
-        raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
+    snapshot_id = require_uuid(snapshot_id, SnapshotNotFound, f"Snapshot {snapshot_id} not found")
     bundle = await service.export_bundle(snapshot_id)
     if bundle is None:
         raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
@@ -231,8 +283,7 @@ async def update_snapshot(
     service: SnapshotServiceDep,
 ) -> SnapshotSummaryDTO:
     """Update a snapshot's title, description and/or ``retain`` flag (kept by pruning)."""
-    if not is_uuid(snapshot_id):
-        raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
+    snapshot_id = require_uuid(snapshot_id, SnapshotNotFound, f"Snapshot {snapshot_id} not found")
     snapshot = await service.update_snapshot_metadata(
         snapshot_id, title=data.title, description=data.description, retain=data.retain
     )
@@ -244,8 +295,7 @@ async def update_snapshot(
 @router.delete("/{snapshot_id}", dependencies=[Security(require_write_access)])
 async def delete_snapshot(snapshot_id: str, service: SnapshotServiceDep) -> bool:
     """Delete a snapshot: it is no longer listed or served, but its row and values are kept."""
-    if not is_uuid(snapshot_id):
-        raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
+    snapshot_id = require_uuid(snapshot_id, SnapshotNotFound, f"Snapshot {snapshot_id} not found")
     if not await service.delete_snapshot(snapshot_id):
         raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
     return True
@@ -258,12 +308,9 @@ async def restore_snapshot(
     actor: ActorDep,
     request: RestoreRequestDTO | None = None,
 ) -> JobCreatedDTO:
-    """Enqueue a restore of a snapshot's setpoints to EPICS (``pv_ids=None`` restores all).
-
-    Logs who asked (the key's name, or the user a forward instance sent it for):
-    a restore changes the machine and stores no row of its own.
-    """
-    if not is_uuid(snapshot_id) or not await service.snapshot_exists(snapshot_id):
+    """Enqueue a restore of a snapshot's setpoints to EPICS (``pv_ids=None`` restores all)."""
+    snapshot_id = require_uuid(snapshot_id, SnapshotNotFound, f"Snapshot {snapshot_id} not found")
+    if not await service.snapshot_exists(snapshot_id):
         raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
     # Narrow the write set to the key's facilities here, pre-enqueue — the worker has no
     # caller identity to check against.
@@ -293,7 +340,6 @@ async def compare_snapshots(
     service: SnapshotServiceDep,
 ) -> ComparisonResultDTO:
     """Compare two stored snapshots value-by-value (within per-PV tolerance)."""
-    for sid in (snapshot_id1, snapshot_id2):
-        if not is_uuid(sid):
-            raise SnapshotNotFound(f"Snapshot {sid} not found")
+    snapshot_id1 = require_uuid(snapshot_id1, SnapshotNotFound, f"Snapshot {snapshot_id1} not found")
+    snapshot_id2 = require_uuid(snapshot_id2, SnapshotNotFound, f"Snapshot {snapshot_id2} not found")
     return await service.compare_snapshots(snapshot_id1, snapshot_id2)

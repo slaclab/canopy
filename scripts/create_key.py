@@ -13,7 +13,7 @@ Run::
     uv run python scripts/create_key.py operator-tools -r -w
     uv run python scripts/create_key.py ops -a
     uv run python scripts/create_key.py trace -r -m mole -m formula-engine   # scoped to two modules
-    uv run python scripts/create_key.py history-site-a -r -w -m squirrel --service  # a forward instance
+    uv run python scripts/create_key.py head -r -w -m squirrel --facility '*' --service  # a history head, on an arm
 
     # In a container (local Docker Compose, or a facility instance where the
     # database is only reachable from the running api container):
@@ -40,8 +40,8 @@ async def main() -> int:
         "--service",
         action="store_true",
         help=(
-            "Mint a service key, for a forward instance on this primary: it may name the user it acts for "
-            "(X-Canopy-On-Behalf-Of), which the primary trusts only with CANOPY_ACCEPT_FORWARDED_WRITES"
+            "Mint a service key, for a history head on this arm: it may name the user it acts for "
+            "(X-Canopy-On-Behalf-Of), which this instance trusts only with CANOPY_ACCEPT_FORWARDED_WRITES"
         ),
     )
     parser.add_argument(

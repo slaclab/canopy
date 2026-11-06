@@ -31,8 +31,8 @@ class ApiKey(UUIDMixin, TimestampMixin, Base):
     up to the cache TTL — minutes of granularity, which is all that question needs.
 
     ``is_service`` marks a key held by another Canopy instance rather than a
-    client: a forward instance's key on its primary, the only kind of key whose
-    ``X-Canopy-On-Behalf-Of`` the primary trusts. Minted only from the CLI.
+    client: a history head's key on one of its arms, the only kind of key whose
+    ``X-Canopy-On-Behalf-Of`` the arm trusts. Minted only from the CLI.
     """
 
     __tablename__ = "api_key"

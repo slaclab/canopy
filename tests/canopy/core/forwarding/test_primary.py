@@ -1,5 +1,5 @@
-"""The primary's half: trusting ``X-Canopy-On-Behalf-Of``, recording it, the caller's
-facility grant, and ``X-Canopy-Commit-LSN``.
+"""The arm's half: trusting ``X-Canopy-On-Behalf-Of``, recording it, the caller's
+facility grant, ``X-Canopy-Commit-LSN``, and the captured import.
 
 The header-trust tests use fake keys. The commit-position tests run the real app
 against Postgres (the ``database`` fixture in this directory's conftest).
@@ -25,7 +25,7 @@ from canopy.core.facilities.models import Facility
 from canopy.core.forwarding.client import lsn_value
 from canopy.core.forwarding.context import forwarded_write
 
-from ..test_read_only_instance import FakeRegistry
+from .conftest import FakeRegistry
 
 EVERY = frozenset({WILDCARD})
 SERVICE = APIKey(
@@ -35,7 +35,7 @@ SERVICE = APIKey(
     is_service=True,
     modules=EVERY,
     facilities=EVERY,
-    name="history-site-a",
+    name="head-service",
 )
 # A service key granted only site-a, for the intersection tests.
 SERVICE_A = APIKey(
@@ -45,13 +45,13 @@ SERVICE_A = APIKey(
     is_service=True,
     modules=EVERY,
     facilities=frozenset({"site-a"}),
-    name="history-site-a-only",
+    name="head-service-site-a",
 )
 CLIENT = APIKey(token="cli", read=True, write=True, modules=EVERY, facilities=EVERY, name="console")
 
 
 def _for(facilities: str) -> dict[str, str]:
-    return {"X-Canopy-On-Behalf-Of": "operator@site_a", "X-Canopy-On-Behalf-Of-Facilities": facilities}
+    return {"X-Canopy-On-Behalf-Of": "operator@head", "X-Canopy-On-Behalf-Of-Facilities": facilities}
 
 
 ON_BEHALF = _for('["*"]')
@@ -89,12 +89,12 @@ def actor_client(keys) -> TestClient:
 
 class TestTrust:
     def test_without_the_header_the_actor_is_the_key(self, actor_client, accepting):
-        assert actor_client.post("/actor", headers={"X-API-Key": "svc"}).json() == {"actor": "history-site-a"}
+        assert actor_client.post("/actor", headers={"X-API-Key": "svc"}).json() == {"actor": "head-service"}
 
     def test_a_service_key_names_the_caller(self, actor_client, accepting):
         resp = actor_client.post("/actor", headers={"X-API-Key": "svc", **ON_BEHALF})
 
-        assert resp.json() == {"actor": "operator@site_a"}
+        assert resp.json() == {"actor": "operator@head"}
 
     def test_refused_unless_the_primary_accepts_forwarded_writes(self, actor_client):
         resp = actor_client.post("/actor", headers={"X-API-Key": "svc", **ON_BEHALF})
@@ -117,10 +117,10 @@ class TestTrust:
     def test_the_name_arrives_percent_encoded(self, actor_client, accepting):
         resp = actor_client.post(
             "/actor",
-            headers={"X-API-Key": "svc", **ON_BEHALF, "X-Canopy-On-Behalf-Of": "op%C3%A9rateur@site_a"},
+            headers={"X-API-Key": "svc", **ON_BEHALF, "X-Canopy-On-Behalf-Of": "op%C3%A9rateur@head"},
         )
 
-        assert resp.json() == {"actor": "opérateur@site_a"}
+        assert resp.json() == {"actor": "opérateur@head"}
 
     def test_the_length_limit_is_on_the_decoded_name(self, actor_client, accepting):
         resp = actor_client.post(
@@ -148,7 +148,7 @@ class TestTrust:
         assert "printable characters" in resp.json()["detail"]
 
     def test_the_callers_facilities_are_required(self, actor_client, accepting):
-        resp = actor_client.post("/actor", headers={"X-API-Key": "svc", "X-Canopy-On-Behalf-Of": "operator@site_a"})
+        resp = actor_client.post("/actor", headers={"X-API-Key": "svc", "X-Canopy-On-Behalf-Of": "operator@head"})
 
         assert resp.status_code == 400
         assert "X-Canopy-On-Behalf-Of-Facilities" in resp.json()["detail"]
@@ -164,7 +164,7 @@ class TestTrust:
         actor_client.post("/actor", headers={"X-API-Key": "svc", **ON_BEHALF})
 
         assert forwarded_write.get() is None
-        assert actor_client.post("/actor", headers={"X-API-Key": "svc"}).json() == {"actor": "history-site-a"}
+        assert actor_client.post("/actor", headers={"X-API-Key": "svc"}).json() == {"actor": "head-service"}
 
 
 def test_a_forwarded_capture_records_the_caller(keys, accepting, monkeypatch):
@@ -180,7 +180,7 @@ def test_a_forwarded_capture_records_the_caller(keys, accepting, monkeypatch):
     resp = client.post("/squirrel/v1/snapshots", json={"title": "t"}, headers={"X-API-Key": "svc", **ON_BEHALF})
 
     assert resp.status_code == 200, resp.text
-    assert enqueued[0]["created_by"] == "operator@site_a"
+    assert enqueued[0]["created_by"] == "operator@head"
     # Only enqueued: nothing committed, so nothing to wait for.
     assert "x-canopy-commit-lsn" not in resp.headers
 
@@ -238,7 +238,7 @@ async def test_a_forwarded_import_keeps_the_author_and_logs_the_caller(http, cap
     assert resp.status_code == 200, resp.text
     assert resp.json()["snapshot"]["createdBy"] == "original-author"
     new_id = resp.json()["snapshot"]["id"]
-    assert f"Snapshot {bundle['id']} imported as {new_id} for operator@site_a" in caplog.text
+    assert f"Snapshot {bundle['id']} imported as {new_id} for operator@head" in caplog.text
     assert "x-canopy-commit-lsn" in resp.headers
 
 
@@ -316,7 +316,7 @@ async def test_a_forwarded_restore_logs_the_caller(http, monkeypatch, caplog):
 
 
 class TestForwardedImport:
-    """#83's import rules hold for a caller a forward instance names, not just the service key.
+    """#83's import rules hold for a caller a head names, not just the service key.
 
     The service key reaches every facility, so what's left out comes from the caller's
     grant and the bundle's facility, never from the service key.
@@ -363,7 +363,7 @@ class TestForwardedImport:
         resp = await self._import(http, self._bundle("site-a", site_pvs["site-b"]), '["site-a"]')
 
         assert resp.status_code == 400
-        assert resp.json()["code"] == "bad_request"
+        assert resp.json()["code"] == "nothing_to_import"
         async with db.get_session_maker()() as session:
             assert await session.scalar(text("SELECT count(*) FROM squirrel.snapshot")) == 0
 
@@ -382,6 +382,98 @@ class TestForwardedImport:
         assert [value["pvId"] for value in resp.json()["skipped"]] == [site_pvs["site-b"]]
 
 
+class TestCapturedImport:
+    """A snapshot a head captured for this arm, saved under its own id and time (``?mode=captured``)."""
+
+    @pytest_asyncio.fixture
+    async def pv(self, sites) -> str:
+        async with db.get_session_maker()() as session:
+            pv = Pv(setpoint_address="SIM:CAPTURED:SP")
+            session.add(pv)
+            await session.flush()
+            await session.execute(pv_facility.insert().values(pv_id=pv.id, facility_id=sites["site-a"]))
+            await session.commit()
+            return pv.id
+
+    @staticmethod
+    def _bundle(*pv_ids: str) -> dict:
+        return {
+            "format": "canopy.squirrel.snapshot-bundle",
+            "version": 1,
+            "sourceInstance": "head",
+            "id": str(uuid4()),
+            "title": "Taken on the head",
+            "createdDate": "2026-11-06T14:02:00Z",
+            "facility": "site-a",
+            "values": [
+                {"pvId": pv_id, "pvName": "SIM:CAPTURED:SP", "setpointValue": {"value": 1.0}} for pv_id in pv_ids
+            ],
+        }
+
+    @staticmethod
+    async def _send(http, bundle: dict, *, key: str = "svc", query: str = "mode=captured", **headers: str):
+        return await http.post(
+            f"/squirrel/v1/snapshots/import?{query}", json=bundle, headers={"X-API-Key": key, **ON_BEHALF, **headers}
+        )
+
+    async def test_saved_under_its_own_id_for_the_caller(self, http, pv):
+        bundle = self._bundle(pv)
+
+        resp = await self._send(http, bundle)
+
+        assert resp.status_code == 200, resp.text
+        saved = resp.json()["snapshot"]
+        assert (saved["id"], saved["title"], saved["createdBy"]) == (bundle["id"], "Taken on the head", "operator@head")
+        assert saved["createdDate"].startswith("2026-11-06T14:02:00")
+        assert saved.get("importedFrom") is None
+        assert resp.json()["created"] is True
+        assert "x-canopy-commit-lsn" in resp.headers
+
+    async def test_a_resend_saves_nothing_and_still_gives_a_position(self, http, pv):
+        bundle = self._bundle(pv)
+        first = await self._send(http, bundle)
+
+        again = await self._send(http, bundle)
+
+        assert again.status_code == 200, again.text
+        assert again.json()["created"] is False
+        # The current WAL position, at or past the first save's commit.
+        assert lsn_value(again.headers["x-canopy-commit-lsn"]) >= lsn_value(first.headers["x-canopy-commit-lsn"])
+        async with db.get_session_maker()() as session:
+            assert await session.scalar(text("SELECT count(*) FROM squirrel.snapshot")) == 1
+
+    async def test_only_a_service_key(self, http, pv):
+        resp = await http.post(
+            "/squirrel/v1/snapshots/import?mode=captured", json=self._bundle(pv), headers={"X-API-Key": "cli"}
+        )
+
+        assert resp.status_code == 403
+        assert resp.json()["code"] == "forwarded_write_refused"
+
+    async def test_it_names_the_caller(self, http, pv):
+        resp = await http.post(
+            "/squirrel/v1/snapshots/import?mode=captured", json=self._bundle(pv), headers={"X-API-Key": "svc"}
+        )
+
+        assert resp.status_code == 403
+        assert "X-Canopy-On-Behalf-Of" in resp.json()["detail"]
+
+    async def test_strict_refuses_a_skip(self, http, pv):
+        resp = await self._send(http, self._bundle(pv, str(uuid4())), query="mode=captured&strict=true")
+
+        assert resp.status_code == 409
+        assert resp.json()["code"] == "import_would_skip"
+
+    async def test_strict_holds_for_a_history_import_too(self, http, pv):
+        resp = await self._send(http, self._bundle(pv, str(uuid4())), query="strict=true")
+
+        assert resp.status_code == 409
+        assert resp.json()["code"] == "import_would_skip"
+
+    async def test_an_unknown_mode_is_a_validation_error(self, http, pv):
+        assert (await self._send(http, self._bundle(pv), query="mode=other")).status_code == 422
+
+
 async def test_a_forwarded_config_records_the_caller_not_the_body(http):
     forwarded = await http.post(
         "/magpie/v1/configs/trace",
@@ -392,7 +484,7 @@ async def test_a_forwarded_config_records_the_caller_not_the_body(http):
         "/magpie/v1/configs/trace", json={"data": {}, "createdBy": "claimed"}, headers={"X-API-Key": "cli"}
     )
 
-    assert forwarded.json()["createdBy"] == "operator@site_a"
+    assert forwarded.json()["createdBy"] == "operator@head"
     assert direct.json()["createdBy"] == "claimed"
 
 
@@ -400,8 +492,8 @@ async def test_a_non_ascii_caller_is_recorded_as_named(http):
     resp = await http.post(
         "/magpie/v1/configs/trace",
         json={"data": {}},
-        headers={"X-API-Key": "svc", **ON_BEHALF, "X-Canopy-On-Behalf-Of": "op%C3%A9rateur@site_a"},
+        headers={"X-API-Key": "svc", **ON_BEHALF, "X-Canopy-On-Behalf-Of": "op%C3%A9rateur@head"},
     )
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["createdBy"] == "opérateur@site_a"
+    assert resp.json()["createdBy"] == "opérateur@head"

@@ -2,6 +2,7 @@
 
 import os
 import asyncio
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
@@ -13,6 +14,8 @@ patch("pydantic_settings.sources.providers.dotenv.dotenv_values", return_value={
 
 # Seed an API-key registry before canopy.main imports cache settings.
 os.environ["CANOPY_API_KEYS"] = "test-read:read@*,test-write:read+write@*,test-admin:admin@*"
+# CANOPY_INSTANCE is required; the suite runs as an arm named arm1 unless a test says otherwise.
+os.environ.setdefault("CANOPY_INSTANCE", "arm1")
 
 
 READ_HEADERS = {"X-API-Key": "test-read"}
@@ -35,34 +38,41 @@ async def wait_for(predicate, timeout: float = 5.0, interval: float = 0.01) -> b
 
 
 @pytest.fixture
-def forward_role(monkeypatch):
-    """Run the test as a forward instance (``CANOPY_ROLE=forward``) named ``site_a``.
-
-    Points ``CANOPY_FORWARD__*`` at a placeholder primary; tests mock it with
-    ``httpx_mock``. Clears the cached ``Settings`` like ``mirror_role``.
-    """
-    from canopy.core.config import get_settings
-
-    monkeypatch.setenv("CANOPY_ROLE", "forward")
-    monkeypatch.setenv("CANOPY_INSTANCE", "site_a")
-    monkeypatch.setenv("CANOPY_FORWARD__PRIMARY_URL", "https://primary.example.org")
-    monkeypatch.setenv("CANOPY_FORWARD__SERVICE_KEY", "service-token")
-    get_settings.cache_clear()
-    yield
-    get_settings.cache_clear()
-
-
-@pytest.fixture
 def mirror_role(monkeypatch):
-    """Run the test as a read-only mirror (``CANOPY_ROLE=mirror``).
+    """Run the test as a mirror (``CANOPY_ROLE=mirror``).
 
     Clears the cached ``Settings`` on both sides: ``monkeypatch`` puts the env var
     back but not the object ``get_settings`` already built from it, and a leaked
-    mirror role would refuse every write in whatever test runs next.
+    role would change whatever test runs next.
     """
     from canopy.core.config import get_settings
 
     monkeypatch.setenv("CANOPY_ROLE", "mirror")
     get_settings.cache_clear()
     yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+def as_instance(monkeypatch):
+    """Run a block as another instance: ``with as_instance("arm2"): ...``.
+
+    Rows created inside are stamped with that name, the way a mirror receives an
+    arm's rows through replication; outside it the suite is ``arm1`` again. Clears
+    the cached ``Settings`` on the way in and out.
+    """
+    from canopy.core.config import get_settings
+
+    @contextmanager
+    def _as(name: str):
+        previous = os.environ["CANOPY_INSTANCE"]
+        monkeypatch.setenv("CANOPY_INSTANCE", name)
+        get_settings.cache_clear()
+        try:
+            yield
+        finally:
+            monkeypatch.setenv("CANOPY_INSTANCE", previous)
+            get_settings.cache_clear()
+
+    yield _as
     get_settings.cache_clear()

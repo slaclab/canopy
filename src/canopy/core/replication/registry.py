@@ -1,9 +1,9 @@
-"""Which tables a history mirror receives, and through which publication.
+"""Which tables a history head receives, through which publication, and who owns each row.
 
-A history mirror is a read-only copy of a primary's database, fed by Postgres
-logical replication. Every table on ``Base.metadata`` is classified here, and a
-test fails on one that isn't, so a new table can't ship before someone decides
-whether the mirror gets it:
+A history head (a mirror) subscribes to one or more arms (primaries) and holds
+every arm's rows plus its own, fed by Postgres logical replication. Every table on
+``Base.metadata`` is classified here, and a test fails on one that isn't, so a new
+table can't ship before someone decides whether the head gets it:
 
 ``reference``
     Rows edited in place and shared across the instance (PVs, tags, configs).
@@ -15,7 +15,13 @@ whether the mirror gets it:
     no deletes, so pruning the primary never removes history.
 ``local``
     Rows that belong to one database and never replicate. API keys are local: a
-    mirror mints and checks its own.
+    head mints and checks its own.
+
+Every replicated table also has an owner path (``canopy.core.ownership``): a root
+table names its row's owner in a column, and a child table follows its parent. On
+a head, that is how a command tells one arm's rows from another's and from the
+head's own. ``shared_keys`` lists the columns unique across every owner, where two
+owners' rows can clash.
 
 Two publication layouts carry the same tables. ``publications`` is the single
 ``canopy_history`` every primary starts with; ``split_publications`` is the pair a
@@ -30,7 +36,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from types import MappingProxyType
-from dataclasses import dataclass
+from dataclasses import field, dataclass
 from collections.abc import Mapping
 
 
@@ -62,8 +68,35 @@ class Publication:
 
 
 @dataclass(frozen=True)
+class OwnerPath:
+    """How a table's rows name their owner.
+
+    Attributes
+    ----------
+    column : str | None
+        For a root table: the column holding the owner's instance name.
+    parent : str | None
+        For a child table: the ``"schema.table"`` whose row it follows.
+    key : str | None
+        For a child table: its column holding the parent row's ``id``.
+    """
+
+    column: str | None = None
+    parent: str | None = None
+    key: str | None = None
+
+
+def _root() -> OwnerPath:
+    return OwnerPath(column="owner_instance")
+
+
+def _child(parent: str, key: str) -> OwnerPath:
+    return OwnerPath(parent=parent, key=key)
+
+
+@dataclass(frozen=True)
 class ReplicationRegistry:
-    """Table classes plus the publications that carry them.
+    """Table classes, the publications that carry them, and each table's owner path.
 
     The commands take one of these (``REGISTRY`` by default), so a test can add a
     table without patching module state.
@@ -72,6 +105,10 @@ class ReplicationRegistry:
     tables: Mapping[str, TableClass]
     publications: tuple[Publication, ...]
     split_publications: tuple[Publication, ...] = ()
+    owner_paths: Mapping[str, OwnerPath] = field(default_factory=dict)
+    # Columns unique across every owner, by table: two owners' rows can't share a
+    # value, so a clash stops replication from the arm whose row arrives second.
+    shared_keys: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def layout(self, split: bool) -> tuple[Publication, ...]:
         """The publications of one layout: the split pair when ``split``, else the single one."""
@@ -81,6 +118,30 @@ class ReplicationRegistry:
     def all_publications(self) -> tuple[Publication, ...]:
         """Every publication either layout uses."""
         return self.publications + self.split_publications
+
+    def owner_chain(self, table: str) -> list[tuple[str, str]]:
+        """The ``(parent, key)`` hops from ``table`` to the root that names its owner.
+
+        Empty for a root table.
+
+        Raises
+        ------
+        ValueError
+            When ``table``, or a parent on the way, has no owner path.
+        """
+        hops: list[tuple[str, str]] = []
+        current = table
+        while (path := self.owner_paths.get(current)) is None or path.column is None:
+            if path is None or len(hops) >= len(self.owner_paths):
+                raise ValueError(f"{current} has no owner path in the replication registry")
+            hops.append((path.parent, path.key))
+            current = path.parent
+        return hops
+
+    def owner_root(self, table: str) -> str:
+        """The root table whose owner column names ``table``'s owner (``table`` itself for a root)."""
+        chain = self.owner_chain(table)
+        return chain[-1][0] if chain else table
 
     def published(self, publication: Publication) -> list[str]:
         """Tables ``publication`` carries, sorted."""
@@ -139,6 +200,21 @@ REGISTRY = ReplicationRegistry(
             "core.history_heartbeat": TableClass.LOCAL,
         }
     ),
+    owner_paths=MappingProxyType(
+        {
+            "core.facility": _root(),
+            "squirrel.pv": _root(),
+            "squirrel.snapshot": _root(),
+            "squirrel.tag_group": _root(),
+            "magpie.config": _root(),
+            "squirrel.snapshot_value": _child("squirrel.snapshot", "snapshot_id"),
+            "squirrel.pv_tag": _child("squirrel.pv", "pv_id"),
+            "squirrel.pv_facility": _child("squirrel.pv", "pv_id"),
+            "squirrel.meta_pv": _child("squirrel.pv", "pv_id"),
+            "squirrel.tag": _child("squirrel.tag_group", "group_id"),
+        }
+    ),
+    shared_keys=MappingProxyType({"core.facility": ("slug",), "magpie.config": ("slug",)}),
     # One publication until the primary prunes old rows. TRUNCATE is left out on
     # purpose: no Canopy code truncates, so one typed on the primary by hand is a
     # mistake the history copy shouldn't repeat.

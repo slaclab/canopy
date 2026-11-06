@@ -210,7 +210,7 @@ async def test_split_keeps_canopy_history_until_a_mirror_is_seen_streaming_the_p
     await publish(db, role="primary", config=config, split=True)
     await db.execute("CREATE PUBLICATION canopy_history FOR TABLE squirrel.pv")
 
-    with pytest.raises(Refused, match="canopy_history is still needed: no history mirror's slot exists here"):
+    with pytest.raises(Refused, match="canopy_history is still needed: no history slot exists here"):
         await publish(db, role="primary", config=config, split=True)
 
     assert await publication_layout(db) == "switching"

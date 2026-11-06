@@ -30,7 +30,8 @@ class ErrorCode(StrEnum):
     API_KEY_NOT_FOUND = auto()
     API_KEY_SELF_DEACTIVATION = auto()
     KEY_STORE_UNAVAILABLE = auto()
-    READ_ONLY_INSTANCE = auto()
+    NOT_OWNER = auto()
+    OWNER_MISMATCH = auto()
     FORWARDED_WRITE_REFUSED = auto()
     ARCHIVED_IMMUTABLE = auto()
     PRIMARY_UNAVAILABLE = auto()
@@ -82,6 +83,9 @@ class ErrorCode(StrEnum):
 
     # Squirrel
     SNAPSHOT_NOT_FOUND = auto()
+    SNAPSHOT_ID_CONFLICT = auto()
+    NOTHING_TO_IMPORT = auto()
+    IMPORT_WOULD_SKIP = auto()
     PV_NOT_FOUND = auto()
     PV_ALREADY_EXISTS = auto()
     TAG_NOT_FOUND = auto()
@@ -256,16 +260,27 @@ class FacilityCycle(CanopyError):
     error_code = ErrorCode.FACILITY_CYCLE
 
 
-class ReadOnlyInstance(CanopyError):
-    """Refused a write or admin request because this instance is a read-only mirror.
+class NotOwner(CanopyError):
+    """Refused a write to a row another instance owns, or a create it would own.
 
-    Distinct from `InsufficientWriteAccess`: no key would succeed here, so a
-    client should send the request to the primary (or hide the control) rather
-    than ask for a different key.
+    Every row of an owned table records the instance that created it
+    (``owner_instance``), and only that instance writes it. The detail names the
+    owner, the instance to send the write to.
     """
 
     status_code = 403
-    error_code = ErrorCode.READ_ONLY_INSTANCE
+    error_code = ErrorCode.NOT_OWNER
+
+
+class OwnerMismatch(CanopyError):
+    """Refused a request that links rows of different owners.
+
+    A PV's facilities and tags, a snapshot's facility and PVs, and a facility's
+    parent all share one owner. Sending the request elsewhere can't help.
+    """
+
+    status_code = 409
+    error_code = ErrorCode.OWNER_MISMATCH
 
 
 class ForwardedWriteRefused(CanopyError):
@@ -273,7 +288,7 @@ class ForwardedWriteRefused(CanopyError):
 
     Only a service key may name another caller, and only on a primary that
     accepts forwarded writes. Refused rather than ignored, so a misconfigured
-    forward instance fails loudly instead of recording writes under its own key.
+    head fails loudly instead of recording writes under its own key.
     """
 
     status_code = 403
@@ -281,10 +296,9 @@ class ForwardedWriteRefused(CanopyError):
 
 
 class ArchivedImmutable(CanopyError):
-    """A forward instance refused to send a change to an entity older than the primary's window.
+    """A change to a snapshot its arm no longer holds, refused on the history head that still does.
 
-    The primary may no longer hold it, and the history copy can't be edited, so
-    the request is answered here without reaching the primary.
+    The arm pruned it, and the head's copy is history that only its owner may change.
     """
 
     status_code = 409
@@ -292,9 +306,9 @@ class ArchivedImmutable(CanopyError):
 
 
 class PrimaryUnavailable(CanopyError):
-    """A forward instance couldn't get an answer from its primary.
+    """A history head couldn't get an answer from the arm that owns a write.
 
-    502 when the primary couldn't be reached (nothing was sent); a subclass with
+    502 when the arm couldn't be reached (nothing was sent); a subclass with
     504 when it stopped answering after the request went out, so the write may
     or may not have been applied.
     """

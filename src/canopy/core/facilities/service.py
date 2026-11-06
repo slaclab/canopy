@@ -19,6 +19,11 @@ from canopy.core.errors import (
     FacilitySlugConflict,
 )
 from canopy.core.modules import WILDCARD
+from canopy.core.ownership import (
+    require_owned,
+    require_same_owner,
+    require_create_owner,
+)
 from canopy.core.facilities.models import Facility
 from canopy.core.facilities.schemas import (
     FacilityDTO,
@@ -56,6 +61,7 @@ class FacilityService:
             name=facility.name,
             description=facility.description,
             parent=parent_slug,
+            owner_instance=facility.owner_instance,
         )
 
     async def _with_parent(self, facility: Facility) -> FacilityDTO:
@@ -86,12 +92,12 @@ class FacilityService:
         facility = await self.facility_repo.get_by_slug(slug)
         return facility.id if facility else None
 
-    async def _resolve_parent_id(self, parent_slug: str) -> str:
-        """Parent *slug* -> its id. Unknown slug is a hard ``FacilityNotFound``."""
+    async def _resolve_parent(self, parent_slug: str) -> Facility:
+        """Parent *slug* -> its row. Unknown slug is a hard ``FacilityNotFound``."""
         parent = await self.facility_repo.get_by_slug(parent_slug)
         if not parent:
             raise FacilityNotFound(f"Parent facility '{parent_slug}' not found")
-        return parent.id
+        return parent
 
     async def known_slugs(self, slugs: list[str]) -> set[str]:
         """The subset of ``slugs`` that exist. One query, not one per slug — callers
@@ -104,6 +110,11 @@ class FacilityService:
         one back at once (``slugs - result.keys()``) rather than discovering them one
         at a time."""
         return await self.facility_repo.ids_by_slug(slugs)
+
+    async def owners_by_id(self, ids: list[str] | set[str]) -> dict[str, str]:
+        """``{id: owner_instance}`` for the subset of ``ids`` that exist, for a module
+        checking that the rows it links to a facility share the facility's owner."""
+        return await self.facility_repo.owners_by_id(ids)
 
     async def slugs_by_id(self, ids: list[str] | set[str]) -> dict[str, str]:
         """``{id: slug}`` for the subset of ``ids`` that exist. The reverse of
@@ -121,11 +132,15 @@ class FacilityService:
             return FacilityAccessDTO(unrestricted=True)
         return FacilityAccessDTO(unrestricted=False, facilities=sorted((await self.slugs_by_id(scope)).values()))
 
-    async def create(self, data: FacilityCreate) -> FacilityDTO:
+    async def create(self, data: FacilityCreate, owner: str | None = None) -> FacilityDTO:
+        """Define a facility, owned by its parent's owner, else by ``owner`` or this instance."""
+        parent = await self._resolve_parent(data.parent) if data.parent is not None else None
+        require_create_owner(parent.owner_instance if parent else None, owner, f"Facility '{data.slug}'")
         if await self.facility_repo.get_by_slug(data.slug):
             raise FacilitySlugConflict(f"Facility with slug '{data.slug}' already exists")
-        parent_id = await self._resolve_parent_id(data.parent) if data.parent is not None else None
-        facility = Facility(slug=data.slug, name=data.name, description=data.description, parent_id=parent_id)
+        facility = Facility(
+            slug=data.slug, name=data.name, description=data.description, parent_id=parent.id if parent else None
+        )
         try:
             facility = await self.facility_repo.create(facility)
         except IntegrityError as e:
@@ -136,20 +151,22 @@ class FacilityService:
         facility = await self.facility_repo.get_by_id(facility_id)
         if not facility:
             return None
+        require_owned(facility.owner_instance, f"Facility '{facility.slug}'")
         if data.parent is not None:
-            parent_id = await self._resolve_parent_id(data.parent)
+            parent = await self._resolve_parent(data.parent)
+            require_same_owner(facility.owner_instance, [parent.owner_instance], f"The parent of '{facility.slug}'")
             # Catches both the self-parent case and reparenting under a descendant —
             # either makes the facility its own ancestor, which `resolve_facility_scope`'s
             # recursive CTE would then never terminate walking.
-            if await self.facility_repo.is_ancestor(facility_id, parent_id):
+            if await self.facility_repo.is_ancestor(facility_id, parent.id):
                 raise FacilityCycle("A facility cannot be reparented under itself or one of its own descendants")
-            facility.parent_id = parent_id
+            facility.parent_id = parent.id
         if data.name is not None:
             facility.name = data.name
         if data.description is not None:
             facility.description = data.description
         facility = await self.facility_repo.update(facility)
-        # A reparent's `data.parent` is already the slug `_resolve_parent_id` just
+        # A reparent's `data.parent` is already the slug `_resolve_parent` just
         # looked up — skip `_with_parent`'s redundant query for that case.
         return self._to_dto(facility, data.parent) if data.parent is not None else await self._with_parent(facility)
 
@@ -157,6 +174,7 @@ class FacilityService:
         facility = await self.facility_repo.get_by_id(facility_id)
         if not facility:
             return False
+        require_owned(facility.owner_instance, f"Facility '{facility.slug}'")
         if await self.facility_repo.get_children(facility_id):
             raise FacilityHasChildren("Cannot delete a facility that has children; reparent or remove them first")
         for checker, what in _in_use_checkers:
