@@ -39,11 +39,34 @@ def test_window_days_is_read_from_the_environment(monkeypatch):
     assert Settings().window_days == 30
 
 
-@pytest.mark.parametrize("name", ["CANOPY_INSTANCE", "CANOPY_HISTORY_URL", "CANOPY_WINDOW_DAYS"])
+@pytest.mark.parametrize("name", ["CANOPY_HISTORY_URL", "CANOPY_WINDOW_DAYS"])
 def test_a_blank_history_field_is_unset(monkeypatch, name):
     # How Helm and compose render a value nobody set.
     monkeypatch.setenv(name, "")
 
     settings = Settings()
 
-    assert (settings.instance, settings.history_url, settings.window_days) == (None, None, None)
+    assert (settings.history_url, settings.window_days) == (None, None)
+
+
+def test_instance_is_required(monkeypatch):
+    monkeypatch.delenv("CANOPY_INSTANCE", raising=False)
+
+    with pytest.raises(ValidationError, match="instance"):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("name", ["arm1", "head", "site_a", "a" * 48])
+def test_instance_names_that_fit_a_subscription_name(monkeypatch, name):
+    monkeypatch.setenv("CANOPY_INSTANCE", name)
+
+    assert Settings(_env_file=None).instance == name
+
+
+@pytest.mark.parametrize("name", ["", "Site-A", "site-a", "a" * 49, "arm 1"])
+def test_instance_names_that_are_refused(monkeypatch, name):
+    # A blank value is refused too: the name has no default.
+    monkeypatch.setenv("CANOPY_INSTANCE", name)
+
+    with pytest.raises(ValidationError, match="instance"):
+        Settings(_env_file=None)
