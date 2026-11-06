@@ -35,7 +35,7 @@ def client(monkeypatch):
 
 @pytest.fixture
 def history_settings(monkeypatch, mirror_role):
-    monkeypatch.setenv("CANOPY_INSTANCE", "site-a")
+    monkeypatch.setenv("CANOPY_INSTANCE", "site_a")
     monkeypatch.setenv("CANOPY_HISTORY_URL", "https://history.example.org")
     get_settings.cache_clear()
 
@@ -46,7 +46,7 @@ def test_primary_defaults(client):
     assert resp.status_code == 200, resp.text
     assert resp.json() == {
         "role": "primary",
-        "instance": None,
+        "instance": "arm1",
         "historyUrl": None,
         "windowDays": None,
         "alembicHead": SHIPPED_HEAD,
@@ -59,7 +59,7 @@ def test_mirror_reports_its_role_and_history_fields(client, history_settings):
     assert resp.status_code == 200, resp.text
     assert resp.json() == {
         "role": "mirror",
-        "instance": "site-a",
+        "instance": "site_a",
         "historyUrl": "https://history.example.org",
         "windowDays": None,
         "alembicHead": SHIPPED_HEAD,

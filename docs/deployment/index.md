@@ -36,7 +36,8 @@ essentials:
 | `CANOPY_LOG_LEVEL` | Root log level for the API and worker (`DEBUG`, `INFO`, `WARNING`, ...). Default `INFO`; an unknown name falls back to `INFO` |
 | `CANOPY_SQUIRREL__RESTORE_HOOKS` | Extra writes Squirrel makes during a snapshot restore, such as magnet trims. Empty means none. Must reach the **worker**, which performs restores. See [Restore hooks](../squirrel/restore_hooks.md) |
 | `CANOPY_ROLE` | `primary` (default) or `mirror`. A mirror is a read-only copy of a primary's database: write and admin routes return 403 `read_only_instance` (API-key management still works, since keys are local to each instance), and the worker runs only `ping` and batch conversion. Set it on both the API and the worker |
-| `CANOPY_INSTANCE`, `CANOPY_HISTORY_URL`, `CANOPY_WINDOW_DAYS` | Optional. Reported by `GET /v1/instance` with the role and the Alembic head shipped in the image: the instance name, the URL of its read-only history copy, and how many days of history it keeps (a whole number of at least 1; unset means all). A blank value counts as unset |
+| `CANOPY_INSTANCE` | **Required.** This instance's name: lowercase letters, digits and underscores, at most 48 (e.g. `arm1`). Choose it once; it is permanent once the instance holds data. Set it on the API, the worker and every `alembic` run. Reported by `GET /v1/instance` |
+| `CANOPY_HISTORY_URL`, `CANOPY_WINDOW_DAYS` | Optional. Reported by `GET /v1/instance` with the role, the instance name and the Alembic head shipped in the image: the URL of the instance's read-only history copy, and how many days of history it keeps (a whole number of at least 1; unset means all). A blank value counts as unset |
 | `CANOPY_<MODULE>__<FIELD>` | Per-module tuning (e.g. `CANOPY_VOLE__GLOBAL_BYTES_MAX`) |
 
 The annotated template
