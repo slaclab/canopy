@@ -681,12 +681,15 @@ class PvService:
             raise MetaPvNotFound(f"Meta PV {id} not found")
         return MetaPVDTO(pv_id=meta_pv.pv_id, display_name=meta_pv.display_name, is_active=meta_pv.is_active)
 
-    async def add_meta_pv(self, pv_name: str, display_name: str) -> MetaPVDTO:
+    async def add_meta_pv(self, pv_name: str, display_name: str, owner: str | None = None) -> MetaPVDTO:
         """Mark one of this instance's live PVs, found by any of its addresses, as a meta-PV.
 
+        ``owner``, the ``?owner=`` the caller named, accepts only this instance's name.
         On a mirror the address may belong only to arms' PVs; that answers
         ``not_owner``, naming them.
         """
+        if owner is not None:
+            require_owned(owner, f"PV {pv_name}")
         # Locked, so the PV can't be deleted between this check and the marker's insert.
         pv = await self.pv_repo.find_by_address(pv_name, owner=local_instance(), for_update=True)
         if pv is None:

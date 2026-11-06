@@ -96,11 +96,30 @@ async def test_get_malformed_slug_404(client: AsyncClient):
 
 
 async def test_malformed_continuation_token_400(client: AsyncClient):
-    """A bad token must not reach asyncpg as an invalid UUID comparison (500)."""
-    for token in ("garbage", "0" * 40, "not-a-uuid-but-36-chars-long-aaaaaaaa"):
-        r = await client.get(f"/v1/configs/trace?continuationToken={token}", headers=READ_HEADERS)
+    """A bad token must not reach asyncpg as an invalid UUID comparison (500), nor pass as a UUID."""
+    for token in ("garbage", "0" * 40, "not-a-uuid-but-36-chars-long-aaaaaaaa", "+" + "0" * 31, "0_" + "0" * 30):
+        r = await client.get("/v1/configs/trace", params={"continuationToken": token}, headers=READ_HEADERS)
         assert r.status_code == 400, f"{token!r} -> {r.status_code} {r.text}"
         assert r.json()["code"] == "bad_request"
+
+
+async def test_continuation_token_forms_are_normalised(client: AsyncClient):
+    """Braced and urn tokens parse as UUIDs but asyncpg rejects them raw; they used to 500."""
+    for i in range(2):
+        r = await client.post("/v1/configs/trace", headers=WRITE_HEADERS, json={"name": f"c{i}", "data": {}})
+        assert r.status_code == 200, r.text
+    first = await client.get("/v1/configs/trace?pageSize=1", headers=READ_HEADERS)
+    assert first.status_code == 200, first.text
+    token = first.json()["continuationToken"]
+    plain = await client.get(f"/v1/configs/trace?pageSize=1&continuationToken={token}", headers=READ_HEADERS)
+    assert plain.status_code == 200, plain.text
+
+    for form in ("{" + token + "}", f"urn:uuid:{token}"):
+        r = await client.get(
+            "/v1/configs/trace", params={"pageSize": 1, "continuationToken": form}, headers=READ_HEADERS
+        )
+        assert r.status_code == 200, f"{form!r} -> {r.status_code} {r.text}"
+        assert r.json() == plain.json()
 
 
 async def test_nul_byte_in_search_is_400(client: AsyncClient):
