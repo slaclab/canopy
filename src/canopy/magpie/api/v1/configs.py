@@ -17,15 +17,15 @@ from typing import Annotated
 
 from fastapi import Path, Query, Security, APIRouter
 
-from canopy.core.errors import BadRequest
 from canopy.core.security import require_read_access, require_write_access
 from canopy.magpie.errors import ConfigNotFound, InvalidAppName
 from canopy.core.app_names import APP_NAME_RULE, is_app
 from canopy.core.ownership import OwnerQuery
+from canopy.core.validation import parse_continuation_token
 from canopy.magpie.dependencies import ConfigServiceDep
 from canopy.contracts.pagination import PagedResult
 from canopy.magpie.schemas.config import ConfigDTO, NewConfigDTO, UpdateConfigDTO
-from canopy.magpie.api.v1._validation import is_slug, is_uuid
+from canopy.magpie.api.v1._validation import is_slug
 
 router = APIRouter(prefix="/configs", tags=["Configs"])
 
@@ -63,15 +63,11 @@ async def list_configs(
 ) -> PagedResult[ConfigDTO]:
     """List an app's configs (keyset-paginated)."""
     _validate_app_name(app)
-    # The token is a row id; letting a malformed one through would reach asyncpg as a
-    # bad UUID comparison and surface as a 500 rather than a 400.
-    if continuationToken is not None and not is_uuid(continuationToken):
-        raise BadRequest("Invalid continuationToken")
     return await service.list_by_app(
         app=app,
         search=search,
         page_size=pageSize,
-        continuation_token=continuationToken,
+        continuation_token=parse_continuation_token(continuationToken),
     )
 
 
