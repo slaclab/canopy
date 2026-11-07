@@ -18,37 +18,35 @@ con_hook = WriteToConHook()
 
 
 def test_bdes_derives_ctrl_trim():
-    assert trim_hook.derive_extra_writes("QUAD:LI21:201:BDES", 1.5) == [("QUAD:LI21:201:CTRL", "TRIM")]
+    assert trim_hook.derive_extra_writes("QUAD:SIM:01:BDES", 1.5) == [("QUAD:SIM:01:CTRL", "TRIM")]
 
 
 @pytest.mark.parametrize("prefix", sorted(MAGNET_PREFIXES))
 def test_every_magnet_prefix(prefix):
-    assert trim_hook.derive_extra_writes(f"{prefix}:DMP1:400:BDES", 2.0) == [(f"{prefix}:DMP1:400:CTRL", "TRIM")]
+    assert trim_hook.derive_extra_writes(f"{prefix}:SIM:01:BDES", 2.0) == [(f"{prefix}:SIM:01:CTRL", "TRIM")]
 
 
 def test_non_magnet_pv_yields_no_extra_writes():
-    assert trim_hook.derive_extra_writes("KLYS:LI22:31:KVAC", 3.0) == []
+    assert trim_hook.derive_extra_writes("KLYS:SIM:01:KVAC", 3.0) == []
 
 
 def test_magnet_without_trailing_bdes_raises():
     with pytest.raises(RestoreHookError):
-        trim_hook.derive_extra_writes("QUAD:LI21:201:BCON", 3.0)
+        trim_hook.derive_extra_writes("QUAD:SIM:01:BCON", 3.0)
 
 
 def test_protocol_prefix_is_preserved():
-    assert trim_hook.derive_extra_writes("pva://QUAD:LI21:201:BDES", 3.0) == [("pva://QUAD:LI21:201:CTRL", "TRIM")]
+    assert trim_hook.derive_extra_writes("pva://QUAD:SIM:01:BDES", 3.0) == [("pva://QUAD:SIM:01:CTRL", "TRIM")]
 
 
 @pytest.mark.parametrize("prefix", ["PVA://", "CA://", "Pva://"])
 def test_protocol_prefix_is_preserved_in_any_case(prefix):
-    assert trim_hook.derive_extra_writes(f"{prefix}QUAD:LI21:201:BDES", 3.0) == [
-        (f"{prefix}QUAD:LI21:201:CTRL", "TRIM")
-    ]
-    assert con_hook.derive_extra_writes(f"{prefix}QUAD:LI21:201:BDES", 0.5) == [(f"{prefix}QUAD:LI21:201:BCON", 0.5)]
+    assert trim_hook.derive_extra_writes(f"{prefix}QUAD:SIM:01:BDES", 3.0) == [(f"{prefix}QUAD:SIM:01:CTRL", "TRIM")]
+    assert con_hook.derive_extra_writes(f"{prefix}QUAD:SIM:01:BDES", 0.5) == [(f"{prefix}QUAD:SIM:01:BCON", 0.5)]
 
 
 def test_bare_address_stays_bare():
-    assert trim_hook.derive_extra_writes("BEND:DMP1:400:BDES", 3.0) == [("BEND:DMP1:400:CTRL", "TRIM")]
+    assert trim_hook.derive_extra_writes("BEND:SIM:01:BDES", 3.0) == [("BEND:SIM:01:CTRL", "TRIM")]
 
 
 def test_only_trailing_bdes_is_swapped():
@@ -59,34 +57,34 @@ def test_only_trailing_bdes_is_swapped():
 
 
 def test_bdes_derives_bcon_carrying_the_value():
-    assert con_hook.derive_extra_writes("QUAD:LI21:201:BDES", 4.25) == [("QUAD:LI21:201:BCON", 4.25)]
+    assert con_hook.derive_extra_writes("QUAD:SIM:01:BDES", 4.25) == [("QUAD:SIM:01:BCON", 4.25)]
 
 
 @pytest.mark.parametrize("prefix", sorted(MAGNET_PREFIXES))
 def test_every_magnet_prefix_writes_to_con(prefix):
-    assert con_hook.derive_extra_writes(f"{prefix}:DMP1:400:BDES", -1.5) == [(f"{prefix}:DMP1:400:BCON", -1.5)]
+    assert con_hook.derive_extra_writes(f"{prefix}:SIM:01:BDES", -1.5) == [(f"{prefix}:SIM:01:BCON", -1.5)]
 
 
 def test_con_non_magnet_pv_yields_no_extra_writes():
-    assert con_hook.derive_extra_writes("KLYS:LI22:31:KVAC", 1.0) == []
+    assert con_hook.derive_extra_writes("KLYS:SIM:01:KVAC", 1.0) == []
 
 
 def test_con_magnet_without_trailing_bdes_raises():
     with pytest.raises(RestoreHookError, match="not a BDES setpoint"):
-        con_hook.derive_extra_writes("QUAD:LI21:201:CTRL", 1.0)
+        con_hook.derive_extra_writes("QUAD:SIM:01:CTRL", 1.0)
 
 
 def test_con_error_names_the_original_address():
-    with pytest.raises(RestoreHookError, match="pva://QUAD:LI21:201:RBV"):
-        con_hook.derive_extra_writes("pva://QUAD:LI21:201:RBV", 1.0)
+    with pytest.raises(RestoreHookError, match="pva://QUAD:SIM:01:RBV"):
+        con_hook.derive_extra_writes("pva://QUAD:SIM:01:RBV", 1.0)
 
 
 def test_con_protocol_prefix_is_preserved():
-    assert con_hook.derive_extra_writes("pva://QUAD:LI21:201:BDES", 0.5) == [("pva://QUAD:LI21:201:BCON", 0.5)]
+    assert con_hook.derive_extra_writes("pva://QUAD:SIM:01:BDES", 0.5) == [("pva://QUAD:SIM:01:BCON", 0.5)]
 
 
 def test_con_bare_address_stays_bare():
-    assert con_hook.derive_extra_writes("BEND:DMP1:400:BDES", 0.0) == [("BEND:DMP1:400:BCON", 0.0)]
+    assert con_hook.derive_extra_writes("BEND:SIM:01:BDES", 0.0) == [("BEND:SIM:01:BCON", 0.0)]
 
 
 # --- registry --------------------------------------------------------------- #

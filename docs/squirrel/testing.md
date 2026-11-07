@@ -104,15 +104,15 @@ PVs. From the same file, slightly shortened:
 
 ```python
 async def test_restore_skips_later_hooks_after_an_earlier_hook_fails(db_session):
-    await _seed_pv(db_session, "QUAD:LI21:201:BDES")
-    io = FakeEpicsIO({"QUAD:LI21:201:BDES": _ev(3.0)})
-    io.fail_writes.add("QUAD:LI21:201:BCON")
+    await _seed_pv(db_session, "QUAD:SIM:01:BDES")
+    io = FakeEpicsIO({"QUAD:SIM:01:BDES": _ev(3.0)})
+    io.fail_writes.add("QUAD:SIM:01:BCON")
     svc = SnapshotService(db_session, io, restore_hooks=[WriteToConHook(), MagnetTrimHook()])
     summary = await svc.create_snapshot(NewSnapshotDTO(title="m"))
 
     io.writes.clear()
     result = await svc.restore_snapshot(summary.id)
-    assert io.writes == {"QUAD:LI21:201:BDES": 3.0}
+    assert io.writes == {"QUAD:SIM:01:BDES": 3.0}
     assert result.failures[0]["phase"] == "WriteToConHook"
 ```
 
@@ -149,10 +149,10 @@ For example, to see a magnet's trim skipped after its `BCON` write fails:
 
 ```bash
 CANOPY_SQUIRREL__RESTORE_HOOKS=write_to_con,magnet_trim
-CANOPY_EPICS__SIM_PUT_FAIL_PVS=QUAD:LI21:201:BCON
+CANOPY_EPICS__SIM_PUT_FAIL_PVS=QUAD:SIM:01:BCON
 ```
 
-Restoring a snapshot that includes `QUAD:LI21:201:BDES` then reports that PV
+Restoring a snapshot that includes `QUAD:SIM:01:BDES` then reports that PV
 as failed in the `WriteToConHook` phase, and writes nothing to its `CTRL`
 PV.
 

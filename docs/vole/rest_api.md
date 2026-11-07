@@ -30,7 +30,7 @@ Returns buffered samples for a single PV within a time window.
 
 ```json
 {
-  "pv": "QUAD:LI21:301:BDES",
+  "pv": "QUAD:SIM:01:BDES",
   "count": 3,
   "samples": [
     {
@@ -96,12 +96,12 @@ Returns multiple PVs aligned to a shared time index using Vole's alignment servi
   "tsNs": [1719388800000000000, 1719388801000000000],
   "pvs": [
     {
-      "pv": "QUAD:LI21:301:BDES",
+      "pv": "QUAD:SIM:01:BDES",
       "values": [3.14, 3.15],
       "severities": [0, 0]
     },
     {
-      "pv": "QUAD:LI21:301:BACT",
+      "pv": "QUAD:SIM:01:BACT",
       "values": [3.13, null],
       "severities": [0, 1]
     }
@@ -138,7 +138,7 @@ maintaining a persistent connection.
 
 ```json
 {
-  "pvs": ["QUAD:LI21:301:BDES", "QUAD:LI21:301:BACT"]
+  "pvs": ["QUAD:SIM:01:BDES", "QUAD:SIM:01:BACT"]
 }
 ```
 
@@ -150,7 +150,7 @@ maintaining a persistent connection.
 
 ```json
 {
-  "subscribed": ["QUAD:LI21:301:BDES", "QUAD:LI21:301:BACT"]
+  "subscribed": ["QUAD:SIM:01:BDES", "QUAD:SIM:01:BACT"]
 }
 ```
 
@@ -187,7 +187,7 @@ Convenience endpoint that subscribes a single PV by path parameter.
 
 ```json
 {
-  "subscribed": ["QUAD:LI21:301:BDES"]
+  "subscribed": ["QUAD:SIM:01:BDES"]
 }
 ```
 
