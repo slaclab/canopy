@@ -306,7 +306,8 @@ PUT /squirrel/v1/snapshots/{snapshotId}
 Changes a snapshot's `title`, `description` and `retain`; saved values never
 change. Both methods apply only the fields sent. Returns the updated summary.
 Requires `write`. A snapshot with `retain` set is never pruned: set it on a
-snapshot a service outside Canopy refers to.
+snapshot a service outside Canopy refers to (see
+[Turn pruning on](../deployment/history/operations.md#turn-pruning-on)).
 
 ??? example "Request body"
     ```json
@@ -426,6 +427,7 @@ the values left out.
 |--------|------|-----------|
 | 400 | `nothing_to_import` | None of the bundle's values could be imported |
 | 403 | `forwarded_write_refused` | `mode=captured` from a key that isn't a service key, or without `X-Canopy-On-Behalf-Of` |
+| 403 | `insufficient_facility_access` | The key is limited to some facilities, and the bundle has no facility or one outside them |
 | 403 | `not_owner` | Another instance owns the bundle's facility |
 | 404 | `facility_not_found` | No facility with the bundle's slug |
 | 409 | `snapshot_id_conflict` | `mode=captured`: a snapshot with this id exists with a different time or facility |
@@ -452,7 +454,8 @@ The body is optional. To restore only some PVs, list their ids in `pvIds`.
     }
     ```
 
-Without a body, the whole snapshot is restored.
+Without a body, the whole snapshot is restored. A [deleted](#delete-a-pv)
+PV's saved value is never written.
 
 | Status | Code | Condition |
 |--------|------|-----------|
@@ -605,12 +608,14 @@ required; the rest are optional. Tolerances default to `0`, which means
 values must match exactly. `tags` takes tag ids.
 
 A PV is identified by its first address in the order setpoint, readback,
-config. Two PVs with the same identifying address are duplicates.
+config. Two PVs with the same identifying address are duplicates. If a
+[deleted](#delete-a-pv) PV has the identifying address, that PV comes back,
+with its id and created date; everything else comes from the request.
 
 | Status | Code | Condition |
 |--------|------|-----------|
 | 400 | `bad_request` | A tag id does not exist |
-| 409 | `pv_already_exists` | A PV with the same identifying address exists |
+| 409 | `pv_already_exists` | A PV that isn't deleted has the same identifying address |
 | 422 | — | No address given |
 
 ### Create PVs in bulk
@@ -624,12 +629,13 @@ created PVs in the same order. Requires `write`. The import is all-or-nothing:
 if any row is rejected, no PV is created.
 
 Unlike [Create a PV](#create-a-pv), a tag id that doesn't exist isn't an
-error here: it is ignored, and the PV is created without that tag.
+error here: it is ignored, and the PV is created without that tag. As there,
+a row with a deleted PV's identifying address brings that PV back.
 
 | Status | Code | Condition |
 |--------|------|-----------|
 | 400 | `bad_request` | Two rows share an identifying address |
-| 409 | `pv_already_exists` | A row's identifying address is already registered |
+| 409 | `pv_already_exists` | A row's identifying address belongs to a PV that isn't deleted |
 | 422 | — | A row has no address |
 
 ### Update a PV
@@ -654,10 +660,12 @@ updated PV. Requires `write`.
 DELETE /squirrel/v1/pvs/{pvId}
 ```
 
-Deletes the PV: it is no longer listed or served, but its row and its saved
-values in every snapshot are kept. Creating a PV with the same setpoint address
-again brings the row back, with its id. Returns `true`. Requires `write`. A meta
-PV must be removed as a meta PV first.
+Deletes the PV. It leaves the searches, and getting or updating it returns
+`404`. Its saved values stay in past snapshots, which still show them with
+the PV's addresses, tags, and tolerances, but restoring a snapshot never
+writes a deleted PV. Registering its identifying address again brings it
+back (see [Create a PV](#create-a-pv)). Returns `true`. Requires `write`. A
+meta PV must be removed as a meta PV first.
 
 | Status | Code | Condition |
 |--------|------|-----------|
