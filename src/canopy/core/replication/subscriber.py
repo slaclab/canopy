@@ -22,7 +22,7 @@ from collections.abc import Mapping, Callable, Awaitable
 
 import asyncpg
 
-from canopy.core.arms import Arm, subscription_name
+from canopy.core.arms import _SUBSCRIPTION_PREFIX, Arm, subscription_name
 from canopy.core.replication.sql import (
     Refused,
     ReplicationError,
@@ -61,7 +61,7 @@ def _selected_arms(arms: Mapping[str, Arm], only: str | None, head: str | None =
         head's own name (an instance can't subscribe to itself).
     """
     if not arms:
-        raise Refused("no arms are configured; set CANOPY_ARMS__<arm>__PUBLISHER_DSN for each arm")
+        raise Refused("no arms are configured; configure each arm in CANOPY_ARMS (CANOPY_ARMS__<arm>__<FIELD>)")
     if only is not None and only not in arms:
         raise Refused(f"no arm named {only!r} is configured (configured: {', '.join(sorted(arms))})")
     if head is not None and head in arms:
@@ -74,10 +74,11 @@ async def _history_subscriptions(conn: asyncpg.Connection) -> list[str]:
     rows = await conn.fetch(
         """
         SELECT subname FROM pg_subscription
-        WHERE subname LIKE 'canopy\\_history\\_%'
+        WHERE starts_with(subname, $1)
           AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())
         ORDER BY subname
-        """
+        """,
+        _SUBSCRIPTION_PREFIX,
     )
     return [row["subname"] for row in rows]
 
@@ -618,6 +619,30 @@ async def grants(
     }
 
 
+async def applied_lsn(conn: asyncpg.Connection, subscription: str) -> str | None:
+    """The primary's WAL position of the last transaction ``subscription`` applied here.
+
+    ``pg_replication_origin_status.remote_lsn``, as in ``subscriber_status``: the end of
+    that transaction's commit record. ``None`` when the subscription doesn't exist or
+    hasn't applied anything yet.
+
+    Raises
+    ------
+    asyncpg.InsufficientPrivilegeError
+        When the role can't read ``pg_replication_origin_status`` (superuser only,
+        unless granted).
+    """
+    return await conn.fetchval(
+        """
+        SELECT o.remote_lsn::text
+        FROM pg_replication_origin_status o
+        JOIN pg_subscription s ON o.external_id = 'pg_' || s.oid::text
+        WHERE s.subname = $1 AND s.subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+        """,
+        subscription,
+    )
+
+
 async def _arm_status(conn: asyncpg.Connection, arm: str, registry: ReplicationRegistry) -> dict:
     """One arm's subscription state; see ``subscriber_status``."""
     name = subscription_name(arm)
@@ -634,12 +659,9 @@ async def _arm_status(conn: asyncpg.Connection, arm: str, registry: ReplicationR
     errors = await conn.fetchrow(
         "SELECT apply_error_count, sync_error_count FROM pg_stat_subscription_stats WHERE subid = $1", sub["oid"]
     )
-    applied_lsn, applied_lsn_error = None, None
+    applied, applied_lsn_error = None, None
     try:
-        applied_lsn = await conn.fetchval(
-            "SELECT remote_lsn::text FROM pg_replication_origin_status WHERE external_id = 'pg_' || $1::oid::text",
-            sub["oid"],
-        )
+        applied = await applied_lsn(conn, name)
     except asyncpg.InsufficientPrivilegeError:
         applied_lsn_error = "pg_replication_origin_status needs a superuser or an explicit grant"
     tables = await _subscribed_tables(conn, sub["oid"])
@@ -654,7 +676,7 @@ async def _arm_status(conn: asyncpg.Connection, arm: str, registry: ReplicationR
         "streaming": sub["substream"],
         "slot_name": sub["subslotname"],
         "worker": jsonable(worker) if worker else None,
-        "applied_lsn": applied_lsn,
+        "applied_lsn": applied,
         "applied_lsn_error": applied_lsn_error,
         "apply_error_count": errors["apply_error_count"] if errors else 0,
         "sync_error_count": errors["sync_error_count"] if errors else 0,
