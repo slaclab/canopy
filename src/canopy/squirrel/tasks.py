@@ -19,9 +19,9 @@ from uuid import uuid4
 from arq import Retry
 
 from canopy.core.db import session_scope
-from canopy.core.errors import PrimaryUnavailable
 from canopy.jobs.gateway import report_progress
 from canopy.squirrel.config import get_squirrel_config
+from canopy.squirrel.errors import OutboxFull
 from canopy.squirrel.outbox import delivery as outbox
 from canopy.core.forwarding.client import Caller, ArmRefused
 from canopy.squirrel.pv_cache.reader import PVCacheReader
@@ -109,9 +109,10 @@ async def create_snapshot_task(
             )
             await session.commit()
         return {"type": "snapshot", "id": summary.id}
-    except (PrimaryUnavailable, ArmRefused):
-        # Not retried here: the arm refused the bundle, or nothing reached it. The job
-        # fails with the reason, and the head's worker never saves the arm's snapshot.
+    except (ArmRefused, OutboxFull):
+        # Not retried, whatever the message says: the arm refused the snapshot, or it
+        # couldn't take it and its outbox is full. The job fails with the reason, and the
+        # head's worker never saves the arm's snapshot.
         logger.exception("create_snapshot_task failed: job_id=%s", ctx.get("job_id"))
         raise
     except Exception as exc:
