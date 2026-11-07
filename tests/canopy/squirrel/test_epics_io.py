@@ -3,8 +3,12 @@
 A fake connector stands in for ``canopy.epics`` — no IOCs, no DB.
 """
 
+import time
+import asyncio
 from typing import Any
 from datetime import UTC, datetime
+
+import pytest
 
 from canopy.contracts.pv import PVValue
 from canopy.contracts.sample import AlarmSeverity
@@ -102,6 +106,82 @@ async def test_get_many_progress_is_chunked():
 
     await EpicsIO(conn, chunk_size=2).get_many_with_progress([f"P{i}" for i in range(5)], cb)
     assert calls == [(2, 5), (4, 5), (5, 5)]  # chunks of 2 over 5 PVs
+
+
+class SlowConnector:
+    """Reads that take `delay[addr]` seconds (0 by default), tracking how many are in flight.
+
+    With `gate` set, every read waits on it first, so reads can be held open.
+    """
+
+    def __init__(self, delay: dict[str, float] | None = None, gate: asyncio.Event | None = None):
+        self.delay = delay or {}
+        self.gate = gate
+        self.inflight = 0
+        self.max_inflight = 0
+        self.started = 0
+        self.cancelled = 0
+
+    async def get(self, addr: str, *, timeout=None) -> PVValue:
+        self.inflight += 1
+        self.started += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            await asyncio.sleep(self.delay.get(addr, 0))
+            return _pv(addr, 1.0)
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        finally:
+            self.inflight -= 1
+
+
+async def test_get_many_slow_pvs_do_not_stall_the_rest():
+    # One slow PV in each of what used to be three chunks. Chunk by chunk this took
+    # three delays in a row; in one pool the slow reads overlap.
+    addrs = [f"P{i}" for i in range(6)]
+    conn = SlowConnector(delay={"P0": 0.3, "P2": 0.3, "P4": 0.3})
+    start = time.perf_counter()
+    out = await EpicsIO(conn, concurrency=4, chunk_size=2).get_many(addrs)
+    assert time.perf_counter() - start < 0.6
+    assert set(out) == set(addrs)
+
+
+async def test_get_many_progress_counts_completions_in_order():
+    # Later PVs finish first; progress still counts up by chunk_size and ends at total.
+    addrs = [f"P{i}" for i in range(5)]
+    conn = SlowConnector(delay={f"P{i}": 0.05 * (5 - i) for i in range(5)})
+    calls: list[tuple[int, int]] = []
+
+    async def cb(cur: int, total: int, _msg: str) -> None:
+        calls.append((cur, total))
+
+    await EpicsIO(conn, concurrency=5, chunk_size=2).get_many_with_progress(addrs, cb)
+    assert calls == [(2, 5), (4, 5), (5, 5)]
+
+
+async def test_get_many_keeps_concurrency_reads_in_flight():
+    conn = SlowConnector(delay={f"P{i}": 0.01 for i in range(50)})
+    await EpicsIO(conn, concurrency=8, chunk_size=3).get_many([f"P{i}" for i in range(50)])
+    assert conn.max_inflight == 8  # saturated, never over
+
+
+async def test_get_many_cancelled_cancels_reads_in_flight():
+    gate = asyncio.Event()  # never set: every read stays open
+    conn = SlowConnector(gate=gate)
+    task = asyncio.create_task(EpicsIO(conn, concurrency=4).get_many([f"P{i}" for i in range(20)]))
+    while conn.inflight < 4:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert conn.inflight == 0
+    assert conn.cancelled == conn.started == 4
+    # Reads still queued on the semaphore never reach the connector, and none is left over.
+    leftover = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+    assert leftover == []
 
 
 # --- batch writes ----------------------------------------------------------- #

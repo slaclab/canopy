@@ -99,9 +99,10 @@ def _to_epics_value(pv: PVValue) -> EpicsValue:
 class EpicsIO:
     """Batch EPICS reads/writes over a ``canopy.epics`` connector.
 
-    Concurrency is bounded by a semaphore; progress is reported on a chunk cadence.
-    The connector is shared and already started (typically the one the worker builds
-    at startup and stashes in the Arq context).
+    Concurrency is bounded by a semaphore. Reads run as one pool; writes go chunk by
+    chunk, each chunk finishing before the next starts. Progress is reported every
+    ``chunk_size`` items either way. The connector is shared and already started
+    (typically the one the worker builds at startup and stashes in the Arq context).
     """
 
     def __init__(
@@ -125,19 +126,35 @@ class EpicsIO:
     async def get_many_with_progress(
         self, pv_names: list[str], progress_callback: ProgressCallback | None = None
     ) -> dict[str, EpicsValue]:
+        """Read every PV, at most ``concurrency`` at a time.
+
+        All reads share one pool rather than running chunk by chunk, so a PV that only
+        answers with a timeout (disconnected, retired, misspelled) holds up its own
+        slot and nothing else. Chunked, every chunk waited for its slowest read, and a
+        few dead PVs scattered through a large facility cost a full timeout per chunk.
+
+        ``progress_callback`` is awaited after every ``chunk_size`` completed reads and
+        once more at the end, in order, from this coroutine alone. If this coroutine is
+        cancelled (a job timing out), the reads still in flight are cancelled with it.
+        """
         results: dict[str, EpicsValue] = {}
         total = len(pv_names)
         if total == 0:
             return results
         sem = asyncio.Semaphore(self._concurrency)
-        done = 0
-        for start in range(0, total, self._chunk_size):
-            chunk = pv_names[start : start + self._chunk_size]
-            pairs = await asyncio.gather(*(self._read_one(sem, addr) for addr in chunk))
-            results.update(dict(pairs))
-            done += len(chunk)
-            if progress_callback:
-                await progress_callback(done, total, f"Read {done}/{total} PVs...")
+        tasks = [asyncio.create_task(self._read_one(sem, addr)) for addr in pv_names]
+        try:
+            for done, next_read in enumerate(asyncio.as_completed(tasks), start=1):
+                addr, value = await next_read
+                results[addr] = value
+                if progress_callback and (done % self._chunk_size == 0 or done == total):
+                    await progress_callback(done, total, f"Read {done}/{total} PVs...")
+        finally:
+            pending = [task for task in tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
         return results
 
     async def _read_one(self, sem: asyncio.Semaphore, addr: str) -> tuple[str, EpicsValue]:
