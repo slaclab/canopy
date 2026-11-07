@@ -85,7 +85,8 @@ class SnapshotSummaryDTO(SnapshotBase):
     """
 
     id: str
-    # The instance that took the snapshot and alone writes it (``canopy.core.ownership``).
+    # The owner of the snapshot's facility and PVs, the one instance that writes it
+    # (``canopy.core.ownership``).
     owner_instance: str
     created_date: datetime
     created_by: str | None = None

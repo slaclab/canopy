@@ -1,6 +1,6 @@
-"""The primary's side: keep the publications in step with the registry, and report on them.
+"""An arm's side: keep the publications in step with the registry, and report on them.
 
-``publish`` runs after ``alembic upgrade head`` on every deploy of a primary. It is
+``publish`` runs after ``alembic upgrade head`` on every deploy of an arm. It is
 idempotent: a run that finds the publications already right changes nothing.
 
 An arm that will prune old rows switches from the single layout to the split
@@ -330,7 +330,7 @@ async def publish(
     Parameters
     ----------
     conn : asyncpg.Connection
-        Connection to the primary as a role that may create publications and owns the tables.
+        Connection to this arm as a role that may create publications and owns the tables.
     role : str
         This instance's ``CANOPY_ROLE``; must be ``"primary"``.
     config : ReplicationConfig
@@ -445,7 +445,7 @@ async def publish(
 async def publisher_status(
     conn: asyncpg.Connection, *, config: ReplicationConfig, registry: ReplicationRegistry = REGISTRY
 ) -> dict:
-    """The primary's replication state, as JSON-ready data.
+    """This arm's replication state, as JSON-ready data.
 
     Returns
     -------
@@ -492,7 +492,7 @@ async def publisher_status(
         """
         SELECT s.slot_name,
                CASE WHEN s.slot_name ~ '^pg_[0-9]+_sync_' THEN 'tablesync'
-                    WHEN s.slot_name LIKE 'canopy\\_history\\_%' THEN 'subscription'
+                    WHEN starts_with(s.slot_name, $1) THEN 'subscription'
                     ELSE 'other' END AS kind,
                s.active, s.active_pid, s.wal_status, s.safe_wal_size,
                s.restart_lsn::text AS restart_lsn, s.confirmed_flush_lsn::text AS confirmed_flush_lsn,
@@ -510,7 +510,8 @@ async def publisher_status(
         LEFT JOIN pg_stat_activity a ON a.pid = s.active_pid
         WHERE s.slot_type = 'logical' AND s.database = current_database()
         ORDER BY s.slot_name
-        """
+        """,
+        _SUBSCRIPTION_PREFIX,
     )
     slot_rows = []
     for row in slots:
