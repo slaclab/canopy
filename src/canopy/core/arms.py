@@ -42,8 +42,8 @@ class Arm(BaseModel):
     reader_dsn: SecretStr | None = Field(
         default=None,
         description=(
-            "postgresql:// URI the head's `drift-check` uses to read this arm, as its read-only reader "
-            "role. Supply it from a secret, like the publisher DSN."
+            "postgresql:// URI the head's `drift-check` and `reseed` use to read this arm, as its "
+            "read-only reader role. Supply it from a secret, like the publisher DSN."
         ),
     )
 
