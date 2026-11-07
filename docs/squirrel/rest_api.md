@@ -9,6 +9,32 @@ header. The key must also be scoped to the `squirrel` module (see
 Snapshots, PVs, tag groups, and tags are identified by UUIDs. An id that is
 not a valid UUID is treated like an unknown one and returns `404`.
 
+## Owners
+
+Every PV, meta PV, snapshot and tag group carries `ownerInstance`: the
+`CANOPY_INSTANCE` of the instance that created it, which never changes. An
+instance writes only rows it owns: editing or deleting another instance's row
+answers `403 not_owner`, naming the owner. On a history head, which holds its
+arms' rows beside its own, `ownerInstance` also tells apart two PVs with the same
+setpoint address, or two tag groups with the same name, from different owners (see
+[Row owners](../deployment/index.md#row-owners)).
+
+A new row takes the owner of what it's created in (a PV's facilities, a
+snapshot's facility, a tag's group). The creates below also take an optional
+`owner` query parameter, for a create with nothing to take the owner from:
+
+| Endpoint | |
+|----------|---|
+| `POST /squirrel/v1/snapshots` | Capture a snapshot |
+| `POST /squirrel/v1/pvs`, `POST /squirrel/v1/pvs/multi` | Create PVs |
+| `POST /squirrel/v1/pvs/meta` | Add a meta PV |
+| `POST /squirrel/v1/tags`, `POST /squirrel/v1/tags/bulk` | Create a tag group, import tags |
+
+`owner` defaults to this instance. An instance refuses with `403 not_owner` a
+create it wouldn't own itself; a history head sends a create naming one of its
+arms to that arm (see [Writes on a head](../deployment/history/operations.md#writes-on-a-head)).
+A request that links rows of different owners answers `409 owner_mismatch`.
+
 ## Background jobs
 
 Capturing and restoring a snapshot run as background jobs in the Canopy
@@ -110,13 +136,18 @@ make you see one twice or skip one.
           "id": "8d0c…",
           "title": "Before ROD",
           "description": "Baseline before the optics change",
+          "ownerInstance": "arm1",
           "createdDate": "2026-10-29T17:04:12Z",
           "createdBy": null,
           "pvCount": 1250,
+          "facility": "injector",
+          "retain": false,
+          "importedFrom": null,
+          "delivery": null,
           "metaPvs": [
             {
               "pvId": "9b2e…",
-              "pvName": "BEND:DMPH:400:BDES",
+              "pvName": "SIM:BEND:01:BDES",
               "value": 10.0,
               "status": 0,
               "severity": 0,
@@ -136,7 +167,33 @@ make you see one twice or skip one.
 
 `continuationToken` is `null` on the last page. `totalCount` counts every
 snapshot matching the filters. `metaPvs` holds each active
-[meta PV](#meta-pvs)'s saved value.
+[meta PV](#meta-pvs)'s saved value. `facility` is the snapshot's facility slug,
+`retain` keeps it from being pruned (see [Update a snapshot](#update-a-snapshot)),
+and `importedFrom` is the id of the snapshot an [import](#import-a-snapshot)
+brought back. Deleted snapshots are never listed.
+
+**Pending and failed snapshots.** On a history head, a snapshot taken for an arm
+that couldn't be reached waits in the head's outbox until the arm saves it (see
+[When an arm is unreachable](../deployment/history/operations.md#when-an-arm-is-unreachable)).
+Until then it is listed and served like any other, under the same id, with
+`delivery` set; `delivery` is `null` for every stored snapshot:
+
+```json
+"delivery": {
+  "state": "pending",
+  "arm": "arm2",
+  "queuedAt": "2026-11-06T14:02:11Z",
+  "attempts": 3,
+  "reason": "arm2 could not be reached"
+}
+```
+
+`state` is `pending` while it waits, or once the arm has saved it and it hasn't
+replicated back yet (`reason` "Saved on arm2; waiting for replication"), and
+`failed` when the arm refused it, with the arm's reason. Compare and export work on
+such a snapshot. Editing or deleting it answers `409 snapshot_pending`, and so does
+restoring it, except where the head has `CANOPY_MACHINE_ACCESS=write`, which
+restores it from its bundle.
 
 | Status | Code | Condition |
 |--------|------|-----------|
@@ -149,18 +206,39 @@ snapshot matching the filters. `metaPvs` holds each active
 POST /squirrel/v1/snapshots
 ```
 
-Queues a capture of every PV Squirrel tracks and returns `{jobId, statusUrl}`
-(see [Background jobs](#background-jobs)). Requires `write`.
+Queues a capture and returns `{jobId, statusUrl}` (see
+[Background jobs](#background-jobs)). Requires `write`. With a `facility` it
+captures the PVs assigned to that facility or one below it; without one, every PV
+this instance owns.
+
+| Parameter | In | Type | Required | Description |
+|-----------|----|------|----------|-------------|
+| `owner` | query | string | no | The instance that will own the snapshot when there is no `facility` (see [Owners](#owners)) |
 
 ??? example "Request body"
     ```json
     {
       "title": "Before ROD",
-      "description": "Baseline before the optics change"
+      "description": "Baseline before the optics change",
+      "facility": "injector"
     }
     ```
 
-`title` is required (1–255 characters); `description` is optional.
+`title` is required (1–255 characters); `description` and `facility` (a slug)
+are optional.
+
+The finished job's `result` is `{"type": "snapshot", "id": "<snapshot id>"}`.
+On a history head, a snapshot of an arm's facility is read here and saved on that
+arm under the same id: the result adds `"arm"`, and `skipped` lists the values the
+arm left out. When the arm can't take it, the job still completes, with the
+snapshot waiting in the head's outbox: its message is "Captured; waiting for
+*arm*" and the result adds `"delivery": {"state": "pending", ...}`.
+
+| Status | Code | Condition |
+|--------|------|-----------|
+| 403 | `not_owner` | The facility, or `owner`, is an instance this one can't save for |
+| 404 | `facility_not_found` | No facility with this slug |
+| 503 | `outbox_full` | On a history head: the arm's outbox is full, and the snapshot could only queue |
 
 ### Get a snapshot
 
@@ -188,16 +266,16 @@ Returns the snapshot summary plus its saved values, sorted by PV address.
       "pvValues": [
         {
           "pvId": "41a7…",
-          "pvName": "QUAD:LI21:201:BDES",
-          "device": "QUAD:LI21:201",
-          "setpointName": "QUAD:LI21:201:BDES",
-          "readbackName": "QUAD:LI21:201:BACT",
+          "pvName": "SIM:QUAD:01:BDES",
+          "device": "SIM:QUAD:01",
+          "setpointName": "SIM:QUAD:01:BDES",
+          "readbackName": "SIM:QUAD:01:BACT",
           "setpointValue": {"value": 12.5, "status": 0, "severity": 0, "timestamp": "2026-10-29T17:04:12Z", "units": null, "precision": null, "upperCtrlLimit": null, "lowerCtrlLimit": null},
           "readbackValue": {"value": 12.49, "status": 0, "severity": 0, "timestamp": "2026-10-29T17:04:12Z", "units": null, "precision": null, "upperCtrlLimit": null, "lowerCtrlLimit": null},
           "status": 0,
           "severity": 0,
           "timestamp": "2026-10-29T17:04:12Z",
-          "tags": [{"id": "c3f1…", "name": "LI21", "groupName": "Area"}]
+          "tags": [{"id": "c3f1…", "name": "S01", "groupName": "Area"}]
         }
       ]
     }
@@ -219,12 +297,14 @@ Returns the snapshot summary plus its saved values, sorted by PV address.
 ### Update a snapshot
 
 ```
+PATCH /squirrel/v1/snapshots/{snapshotId}
 PUT /squirrel/v1/snapshots/{snapshotId}
 ```
 
-Changes a snapshot's title and/or description; saved values never change.
-Omitted fields are left as they are. Returns the updated summary. Requires
-`write`.
+Changes a snapshot's `title`, `description` and `retain`; saved values never
+change. Both methods apply only the fields sent. Returns the updated summary.
+Requires `write`. A snapshot with `retain` set is never pruned: set it on a
+snapshot a service outside Canopy refers to.
 
 ??? example "Request body"
     ```json
@@ -235,7 +315,9 @@ Omitted fields are left as they are. Returns the updated summary. Requires
 
 | Status | Code | Condition |
 |--------|------|-----------|
+| 403 | `not_owner` | Another instance owns the snapshot |
 | 404 | `snapshot_not_found` | No snapshot with this id |
+| 409 | `snapshot_pending` | On a history head: the snapshot is still waiting for its arm |
 
 ### Delete a snapshot
 
@@ -243,12 +325,110 @@ Omitted fields are left as they are. Returns the updated summary. Requires
 DELETE /squirrel/v1/snapshots/{snapshotId}
 ```
 
-Deletes the snapshot and all its saved values. Returns `true`. Requires
-`write`.
+Deletes the snapshot: it is no longer listed or served, and every read answers
+`404`, but its row and saved values are kept, and the delete reaches a history
+copy like any change. Returns `true`. Requires `write`.
+
+| Status | Code | Condition |
+|--------|------|-----------|
+| 403 | `not_owner` | Another instance owns the snapshot |
+| 404 | `snapshot_not_found` | No snapshot with this id |
+| 409 | `snapshot_pending` | On a history head: the snapshot is still waiting for its arm |
+
+### Export a snapshot
+
+```
+GET /squirrel/v1/snapshots/{snapshotId}/export
+```
+
+Returns the snapshot with every saved value as a bundle, for
+[import](#import-a-snapshot) on another instance. Each value carries its PV's id
+and its addresses as this instance holds them. Requires `read`.
+
+??? example "Response"
+    ```json
+    {
+      "format": "canopy.squirrel.snapshot-bundle",
+      "version": 1,
+      "sourceInstance": "head",
+      "id": "8d0c…",
+      "title": "Before ROD",
+      "description": null,
+      "createdDate": "2026-10-29T17:04:12Z",
+      "createdBy": "operator@head",
+      "facility": "injector",
+      "values": [
+        {
+          "pvId": "41a7…",
+          "pvName": "SIM:QUAD:01:BDES",
+          "setpointAddress": "SIM:QUAD:01:BDES",
+          "readbackAddress": "SIM:QUAD:01:BACT",
+          "configAddress": null,
+          "setpointValue": {"value": 12.5},
+          "readbackValue": {"value": 12.49},
+          "status": 0,
+          "severity": 0,
+          "timestamp": "2026-10-29T17:04:12Z"
+        }
+      ]
+    }
+    ```
 
 | Status | Code | Condition |
 |--------|------|-----------|
 | 404 | `snapshot_not_found` | No snapshot with this id |
+
+### Import a snapshot
+
+```
+POST /squirrel/v1/snapshots/import
+```
+
+Saves a snapshot from a bundle that [export](#export-a-snapshot) produced.
+Requires `write`. Nothing is read from or written to EPICS.
+
+| Parameter | In | Type | Required | Description |
+|-----------|----|------|----------|-------------|
+| `mode` | query | string | no | `history` (default) or `captured` |
+| `strict` | query | bool | no | Refuse, saving nothing, when any value would be left out. Default `false` |
+
+- **`history`** brings back a snapshot exported from a history copy, typically to
+  restore one an arm has pruned. The new snapshot has a new id, today's time, a
+  "Restored from history" title and `importedFrom` set to the bundle's id;
+  `createdBy` stays the original's.
+- **`captured`** is how a history head saves a snapshot it took for this
+  instance. Only a service key may send it, naming in `X-Canopy-On-Behalf-Of` the
+  user it was taken for, who becomes its author. It keeps the bundle's id, time,
+  title and description, and is idempotent on the id: sending it again answers
+  `created: false` and saves nothing. The answer always carries
+  `X-Canopy-Commit-LSN`.
+
+Either way, a value is kept only when its PV exists here, the key could restore
+it, and, for a bundle with a facility, the PV is assigned to that facility or one
+below it. The new snapshot belongs to the bundle's facility, which must be this
+instance's.
+
+??? example "Response"
+    ```json
+    {
+      "snapshot": {"id": "f31a…", "title": "Restored from history: Before ROD", "importedFrom": "8d0c…"},
+      "skipped": [{"pvId": "77d0…", "pvName": "SIM:QUAD:02:BDES"}],
+      "created": true
+    }
+    ```
+
+`snapshot` is the saved snapshot's summary (shortened above), and `skipped` lists
+the values left out.
+
+| Status | Code | Condition |
+|--------|------|-----------|
+| 400 | `nothing_to_import` | None of the bundle's values could be imported |
+| 403 | `forwarded_write_refused` | `mode=captured` from a key that isn't a service key, or without `X-Canopy-On-Behalf-Of` |
+| 403 | `not_owner` | Another instance owns the bundle's facility |
+| 404 | `facility_not_found` | No facility with the bundle's slug |
+| 409 | `snapshot_id_conflict` | `mode=captured`: a snapshot with this id exists with a different time or facility |
+| 409 | `import_would_skip` | `strict=true` and some values would be left out; the detail names the PVs |
+| 422 | — | A malformed bundle, or one with a PV twice |
 
 ### Restore a snapshot
 
@@ -293,7 +473,7 @@ differ. See [Comparing snapshots](index.md#comparing-snapshots) for the rules.
       "differences": [
         {
           "pvId": "41a7…",
-          "pvName": "QUAD:LI21:201:BDES",
+          "pvName": "SIM:QUAD:01:BDES",
           "value1": 12.5,
           "value2": 12.9,
           "withinTolerance": false
@@ -321,14 +501,14 @@ Every endpoint that returns a PV uses the same shape.
     ```json
     {
       "id": "41a7…",
-      "setpointAddress": "QUAD:LI21:201:BDES",
-      "readbackAddress": "QUAD:LI21:201:BACT",
+      "setpointAddress": "SIM:QUAD:01:BDES",
+      "readbackAddress": "SIM:QUAD:01:BACT",
       "configAddress": null,
-      "device": "QUAD:LI21:201",
-      "description": "LI21 quad field",
+      "device": "SIM:QUAD:01",
+      "description": "Sector 1 quad field",
       "absTolerance": 0.01,
       "relTolerance": 0.0,
-      "tags": [{"id": "c3f1…", "name": "LI21", "description": null}],
+      "tags": [{"id": "c3f1…", "name": "S01", "description": null}],
       "createdDate": "2026-10-29T17:04:12Z",
       "lastModifiedDate": "2026-10-29T17:04:12Z",
       "createdBy": null,
@@ -339,7 +519,7 @@ Every endpoint that returns a PV uses the same shape.
 A text search matches a case-insensitive substring of any address, the
 device, or the description. The text is used as a SQL `LIKE` pattern, so
 `_` matches any one character and `%` any run of characters: `QUAD_` also
-finds `QUAD:LI21:201:BDES`. `*` and `?` are matched literally.
+finds `SIM:QUAD:01:BDES`. `*` and `?` are matched literally.
 
 ### Search PVs (paged)
 
@@ -405,10 +585,10 @@ Requires `write`. Returns the created PV.
 ??? example "Request body"
     ```json
     {
-      "setpointAddress": "QUAD:LI21:201:BDES",
-      "readbackAddress": "QUAD:LI21:201:BACT",
-      "device": "QUAD:LI21:201",
-      "description": "LI21 quad field",
+      "setpointAddress": "SIM:QUAD:01:BDES",
+      "readbackAddress": "SIM:QUAD:01:BACT",
+      "device": "SIM:QUAD:01",
+      "description": "Sector 1 quad field",
       "absTolerance": 0.01,
       "relTolerance": 0.0,
       "tags": ["c3f1…"]
@@ -469,8 +649,10 @@ updated PV. Requires `write`.
 DELETE /squirrel/v1/pvs/{pvId}
 ```
 
-Deletes the PV and its saved values in every snapshot. Returns `true`.
-Requires `write`. A meta PV must be removed as a meta PV first.
+Deletes the PV: it is no longer listed or served, but its row and its saved
+values in every snapshot are kept. Creating a PV with the same setpoint address
+again brings the row back, with its id. Returns `true`. Requires `write`. A meta
+PV must be removed as a meta PV first.
 
 | Status | Code | Condition |
 |--------|------|-----------|
@@ -495,7 +677,7 @@ Requires `write`.
 ??? example "Request body"
     ```json
     {
-      "pvName": "BEND:DMPH:400:BDES",
+      "pvName": "SIM:BEND:01:BDES",
       "displayName": "DMP Energy"
     }
     ```
@@ -596,7 +778,7 @@ Endpoints that return a full tag group, with its tags, use the same shape.
       "id": "a1d4…",
       "name": "Area",
       "description": "Machine area",
-      "tags": [{"id": "c3f1…", "name": "LI21", "description": null}],
+      "tags": [{"id": "c3f1…", "name": "S01", "description": null}],
       "createdDate": "2026-10-29T17:04:12Z",
       "lastModifiedDate": "2026-10-29T17:04:12Z"
     }
@@ -670,7 +852,7 @@ yet.
 POST /squirrel/v1/tags/{groupId}/tags
 ```
 
-Requires `write`. Body `{"name": "LI21", "description": null}`.
+Requires `write`. Body `{"name": "S01", "description": null}`.
 
 | Parameter | In | Type | Required | Description |
 |-----------|----|------|----------|-------------|
@@ -722,7 +904,7 @@ Creates any missing groups and tags. Requires `write`.
     ```json
     {
       "groups": {
-        "Area": ["LI21", "LI22"],
+        "Area": ["S01", "S02"],
         "Subsystem": ["Magnets"]
       }
     }
@@ -737,7 +919,7 @@ added, are skipped with a warning instead of failing the import.
       "groupsCreated": 1,
       "tagsCreated": 2,
       "tagsSkipped": 1,
-      "warnings": ["Tag 'LI21' already exists in group 'Area'"]
+      "warnings": ["Tag 'S01' already exists in group 'Area'"]
     }
     ```
 
@@ -798,6 +980,7 @@ FastAPI's validation body, which lists each problem under `detail`.
 | `job_not_found` | 404 | From `/jobs/v1/{jobId}`: no such job, or its result has expired |
 | `not_owner` | 403 | The row, or the facility or group a create goes into, belongs to another instance; the detail names it. On a history head, a write to a read-only arm's row. See [Row owners](../deployment/index.md#row-owners) |
 | `owner_mismatch` | 409 | The request links rows of different owners, such as a PV with another owner's tag or facility |
+| `facility_not_found` | 404 | No facility with this slug |
 | `facility_slug_conflict` | 409 | A facility with this slug already exists, under any owner |
 | `machine_read_only` | 403 | This instance has `CANOPY_MACHINE_ACCESS=read`: no restores or PV writes here |
 | `forwarded_write_refused` | 403 | `X-Canopy-On-Behalf-Of` from a key that isn't a service key, or on an instance without `CANOPY_ACCEPT_FORWARDED_WRITES` |
