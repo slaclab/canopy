@@ -29,11 +29,14 @@ class ReplicationConfig(BaseSettings):
     )
     reader_role: str = Field(
         default="canopy_reader",
-        description="Read-only role for checks run against the primary; `publish` grants it the same SELECT.",
+        description="Read-only role for a head's checks on an arm; `publish` grants it the same SELECT.",
     )
     app_role: str = Field(
         default="canopy_app",
-        description="Role the mirror's API connects as; `grants` gives it read access to replicated tables.",
+        description=(
+            "Role the head's API connects as; `grants` lets it read every replicated row and write only "
+            "the head's own (row-level security on the root tables)."
+        ),
     )
 
 

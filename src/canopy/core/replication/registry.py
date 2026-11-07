@@ -7,8 +7,8 @@ table can't ship before someone decides whether the head gets it:
 
 ``reference``
     Rows edited in place and shared across the instance (PVs, tags, configs).
-    Replicated with every operation, so an edit or a delete on the primary is
-    applied on the mirror too.
+    Replicated with every operation, so an edit or a delete on an arm is
+    applied on its head too.
 ``time_series``
     Rows that only accumulate (snapshots and their values). Replicated with every
     operation for now; a later phase moves them to a publication without
@@ -50,7 +50,7 @@ class Publication:
     Attributes
     ----------
     name : str
-        Publication name on the primary; the mirror's subscription names it too.
+        Publication name on each arm; the head's subscription to that arm names it too.
     classes : frozenset[TableClass]
         Table classes it carries. Every table outside ``LOCAL`` is in exactly one publication.
     operations : tuple[str, ...]
@@ -191,9 +191,9 @@ REGISTRY = ReplicationRegistry(
         }
     ),
     shared_keys=MappingProxyType({"core.facility": ("slug",), "magpie.config": ("slug",)}),
-    # One publication until the primary prunes old rows. TRUNCATE is left out on
-    # purpose: no Canopy code truncates, so one typed on the primary by hand is a
-    # mistake the history copy shouldn't repeat.
+    # One publication until an arm prunes old rows. TRUNCATE is left out on
+    # purpose: no Canopy code truncates, so one typed on an arm by hand is a
+    # mistake the head's copy shouldn't repeat.
     publications=(
         Publication(
             name="canopy_history",

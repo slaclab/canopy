@@ -33,7 +33,7 @@ def test_arms_as_json(monkeypatch):
 
 @pytest.mark.parametrize("name", ["", "Arm1", "arm-1", "arm 1", "x" * 49])
 def test_names_must_suit_a_subscription_name(name):
-    with pytest.raises(ValidationError, match="arm names must be"):
+    with pytest.raises(ValidationError, match="arm names must match"):
         ArmsConfig(arms={name: Arm()})
 
 
