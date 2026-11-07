@@ -284,9 +284,9 @@ large.
 
 **What happens.**
 
-- A capture for the arm is taken on the head and waits in its outbox, under the id the
+- If it's a forwarding arm, a capture for it is taken on the head and waits in its outbox, under the id the
   head gave it, listed as pending. Every other write to that arm's rows is refused with
-  502 or 504.
+  502 or 504. A read-only arm's captures are refused at once, as always.
 - The head's worker delivers each arm's queue in capture order, with backoff, and
   never gives up on a pending one. A snapshot the arm refuses (its facility gone, PVs
   moved) is marked failed with the arm's reason, and an alert fires.
