@@ -131,7 +131,7 @@ def test_arm_applies_only_on_a_head(env, no_connect, caplog):
 def test_an_invalid_arm_name_is_refused_without_echoing_its_settings(env, no_connect, caplog, monkeypatch):
     monkeypatch.setenv("CANOPY_ARMS", '{"Bad-Name": {"publisher_dsn": "host=x password=s3cret-arm"}}')
     assert cli.main(["status"]) == 2
-    assert "CANOPY_ARMS: Value error, arm names must be" in caplog.text and "s3cret-arm" not in caplog.text
+    assert "CANOPY_ARMS: Value error, arm names must match" in caplog.text and "s3cret-arm" not in caplog.text
 
 
 def test_a_missing_instance_is_refused(env, no_connect, caplog, monkeypatch):
