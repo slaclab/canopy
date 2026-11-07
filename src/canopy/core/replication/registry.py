@@ -24,8 +24,8 @@ head's own. ``shared_keys`` lists the columns unique across every owner, where t
 owners' rows can clash.
 
 Two publication layouts carry the same tables. ``publications`` is the single
-``canopy_history`` every primary starts with; ``split_publications`` is the pair a
-primary that prunes old rows switches to (``publish --split``): ``canopy_ref`` with
+``canopy_history`` every arm starts with; ``split_publications`` is the pair an
+arm that prunes old rows switches to (``publish --split``): ``canopy_ref`` with
 every operation and ``canopy_ts`` with inserts and updates only.
 
 Keys are ``"schema.table"`` strings rather than model classes, so ``canopy.core``

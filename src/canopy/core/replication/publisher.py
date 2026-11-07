@@ -3,7 +3,7 @@
 ``publish`` runs after ``alembic upgrade head`` on every deploy of a primary. It is
 idempotent: a run that finds the publications already right changes nothing.
 
-A primary that will prune old rows switches from the single layout to the split
+An arm that will prune old rows switches from the single layout to the split
 one, once, in three steps:
 
 1. ``publish --split`` creates ``canopy_ref`` and ``canopy_ts`` beside ``canopy_history``.
