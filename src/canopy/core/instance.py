@@ -2,7 +2,7 @@
 
 Clients read ``instance`` to tell which rows they can write here (a row's
 ``ownerInstance`` must match it) and ``historyUrl`` to link to the full history.
-The deploy pipeline compares ``alembicHead`` between a mirror and its primary to
+The deploy pipeline compares the head's ``alembicHead`` with the new image's to
 stop a release that would migrate the primary ahead of the copy subscribed to it.
 """
 
