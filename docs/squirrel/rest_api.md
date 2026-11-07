@@ -796,4 +796,16 @@ FastAPI's validation body, which lists each problem under `detail`.
 | `tag_group_already_exists` | 409 | A group with this name exists |
 | `tag_already_exists` | 409 | The group already has a tag with this name |
 | `job_not_found` | 404 | From `/jobs/v1/{jobId}`: no such job, or its result has expired |
-| `service_key_refused` | 502 | On a history head: the arm refused the head's service key for it, not the caller's key. See [When an arm is unreachable](../deployment/history.md#when-an-arm-is-unreachable) |
+| `not_owner` | 403 | The row, or the facility or group a create goes into, belongs to another instance; the detail names it. On a history head, a write to a read-only arm's row. See [Row owners](../deployment/index.md#row-owners) |
+| `owner_mismatch` | 409 | The request links rows of different owners, such as a PV with another owner's tag or facility |
+| `facility_slug_conflict` | 409 | A facility with this slug already exists, under any owner |
+| `machine_read_only` | 403 | This instance has `CANOPY_MACHINE_ACCESS=read`: no restores or PV writes here |
+| `forwarded_write_refused` | 403 | `X-Canopy-On-Behalf-Of` from a key that isn't a service key, or on an instance without `CANOPY_ACCEPT_FORWARDED_WRITES` |
+| `nothing_to_import` | 400 | An import bundle with no value this key could import |
+| `snapshot_id_conflict` | 409 | A captured import's id exists with a different time or facility |
+| `import_would_skip` | 409 | A strict captured import would leave out values; the detail names the PVs |
+| `snapshot_pending` | 409 | On a history head: the snapshot is still waiting for its arm, so it can't be edited, deleted, or restored with machine access `read` |
+| `outbox_full` | 503 | On a history head: the arm's snapshot outbox is at its cap |
+| `archived_immutable` | 409 | On a history head: the arm no longer holds this snapshot (it was pruned there) |
+| `primary_unavailable` | 502, 504 | On a history head: the arm couldn't be reached (502, nothing sent) or didn't answer in time (504, the write may have landed) |
+| `service_key_refused` | 502 | On a history head: the arm refused the head's service key for it, not the caller's key. See [When an arm is unreachable](../deployment/history/operations.md#when-an-arm-is-unreachable) |

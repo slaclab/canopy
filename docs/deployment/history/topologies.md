@@ -8,7 +8,8 @@ arm. Every topology below runs the same code with different settings.
 
 For each one, this page says which settings go on which side, which commands run and
 in what order, what replicates, what is pruned and what is backed up, and what keeps
-working while a link is down. The mechanisms are in the [history guide](../history.md).
+working while a link is down. What each database holds is on the [overview](index.md), the mechanisms under
+[Operations](operations.md), and repairs under [Runbooks](runbooks.md).
 
 | Topology | Arms | The head writes | Prunes |
 |---|---|---|---|
@@ -61,7 +62,7 @@ flowchart LR
 - **arm1**: `CANOPY_INSTANCE=arm1`. Its Postgres has `wal_level = logical`, a
   `max_slot_wal_keep_size` cap set before the first slot exists, and `pg_hba.conf`
   lines for `replicator` and `canopy_reader` from the head's network (see
-  [Database roles](../history.md#database-roles)).
+  [Database roles](index.md#database-roles)).
 - **head**: `CANOPY_ROLE=mirror`, `CANOPY_INSTANCE=head`, and from secrets
   `CANOPY_ARMS__ARM1__PUBLISHER_DSN` and `CANOPY_ARMS__ARM1__READER_DSN`. Its own Redis.
   Leave out the forward settings: arm1's rows are then read-only on the head, and a
@@ -77,7 +78,7 @@ flowchart LR
 4. Head, hourly: `refresh`, then `drift-check`.
 
 On every later release the head migrates first (see
-[Release order](../history.md#release-order)).
+[Release order](operations.md#release-order)).
 
 **Replicated, pruned, backed up.** arm1's reference and time-series rows reach the
 head. API keys, the heartbeat table and the outbox stay local to each side. Nothing is
@@ -87,7 +88,7 @@ pruned. Both sides' backups hold arm1's rows.
 
 - **Replication**: the head serves reads as of the break. arm1 keeps its slot's WAL up
   to the cap, and the head's `receive-stale` alert fires. Past the cap the slot is
-  lost: follow [Slot lost](../history.md#slot-lost).
+  lost: follow [Slot lost](runbooks.md#slot-lost).
 - **Checks**: `drift-check` exits 2 for arm1.
 - arm1 notices neither.
 
@@ -109,27 +110,29 @@ flowchart LR
   ```sh
   python scripts/create_key.py head -r -w -m squirrel --facility '*' --service
   ```
-  Add `-m magpie` if the head's users edit arm1's Magpie configs, and `-a` only if the
-  head should create, edit or delete arm1's facilities: an admin key on arm1 also
-  manages arm1's API keys (see [Who wrote it](../history.md#who-wrote-it)).
+  Add `-m magpie` if the head's users edit arm1's Magpie configs, and `-m core -a` only
+  if the head should create, edit or delete arm1's facilities: an admin key on arm1
+  also manages arm1's API keys (see [Who wrote it](operations.md#who-wrote-it)).
 - **head**: as in topology 2, plus `CANOPY_ARMS__ARM1__FORWARD_URL` (https) and
   `CANOPY_ARMS__ARM1__SERVICE_KEY` from a secret, set together. Optionally
   `CANOPY_FORWARD__WAIT_S`, `__TIMEOUT_S` and `__CA_BUNDLE`. A superuser on the head
   grants its app role `SELECT` on `pg_replication_origin_status` and `EXECUTE` on
-  `pg_show_replication_origin_status()`, or every forwarded answer is marked stale.
+  `pg_show_replication_origin_status()`, or every forwarded answer is marked stale
+  (grant the table owner the same, or run `status` as a superuser).
 
 **Commands.** As in topology 2. Deploy the head from the same release as arm1.
 
 **Replicated, pruned, backed up.** As in topology 2. A write the head forwards is
 saved on arm1, and the head waits up to `WAIT_S` for it to come back. A capture is
 taken on the head and saved on arm1 under the head's id (see
-[Snapshots taken on the head](../history.md#snapshots-taken-on-the-head)).
+[Snapshots taken on the head](operations.md#snapshots-taken-on-the-head)).
 
 **While a link is down.**
 
 - **Forwarding**: a write to arm1's rows fails with 502 `primary_unavailable` (nothing
   sent) or 504 (it may have landed). A capture for arm1 waits in the head's outbox
-  ([topology 8](#8-an-arm-that-cant-be-reached)).
+  ([topology 8](#8-an-arm-that-cant-be-reached)). An arm1 that turns down the head's
+  service key gives 502 `service_key_refused`, naming arm1: mint the key again.
 - **Replication**, with forwarding up: writes succeed on arm1, and their answers carry
   `X-Canopy-Replica-Stale: true`.
 
@@ -166,7 +169,7 @@ flowchart LR
 retained, and aren't their facility's newest, leave arm1; their deletes aren't
 published, so the head keeps them. The head never prunes. arm1's backups hold its
 window, the head's the rest. An old snapshot comes back to arm1 by export from the
-head and import there (see [Prune](../history.md#prune)).
+head and import there (see [Prune](operations.md#prune)).
 
 **While a link is down.** The prune stops at its gate (slot inactive, lag, or no fresh
 heartbeat) and resumes after the next good heartbeat. Nothing is lost.
@@ -204,17 +207,21 @@ same PV can live on two arms.
 - **Releases**: the head first, then each arm, in any order. Arms may sit at different
   revisions; before a release that declares `canopy_requires_primary_at`, confirm
   every arm runs that revision.
-- **Removing an arm**: take its settings off the head (its subscription then shows as
-  `unexpected`), then `DROP SUBSCRIPTION canopy_history_<arm>` on the head. Its rows
-  stay on the head, read-only.
+- **Removing an arm**: take its settings off the head. `status` then lists its
+  subscription under `unexpected`, and `canopy-replication-subscription-unlisted`
+  fires. Then run `DROP SUBSCRIPTION canopy_history_<arm>` on the head, which also
+  drops the slot on the arm if the arm can be reached. If it can't, disable the
+  subscription, `SET (slot_name = NONE)`, drop it, and drop the slot on the arm later:
+  until then the slot holds the arm's WAL. The arm's rows stay on the head as a
+  read-only archive.
 
 **Replicated, pruned, backed up.** Per arm, as in topologies 2 to 4. The head's
 backups are the one place every arm's full history meets.
 
 **While a link is down.** Only that arm is affected; the others stream and forward as
-usual. A slug that two arms create while both stream stops the second arm's apply, and
-`canopy-replication-apply-stopped` fires for it (see
-[An arm's apply stopped on a duplicate key](../history.md#an-arms-apply-stopped-on-a-duplicate-key)).
+usual. A slug that two owners create while both stream stops the later one's apply,
+and `canopy-replication-apply-stopped` fires for that arm (see
+[An arm's apply stopped on a duplicate key](runbooks.md#an-arms-apply-stopped-on-a-duplicate-key)).
 
 ## 6. A head that owns its own facilities
 
@@ -231,7 +238,7 @@ each changing only the rows it owns.
 **Replicated, pruned, backed up.** Nothing: the head's own rows are never published,
 compared, re-seeded or pruned, and **they exist only in the head's database and its
 backups**. Back the head up like a primary, with base backups and WAL archiving (see
-[Backups](../history.md#backups)). A point-in-time restore of the head loses its own
+[Backups](index.md#backups)). A point-in-time restore of the head loses its own
 rows written after the restore point.
 
 **While a link is down.** No arm link matters. Captures of the head's facilities are
@@ -289,14 +296,14 @@ large.
 **Commands.** On the head, `python -m canopy.squirrel.outbox status`;
 `retry <id>...` or `retry --arm <arm>` once the cause is fixed (`--allow-skips` to
 accept moved PVs); export a snapshot that can't be saved, then `discard <id>`. See
-[When an arm is unreachable](../history.md#when-an-arm-is-unreachable).
+[When an arm is unreachable](operations.md#when-an-arm-is-unreachable).
 
 **Replicated, pruned, backed up.** Queued snapshots exist only in the head's outbox and
 its backups until they're delivered. A head restored from backup may lose some or send
 some again; the arm's captured import is idempotent on the id.
 
 **When it lasts.** If the outage outlasts the arm's slot cap, the slot is lost: once
-the arm is back, follow [Slot lost](../history.md#slot-lost) for that arm.
+the arm is back, follow [Slot lost](runbooks.md#slot-lost) for that arm.
 
 ## Moving between topologies
 
