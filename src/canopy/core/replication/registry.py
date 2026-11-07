@@ -173,8 +173,8 @@ def split_name(qualified: str) -> tuple[str, str]:
 # the registry's own schemas, so these are listed for the completeness test.
 EXCLUDED = frozenset({"public.alembic_version"})
 
-# Tables a migration has dropped but a deployed database may still hold: a mirror drops a
-# column or table a release after its primary, and the migration-order test walks old
+# Tables a migration has dropped but a deployed database may still hold: the head drops a
+# column or table a release after every arm, and the migration-order test walks old
 # revisions. Each keeps its entry in the registry, so `publish` and `grants` classify it
 # wherever it still exists, while its model is gone. Remove both once no deployed
 # database can still hold the table.
