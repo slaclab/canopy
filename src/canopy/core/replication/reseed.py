@@ -64,7 +64,7 @@ from collections.abc import Mapping, Callable, Awaitable
 
 import asyncpg
 
-from canopy.core.arms import Arm, get_arms_config, subscription_name
+from canopy.core.arms import Arm, subscription_name
 from canopy.core.config import get_settings
 from canopy.core.replication.sql import (
     Refused,
@@ -85,6 +85,8 @@ from canopy.core.replication.drift import (
     references,
     primary_key,
     table_columns,
+    connect_reader,
+    configured_arms,
 )
 from canopy.core.replication.registry import REGISTRY, TableClass, ReplicationRegistry
 from canopy.core.replication.subscriber import (
@@ -95,6 +97,8 @@ from canopy.core.replication.subscriber import (
 )
 
 logger = logging.getLogger(__name__)
+
+RESEED_SESSION = {**SESSION, "application_name": "canopy-reseed"}
 
 CUT_WAIT_S = 60.0
 """Default for ``--cut-wait``: how long to keep trying for an exact cut before refusing."""
@@ -674,19 +678,17 @@ def parse_since(value: str) -> datetime:
 async def run(args: argparse.Namespace) -> int:
     """``reseed --arm``: 0 done, 1 a database step failed, 2 refused (nothing copied)."""
     settings = get_settings()
-    arms = get_arms_config().arms
-    secrets = [dsn.get_secret_value() for arm in arms.values() for dsn in (arm.reader_dsn, arm.publisher_dsn) if dsn]
+    secrets: list[str] = []
     primary = mirror = None
     try:
+        arms = configured_arms()
+        secrets = [
+            dsn.get_secret_value() for arm in arms.values() for dsn in (arm.reader_dsn, arm.publisher_dsn) if dsn
+        ]
         require_role("reseed", "mirror", settings.role)
         (name,) = _selected_arms(arms, args.arm, settings.instance)
-        reader_dsn = arms[name].reader_dsn.get_secret_value() if arms[name].reader_dsn else None
-        if not reader_dsn:
-            raise Refused(
-                f"set CANOPY_ARMS__{name.upper()}__READER_DSN to this arm's read-only connection URI (from a secret)"
-            )
-        primary = await asyncpg.connect(reader_dsn, server_settings={**SESSION, "default_transaction_read_only": "on"})
-        mirror = await asyncpg.connect(asyncpg_dsn(settings.database_url), server_settings=SESSION)
+        primary = await connect_reader(name, arms[name], RESEED_SESSION)
+        mirror = await asyncpg.connect(asyncpg_dsn(settings.database_url), server_settings=RESEED_SESSION)
         report = await reseed(
             primary,
             mirror,
