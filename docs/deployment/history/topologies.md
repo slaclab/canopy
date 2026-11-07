@@ -295,7 +295,10 @@ large.
 
 **Commands.** On the head, `python -m canopy.squirrel.outbox status`;
 `retry <id>...` or `retry --arm <arm>` once the cause is fixed (`--allow-skips` to
-accept moved PVs); export a snapshot that can't be saved, then `discard <id>`. See
+accept moved PVs); export a snapshot that can't be saved, then `discard <id>`.
+`discard` also takes a snapshot the arm saved that hasn't come back yet: it drops only
+the head's waiting copy, since the arm holds the snapshot and replication brings it
+back once it's healthy. See
 [When an arm is unreachable](operations.md#when-an-arm-is-unreachable).
 
 **Replicated, pruned, backed up.** Queued snapshots exist only in the head's outbox and
