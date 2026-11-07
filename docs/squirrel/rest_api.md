@@ -289,6 +289,8 @@ Returns the snapshot summary plus its saved values, sorted by PV address.
   setpoint's read failed during capture.
 - `units`, `precision`, and the control limits are not captured yet and are
   always `null`.
+- On a history head, a snapshot still waiting for its arm is served from the
+  bundle in the head's outbox, with [`delivery`](#list-snapshots) set.
 
 | Status | Code | Condition |
 |--------|------|-----------|
@@ -454,7 +456,10 @@ Without a body, the whole snapshot is restored.
 
 | Status | Code | Condition |
 |--------|------|-----------|
+| 403 | `machine_read_only` | This instance has `CANOPY_MACHINE_ACCESS=read`, and the restore can't go to the snapshot's arm |
+| 403 | `not_owner` | On a history head with `read`: the snapshot belongs to an arm the head doesn't forward to |
 | 404 | `snapshot_not_found` | No snapshot with this id |
+| 409 | `snapshot_pending` | On a history head with `read`: the snapshot is still waiting for its arm |
 
 ### Compare two snapshots
 
