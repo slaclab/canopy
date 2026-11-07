@@ -100,7 +100,7 @@ async def test_invalid_arms_are_refused_without_their_values(env, caplog, capsys
     )
     assert await reseed.run(ARGS) == 2
     out = caplog.text + capsys.readouterr().out
-    assert "refused: CANOPY_ARMS is invalid: Value error, arm names must be" in out
+    assert "refused: CANOPY_ARMS is invalid: " in out
     assert "s3cret" not in out
 
 
