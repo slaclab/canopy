@@ -25,6 +25,7 @@ from prometheus_client.registry import Collector
 from canopy.core.config import get_settings
 from canopy.squirrel.config import get_squirrel_config
 from canopy.core.replication.sql import asyncpg_dsn
+from canopy.squirrel.data.models import OUTBOX_STATES
 from canopy.core.forwarding.client import forwardable_arms
 from canopy.squirrel.outbox.status import outbox_status
 
@@ -32,8 +33,6 @@ logger = logging.getLogger(__name__)
 
 TIMEOUT_S = 2.0
 """Budget for one refresh, connection included."""
-
-STATES = ("pending", "delivered", "failed")
 
 
 class OutboxCollector(Collector):
@@ -110,7 +109,7 @@ def status_families(status: dict) -> Iterable[Metric]:
         labels=["arm"],
     )
     for arm, queue in status["arms"].items():
-        for state in STATES:
+        for state in OUTBOX_STATES:
             snapshots.add_metric([arm, state], queue[state])
         size.add_metric([arm], queue["bytes"])
         if queue["oldest_pending_age_s"] is not None:

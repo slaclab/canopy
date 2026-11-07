@@ -39,7 +39,7 @@ from canopy.squirrel.capture import deliver_capture
 from canopy.squirrel.data.models import SnapshotOutbox
 from canopy.core.forwarding.client import Caller, ArmRefused, forwardable_arms
 from canopy.squirrel.schemas.snapshot import SnapshotBundleDTO
-from canopy.squirrel.data.repositories import OutboxRepository
+from canopy.squirrel.data.repositories import OutboxRepository, SnapshotRepository
 from canopy.squirrel.services.snapshot_service import delivery_of
 
 logger = logging.getLogger(__name__)
@@ -90,13 +90,18 @@ def bundle_json(bundle: SnapshotBundleDTO) -> str:
     return bundle.model_dump_json(by_alias=True)
 
 
+def _over_cap(rows: int, used: int, size: int, config: OutboxConfig) -> str | None:
+    """Why an outbox of ``rows`` snapshots in ``used`` bytes can't take one more of ``size`` bytes, or ``None``."""
+    if rows + 1 > config.max_snapshots or used + size > config.max_bytes:
+        return f"its outbox is full ({rows} snapshots, {used} of {config.max_bytes} bytes)"
+    return None
+
+
 async def outbox_full(repo: OutboxRepository, arm: str, config: OutboxConfig) -> str | None:
-    """Why the arm's outbox can take no more snapshots, or ``None`` while it can."""
-    rows, size = await repo.usage(arm)
-    if rows >= config.max_snapshots:
-        return f"{arm} can't be reached and its outbox is full ({rows} snapshots); the snapshot would not be saved"
-    if size >= config.max_bytes:
-        return f"{arm} can't be reached and its outbox is full ({size} bytes); the snapshot would not be saved"
+    """Why the arm's outbox can take no more snapshots, not even the smallest, or ``None`` while it can."""
+    rows, used = await repo.usage(arm)
+    if full := _over_cap(rows, used, 1, config):
+        return f"{arm} can't be reached and {full}; the snapshot would not be saved"
     return None
 
 
@@ -133,8 +138,8 @@ async def _keep(
     size = len(document.encode())
     await repo.lock_arm(arm)
     rows, used = await repo.usage(arm)
-    if rows + 1 > config.max_snapshots or used + size > config.max_bytes:
-        return f"its outbox is full ({rows} snapshots, {used} of {config.max_bytes} bytes)"
+    if full := _over_cap(rows, used, size, config):
+        return full
     await repo.add(
         bundle_json=document,
         id=str(bundle.id),
@@ -204,9 +209,9 @@ async def _saved(
     """
     snapshot_id = str(bundle.id)
     async with session_scope() as session:
-        repo = OutboxRepository(session)
-        if await repo.is_stored(snapshot_id):
+        if await SnapshotRepository(session).get_by_id(snapshot_id, include_deleted=True) is not None:
             return Submitted(result, f"Saved on {arm}")
+        repo = OutboxRepository(session)
         now = datetime.now(UTC)
         full = await _keep(
             repo,
@@ -218,7 +223,6 @@ async def _saved(
             config=config,
             state="delivered",
             attempts=1,
-            last_attempt_at=now,
             delivered_at=now,
         )
         if full is not None:
@@ -287,7 +291,6 @@ async def submit(
             await repo.update_state(
                 snapshot_id,
                 attempts=1,
-                last_attempt_at=now,
                 last_error=attempted,
                 next_attempt_at=now + timedelta(seconds=retry_delay(1, config)),
             )
@@ -357,9 +360,7 @@ async def _delivered(entry: SnapshotOutbox, attempts: int, now: datetime) -> Non
         if swept := await repo.sweep(entry.id):
             log_swept(swept)
         else:
-            await repo.update_state(
-                entry.id, state="delivered", attempts=attempts, last_attempt_at=now, delivered_at=now, last_error=None
-            )
+            await repo.update_state(entry.id, state="delivered", attempts=attempts, delivered_at=now, last_error=None)
             logger.info("Snapshot %s saved on %s; waiting for it to replicate back", entry.id, entry.arm)
         await session.commit()
 
@@ -397,7 +398,6 @@ async def deliver_arm(
                         entry,
                         state="failed",
                         attempts=attempts,
-                        last_attempt_at=now,
                         failed_at=now,
                         last_error=refusal_reason(exc),
                     )
@@ -409,7 +409,6 @@ async def deliver_arm(
                 await _record(
                     entry,
                     attempts=attempts,
-                    last_attempt_at=now,
                     last_error=reason,
                     next_attempt_at=now + timedelta(seconds=wait),
                 )

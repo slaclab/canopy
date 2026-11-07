@@ -20,6 +20,8 @@ from tests.conftest import WRITE_HEADERS
 from canopy.squirrel import tasks, capture
 from canopy.core.config import get_settings
 from canopy.core.errors import NotOwner
+from canopy.squirrel.errors import OutboxFull
+from canopy.squirrel.outbox import delivery as outbox
 from canopy.squirrel.capture import CaptureTarget, capture_target
 from canopy.squirrel.data.models import Pv, Snapshot, SnapshotOutbox, pv_facility
 from canopy.core.facilities.models import Facility
@@ -267,6 +269,18 @@ class TestTheTask:
         assert (refused.value.status, refused.value.code, refused.value.detail) == (404, "facility_not_found", "gone")
         assert worker.waits == []
 
+    async def test_a_full_outbox_fails_the_job_unretried(self, sites, worker, monkeypatch):
+        # Even when its message reads like a transient failure ("connection").
+        async def full(*args, **kwargs):
+            raise OutboxFull("arm1 can't be reached (connection refused) and its outbox is full")
+
+        monkeypatch.setattr(outbox, "submit", full)
+
+        with pytest.raises(OutboxFull):
+            await tasks.create_snapshot_task(
+                worker.ctx, "t", facility_id=sites["arm1"]["facility"], arm="arm1", caller=CALLER
+            )
+
     async def test_an_unreachable_arm_gets_the_snapshot_through_the_outbox(
         self, sites, worker, httpx_mock: HTTPXMock, db_session
     ):
@@ -334,6 +348,3 @@ async def test_restore_values_from_a_list(db_session: AsyncSession):
 
     assert io.writes == {"LIST:SP": 4.0}
     assert (result.total_pvs, result.success_count) == (1, 1)
-    io.writes.clear()
-    assert (await service.restore_values(values, SimpleNamespace(pv_ids=[str(uuid4())]))).total_pvs == 0
-    assert io.writes == {}

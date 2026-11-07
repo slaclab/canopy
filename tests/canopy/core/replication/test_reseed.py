@@ -91,6 +91,19 @@ async def test_refused_without_the_arms_reader_connection(env, caplog):
     assert "CANOPY_ARMS__ARM1__READER_DSN" in caplog.text
 
 
+async def test_invalid_arms_are_refused_without_their_values(env, caplog, capsys):
+    env(
+        CANOPY_ROLE="mirror",
+        CANOPY_INSTANCE="head",
+        CANOPY_ARMS='{"Bad-Name": {"publisher_dsn": "host=x password=s3cret-publisher",'
+        ' "reader_dsn": "postgresql://r:s3cret-reader@x/db"}}',
+    )
+    assert await reseed.run(ARGS) == 2
+    out = caplog.text + capsys.readouterr().out
+    assert "refused: CANOPY_ARMS is invalid: " in out
+    assert "s3cret" not in out
+
+
 async def test_a_failed_connection_is_exit_1_and_never_shows_a_password(env, caplog, capsys):
     secret, other = "s3cret-reader-pw", "s3cret-publisher-pw"
     env(

@@ -359,7 +359,7 @@ async def test_a_saved_snapshot_not_back_yet_is_kept_as_delivered_until_it_is(db
     # The head serves it as pending, rather than not at all, until it replicates.
     row = (await _rows(db_session))[str(bundle.id)]
     assert (row.state, row.attempts, row.caller) == ("delivered", 1, CALLER)
-    assert row.delivered_at == row.last_attempt_at and row.delivered_at is not None
+    assert row.delivered_at is not None
     assert (submitted.message, submitted.queued) == ("Saved on arm2; waiting for it to replicate here", False)
     assert submitted.result == {
         "type": "snapshot",
@@ -423,7 +423,7 @@ async def test_submit_queues_what_the_arm_couldnt_take_with_the_attempt(db_sessi
 
     row = (await _rows(db_session))[str(bundle.id)]
     assert (row.state, row.attempts, row.caller) == ("pending", 1, CALLER)
-    assert row.next_attempt_at > row.last_attempt_at
+    assert row.next_attempt_at > row.queued_at
     assert result["delivery"]["state"] == "pending" and result["delivery"]["attempts"] == 1
     assert result["delivery"]["reason"] == row.last_error and row.last_error
     assert (result["type"], result["id"], result["arm"]) == ("snapshot", str(bundle.id), "arm2")

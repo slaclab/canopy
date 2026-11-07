@@ -16,7 +16,6 @@ from collections.abc import Callable
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from canopy.core.config import get_settings
 from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
 from canopy.core.ownership import require_owned, local_instance, require_create_owner
 from canopy.core.facilities import gateway as facilities_gateway
@@ -179,6 +178,22 @@ def _parse_jsonb(value: Any) -> dict | None:
         except (json.JSONDecodeError, TypeError):
             return None
     return None
+
+
+def _export_value(row: Any) -> BundleValueDTO:
+    """One value of an export, from a row of ``get_export_rows`` or ``OutboxRepository.export_rows``."""
+    return BundleValueDTO(
+        pv_id=row.pv_id,
+        pv_name=row.pv_name,
+        setpoint_address=row.setpoint_address,
+        readback_address=row.readback_address,
+        config_address=row.config_address,
+        setpoint_value=_parse_jsonb(row.setpoint_value),
+        readback_value=_parse_jsonb(row.readback_value),
+        status=row.status,
+        severity=row.severity,
+        timestamp=row.timestamp,
+    )
 
 
 def _sanitize_for_json(value: Any) -> Any:
@@ -880,20 +895,7 @@ class SnapshotService:
             raise SnapshotIdConflict(f"Snapshot {snapshot_id} is already here")
         logger.info("Snapshot saved in %.2fs (%d values)", (datetime.now(UTC) - start_time).total_seconds(), count)
         snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
-        meta_pvs = [pv.pv_id for pv in await self.meta_pv_repo.get(active=True)]
-        return SnapshotSummaryDTO(
-            id=snapshot.id,
-            owner_instance=snapshot.owner_instance,
-            title=snapshot.title,
-            description=snapshot.description,
-            created_date=snapshot.created_at,
-            created_by=snapshot.created_by,
-            pv_count=count,
-            facility=await self._facility_slug(snapshot.facility_id),
-            retain=snapshot.retain,
-            imported_from=snapshot.imported_from,
-            meta_pvs=await self._get_meta_pv_values_for_snapshot(snapshot.id, meta_pvs),
-        )
+        return await self._summary(snapshot, pv_count=count)
 
     async def bundle_captured(
         self,
@@ -912,7 +914,7 @@ class SnapshotService:
         arms' copies.
         """
         return SnapshotBundleDTO(
-            format="canopy.squirrel.snapshot-bundle",
+            format=BUNDLE_FORMAT,
             version=1,
             source_instance=local_instance(),
             id=snapshot_id,
@@ -992,30 +994,15 @@ class SnapshotService:
             if await self.queued(snapshot_id) is None:
                 return None
             header = await self.outbox_repo.bundle_header(snapshot_id)
-            return SnapshotBundleDTO.model_validate(
-                {**header, "values": await self.outbox_repo.export_values(snapshot_id)}
-            )
+            values = [_export_value(row) for row in await self.outbox_repo.export_rows(snapshot_id)]
+            return SnapshotBundleDTO.model_validate({**header, "values": values})
         if not self._in_facility_scope(snapshot.facility_id):
             return None
-        values = [
-            BundleValueDTO(
-                pv_id=row.pv_id,
-                pv_name=row.pv_name,
-                setpoint_address=row.setpoint_address,
-                readback_address=row.readback_address,
-                config_address=row.config_address,
-                setpoint_value=_parse_jsonb(row.setpoint_value),
-                readback_value=_parse_jsonb(row.readback_value),
-                status=row.status,
-                severity=row.severity,
-                timestamp=row.timestamp,
-            )
-            for row in await self.value_repo.get_export_rows(snapshot_id)
-        ]
+        values = [_export_value(row) for row in await self.value_repo.get_export_rows(snapshot_id)]
         return SnapshotBundleDTO(
             format=BUNDLE_FORMAT,
             version=1,
-            source_instance=get_settings().instance,
+            source_instance=local_instance(),
             id=snapshot.id,
             title=snapshot.title,
             description=snapshot.description,
@@ -1313,21 +1300,16 @@ class SnapshotService:
     async def restore_values(
         self,
         values: list[Any],
-        request: RestoreRequestDTO | None = None,
         progress_callback: Callable | None = None,
     ) -> RestoreResultDTO:
         """Restore stored values' setpoints to EPICS: ``restore_snapshot`` without the load.
 
         ``values`` are rows with a ``pv_id`` and a ``setpoint_value`` (the stored JSONB
         blob, or its text): a snapshot's values here, or a bundle's adapted to that
-        shape for one that isn't saved here yet. ``request.pv_ids`` keeps only those
-        PVs. Everything else is as ``restore_snapshot`` describes.
+        shape for one that isn't saved here yet. Everything else is as
+        ``restore_snapshot`` describes.
         """
         start_time = datetime.now(UTC)
-        if request is not None and request.pv_ids is not None:
-            wanted = set(request.pv_ids)
-            values = [value for value in values if str(value.pv_id) in wanted]
-
         if not values:
             return RestoreResultDTO(total_pvs=0, success_count=0, failure_count=0, failures=[])
 
@@ -1574,12 +1556,11 @@ class SnapshotService:
     async def _with_all_values(
         self, snapshot_id: str
     ) -> tuple[Snapshot | SnapshotOutbox, list[SnapshotValue | BundleValueRow]] | None:
-        """A snapshot and every value it holds, stored or queued in the outbox; ``None`` when neither."""
+        """A snapshot and every value it holds, stored or held only in the outbox (``queued``); ``None`` when neither."""
         if result := await self.snapshot_repo.get_with_values(snapshot_id):
             return result
-        if (entry := await self.outbox_repo.get(snapshot_id)) is not None:
-            if await self.snapshot_repo.get_by_id(snapshot_id, include_deleted=True) is None:
-                return entry, await self.outbox_repo.values(snapshot_id)
+        if (entry := await self.queued(snapshot_id)) is not None:
+            return entry, await self.outbox_repo.values(snapshot_id)
         return None
 
     @staticmethod
