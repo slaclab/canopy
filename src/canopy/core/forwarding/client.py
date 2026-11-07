@@ -20,7 +20,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from canopy.core.db import get_engine
 from canopy.core.arms import get_arms_config, subscription_name
 from canopy.core.config import get_settings
-from canopy.core.errors import PrimaryTimeout, PrimaryUnavailable
+from canopy.core.errors import PrimaryTimeout, ServiceKeyRefused, PrimaryUnavailable
 from canopy.core.security import APIKey
 from canopy.core.forwarding.config import ForwardConfig, get_forward_config
 from canopy.core.forwarding.context import (
@@ -248,3 +248,47 @@ async def wait_until_applied(
     except (OSError, asyncpg.PostgresError, SQLAlchemyError) as exc:
         logger.warning("Cannot read the applied replication position: %s", exc)
     return False
+
+
+# 403 codes an arm answers only about the service key: the head checked the caller's
+# key against the route's gates first, and the arm checks these against its own key.
+_SERVICE_KEY_REFUSALS = frozenset(
+    {
+        "insufficient_read_access",
+        "insufficient_write_access",
+        "insufficient_admin_access",
+        "insufficient_module_access",
+    }
+)
+
+
+def arm_error(answer: httpx.Response) -> tuple[str | None, str]:
+    """An arm's error answer as ``(code, detail)``; ``None`` and the body's text when it isn't ``{code, detail}``."""
+    try:
+        body = answer.json()
+    except ValueError:
+        body = None
+    if isinstance(body, dict) and isinstance(body.get("code"), str):
+        return body["code"], str(body.get("detail", ""))
+    return None, answer.text[:500]
+
+
+def service_key_refusal(arm: str, answer: httpx.Response, *, manages_facilities: bool) -> ServiceKeyRefused | None:
+    """The head's own error for ``arm`` refusing its service key, or ``None`` for any other answer.
+
+    A 401 is always about the service key, since the caller's token never goes to the
+    arm; so is a 403 for scope, module or admin access. A facility refusal is the
+    service key's only on a route that manages facilities, whose gate the caller
+    passed here with every facility. Elsewhere it may be the caller's own grant, and
+    ``forwarded_write_refused`` already names forwarding: both go back as they are.
+    Only the router relays this: a caller that acts on the arm's answer (a capture
+    the head delivers) sees it raw.
+    """
+    if answer.status_code not in (401, 403):
+        return None
+    code, detail = arm_error(answer)
+    if answer.status_code == 403 and code not in _SERVICE_KEY_REFUSALS:
+        if not (manages_facilities and code == "insufficient_facility_access"):
+            return None
+    answered = f"{answer.status_code} {code}" if code else str(answer.status_code)
+    return ServiceKeyRefused(f"Arm '{arm}' refused this head's service key for it ({answered}: {detail})")

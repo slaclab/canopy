@@ -354,10 +354,19 @@ the head. Everything a forwarded write may change is that arm's own: the arm app
 its own rules to it, as for one of its local users, and the service key bounds the
 rest.
 
+The head checks the caller's grant first, for a snapshot change or a PV edit or
+delete. A caller whose grant shares no facility with the row gets the head's own
+answer, the same as on any instance, and nothing is sent to the arm: 404
+`snapshot_not_found` for a snapshot, as `GET` answers, and 403
+`insufficient_facility_access` for a PV or an unassigned snapshot. So the answer
+doesn't depend on the arm being up, and doesn't say who owns the row.
+
 Mint one service key on each arm, for that arm only, with the modules the head
 forwards to it (`-m squirrel`, and `-m magpie` for Magpie configs), every facility
 (`--facility '*'`) or only those the head's users work in. Each caller's own grant
-still limits its requests. Add `-a` only if the head should create, edit or delete the
+still limits its requests. A key limited to some facilities must cover every one the
+head's users reach on that arm. Otherwise the arm hides a snapshot outside them from the
+key with a 404, and the head reads that as a prune (`archived_immutable`). Add `-a` only if the head should create, edit or delete the
 arm's facilities: admin on the arm also manages that arm's API keys, and without it
 the arm refuses facility writes with 403 `insufficient_admin_access`. Only the CLI
 mints service keys:
@@ -441,6 +450,19 @@ reached; nothing was sent. It fails with 504 when the request went out and no an
 came back; the write may have been applied, so check before sending it again. Reads
 keep working from the head's own copy, and so do writes to the head's own rows and to
 other arms.
+
+An arm that refuses the head's service key answers a forwarded write with 502
+`service_key_refused`. That covers a 401, or a 403 for the key's scope, modules or
+admin access (and on facility routes, for its facilities). The caller's own key is fine:
+the head checked it first. The detail names the arm and relays its answer, for example
+"Arm 'arm1' refused this head's service key for it (401 invalid_api_key: Invalid API
+key)". `canopy_forwarded_requests_total` counts these with `outcome="key_refused"`.
+
+To fix it, mint the arm's service key again with the modules and access the head
+forwards (see [Who wrote it](#who-wrote-it)), and set it as
+`CANOPY_ARMS__<arm>__SERVICE_KEY` on the head. A refusal that comes from the caller's
+own facility grant, and `forwarded_write_refused`, reach the caller as the arm sent
+them.
 
 ## Runbooks
 

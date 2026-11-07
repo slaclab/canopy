@@ -8,13 +8,22 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 
 from canopy.core import db
 from canopy.core.errors import FacilitySlugConflict
+from canopy.core.modules import WILDCARD
+from canopy.core.security import APIKey
+from canopy.core.forwarding import owners
 from canopy.magpie.data.models import Config
 from canopy.squirrel.data.models import Pv, Snapshot, TagGroup, pv_facility
 from canopy.core.facilities.models import Facility
-from canopy.core.forwarding.owners import owner_of, require_unused, snapshot_is_live
+from canopy.core.forwarding.owners import (
+    owner_of,
+    caller_reaches,
+    require_unused,
+    snapshot_is_live,
+)
 from canopy.core.forwarding.routes import ROUTES, match
 
 ROUTED = {(route.method, route.path): route for route in ROUTES}
@@ -170,3 +179,65 @@ async def test_a_snapshot_is_live_here(rows, as_instance):
     assert not await snapshot_is_live(gone.id)
     assert not await snapshot_is_live(str(uuid4()))
     assert not await snapshot_is_live("latest")
+
+
+def _key(*facilities: str) -> APIKey:
+    return APIKey(token="t", read=True, write=True, modules=frozenset({WILDCARD}), facilities=frozenset(facilities))
+
+
+async def _reaches(key: APIKey, method: str, path: str) -> bool:
+    route, params = match(method, path)
+    return await caller_reaches(route, params, key)
+
+
+class TestCallerReaches:
+    async def test_a_restricted_key_reaches_rows_in_its_facilities_only(self, rows):
+        arm1 = rows["arm1"]
+        for method, path in [
+            ("PATCH", f"/squirrel/v1/snapshots/{arm1['snapshot']}"),
+            ("POST", f"/squirrel/v1/snapshots/{arm1['snapshot']}/restore"),
+            ("DELETE", f"/squirrel/v1/pvs/{arm1['pv']}"),
+        ]:
+            assert await _reaches(_key("arm1-site"), method, path)
+            assert not await _reaches(_key("head-site"), method, path)
+            assert not await _reaches(_key(), method, path)
+
+    async def test_a_grant_on_a_parent_reaches_its_children(self, rows, as_instance):
+        with as_instance("arm1"):
+            async with db.get_session_maker()() as session:
+                parent = await session.scalar(select(Facility.id).where(Facility.slug == "arm1-site"))
+                child = Facility(slug="arm1-child", name="child", parent_id=parent)
+                session.add(child)
+                await session.flush()
+                snapshot = Snapshot(title="S", facility_id=child.id)
+                session.add(snapshot)
+                await session.commit()
+
+        assert await _reaches(_key("arm1-site"), "DELETE", f"/squirrel/v1/snapshots/{snapshot.id}")
+
+    async def test_a_row_with_no_facility_is_outside_every_restricted_grant(self, rows, as_instance):
+        with as_instance("arm1"):
+            async with db.get_session_maker()() as session:
+                snapshot = Snapshot(title="S")
+                session.add(snapshot)
+                await session.commit()
+
+        assert not await _reaches(_key("arm1-site"), "DELETE", f"/squirrel/v1/snapshots/{snapshot.id}")
+        assert await _reaches(_key(WILDCARD), "DELETE", f"/squirrel/v1/snapshots/{snapshot.id}")
+
+    async def test_rows_the_app_doesnt_gate_by_facility(self, rows):
+        arm1 = rows["arm1"]
+        assert await _reaches(_key(), "PATCH", f"/squirrel/v1/pvs/meta/{arm1['pv']}")
+        assert await _reaches(_key(), "DELETE", f"/squirrel/v1/tags/{arm1['group']}")
+        assert await _reaches(_key(), "PUT", f"/magpie/v1/configs/trace/{arm1['config']}")
+
+
+async def test_an_unrestricted_key_reaches_every_row_without_a_read(monkeypatch):
+    def no_read():
+        raise AssertionError("read the database")
+
+    monkeypatch.setattr(owners, "session_scope", no_read)
+    monkeypatch.setattr(owners.facilities_gateway, "resolve_key_facility_scope", no_read)
+
+    assert await _reaches(_key(WILDCARD), "DELETE", f"/squirrel/v1/snapshots/{uuid4()}")
+    assert await _reaches(_key("a"), "DELETE", "/squirrel/v1/snapshots/not-a-uuid")

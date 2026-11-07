@@ -1,8 +1,9 @@
 """A history head sending writes to their owners (arm1 mocked with ``httpx_mock``).
 
-The owner lookup is stubbed here (``owner``), so these need no database;
-``test_owners.py`` covers the lookup itself and ``test_head.py`` the two together.
-Keys are fakes bound to the head's registry.
+The owner lookup (``owner``) and the caller's facility check (``reach``, true unless
+set) are stubbed here, so these need no database; ``test_owners.py`` covers the
+lookup itself and ``test_head.py`` all of it together. Keys are fakes bound to the
+head's registry.
 """
 
 import json
@@ -11,6 +12,7 @@ from urllib.parse import unquote
 import httpx
 import pytest
 from pytest_httpx import HTTPXMock
+from prometheus_client import REGISTRY
 from fastapi.testclient import TestClient
 
 from canopy.main import app
@@ -51,6 +53,25 @@ def owner(monkeypatch):
             return name
 
         monkeypatch.setattr(owners, "owner_of", owner_of)
+        return calls
+
+    return _set
+
+
+@pytest.fixture(autouse=True)
+def reach(monkeypatch):
+    """Stub the caller's facility check: ``reach(False)`` puts the caller outside every row; returns the calls."""
+    calls = []
+    reaches = {"value": True}
+
+    async def caller_reaches(route, params, key):
+        calls.append((route.path, params, key.name))
+        return reaches["value"]
+
+    monkeypatch.setattr(owners, "caller_reaches", caller_reaches)
+
+    def _set(value: bool):
+        reaches["value"] = value
         return calls
 
     return _set
@@ -259,6 +280,25 @@ class TestLeftToTheAppHere:
         # The body read to find the owner is handed on to the app whole.
         assert json.loads(app_here[0]["body"]) == {"setpointAddress": "SIM:1"}
 
+    def test_a_caller_outside_the_rows_facilities(self, client, owner, reach, app_here):
+        owner("arm1")
+        calls = reach(False)
+
+        resp = client.patch(f"/squirrel/v1/snapshots/{SNAPSHOT_ID}", json={"title": "x"}, headers=_as(WRITER))
+
+        # The app here answers as any instance would; nothing goes to arm1, up or down.
+        assert resp.status_code == 299
+        assert json.loads(app_here[0]["body"]) == {"title": "x"}
+        assert calls == [("/squirrel/v1/snapshots/{snapshot_id}", {"snapshot_id": SNAPSHOT_ID}, "console")]
+
+    def test_the_facility_check_is_only_for_an_arms_row(self, client, owner, reach, app_here):
+        owner("head")
+        calls = reach(False)
+
+        client.delete("/squirrel/v1/pvs/p1", headers=_as(WRITER))
+
+        assert calls == []
+
     def test_a_captured_import(self, client, owner, app_here):
         calls = owner("arm1")
 
@@ -335,6 +375,87 @@ class TestArmTrouble:
         monkeypatch.setenv("CANOPY_FORWARD__ALLOW_INSECURE_HTTP", "true")
         httpx_mock.add_response(method="DELETE", url="http://arm1.example.org/squirrel/v1/pvs/p1", json=True)
         assert client.delete("/squirrel/v1/pvs/p1", headers=_as(WRITER)).status_code == 200
+
+
+class TestServiceKeyRefused:
+    """An arm refusing the head's service key is the head's error, not the caller's."""
+
+    PATCH = f"/squirrel/v1/snapshots/{SNAPSHOT_ID}"
+
+    def _count(self, method: str, route: str) -> float:
+        labels = {"method": method, "route": route, "arm": "arm1", "status": "502", "outcome": "key_refused"}
+        return REGISTRY.get_sample_value("canopy_forwarded_requests_total", labels) or 0.0
+
+    def test_a_401_names_the_arm_and_its_answer(self, client, owner, httpx_mock: HTTPXMock):
+        owner("arm1")
+        httpx_mock.add_response(status_code=401, json={"code": "invalid_api_key", "detail": "Invalid API key"})
+        before = self._count("PATCH", "/squirrel/v1/snapshots/{snapshot_id}")
+
+        resp = client.patch(self.PATCH, json={"title": "x"}, headers=_as(WRITER))
+
+        assert resp.status_code == 502
+        assert resp.json() == {
+            "code": "service_key_refused",
+            "detail": "Arm 'arm1' refused this head's service key for it (401 invalid_api_key: Invalid API key)",
+        }
+        assert self._count("PATCH", "/squirrel/v1/snapshots/{snapshot_id}") == before + 1
+
+    def test_a_401_without_a_canopy_body(self, client, owner, httpx_mock: HTTPXMock):
+        owner("arm1")
+        httpx_mock.add_response(status_code=401, text="Unauthorized")
+
+        resp = client.patch(self.PATCH, json={"title": "x"}, headers=_as(WRITER))
+
+        assert resp.json()["detail"] == "Arm 'arm1' refused this head's service key for it (401: Unauthorized)"
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "insufficient_read_access",
+            "insufficient_write_access",
+            "insufficient_admin_access",
+            "insufficient_module_access",
+        ],
+    )
+    def test_a_403_for_the_keys_access(self, client, owner, httpx_mock: HTTPXMock, code):
+        owner("arm1")
+        httpx_mock.add_response(status_code=403, json={"code": code, "detail": "no"})
+
+        resp = client.patch(self.PATCH, json={"title": "x"}, headers=_as(WRITER))
+
+        assert resp.status_code == 502
+        assert resp.json()["code"] == "service_key_refused"
+        assert f"(403 {code}: no)" in resp.json()["detail"]
+
+    def test_a_facility_write_the_key_isnt_scoped_for(self, client, owner, httpx_mock: HTTPXMock):
+        owner("arm1")
+        detail = "API key is not scoped to 'core'"
+        httpx_mock.add_response(status_code=403, json={"code": "insufficient_module_access", "detail": detail})
+
+        resp = client.put("/v1/facilities/site-a", json={"name": "A"}, headers=_as(HIERARCHY))
+
+        assert resp.status_code == 502
+        assert resp.json()["detail"].endswith(f"(403 insufficient_module_access: {detail})")
+
+    def test_a_facility_refusal_on_a_facility_route_is_the_keys(self, client, owner, httpx_mock: HTTPXMock):
+        # The caller passed the wildcard gate here, so only the service key can lack it.
+        owner("arm1")
+        httpx_mock.add_response(status_code=403, json={"code": "insufficient_facility_access", "detail": "no"})
+
+        resp = client.delete("/v1/facilities/site-a", headers=_as(HIERARCHY))
+
+        assert resp.status_code == 502
+        assert resp.json()["code"] == "service_key_refused"
+
+    @pytest.mark.parametrize("code", ["insufficient_facility_access", "forwarded_write_refused", "not_owner"])
+    def test_any_other_403_comes_back_as_it_is(self, client, owner, httpx_mock: HTTPXMock, code):
+        # A facility refusal here may be the caller's own grant; forwarded_write_refused names forwarding.
+        owner("arm1")
+        httpx_mock.add_response(status_code=403, json={"code": code, "detail": "no"})
+
+        resp = client.patch(self.PATCH, json={"title": "x"}, headers=_as(WRITER))
+
+        assert (resp.status_code, resp.json()) == (403, {"code": code, "detail": "no"})
 
 
 class TestReadYourWrites:
