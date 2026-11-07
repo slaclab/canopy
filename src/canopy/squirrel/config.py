@@ -50,6 +50,30 @@ class PVCacheConfig(BaseModel):
         return self
 
 
+class OutboxConfig(BaseModel):
+    """A history head's queue of snapshots for arms it can't reach (``CANOPY_SQUIRREL__OUTBOX__*``).
+
+    The caps hold per arm and count every row the arm has in the queue, failed and
+    delivered ones included, since each keeps its bundle on the head's disk. A full
+    snapshot is tens of MB, so size ``max_bytes`` from the head's free space and the
+    number of arms. At either cap, new captures for that arm are refused.
+    """
+
+    max_snapshots: int = Field(200, ge=1, description="Most snapshots queued for one arm.")
+    max_bytes: int = Field(4 * 1024**3, ge=1, description="Most bundle bytes queued for one arm.")
+    retry_initial_s: float = Field(30.0, gt=0, description="Wait before retrying an arm after its first failure.")
+    retry_max_s: float = Field(900.0, gt=0, description="Longest wait between retries; the wait doubles up to it.")
+    interval_s: int = Field(30, ge=1, le=60, description="How often the worker checks for deliveries due, in seconds.")
+
+    @model_validator(mode="after")
+    def _initial_within_max(self) -> Self:
+        if self.retry_initial_s > self.retry_max_s:
+            raise ValueError(
+                f"retry_initial_s ({self.retry_initial_s:g}) must not be longer than retry_max_s ({self.retry_max_s:g})"
+            )
+        return self
+
+
 class SquirrelConfig(BaseSettings):
     """Squirrel's environment-sourced settings."""
 
@@ -84,6 +108,9 @@ class SquirrelConfig(BaseSettings):
 
     # Worker-side PV cache for cached snapshots (CANOPY_SQUIRREL__PV_CACHE__*).
     pv_cache: PVCacheConfig = PVCacheConfig()
+
+    # A history head's snapshot outbox (CANOPY_SQUIRREL__OUTBOX__*).
+    outbox: OutboxConfig = OutboxConfig()
 
     @property
     def restore_hooks_list(self) -> list[str]:

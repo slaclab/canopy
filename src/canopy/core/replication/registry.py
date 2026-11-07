@@ -15,7 +15,8 @@ table can't ship before someone decides whether the head gets it:
     no deletes, so pruning the primary never removes history.
 ``local``
     Rows that belong to one database and never replicate. API keys are local: a
-    head mints and checks its own.
+    head mints and checks its own. So is a head's snapshot outbox: an arm's copy of a
+    queued snapshot arrives through ``squirrel.snapshot``, never through the queue.
 
 Every replicated table also has an owner path (``canopy.core.ownership``): a root
 table names its row's owner in a column, and a child table follows its parent. On
@@ -198,6 +199,7 @@ REGISTRY = ReplicationRegistry(
             "squirrel.snapshot_value": TableClass.TIME_SERIES,
             "core.api_key": TableClass.LOCAL,
             "core.history_heartbeat": TableClass.LOCAL,
+            "squirrel.snapshot_outbox": TableClass.LOCAL,
         }
     ),
     owner_paths=MappingProxyType(

@@ -154,3 +154,13 @@ def test_metrics_endpoint_is_unauthenticated_and_parseable():
         "canopy_hare_subscriptions",
         "canopy_replication_status_up",
     } <= names
+
+
+def test_metrics_endpoint_carries_the_outbox_gauges_where_arms_are_delivered_to(monkeypatch):
+    from canopy.squirrel.outbox import metrics as outbox_metrics
+
+    monkeypatch.setattr(outbox_metrics.COLLECTOR, "arms", lambda: ["arm2"])
+    with TestClient(app) as client:
+        resp = client.get("/metrics")
+    names = {family.name for family in text_string_to_metric_families(resp.text)}
+    assert "canopy_squirrel_outbox_status_up" in names

@@ -22,7 +22,7 @@ from canopy.core.db import session_scope
 from canopy.core.errors import PrimaryUnavailable
 from canopy.jobs.gateway import report_progress
 from canopy.squirrel.config import get_squirrel_config
-from canopy.squirrel.capture import deliver_capture
+from canopy.squirrel.outbox import delivery as outbox
 from canopy.core.forwarding.client import Caller, ArmRefused
 from canopy.squirrel.pv_cache.reader import PVCacheReader
 from canopy.squirrel.schemas.snapshot import NewSnapshotDTO, RestoreRequestDTO
@@ -130,7 +130,7 @@ async def _capture_for_arm(
     description: str | None,
     facility_id: str | None,
 ) -> dict:
-    """Capture the arm's PVs here, then save the snapshot on the arm (``deliver_capture``)."""
+    """Capture the arm's PVs here, then save the snapshot on the arm, or queue it for the arm (``outbox.submit``)."""
     progress = _progress_sink(ctx)
     async with session_scope() as session:  # read-only: the snapshot is the arm's to save
         service = SnapshotService(session, epics_io)
@@ -144,7 +144,22 @@ async def _capture_for_arm(
             facility_id=facility_id,
         )
     await progress(captured.total_pvs, captured.total_pvs, f"Saving {len(bundle.values):,} PV values on {arm}...")
-    return await deliver_capture(arm, bundle, Caller(**caller))
+    submitted = await outbox.submit(arm, bundle, Caller(**caller), facility_id=facility_id)
+    await progress(captured.total_pvs, captured.total_pvs, submitted.message)
+    if submitted.queued:
+        # The arm couldn't take it, or has older snapshots waiting. Redis only starts a
+        # delivery run sooner; the queue itself is in Postgres.
+        await ctx["redis"].enqueue_job("deliver_outbox_task")
+    return submitted.result
+
+
+async def deliver_outbox_task(ctx: dict) -> dict:
+    """Send every arm's due queued snapshots, in order (``canopy.squirrel.outbox.delivery``).
+
+    Runs on the head's cron every ``CANOPY_SQUIRREL__OUTBOX__INTERVAL_S`` and whenever a
+    capture is queued. Returns each arm's counts by outcome.
+    """
+    return await outbox.deliver_all()
 
 
 async def restore_snapshot_task(
