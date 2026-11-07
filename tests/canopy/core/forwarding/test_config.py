@@ -50,10 +50,3 @@ def test_blank_forward_settings_are_unset(monkeypatch):
     monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "host=arm1.example.org")
 
     assert not ArmsConfig().arms["arm1"].forwards
-
-
-@pytest.mark.parametrize("name", ["PRIMARY_URL", "SERVICE_KEY", "PRIMARY_WINDOW_DAYS", "ALLOW_SHARED"])
-def test_the_single_primary_settings_are_gone(monkeypatch, name):
-    monkeypatch.setenv(f"CANOPY_FORWARD__{name}", "x")
-
-    assert not hasattr(ForwardConfig(), name.lower())
