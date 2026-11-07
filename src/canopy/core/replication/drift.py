@@ -64,9 +64,8 @@ from dataclasses import dataclass
 from collections.abc import Mapping, Callable, Awaitable
 
 import asyncpg
-import pydantic
 
-from canopy.core.arms import Arm, get_arms_config, subscription_name
+from canopy.core.arms import Arm, ArmsConfigError, get_arms_config, subscription_name
 from canopy.core.config import get_settings
 from canopy.core.replication.sql import (
     Refused,
@@ -668,9 +667,8 @@ async def run(args: argparse.Namespace) -> int:
     settings = get_settings()
     try:
         arms = get_arms_config().arms
-    except pydantic.ValidationError as exc:
-        # Only the messages: the error's own text would echo the settings it was given.
-        logger.error("refused: CANOPY_ARMS is invalid: %s", "; ".join(error["msg"] for error in exc.errors()))
+    except ArmsConfigError as exc:  # names each wrong setting, never a value
+        logger.error("refused: %s", exc)
         return 2
     mirror = None
     try:
