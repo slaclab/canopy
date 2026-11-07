@@ -737,7 +737,7 @@ async def test_unassigned_snapshot_is_not_writable_or_restorable_by_a_restricted
 
     # update/delete go through `_require_facility_write`, which refuses an unassigned
     # row with 403 (it's known to exist, just not writable); restore goes through
-    # `snapshot_exists`, which uses the read-side masking rule, so it's 404.
+    # `restorable_owner`, which uses the read-side masking rule, so it's 404.
     r = await client.put(f"/v1/snapshots/{snapshot.id}", headers=SC_HEADERS, json={"title": "renamed"})
     assert r.status_code == 403, r.text
     r = await client.delete(f"/v1/snapshots/{snapshot.id}", headers=SC_HEADERS)
