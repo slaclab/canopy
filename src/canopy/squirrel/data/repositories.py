@@ -271,11 +271,6 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         )
         return result.scalar() or 0
 
-    async def get_value_pv_ids(self, snapshot_id: str) -> set[str]:
-        """The PV ids ``snapshot_id`` holds values for."""
-        result = await self.session.execute(select(SnapshotValue.pv_id).where(SnapshotValue.snapshot_id == snapshot_id))
-        return set(result.scalars())
-
     async def get_value_counts_batch(self, snapshot_ids: list[str]) -> dict[str, int]:
         """Value counts for many snapshots in a single grouped query."""
         if not snapshot_ids:
