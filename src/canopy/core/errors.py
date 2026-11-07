@@ -35,6 +35,7 @@ class ErrorCode(StrEnum):
     FORWARDED_WRITE_REFUSED = auto()
     ARCHIVED_IMMUTABLE = auto()
     PRIMARY_UNAVAILABLE = auto()
+    SERVICE_KEY_REFUSED = auto()
 
     # Mole
     ARCHIVER_NOT_CONFIGURED = auto()
@@ -318,6 +319,19 @@ class PrimaryUnavailable(CanopyError):
 
 class PrimaryTimeout(PrimaryUnavailable):
     status_code = 504
+
+
+class ServiceKeyRefused(CanopyError):
+    """An arm refused the service key a history head sends a write with.
+
+    The head checks the caller's own key before forwarding, so this is the head's
+    configuration, not the caller's key: the key it holds for that arm is unknown
+    there, or lacks the modules or access the write needs. The detail names the arm
+    and relays its answer.
+    """
+
+    status_code = 502
+    error_code = ErrorCode.SERVICE_KEY_REFUSED
 
 
 def register_canopy_error_handler(app: FastAPI) -> None:
