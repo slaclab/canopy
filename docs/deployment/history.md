@@ -56,7 +56,7 @@ flowchart LR
 | `CANOPY_ROLE` | Holds | Writes |
 |---|---|---|
 | `primary` (default) | Only its own rows; publishes them, and may prune | Its own rows |
-| `mirror` | Its arms' rows, beside its own; never prunes | Its own rows; an arm's rows are read-only here |
+| `mirror` | Its arms' rows, beside its own; never prunes | Its own rows; an arm's rows on that arm, when the head forwards to it ([Writes on a head](#writes-on-a-head)) |
 
 Every instance writes only the rows it owns (see [Row owners](index.md#row-owners)),
 and a head meant to stay read-only gives its users read keys only. `GET /v1/instance`
@@ -285,6 +285,146 @@ capture there would; a PV moved to another facility since the snapshot was taken
 left out and listed in the response's `skipped`. A snapshot with `retain` set is never
 pruned. Prune can't see references held outside Canopy, so a service that refers to
 snapshots, such as an optimization service's runs, sets `retain` on the ones it needs.
+
+## Writes on a head
+
+A head writes only its own rows, like every instance. A write to an arm's row goes to
+that arm, over HTTPS, when the head forwards to it: the arm saves it, and the change
+comes back through replication. An arm forwards when the head has both of its forward
+settings, `CANOPY_ARMS__<arm>__FORWARD_URL` and `__SERVICE_KEY`. Without them the
+arm's rows are read-only on the head, and a write to one is refused with 403
+`not_owner`, naming the arm. `GET /v1/instance` shows each arm's `forwards`.
+
+### Where each write goes
+
+`canopy.core.forwarding.routes` names, for every write route, how the head finds the
+owner of what it writes, in its own copy. A test fails when a route is neither routed
+nor named as local.
+
+| Writes | Owner |
+|---|---|
+| Snapshot edit, retain, delete and restore; PV edit and delete; meta-PV edit and delete; tag group and tag changes; Magpie config edit and delete; facility edit and delete | The row's |
+| Snapshot capture and history import | The facility's, from the body |
+| PV create and PV import (`/pvs/multi`) | The facilities' in the body, which must share one owner |
+| Meta-PV create | The owner of the PV at that address: the head's own first, else the one arm that holds it |
+| Facility create | The parent's |
+| Tag group create, tag import, Magpie config create, and any create above with no facility or parent | The head's, unless `?owner=` names another instance |
+| API keys, Vole buffer evicts, analytics events, e-log entries and attachments, Hare PV writes | Always the head's own: never forwarded |
+
+The creates that take a target from nothing else also take `?owner=<instance>`: a
+forwardable arm's name sends the create to that arm, and any other name but the head's
+is refused with 403 `not_owner`. A create whose `owner` contradicts its facility or
+parent is answered by the head, with `not_owner` or 409 `owner_mismatch`. A facility
+create sent to an arm whose slug the head already holds, under any owner, is refused
+with 409 `facility_slug_conflict` before it is sent: slugs are unique across every
+instance, and the arm's new row would otherwise stop replication from that arm.
+
+A row or facility the head doesn't hold is answered by the head (404). A captured
+import (`?mode=captured`) is never forwarded: it is how a head saves a snapshot it took
+for an arm, and only a service key sends one, to the arm.
+
+A snapshot an arm has pruned is still on the head. A change to it that the arm answers
+with 404 is refused with 409 `archived_immutable`. To bring such a snapshot back to its
+arm, export it on the head (`GET /squirrel/v1/snapshots/{id}/export`) and post the
+bundle to `POST /squirrel/v1/snapshots/import`, which goes to the facility's arm and
+creates a new snapshot there.
+
+A forwarded capture or restore runs as a job on the arm. Clients poll it on the head
+as usual: `GET /jobs/v1/{id}` asks that arm about a job the head started there, for a
+day after it started.
+
+### Who wrote it
+
+The head checks the caller's own key against the same gates the route has (write
+scope and module; for facilities, admin over every facility), then calls the arm with
+the head's service key there and names the caller in `X-Canopy-On-Behalf-Of`, as
+`<key name>@<head>`, percent-encoded UTF-8 so a non-ASCII key name survives the trip.
+The arm trusts that header only from a service key and only with
+`CANOPY_ACCEPT_FORWARDED_WRITES=true`; otherwise it refuses the request with 403
+`forwarded_write_refused`. It records the name in `createdBy` (snapshot captures,
+Magpie configs) and logs it for imports.
+
+The caller's facility grant goes with the request too, in
+`X-Canopy-On-Behalf-Of-Facilities`, and the arm requires it alongside
+`X-Canopy-On-Behalf-Of`. The arm's facility checks then allow only what both the
+service key and the caller reach, so a caller keeps its own facility limits through
+the head. Everything a forwarded write may change is that arm's own: the arm applies
+its own rules to it, as for one of its local users, and the service key bounds the
+rest.
+
+The head checks the caller's grant first, for a snapshot change or a PV edit or
+delete. A caller whose grant shares no facility with the row gets the head's own
+answer, the same as on any instance, and nothing is sent to the arm: 404
+`snapshot_not_found` for a snapshot, as `GET` answers, and 403
+`insufficient_facility_access` for a PV or an unassigned snapshot. So the answer
+doesn't depend on the arm being up, and doesn't say who owns the row.
+
+Mint one service key on each arm, for that arm only, with the modules the head
+forwards to it (`-m squirrel`, and `-m magpie` for Magpie configs), every facility
+(`--facility '*'`) or only those the head's users work in. Each caller's own grant
+still limits its requests. A key limited to some facilities must cover every one the
+head's users reach on that arm. Otherwise the arm hides a snapshot outside them from the
+key with a 404, and the head reads that as a prune (`archived_immutable`). Add `-a` only if the head should create, edit or delete the
+arm's facilities: admin on the arm also manages that arm's API keys, and without it
+the arm refuses facility writes with 403 `insufficient_admin_access`. Only the CLI
+mints service keys:
+
+```sh
+python scripts/create_key.py head -r -w -m squirrel --facility '*' --service
+```
+
+### Reading your own write
+
+For a forwarded request that committed a write, the arm returns
+`X-Canopy-Commit-LSN`. The head waits up to `CANOPY_FORWARD__WAIT_S` (2 s) for its
+subscription to that arm, `canopy_history_<arm>`, to reach that position
+(`pg_replication_origin_status`). If it doesn't, the answer carries
+`X-Canopy-Replica-Stale: true`: the write succeeded, but a read straight after it may
+not show it yet. A capture commits later, in the arm's worker, so it carries no
+position. Both headers are exposed through CORS, so a browser client on another
+origin can read them. The wait includes getting a database connection, so a busy pool
+marks the answer stale rather than delaying it.
+
+The view is readable only by superusers by default. As a superuser on the head's
+database, grant its app role both:
+
+```sql
+GRANT SELECT ON pg_replication_origin_status TO canopy_app;
+GRANT EXECUTE ON FUNCTION pg_show_replication_origin_status() TO canopy_app;
+```
+
+Without them every forwarded write is marked stale.
+
+### Settings
+
+On the head, per arm it forwards to: `CANOPY_ARMS__<arm>__FORWARD_URL` (https) and
+`CANOPY_ARMS__<arm>__SERVICE_KEY` from a secret, set together. A head with only one
+of the two doesn't start. Optional, for every arm: `CANOPY_FORWARD__WAIT_S`,
+`CANOPY_FORWARD__TIMEOUT_S` and `CANOPY_FORWARD__CA_BUNDLE`. On each arm:
+`CANOPY_ACCEPT_FORWARDED_WRITES=true`. The full list is in the
+[environment table](index.md). Deploy the head from the same release as its arms, so
+what it forwards has the shapes they expect.
+
+### When an arm is unreachable
+
+A forwarded write fails with 502 `primary_unavailable` when the arm couldn't be
+reached; nothing was sent. It fails with 504 when the request went out and no answer
+came back; the write may have been applied, so check before sending it again. Reads
+keep working from the head's own copy, and so do writes to the head's own rows and to
+other arms.
+
+An arm that refuses the head's service key answers a forwarded write with 502
+`service_key_refused`. That covers a 401, or a 403 for the key's scope, modules or
+admin access (and on facility routes, for its facilities). The caller's own key is fine:
+the head checked it first. The detail names the arm and relays its answer, for example
+"Arm 'arm1' refused this head's service key for it (401 invalid_api_key: Invalid API
+key)". `canopy_forwarded_requests_total` counts these with `outcome="key_refused"`.
+
+To fix it, mint the arm's service key again with the modules and access the head
+forwards (see [Who wrote it](#who-wrote-it)), and set it as
+`CANOPY_ARMS__<arm>__SERVICE_KEY` on the head. A refusal that comes from the caller's
+own facility grant, and `forwarded_write_refused`, reach the caller as the arm sent
+them.
 
 ## Runbooks
 

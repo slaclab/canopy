@@ -18,6 +18,7 @@ class ApiKeyDTO(CanopyModel):
     read_access: bool
     write_access: bool
     admin_access: bool
+    is_service: bool = False
     modules: list[str]
     facilities: list[str]
     created_at: datetime
