@@ -316,7 +316,7 @@ async def test_invalid_arms_are_refused_without_their_values(env, caplog):
         CANOPY_ARMS='{"Bad-Name": {"reader_dsn": "postgresql://r:s3cret@x/db"}}',
     )
     assert await drift.run(ARGS) == 2
-    assert "CANOPY_ARMS is invalid" in caplog.text and "s3cret" not in caplog.text
+    assert "refused: CANOPY_ARMS" in caplog.text and "s3cret" not in caplog.text
 
 
 async def test_arm_checks_one_arm(head_only, env, monkeypatch, capsys):

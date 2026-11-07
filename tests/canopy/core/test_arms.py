@@ -1,9 +1,17 @@
 """``canopy.core.arms``: the head's arms setting and the subscription names it implies."""
 
+import traceback
+
 import pytest
 from pydantic import ValidationError
 
-from canopy.core.arms import Arm, ArmsConfig, get_arms_config, subscription_name
+from canopy.core.arms import (
+    Arm,
+    ArmsConfig,
+    ArmsConfigError,
+    get_arms_config,
+    subscription_name,
+)
 
 
 def test_no_arms_by_default():
@@ -33,8 +41,31 @@ def test_arms_as_json(monkeypatch):
 
 @pytest.mark.parametrize("name", ["", "Arm1", "arm-1", "arm 1", "x" * 49])
 def test_names_must_suit_a_subscription_name(name):
-    with pytest.raises(ValidationError, match="arm names must be"):
+    with pytest.raises(ValidationError, match="arm names must match"):
         ArmsConfig(arms={name: Arm()})
+
+
+@pytest.mark.parametrize(
+    ("value", "says"),
+    [
+        # A bad name: pydantic's input is the whole setting, every arm's DSN with it.
+        ('{"Bad-Name": {"publisher_dsn": "host=x password=s3cret"}}', "CANOPY_ARMS: Value error, arm names must match"),
+        # An arm that isn't an object: the input is the DSN itself.
+        ('{"arm1": "host=x password=s3cret"}', "CANOPY_ARMS__ARM1: Input should be a valid dictionary"),
+        # Not JSON at all.
+        ('{"arm1": {"publisher_dsn": "host=x password=s3cret"', 'error parsing value for field "arms"'),
+    ],
+)
+def test_an_invalid_setting_is_reported_without_its_values(monkeypatch, value, says):
+    monkeypatch.setenv("CANOPY_ARMS", value)
+
+    with pytest.raises(ArmsConfigError) as caught:
+        get_arms_config()
+
+    assert says in str(caught.value)
+    shown = {"str": str(caught.value), "repr": repr(caught.value)}
+    shown["traceback"] = "".join(traceback.format_exception(caught.value))
+    assert [how for how, text in shown.items() if "s3cret" in text] == []
 
 
 def test_the_longest_name_fits_postgres():

@@ -1,8 +1,8 @@
 from typing import Literal
 from functools import lru_cache
 
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, ValidationError, field_validator
+from pydantic_settings import BaseSettings, SettingsError, SettingsConfigDict
 
 INSTANCE_NAME_PATTERN = r"^[a-z0-9_]{1,48}$"
 """An instance name: ``CANOPY_INSTANCE``, an arm's name and every owner stamp."""
@@ -43,8 +43,8 @@ class Settings(BaseSettings):
         (``canopy_history_<name>`` must fit a Postgres identifier). Required, and
         permanent once the instance holds data. Reported by ``GET /v1/instance``.
     history_url : str | None
-        Base URL of the read-only history instance holding this instance's full
-        history, reported by ``GET /v1/instance`` so clients can link to it.
+        Base URL of the history head holding this instance's full history,
+        reported by ``GET /v1/instance`` so clients can link to it.
     window_days : int | None
         Days of history this instance keeps, at least 1; ``None`` means it keeps
         everything. A blank value, as Helm and compose render an unset one, is ``None``
@@ -111,3 +111,18 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def describe_settings_error(exc: ValidationError | SettingsError, prefix: str = "CANOPY_") -> str:
+    """Which settings are wrong and why, never their values.
+
+    A ``ValidationError``'s own text (``str`` and ``repr``) echoes its input, which
+    may hold a password, so only each error's variable and message are kept. A
+    ``SettingsError`` names only the field and its source (a value that isn't JSON).
+    """
+    if isinstance(exc, SettingsError):
+        return str(exc)
+    return "; ".join(
+        f"{prefix}{'__'.join(str(part) for part in error['loc']).upper()}: {error['msg']}"
+        for error in exc.errors(include_input=False, include_url=False, include_context=False)
+    )

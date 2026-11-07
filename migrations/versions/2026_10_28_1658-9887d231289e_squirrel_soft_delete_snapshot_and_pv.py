@@ -21,8 +21,8 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     # Deleting a snapshot or a PV sets deleted_at instead of removing the row. Nullable
     # with no default, so existing rows stay live and the ALTER doesn't rewrite the table.
-    # With a history mirror, run this there before the primary: an added column has to
-    # exist on the subscriber before the primary starts sending it.
+    # With a history head, run this there before its arms: an added column has to exist
+    # on the subscriber before an arm starts sending it.
     op.add_column("pv", sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True), schema="squirrel")
     op.add_column("snapshot", sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True), schema="squirrel")
 
