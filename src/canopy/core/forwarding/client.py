@@ -187,13 +187,7 @@ class ArmRefused(Exception):
 
     @classmethod
     def from_answer(cls, arm: str, answer: httpx.Response) -> ArmRefused:
-        try:
-            body = answer.json()
-        except ValueError:
-            body = None
-        if isinstance(body, dict) and isinstance(body.get("code"), str):
-            return cls(arm, answer.status_code, body["code"], str(body.get("detail", "")))
-        return cls(arm, answer.status_code, None, answer.text[:500])
+        return cls(arm, answer.status_code, *arm_error(answer))
 
 
 def lsn_value(lsn: str) -> int:
