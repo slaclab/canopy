@@ -34,8 +34,8 @@ import argparse
 import asyncpg
 import pydantic
 
-from canopy.core.arms import get_arms_config
-from canopy.core.config import get_settings
+from canopy.core.arms import ArmsConfigError, get_arms_config
+from canopy.core.config import get_settings, describe_settings_error
 from canopy.core.logging import JsonFormatter
 from canopy.core.replication import drift
 from canopy.core.replication.sql import (
@@ -114,8 +114,8 @@ async def run(command: str, arm: str | None = None) -> int:
     config = get_replication_config()
     try:
         arms = get_arms_config().arms
-    except pydantic.ValidationError as exc:
-        logger.error("refused: %s", _settings_errors(exc, "CANOPY_"))
+    except ArmsConfigError as exc:
+        logger.error("refused: %s", exc)
         return 2
     local_dsn = asyncpg_dsn(settings.database_url)
     # Only the arms' DSNs enter SQL text. Redacting the local one too would mask its
@@ -167,20 +167,13 @@ async def run(command: str, arm: str | None = None) -> int:
     return 0
 
 
-def _settings_errors(exc: pydantic.ValidationError, prefix: str) -> str:
-    """Which settings are wrong and why, without the values: the error's own text would echo them."""
-    return "; ".join(
-        f"{prefix}{'__'.join(str(part) for part in error['loc']).upper()}: {error['msg']}" for error in exc.errors()
-    )
-
-
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         settings = get_settings()
     except pydantic.ValidationError as exc:
         _configure_logging("text")
-        logger.error("refused: %s", _settings_errors(exc, "CANOPY_"))
+        logger.error("refused: %s", describe_settings_error(exc))
         return 2
     _configure_logging(settings.log_format)
     if args.command == "drift-check":
