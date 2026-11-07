@@ -66,7 +66,7 @@ async def test_cli_status_retry_and_discard(db_session, seeded: Seeded, app_data
     code, status = await _cli(capsys, "status")
     assert code == 0 and status["arms"]["arm2"]["failed"] == 1
 
-    # Only a failed row can be discarded, and only a failed row retried.
+    # A pending row can't be discarded, and only a failed row can be retried.
     assert (await _cli(capsys, "discard", pending))[0] == 1
     assert await _state(db_session, pending) is not None
     assert (await _cli(capsys, "retry", pending))[0] == 1
@@ -83,9 +83,35 @@ async def test_cli_status_retry_and_discard(db_session, seeded: Seeded, app_data
     await db_session.execute(update(SnapshotOutbox).where(SnapshotOutbox.id == other).values(state="failed"))
     await db_session.commit()
     code, out = await _cli(capsys, "discard", other)
-    assert code == 0 and out["discarded"] == other and out["arm"] == "arm3"
+    assert code == 0 and (out["discarded"], out["arm"], out["state"]) == (other, "arm3", "failed")
     assert await _state(db_session, other) is None
     assert (await _cli(capsys, "discard", other))[0] == 1
+
+
+async def test_cli_discards_a_delivered_rows_copy_and_frees_its_cap_share(
+    db_session, seeded: Seeded, app_database, capsys, caplog
+):
+    from canopy.squirrel.data.repositories import OutboxRepository
+
+    delivered = await queue(db_session, seeded, state="delivered", attempts=1)
+    repo = OutboxRepository(db_session)
+    rows, size = await repo.usage("arm2")
+    assert rows == 1 and size > 0
+
+    code, out = await _cli(capsys, "discard", delivered)
+
+    assert code == 0 and (out["discarded"], out["arm"], out["state"], out["bytes"]) == (
+        delivered,
+        "arm2",
+        "delivered",
+        size,
+    )
+    assert await _state(db_session, delivered) is None
+    assert await repo.usage("arm2") == (0, 0)
+    # It says what it did: the head's copy only; the arm has the snapshot.
+    [message] = [r.getMessage() for r in caplog.records if r.name == "canopy.squirrel.outbox"]
+    assert "waiting copy" in message and "arm2 still holds the snapshot" in message
+    assert "reseed --arm arm2" in message and "gone" not in message
 
 
 async def test_cli_exits_1_when_the_database_cant_be_reached(monkeypatch, capsys):

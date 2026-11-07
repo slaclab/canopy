@@ -1,5 +1,6 @@
 """Queueing snapshots for an arm within its caps, and delivering them in order."""
 
+import json
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
@@ -12,8 +13,9 @@ from canopy.core.errors import PrimaryTimeout, PrimaryUnavailable
 from canopy.squirrel.config import OutboxConfig
 from canopy.squirrel.errors import OutboxFull
 from canopy.squirrel.data.models import Snapshot, SnapshotOutbox
-from canopy.core.forwarding.client import ArmRefused
+from canopy.core.forwarding.client import Caller, ArmRefused
 from canopy.squirrel.outbox.delivery import (
+    Submitted,
     submit,
     enqueue,
     bundle_json,
@@ -50,8 +52,6 @@ class FakeArm:
 
 
 def _ids(arm: FakeArm) -> list[str]:
-    import json
-
     return [json.loads(document)["id"] for _, document, _, _ in arm.sent]
 
 
@@ -74,7 +74,7 @@ async def test_enqueue_stores_the_bundle_as_sent_and_its_copies(db_session, seed
     )
     assert row.size_bytes == len(bundle_json(bundle).encode())
     assert row.caller == CALLER
-    assert await repo.bundle(str(bundle.id)) == bundle.model_dump(mode="json", by_alias=True)
+    assert json.loads(await repo.bundle_text(str(bundle.id))) == bundle.model_dump(mode="json", by_alias=True)
 
 
 async def test_the_count_cap_counts_every_state(db_session, seeded: Seeded):
@@ -315,16 +315,23 @@ async def test_a_capture_time_without_an_offset_is_read_as_utc(db_session, seede
 
 
 @pytest.fixture
-def arm_answers(monkeypatch):
-    """Stub ``deliver_capture`` for ``submit``: ``arm_answers(outcome)``; records each bundle id sent."""
+def arm_answers(monkeypatch, db_session):
+    """Stub ``deliver_capture`` for ``submit``: ``arm_answers(outcome)``; records each bundle id sent.
+
+    A save answers ``result``; with ``replicated`` the snapshot is here by the time the
+    wait ends, as replication would have brought it.
+    """
     sent: list[str] = []
 
-    def _set(outcome=None):
+    def _set(outcome=None, *, replicated: bool = False, result: dict | None = None):
         async def deliver_capture(arm, bundle, caller, *, strict=False):
             sent.append(str(bundle.id))
             if isinstance(outcome, Exception):
                 raise outcome
-            return {"type": "snapshot", "id": str(bundle.id), "arm": arm}
+            if replicated:
+                db_session.add(Snapshot(id=str(bundle.id), title=bundle.title, created_at=CAPTURED))
+                await db_session.commit()
+            return result or {"type": "snapshot", "id": str(bundle.id), "arm": arm}
 
         monkeypatch.setattr("canopy.squirrel.outbox.delivery.deliver_capture", deliver_capture)
         return sent
@@ -332,16 +339,69 @@ def arm_answers(monkeypatch):
     return _set
 
 
-async def test_submit_saves_on_a_reachable_arm_and_queues_nothing(db_session, seeded: Seeded, arm_answers):
-    from canopy.core.forwarding.client import Caller
-
-    sent = arm_answers()
+async def test_submit_saves_on_a_reachable_arm_and_keeps_nothing_once_its_back(db_session, seeded: Seeded, arm_answers):
+    sent = arm_answers(replicated=True)
     bundle = make_bundle(seeded)
 
-    result = await submit("arm2", bundle, Caller(**CALLER), facility_id=seeded.facility_id, config=CONFIG)
+    submitted = await submit("arm2", bundle, Caller(**CALLER), facility_id=seeded.facility_id, config=CONFIG)
 
-    assert result == {"type": "snapshot", "id": str(bundle.id), "arm": "arm2"}
+    assert submitted == Submitted({"type": "snapshot", "id": str(bundle.id), "arm": "arm2"}, "Saved on arm2")
     assert sent == [str(bundle.id)] and await _rows(db_session) == {}
+
+
+async def test_a_saved_snapshot_not_back_yet_is_kept_as_delivered_until_it_is(db_session, seeded: Seeded, arm_answers):
+    bundle = make_bundle(seeded)
+    skipped = [{"pvId": seeded.rb_id, "pvName": "LAB:B:ONLY:RB"}]
+    arm_answers(result={"type": "snapshot", "id": str(bundle.id), "arm": "arm2", "skipped": skipped})
+
+    submitted = await submit("arm2", bundle, Caller(**CALLER), facility_id=seeded.facility_id, config=CONFIG)
+
+    # The head serves it as pending, rather than not at all, until it replicates.
+    row = (await _rows(db_session))[str(bundle.id)]
+    assert (row.state, row.attempts, row.caller) == ("delivered", 1, CALLER)
+    assert row.delivered_at == row.last_attempt_at and row.delivered_at is not None
+    assert (submitted.message, submitted.queued) == ("Saved on arm2; waiting for it to replicate here", False)
+    assert submitted.result == {
+        "type": "snapshot",
+        "id": str(bundle.id),
+        "arm": "arm2",
+        "skipped": skipped,
+        "delivery": {
+            "state": "pending",
+            "arm": "arm2",
+            "queuedAt": submitted.result["delivery"]["queuedAt"],
+            "attempts": 1,
+            "reason": "Saved on arm2; waiting for replication",
+        },
+    }
+    # It holds nothing behind it, and is never sent again; the sweep removes it once back.
+    assert not await OutboxRepository(db_session).has_backlog("arm2")
+    arm = FakeArm()
+    await deliver_arm("arm2", arm, config=CONFIG)
+    assert arm.sent == [] and str(bundle.id) in await _rows(db_session)
+    db_session.add(Snapshot(id=str(bundle.id), title="back", created_at=CAPTURED))
+    await db_session.commit()
+    await deliver_arm("arm2", arm, config=CONFIG)
+    assert arm.sent == [] and await _rows(db_session) == {}
+
+
+async def test_a_saved_snapshot_past_a_cap_isnt_kept_and_the_capture_succeeds(
+    db_session, seeded: Seeded, arm_answers, caplog
+):
+    failed = await queue(db_session, seeded, state="failed", last_error="x: y")
+    arm_answers()
+    bundle = make_bundle(seeded, created=CAPTURED + timedelta(minutes=1))
+
+    with caplog.at_level(logging.WARNING, logger="canopy.squirrel.outbox.delivery"):
+        submitted = await submit(
+            "arm2", bundle, Caller(**CALLER), facility_id=seeded.facility_id, config=OutboxConfig(max_snapshots=1)
+        )
+
+    assert submitted == Submitted(
+        {"type": "snapshot", "id": str(bundle.id), "arm": "arm2"}, "Saved on arm2; it hasn't replicated here yet"
+    )
+    assert list(await _rows(db_session)) == [failed]
+    assert str(bundle.id) in caplog.text and "its outbox is full (1 snapshots" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -353,12 +413,13 @@ async def test_submit_saves_on_a_reachable_arm_and_queues_nothing(db_session, se
     ],
 )
 async def test_submit_queues_what_the_arm_couldnt_take_with_the_attempt(db_session, seeded: Seeded, arm_answers, error):
-    from canopy.core.forwarding.client import Caller
-
     arm_answers(error)
     bundle = make_bundle(seeded)
 
-    result = await submit("arm2", bundle, Caller(**CALLER), facility_id=seeded.facility_id, config=CONFIG)
+    submitted = await submit("arm2", bundle, Caller(**CALLER), facility_id=seeded.facility_id, config=CONFIG)
+
+    assert (submitted.message, submitted.queued) == ("Captured; waiting for arm2", True)
+    result = submitted.result
 
     row = (await _rows(db_session))[str(bundle.id)]
     assert (row.state, row.attempts, row.caller) == ("pending", 1, CALLER)
@@ -369,13 +430,11 @@ async def test_submit_queues_what_the_arm_couldnt_take_with_the_attempt(db_sessi
 
 
 async def test_submit_queues_behind_a_backlog_without_trying(db_session, seeded: Seeded, arm_answers):
-    from canopy.core.forwarding.client import Caller
-
     older = await queue(db_session, seeded)
     sent = arm_answers()
     bundle = make_bundle(seeded, created=CAPTURED + timedelta(minutes=1))
 
-    result = await submit("arm2", bundle, Caller(**CALLER), facility_id=seeded.facility_id, config=CONFIG)
+    result = (await submit("arm2", bundle, Caller(**CALLER), facility_id=seeded.facility_id, config=CONFIG)).result
 
     assert sent == []
     assert result["delivery"] == {
@@ -389,8 +448,6 @@ async def test_submit_queues_behind_a_backlog_without_trying(db_session, seeded:
 
 
 async def test_submit_lets_a_refusal_fail_the_capture(db_session, seeded: Seeded, arm_answers):
-    from canopy.core.forwarding.client import Caller
-
     arm_answers(ArmRefused("arm2", 404, "facility_not_found", "gone"))
 
     with pytest.raises(ArmRefused):
@@ -399,8 +456,6 @@ async def test_submit_lets_a_refusal_fail_the_capture(db_session, seeded: Seeded
 
 
 async def test_submit_refuses_past_the_cap(db_session, seeded: Seeded, arm_answers):
-    from canopy.core.forwarding.client import Caller
-
     await queue(db_session, seeded)
     with pytest.raises(OutboxFull):
         await submit(

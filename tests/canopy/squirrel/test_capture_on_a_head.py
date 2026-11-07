@@ -129,7 +129,7 @@ class TestTheTask:
     """The head's worker: read the arm's PVs here, send one bundle, wait for it to come back."""
 
     @pytest.fixture
-    def worker(self, monkeypatch):
+    def worker(self, monkeypatch, db_session, as_instance):
         io = FakeEpicsIO(
             {
                 address: _ev(1.5)
@@ -138,16 +138,30 @@ class TestTheTask:
             }
             | {"ARM1:IN:RB": _ev(1.4)}
         )
-        waits = []
+        waits, messages = [], []
+        state = SimpleNamespace(replicates=True)
 
-        async def no_progress(*args, **kwargs):
-            pass
+        async def record_progress(redis, job_id, percent, message, **kwargs):
+            messages.append(message)
 
         async def wait_until_applied(commit_lsn, timeout_s, *, subscription, until=None):
             waits.append((commit_lsn, subscription, until is not None))
+            if not state.replicates:
+                return False  # the wait ran out; the snapshot is saved on arm1 all the same
+            # Replication brings arm1's snapshot here: the one ``until`` looks for.
+            seen = []
+
+            class Probe:
+                async def fetchval(self, query, snapshot_id):
+                    seen.append(snapshot_id)
+
+            await until(Probe())
+            with as_instance("arm1"):
+                db_session.add(Snapshot(id=seen[0], title="back from arm1"))
+                await db_session.commit()
             return True
 
-        monkeypatch.setattr(tasks, "report_progress", no_progress)
+        monkeypatch.setattr(tasks, "report_progress", record_progress)
         monkeypatch.setattr(tasks, "_build_epics_io", lambda ctx: io)
         monkeypatch.setattr(capture, "wait_until_applied", wait_until_applied)
         triggered = []
@@ -156,7 +170,14 @@ class TestTheTask:
             async def enqueue_job(self, function, *args, **kwargs):
                 triggered.append(function)
 
-        return SimpleNamespace(io=io, waits=waits, triggered=triggered, ctx={"redis": Redis(), "job_id": "j"})
+        return SimpleNamespace(
+            io=io,
+            waits=waits,
+            messages=messages,
+            triggered=triggered,
+            state=state,
+            ctx={"redis": Redis(), "job_id": "j"},
+        )
 
     @staticmethod
     def _saved(request: httpx.Request, *, skipped: list | None = None, created: bool = True) -> httpx.Response:
@@ -196,8 +217,32 @@ class TestTheTask:
         assert value["setpointValue"]["value"] == 1.5 and value["readbackValue"]["value"] == 1.4
         assert result == {"type": "snapshot", "id": bundle["id"], "arm": "arm1"}
         assert worker.waits == [("0/16B3748", "canopy_history_arm1", True)]
-        # Nothing saved here: the snapshot is arm1's, and comes back through replication.
-        assert (await db_session.scalar(select(Snapshot.id))) is None
+        assert worker.messages[-1] == "Saved on arm1"
+        # Nothing saved by the head: the snapshot here is arm1's, back through replication.
+        assert (await db_session.scalar(select(Snapshot.owner_instance))) == "arm1"
+        assert (await db_session.scalar(select(SnapshotOutbox.id))) is None
+
+    async def test_a_snapshot_not_back_in_time_is_kept_here_as_pending(
+        self, sites, worker, httpx_mock: HTTPXMock, db_session
+    ):
+        httpx_mock.add_callback(self._saved, method="POST", url=IMPORT)
+        worker.state.replicates = False
+
+        result = await tasks.create_snapshot_task(
+            worker.ctx, "t", facility_id=sites["arm1"]["facility"], arm="arm1", caller=CALLER
+        )
+
+        kept = await db_session.get(SnapshotOutbox, result["id"])
+        assert (kept.arm, kept.state, kept.attempts, kept.caller) == ("arm1", "delivered", 1, CALLER)
+        assert result["delivery"] == {
+            "state": "pending",
+            "arm": "arm1",
+            "queuedAt": result["delivery"]["queuedAt"],
+            "attempts": 1,
+            "reason": "Saved on arm1; waiting for replication",
+        }
+        assert worker.messages[-1] == "Saved on arm1; waiting for it to replicate here"
+        assert worker.triggered == []  # nothing to send; the sweep removes it once back
 
     async def test_skipped_values_reach_the_job_result(self, sites, worker, httpx_mock: HTTPXMock):
         skipped = [{"pvId": str(uuid4()), "pvName": "ARM1:IN:SP"}]
@@ -247,6 +292,7 @@ class TestTheTask:
             },
         }
         assert worker.triggered == ["deliver_outbox_task"]
+        assert worker.messages[-1] == "Captured; waiting for arm1"
         assert (await db_session.scalar(select(Snapshot.id))) is None
 
     async def test_strict_goes_with_the_bundle(self, sites, worker, httpx_mock: HTTPXMock, db_session):

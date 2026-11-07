@@ -15,6 +15,7 @@ from canopy.core import db
 from canopy.core.arms import subscription_name
 from canopy.core.errors import CanopyError, PrimaryTimeout, PrimaryUnavailable
 from canopy.squirrel.config import OutboxConfig
+from canopy.squirrel.errors import SnapshotPending
 from canopy.core.forwarding.client import Caller, ArmRefused, wait_until_applied
 from canopy.squirrel.outbox.delivery import submit, deliver_arm, send_queued
 from canopy.squirrel.schemas.snapshot import BundleValueDTO, SnapshotBundleDTO
@@ -36,6 +37,7 @@ class FakeArms:
 
     def __init__(self, octopus: Octopus, monkeypatch):
         self.octopus, self.monkeypatch = octopus, monkeypatch
+        self.timeout_s = 30.0  # ``CANOPY_FORWARD__TIMEOUT_S``: how long a send waits for its snapshot here
         self.down: set[str] = set()
         self.applied_then_lost: set[str] = set()  # the arm saves it, the head never hears back
         self.sent: list[tuple[str, str, bool]] = []
@@ -56,7 +58,7 @@ class FakeArms:
         async def is_here(conn) -> bool:
             return bool(await conn.fetchval("SELECT 1 FROM squirrel.snapshot WHERE id = $1::uuid", snapshot_id))
 
-        await wait_until_applied(position, 30.0, subscription=subscription_name(arm), until=is_here)
+        await wait_until_applied(position, self.timeout_s, subscription=subscription_name(arm), until=is_here)
         return {"type": "snapshot", "id": snapshot_id, "arm": arm}
 
 
@@ -85,7 +87,7 @@ def _bundle(arm: str, ids: dict[str, str], minutes: int) -> SnapshotBundleDTO:
 
 
 async def _submit(arm: str, bundle: SnapshotBundleDTO, ids: dict[str, str]) -> dict:
-    return await submit(arm, bundle, CALLER, facility_id=ids["facility"], config=CONFIG)
+    return (await submit(arm, bundle, CALLER, facility_id=ids["facility"], config=CONFIG)).result
 
 
 async def _make_due(octopus: Octopus) -> None:
@@ -213,3 +215,65 @@ async def test_a_pv_moved_while_cut_off_fails_the_snapshot_until_retried(octopus
     )
     assert [v["pv_id"] for v in values] == [ids["pv"]]
     await eventually(lambda: _outbox_empty(octopus))
+
+
+async def test_a_capture_saved_before_replication_stalled_is_pending_until_it_comes_back(
+    octopus: Octopus, arms: FakeArms
+):
+    _, arm2 = octopus.arms.values()
+    ids = await _subscribed(octopus, arm2.name)
+    head = octopus.head
+    subscription = subscription_name(arm2.name)
+    bundle = _bundle(arm2.name, ids, 0)
+    arms.timeout_s = 1.0
+    await head.admin.execute(f"ALTER SUBSCRIPTION {subscription} DISABLE")
+    try:
+        # arm2 saves it at once, but the head's copy doesn't move: the wait runs out.
+        saved = await _submit(arm2.name, bundle, ids)
+
+        assert await arm2.admin.fetchval("SELECT count(*) FROM squirrel.snapshot WHERE id = $1", str(bundle.id)) == 1
+        assert saved["delivery"]["reason"] == f"Saved on {arm2.name}; waiting for replication"
+        assert (await _listed(octopus))[str(bundle.id)] == "pending"
+        async with db.session_scope() as session:
+            service = SnapshotService(session, None)
+            served = await service.get_by_id(str(bundle.id))
+            assert (served.owner_instance, served.delivery.state) == (arm2.name, "pending")
+            with pytest.raises(SnapshotPending, match=f"is saved on {arm2.name} but hasn't replicated here yet"):
+                await service.update_snapshot_metadata(str(bundle.id), title="renamed")
+        # A run sends nothing for it; the row waits for its snapshot.
+        arms.sent.clear()
+        assert await deliver_arm(arm2.name, send_queued, config=CONFIG) == {"delivered": 0, "retried": 0, "failed": 0}
+        assert arms.sent == []
+    finally:
+        await head.admin.execute(f"ALTER SUBSCRIPTION {subscription} ENABLE")
+
+    async def back() -> bool:
+        return bool(await head.conn.fetchval("SELECT 1 FROM squirrel.snapshot WHERE id = $1", str(bundle.id)))
+
+    await eventually(back)
+    await deliver_arm(arm2.name, send_queued, config=CONFIG)
+    assert await _outbox_empty(octopus)
+    assert (await _listed(octopus))[str(bundle.id)] is None
+
+
+async def test_a_queued_snapshot_exports_the_addresses_it_will_have_once_delivered(octopus: Octopus, arms: FakeArms):
+    _, arm2 = octopus.arms.values()
+    ids = await _subscribed(octopus, arm2.name)
+    arms.down.add(arm2.name)
+    bundle = _bundle(arm2.name, ids, 0)
+    assert bundle.values[0].setpoint_address is None  # a capture's bundle carries none
+    await _submit(arm2.name, bundle, ids)
+
+    async def exported() -> dict[str, tuple]:
+        async with db.session_scope() as session:
+            document = await SnapshotService(session, None).export_bundle(str(bundle.id))
+        return {str(v.pv_id): (v.setpoint_address, v.readback_address, v.config_address) for v in document.values}
+
+    pending = await exported()
+    arms.down.clear()
+    await _make_due(octopus)
+    assert (await deliver_arm(arm2.name, send_queued, config=CONFIG))["delivered"] == 1
+    await eventually(lambda: _outbox_empty(octopus))
+
+    assert pending == await exported()
+    assert pending[ids["pv"]][0] is not None

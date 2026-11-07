@@ -1,17 +1,23 @@
 """The snapshot API on a history head serves snapshots it holds only in its outbox."""
 
+import uuid
 from datetime import timedelta
 
 from httpx import AsyncClient
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.core.config import get_settings
-from canopy.squirrel.data.models import Snapshot, SnapshotValue, pv_facility
+from canopy.squirrel.config import OutboxConfig
+from canopy.squirrel.data.models import Pv, Snapshot, SnapshotValue, pv_facility
 from tests.canopy.squirrel.conftest import READ_HEADERS, WRITE_HEADERS
+from canopy.squirrel.outbox.delivery import enqueue
+from canopy.squirrel.schemas.snapshot import BundleValueDTO
+from canopy.squirrel.data.repositories import OutboxRepository
 from canopy.squirrel.services.snapshot_service import SnapshotService
 from tests.canopy.squirrel.test_services_snapshot import FakeEpicsIO
 
-from .conftest import CAPTURED, Seeded, queue
+from .conftest import CALLER, CAPTURED, Seeded, queue, make_bundle
 
 
 async def _stored(session: AsyncSession, s: Seeded, *, minutes: int, title: str = "stored save") -> str:
@@ -137,13 +143,46 @@ async def test_detail_serves_the_bundle_with_names_and_tags_from_the_pv_rows(cli
     assert [v["pvName"] for v in r.json()["pvValues"]] == ["LAB:B:SP"]
 
 
-async def test_export_returns_the_bundle_it_waits_with(client, db_session, seeded: Seeded):
-    sid = await queue(db_session, seeded, state="failed", last_error="x: y")
+async def test_export_returns_the_bundle_with_the_pvs_current_addresses(client, db_session, seeded: Seeded):
+    # A capture's bundle carries no addresses; the export reads them from the PV rows,
+    # as a stored snapshot's does. A value whose PV row isn't here keeps the bundle's.
+    unknown = str(uuid.uuid4())
+    bundle = make_bundle(seeded, sid=str(uuid.uuid4()))
+    for value in bundle.values:
+        value.setpoint_address = value.readback_address = None
+    bundle.values.append(BundleValueDTO(pv_id=unknown, pv_name="GONE:PV", setpoint_address="GONE:PV"))
+    await enqueue(
+        OutboxRepository(db_session),
+        arm="arm2",
+        bundle=bundle,
+        facility_id=seeded.facility_id,
+        caller=CALLER,
+        config=OutboxConfig(),
+    )
+    await db_session.commit()
+    await db_session.execute(
+        update(Pv).where(Pv.id == seeded.rb_id).values(config_address="LAB:B:ONLY:CFG", deleted_at=CAPTURED)
+    )
+    await db_session.commit()
 
-    r = await client.get(f"/v1/snapshots/{sid}/export", headers=READ_HEADERS)
+    r = await client.get(f"/v1/snapshots/{bundle.id}/export", headers=READ_HEADERS)
 
     assert r.status_code == 200, r.text
-    assert r.json()["id"] == sid and len(r.json()["values"]) == 2
+    exported = r.json()
+    assert (exported["id"], exported["title"], exported["createdBy"]) == (
+        str(bundle.id),
+        "queued save",
+        "operator@head",
+    )
+    addresses = [
+        (v["pvName"], v["setpointAddress"], v["readbackAddress"], v["configAddress"]) for v in exported["values"]
+    ]
+    assert addresses == [
+        ("GONE:PV", "GONE:PV", None, None),
+        ("LAB:B:ONLY:RB", None, "LAB:B:ONLY:RB", "LAB:B:ONLY:CFG"),
+        ("LAB:B:SP", "LAB:B:SP", "LAB:B:RB", None),
+    ]
+    assert exported["values"][2]["setpointValue"] == {"value": 2.5, "units": "A", "precision": 2}
 
 
 async def test_compare_works_from_the_bundle(client, db_session, seeded: Seeded):
@@ -164,6 +203,7 @@ async def test_compare_works_from_the_bundle(client, db_session, seeded: Seeded)
 async def test_edit_and_delete_are_refused_while_pending_or_failed(client, db_session, seeded: Seeded):
     pending = await queue(db_session, seeded)
     failed = await queue(db_session, seeded, minutes=1, state="failed", last_error="x: y")
+    delivered = await queue(db_session, seeded, minutes=2, state="delivered", attempts=1)
 
     for request in (
         client.patch(f"/v1/snapshots/{pending}", headers=WRITE_HEADERS, json={"title": "renamed"}),
@@ -178,6 +218,12 @@ async def test_edit_and_delete_are_refused_while_pending_or_failed(client, db_se
     r = await client.delete(f"/v1/snapshots/{failed}", headers=WRITE_HEADERS)
     assert r.status_code == 409
     assert r.json()["detail"] == f"Snapshot {failed} was not saved: its delivery to arm2 failed: x: y"
+
+    r = await client.patch(f"/v1/snapshots/{delivered}", headers=WRITE_HEADERS, json={"title": "renamed"})
+    assert r.status_code == 409
+    assert r.json()["detail"] == (
+        f"Snapshot {delivered} is saved on arm2 but hasn't replicated here yet; change it once it has"
+    )
 
 
 async def test_restore_runs_from_the_bundle_only_with_machine_access(
@@ -204,7 +250,7 @@ async def test_restore_runs_from_the_bundle_only_with_machine_access(
     assert r.status_code == 409
     assert r.json() == {
         "code": "snapshot_pending",
-        "detail": f"Snapshot {pending} is waiting for delivery to arm2; it can be restored once it's saved there",
+        "detail": f"Snapshot {pending} is waiting for delivery to arm2; restore it once it's saved there",
     }
     assert len(enqueued) == 2
 
