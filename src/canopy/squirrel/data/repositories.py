@@ -967,7 +967,7 @@ class MetaPvRepository(BaseRepository[MetaPv]):
 async def facility_in_use(session: AsyncSession, facility_id: str) -> bool:
     """Whether any PV or snapshot still references ``facility_id``.
 
-    Deleted rows count: they keep their facility, and so does the history mirror's copy.
+    Deleted rows count: they keep their facility, and so does a history head's copy.
 
     Registered with ``core.facilities.gateway.register_in_use_checker`` at startup (see
     ``squirrel/app.py``) so core's ``FacilityService.delete`` can enforce its guard
