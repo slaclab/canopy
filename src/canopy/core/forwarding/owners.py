@@ -175,25 +175,27 @@ async def _row_owner(rule: Row, value: str) -> str | None:
 
 async def _facility_owners(slugs: list[str]) -> dict[str, str]:
     """The owner of each of ``slugs`` that names a facility here."""
+    join_sql, owner_sql = owner_join(REGISTRY, "core.facility", alias="t")
     async with session_scope() as session:
         rows = await session.execute(
-            text("SELECT slug, owner_instance FROM core.facility WHERE slug = ANY(:slugs)"),
+            text(f"SELECT t.slug, {owner_sql} AS owner FROM core.facility t {join_sql} WHERE t.slug = ANY(:slugs)"),
             {"slugs": sorted(set(slugs))},
         )
-        return {row.slug: row.owner_instance for row in rows}
+        return {row.slug: row.owner for row in rows}
 
 
 async def _address_owners(address: str) -> set[str]:
     """The owners of the live PVs holding ``address`` as any of their addresses."""
+    join_sql, owner_sql = owner_join(REGISTRY, "squirrel.pv", alias="t")
     async with session_scope() as session:
         rows = await session.execute(
             text(
-                "SELECT DISTINCT owner_instance FROM squirrel.pv WHERE deleted_at IS NULL "
-                "AND (setpoint_address = :a OR readback_address = :a OR config_address = :a)"
+                f"SELECT DISTINCT {owner_sql} AS owner FROM squirrel.pv t {join_sql} WHERE t.deleted_at IS NULL "
+                "AND (t.setpoint_address = :a OR t.readback_address = :a OR t.config_address = :a)"
             ),
             {"a": address},
         )
-        return {row.owner_instance for row in rows}
+        return {row.owner for row in rows}
 
 
 async def snapshot_is_live(snapshot_id: str) -> bool:

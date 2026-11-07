@@ -26,6 +26,7 @@ from starlette.datastructures import Headers, QueryParams
 from canopy.core.config import get_settings
 from canopy.core.errors import CanopyError, ArchivedImmutable
 from canopy.core.security import APIKey, get_registry
+from canopy.core.ownership import local_instance
 from canopy.core.forwarding import owners, routes
 from canopy.core.forwarding.client import (
     PASSED_RESPONSE_HEADERS,
@@ -138,7 +139,7 @@ class ForwardingMiddleware:
             body = await _read_body(receive)
             receive = _replay(body, receive)
         parsed = owners.parse_body(body) if body else None
-        local = get_settings().instance
+        local = local_instance()
         requested = query.get("owner") if route.owner_param else None
         owner = await owners.owner_of(route, params, parsed, requested=requested, local=local)
         if owner is None or owner == local or owner not in arms or (arm := forward_target(owner)) is None:
