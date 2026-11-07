@@ -147,11 +147,11 @@ class BundleValueDTO(CanopyModel):
 class SnapshotBundleDTO(CanopyModel):
     """A snapshot with all its values, as one instance exports it for another to import.
 
-    ``GET /snapshots/{id}/export`` writes it, typically on a history mirror;
-    ``POST /snapshots/import`` reads it on the primary. ``source_instance`` is the
-    exporter's ``CANOPY_INSTANCE``. ``facility`` is the snapshot's facility slug: slugs
-    don't change and ``core.facility`` replicates, so it names the same facility on the
-    mirror and its primary.
+    ``GET /snapshots/{id}/export`` writes it, typically on a history head;
+    ``POST /snapshots/import`` reads it on the arm that owns the facility.
+    ``source_instance`` is the exporter's ``CANOPY_INSTANCE``. ``facility`` is the
+    snapshot's facility slug: slugs don't change and ``core.facility`` replicates, so it
+    names the same facility on the head and on its arm.
     """
 
     format: Literal["canopy.squirrel.snapshot-bundle"]
