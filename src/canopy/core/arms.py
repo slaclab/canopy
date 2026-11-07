@@ -21,10 +21,10 @@ from __future__ import annotations
 
 import re
 
-from pydantic import Field, BaseModel, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, BaseModel, SecretStr, ValidationError, field_validator
+from pydantic_settings import BaseSettings, SettingsError, SettingsConfigDict
 
-from canopy.core.config import INSTANCE_NAME_PATTERN
+from canopy.core.config import INSTANCE_NAME_PATTERN, describe_settings_error
 
 _SUBSCRIPTION_PREFIX = "canopy_history_"
 
@@ -83,8 +83,23 @@ class ArmsConfig(BaseSettings):
         return arms
 
 
+class ArmsConfigError(ValueError):
+    """``CANOPY_ARMS`` is invalid. The message names each wrong setting and why, never a value."""
+
+
 def get_arms_config() -> ArmsConfig:
-    return ArmsConfig()
+    """The head's arms, from the environment.
+
+    Raises
+    ------
+    ArmsConfigError
+        When ``CANOPY_ARMS`` doesn't parse. pydantic's own error would echo the whole
+        arms setting, every arm's DSN with it, so it is replaced, not chained.
+    """
+    try:
+        return ArmsConfig()
+    except (ValidationError, SettingsError) as exc:
+        raise ArmsConfigError(describe_settings_error(exc)) from None
 
 
 def subscription_name(arm: str) -> str:
