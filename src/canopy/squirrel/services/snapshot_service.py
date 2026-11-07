@@ -181,6 +181,22 @@ def _parse_jsonb(value: Any) -> dict | None:
     return None
 
 
+def _export_value(row: Any) -> BundleValueDTO:
+    """One value of an export, from a row of ``get_export_rows`` or ``OutboxRepository.export_rows``."""
+    return BundleValueDTO(
+        pv_id=row.pv_id,
+        pv_name=row.pv_name,
+        setpoint_address=row.setpoint_address,
+        readback_address=row.readback_address,
+        config_address=row.config_address,
+        setpoint_value=_parse_jsonb(row.setpoint_value),
+        readback_value=_parse_jsonb(row.readback_value),
+        status=row.status,
+        severity=row.severity,
+        timestamp=row.timestamp,
+    )
+
+
 def _sanitize_for_json(value: Any) -> Any:
     """Make a value JSON-safe, recursing into lists/dicts.
 
@@ -992,26 +1008,11 @@ class SnapshotService:
             if await self.queued(snapshot_id) is None:
                 return None
             header = await self.outbox_repo.bundle_header(snapshot_id)
-            return SnapshotBundleDTO.model_validate(
-                {**header, "values": await self.outbox_repo.export_values(snapshot_id)}
-            )
+            values = [_export_value(row) for row in await self.outbox_repo.export_rows(snapshot_id)]
+            return SnapshotBundleDTO.model_validate({**header, "values": values})
         if not self._in_facility_scope(snapshot.facility_id):
             return None
-        values = [
-            BundleValueDTO(
-                pv_id=row.pv_id,
-                pv_name=row.pv_name,
-                setpoint_address=row.setpoint_address,
-                readback_address=row.readback_address,
-                config_address=row.config_address,
-                setpoint_value=_parse_jsonb(row.setpoint_value),
-                readback_value=_parse_jsonb(row.readback_value),
-                status=row.status,
-                severity=row.severity,
-                timestamp=row.timestamp,
-            )
-            for row in await self.value_repo.get_export_rows(snapshot_id)
-        ]
+        values = [_export_value(row) for row in await self.value_repo.get_export_rows(snapshot_id)]
         return SnapshotBundleDTO(
             format=BUNDLE_FORMAT,
             version=1,
@@ -1574,12 +1575,11 @@ class SnapshotService:
     async def _with_all_values(
         self, snapshot_id: str
     ) -> tuple[Snapshot | SnapshotOutbox, list[SnapshotValue | BundleValueRow]] | None:
-        """A snapshot and every value it holds, stored or queued in the outbox; ``None`` when neither."""
+        """A snapshot and every value it holds, stored or held only in the outbox (``queued``); ``None`` when neither."""
         if result := await self.snapshot_repo.get_with_values(snapshot_id):
             return result
-        if (entry := await self.outbox_repo.get(snapshot_id)) is not None:
-            if await self.snapshot_repo.get_by_id(snapshot_id, include_deleted=True) is None:
-                return entry, await self.outbox_repo.values(snapshot_id)
+        if (entry := await self.queued(snapshot_id)) is not None:
+            return entry, await self.outbox_repo.values(snapshot_id)
         return None
 
     @staticmethod
