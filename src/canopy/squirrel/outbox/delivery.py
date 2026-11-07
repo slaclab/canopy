@@ -223,7 +223,6 @@ async def _saved(
             config=config,
             state="delivered",
             attempts=1,
-            last_attempt_at=now,
             delivered_at=now,
         )
         if full is not None:
@@ -292,7 +291,6 @@ async def submit(
             await repo.update_state(
                 snapshot_id,
                 attempts=1,
-                last_attempt_at=now,
                 last_error=attempted,
                 next_attempt_at=now + timedelta(seconds=retry_delay(1, config)),
             )
@@ -362,9 +360,7 @@ async def _delivered(entry: SnapshotOutbox, attempts: int, now: datetime) -> Non
         if swept := await repo.sweep(entry.id):
             log_swept(swept)
         else:
-            await repo.update_state(
-                entry.id, state="delivered", attempts=attempts, last_attempt_at=now, delivered_at=now, last_error=None
-            )
+            await repo.update_state(entry.id, state="delivered", attempts=attempts, delivered_at=now, last_error=None)
             logger.info("Snapshot %s saved on %s; waiting for it to replicate back", entry.id, entry.arm)
         await session.commit()
 
@@ -402,7 +398,6 @@ async def deliver_arm(
                         entry,
                         state="failed",
                         attempts=attempts,
-                        last_attempt_at=now,
                         failed_at=now,
                         last_error=refusal_reason(exc),
                     )
@@ -414,7 +409,6 @@ async def deliver_arm(
                 await _record(
                     entry,
                     attempts=attempts,
-                    last_attempt_at=now,
                     last_error=reason,
                     next_attempt_at=now + timedelta(seconds=wait),
                 )
