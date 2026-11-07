@@ -64,9 +64,8 @@ from dataclasses import dataclass
 from collections.abc import Mapping, Callable, Awaitable
 
 import asyncpg
-import pydantic
 
-from canopy.core.arms import Arm, get_arms_config, subscription_name
+from canopy.core.arms import Arm, ArmsConfigError, get_arms_config, subscription_name
 from canopy.core.config import get_settings
 from canopy.core.replication.sql import (
     Refused,
@@ -608,9 +607,8 @@ def configured_arms() -> Mapping[str, Arm]:
     """``CANOPY_ARMS``; ``Refused`` says what's wrong in it without its values."""
     try:
         return get_arms_config().arms
-    except pydantic.ValidationError as exc:
-        # Only the messages: the error's own text would echo the settings it was given.
-        raise Refused("CANOPY_ARMS is invalid: " + "; ".join(error["msg"] for error in exc.errors())) from None
+    except ArmsConfigError as exc:  # names each wrong setting, never a value
+        raise Refused(str(exc)) from None
 
 
 async def connect_reader(name: str, arm: Arm, session: Mapping[str, str] = SESSION) -> asyncpg.Connection:

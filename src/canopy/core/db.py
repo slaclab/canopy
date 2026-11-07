@@ -56,7 +56,7 @@ class SoftDeleteMixin:
     """``deleted_at``: set when a user deletes the row, which then stays in the table.
 
     Reads skip rows with ``deleted_at`` set. Deleting is an UPDATE, so it still reaches
-    a history mirror whose publication carries inserts and updates only, and anything
+    a history head through a publication that carries inserts and updates only, and anything
     that refers to the row (snapshot values referring to a PV) keeps working.
     """
 

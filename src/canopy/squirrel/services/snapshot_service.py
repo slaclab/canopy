@@ -1015,7 +1015,7 @@ class SnapshotService:
     async def _importable_pv_ids(self, pv_ids: list[str], capture_scope: set[str] | None) -> set[str]:
         """The PV ids of a bundle that an import may keep values for.
 
-        A PV must exist here and be this instance's (deleted PVs included: a mirror
+        A PV must exist here and be this instance's (deleted PVs included: a head
         replicates its arms' PV rows, ids and all, but a snapshot's PVs share its owner,
         which is the importer), and the key must be able to restore it (``_pv_in_scope``).
         The new snapshot's export shows each value's PV addresses, so a value of a PV the
@@ -1049,7 +1049,7 @@ class SnapshotService:
         Two modes:
 
         * **History** (the default): bring an old snapshot back, typically from a history
-          mirror, so it can be restored here. The snapshot gets a new id and today's
+          head, so it can be restored here. The snapshot gets a new id and today's
           creation time, so pruning treats it as recent; its title is marked "Restored
           from history" and ``imported_from`` records the bundle's id.
         * **Captured**: save a snapshot another instance captured for this one, keeping
@@ -1062,7 +1062,7 @@ class SnapshotService:
           that would leave any value out.
 
         In both modes the snapshot belongs to this instance, and values are matched to
-        PVs here by ``pv_id``, deleted PVs included: a history mirror replicates its
+        PVs here by ``pv_id``, deleted PVs included: a history head replicates its
         arms' PV rows, ids and all. Each value keeps its capture ``timestamp``. Values
         whose PV isn't here or is another instance's, that the key couldn't restore, or
         that isn't assigned to the bundle's facility or one below it are skipped and
@@ -1232,7 +1232,7 @@ class SnapshotService:
                 f"{existing.created_at.isoformat()}, not this bundle's {bundle.facility or 'none'} and "
                 f"{to_utc(bundle.created_date).isoformat()}"
             )
-        saved = await self.snapshot_repo.get_value_pv_ids(existing.id)
+        saved = set(await self.value_repo.get_pv_ids_by_snapshot(existing.id))
         skipped = [
             SkippedValueDTO(pv_id=str(value.pv_id), pv_name=value.pv_name)
             for value in bundle.values

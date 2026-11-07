@@ -328,11 +328,6 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         )
         return result.scalar() or 0
 
-    async def get_value_pv_ids(self, snapshot_id: str) -> set[str]:
-        """The PV ids ``snapshot_id`` holds values for."""
-        result = await self.session.execute(select(SnapshotValue.pv_id).where(SnapshotValue.snapshot_id == snapshot_id))
-        return set(result.scalars())
-
     async def get_value_counts_batch(self, snapshot_ids: list[str]) -> dict[str, int]:
         """Value counts for many snapshots in a single grouped query."""
         if not snapshot_ids:
@@ -425,7 +420,7 @@ class SnapshotValueRepository(BaseRepository[SnapshotValue]):
 
         Plain columns rather than ORM objects, since a full save has 16k–100k values. The
         PV is outer-joined and never filtered: a deleted PV still exports its addresses,
-        and a value whose PV row is missing (foreign keys aren't checked when a mirror
+        and a value whose PV row is missing (foreign keys aren't checked when a head
         applies changes) still exports, without them.
         """
         result = await self.session.execute(
@@ -1191,7 +1186,7 @@ class MetaPvRepository(BaseRepository[MetaPv]):
 async def facility_in_use(session: AsyncSession, facility_id: str) -> bool:
     """Whether any PV or snapshot still references ``facility_id``.
 
-    Deleted rows count: they keep their facility, and so does the history mirror's copy.
+    Deleted rows count: they keep their facility, and so does a history head's copy.
 
     Registered with ``core.facilities.gateway.register_in_use_checker`` at startup (see
     ``squirrel/app.py``) so core's ``FacilityService.delete`` can enforce its guard

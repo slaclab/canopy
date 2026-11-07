@@ -196,7 +196,7 @@ async def test_a_history_import_still_makes_a_new_copy(client, db_session):
 
 # --- owners ----------------------------------------------------------------------- #
 # The suite runs as arm1; rows made inside ``as_instance("arm2")`` stand for an arm's
-# rows replicated to a mirror.
+# rows replicated to a head.
 
 
 @pytest.mark.parametrize("captured", [False, True], ids=["history", "captured"])
