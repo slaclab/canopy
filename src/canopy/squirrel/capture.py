@@ -33,8 +33,6 @@ from canopy.squirrel.schemas.snapshot import SnapshotBundleDTO, SnapshotImportRe
 
 logger = logging.getLogger(__name__)
 
-_NEVER = "FFFFFFFF/FFFFFFFF"
-
 
 @dataclass(frozen=True)
 class CaptureTarget:
@@ -120,9 +118,7 @@ async def deliver_capture(arm: str, bundle: SnapshotBundleDTO, caller: Caller, *
     async def is_here(conn: asyncpg.Connection) -> bool:
         return bool(await conn.fetchval("SELECT 1 FROM squirrel.snapshot WHERE id = $1::uuid", snapshot_id))
 
-    # Without a position (an arm from before the captured import always gave one) only
-    # the snapshot's arrival ends the wait.
-    commit_lsn = answer.headers.get(COMMIT_LSN_HEADER) or _NEVER
+    commit_lsn = answer.headers.get(COMMIT_LSN_HEADER, "")
     if not await wait_until_applied(commit_lsn, config.timeout_s, subscription=target.subscription, until=is_here):
         logger.warning(
             "Snapshot %s is saved on arm %s but hadn't replicated here within %.0fs",

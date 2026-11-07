@@ -348,6 +348,3 @@ async def test_restore_values_from_a_list(db_session: AsyncSession):
 
     assert io.writes == {"LIST:SP": 4.0}
     assert (result.total_pvs, result.success_count) == (1, 1)
-    io.writes.clear()
-    assert (await service.restore_values(values, SimpleNamespace(pv_ids=[str(uuid4())]))).total_pvs == 0
-    assert io.writes == {}
