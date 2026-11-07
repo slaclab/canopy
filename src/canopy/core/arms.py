@@ -25,11 +25,19 @@ from __future__ import annotations
 
 import re
 
-from pydantic import Field, BaseModel, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import (
+    Field,
+    BaseModel,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+from pydantic_settings import BaseSettings, SettingsError, SettingsConfigDict
+
+from canopy.core.config import INSTANCE_NAME_PATTERN, describe_settings_error
 
 _SUBSCRIPTION_PREFIX = "canopy_history_"
-_ARM_NAME = re.compile(r"[a-z0-9_]{1,48}")
 
 
 class Arm(BaseModel):
@@ -47,8 +55,8 @@ class Arm(BaseModel):
     reader_dsn: SecretStr | None = Field(
         default=None,
         description=(
-            "postgresql:// URI the head's `drift-check` uses to read this arm, as its read-only reader "
-            "role. Supply it from a secret, like the publisher DSN."
+            "postgresql:// URI the head's `drift-check` and `reseed` use to read this arm, as its "
+            "read-only reader role. Supply it from a secret, like the publisher DSN."
         ),
     )
 
@@ -119,15 +127,31 @@ class ArmsConfig(BaseSettings):
     @field_validator("arms")
     @classmethod
     def _names_are_identifier_safe(cls, arms: dict[str, Arm]) -> dict[str, Arm]:
-        # The name becomes part of the subscription and slot name: at most 63 bytes
-        # with the 15-byte prefix, and lowercase so it reads the same in SQL.
-        if bad := sorted(name for name in arms if not _ARM_NAME.fullmatch(name)):
-            raise ValueError(f"arm names must be 1-48 lowercase letters, digits or underscores: {', '.join(bad)}")
+        # The name is the arm's own CANOPY_INSTANCE and becomes part of the subscription
+        # and slot name; the instance pattern keeps that within 63 bytes with the
+        # 15-byte prefix, and lowercase so it reads the same in SQL.
+        if bad := sorted(name for name in arms if not re.fullmatch(INSTANCE_NAME_PATTERN, name)):
+            raise ValueError(f"arm names must match {INSTANCE_NAME_PATTERN}, as CANOPY_INSTANCE does: {', '.join(bad)}")
         return arms
 
 
+class ArmsConfigError(ValueError):
+    """``CANOPY_ARMS`` is invalid. The message names each wrong setting and why, never a value."""
+
+
 def get_arms_config() -> ArmsConfig:
-    return ArmsConfig()
+    """The head's arms, from the environment.
+
+    Raises
+    ------
+    ArmsConfigError
+        When ``CANOPY_ARMS`` doesn't parse. pydantic's own error would echo the whole
+        arms setting, every arm's DSN with it, so it is replaced, not chained.
+    """
+    try:
+        return ArmsConfig()
+    except (ValidationError, SettingsError) as exc:
+        raise ArmsConfigError(describe_settings_error(exc)) from None
 
 
 def subscription_name(arm: str) -> str:

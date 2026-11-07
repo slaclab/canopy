@@ -64,9 +64,8 @@ from dataclasses import dataclass
 from collections.abc import Mapping, Callable, Awaitable
 
 import asyncpg
-import pydantic
 
-from canopy.core.arms import Arm, get_arms_config, subscription_name
+from canopy.core.arms import Arm, ArmsConfigError, get_arms_config, subscription_name
 from canopy.core.config import get_settings
 from canopy.core.replication.sql import (
     Refused,
@@ -604,15 +603,27 @@ def overall(statuses: list[str]) -> str:
     return "not_checked" if "not_checked" in statuses else "in_step"
 
 
+def configured_arms() -> Mapping[str, Arm]:
+    """``CANOPY_ARMS``; ``Refused`` says what's wrong in it without its values."""
+    try:
+        return get_arms_config().arms
+    except ArmsConfigError as exc:  # names each wrong setting, never a value
+        raise Refused(str(exc)) from None
+
+
+async def connect_reader(name: str, arm: Arm, session: Mapping[str, str] = SESSION) -> asyncpg.Connection:
+    """The arm as its reader role, in a read-only session; ``Refused`` without a reader URI."""
+    dsn = arm.reader_dsn.get_secret_value() if arm.reader_dsn else ""
+    if not dsn:
+        raise Refused(f"set CANOPY_ARMS__{name.upper()}__READER_DSN to this arm's read-only URI (from a secret)")
+    return await asyncpg.connect(dsn, server_settings={**session, "default_transaction_read_only": "on"})
+
+
 async def _check_arm(mirror: asyncpg.Connection, name: str, arm: Arm, *, days, settle_s, secrets) -> dict:
     """One arm's report; a failure to reach or read it makes that arm not checked, not the run."""
-    if arm.reader_dsn is None or not arm.reader_dsn.get_secret_value():
-        return _not_checked(f"set CANOPY_ARMS__{name.upper()}__READER_DSN to this arm's read-only URI (from a secret)")
     primary = None
     try:
-        primary = await asyncpg.connect(
-            arm.reader_dsn.get_secret_value(), server_settings={**SESSION, "default_transaction_read_only": "on"}
-        )
+        primary = await connect_reader(name, arm)
         return await drift_check(primary, mirror, arm=name, days=days, settle_s=settle_s)
     except Refused as exc:
         return _not_checked(str(exc))
@@ -668,14 +679,9 @@ async def check_arms(
 async def run(args: argparse.Namespace) -> int:
     """``drift-check``: 0 every arm in step, 1 drift found, 2 not everything could be checked."""
     settings = get_settings()
-    try:
-        arms = get_arms_config().arms
-    except pydantic.ValidationError as exc:
-        # Only the messages: the error's own text would echo the settings it was given.
-        logger.error("refused: CANOPY_ARMS is invalid: %s", "; ".join(error["msg"] for error in exc.errors()))
-        return 2
     mirror = None
     try:
+        arms = configured_arms()
         require_role("drift-check", "mirror", settings.role)
         names = _selected_arms(arms, args.arm, settings.instance)
         mirror = await asyncpg.connect(asyncpg_dsn(settings.database_url), server_settings=SESSION)

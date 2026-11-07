@@ -7,12 +7,12 @@ table can't ship before someone decides whether the head gets it:
 
 ``reference``
     Rows edited in place and shared across the instance (PVs, tags, configs).
-    Replicated with every operation, so an edit or a delete on the primary is
-    applied on the mirror too.
+    Replicated with every operation, so an edit or a delete on an arm is
+    applied on its head too.
 ``time_series``
     Rows that only accumulate (snapshots and their values). Replicated with every
     operation in the single layout; in the split layout their publication carries
-    no deletes, so pruning the primary never removes history.
+    no deletes, so pruning an arm never removes the head's history.
 ``local``
     Rows that belong to one database and never replicate. API keys are local: a
     head mints and checks its own.
@@ -24,8 +24,8 @@ head's own. ``shared_keys`` lists the columns unique across every owner, where t
 owners' rows can clash.
 
 Two publication layouts carry the same tables. ``publications`` is the single
-``canopy_history`` every primary starts with; ``split_publications`` is the pair a
-primary that prunes old rows switches to (``publish --split``): ``canopy_ref`` with
+``canopy_history`` every arm starts with; ``split_publications`` is the pair an
+arm that prunes old rows switches to (``publish --split``): ``canopy_ref`` with
 every operation and ``canopy_ts`` with inserts and updates only.
 
 Keys are ``"schema.table"`` strings rather than model classes, so ``canopy.core``
@@ -55,7 +55,7 @@ class Publication:
     Attributes
     ----------
     name : str
-        Publication name on the primary; the mirror's subscription names it too.
+        Publication name on each arm; the head's subscription to that arm names it too.
     classes : frozenset[TableClass]
         Table classes it carries. Every table outside ``LOCAL`` is in exactly one publication.
     operations : tuple[str, ...]
@@ -173,8 +173,8 @@ def split_name(qualified: str) -> tuple[str, str]:
 # the registry's own schemas, so these are listed for the completeness test.
 EXCLUDED = frozenset({"public.alembic_version"})
 
-# Tables a migration has dropped but a deployed database may still hold: a mirror drops a
-# column or table a release after its primary, and the migration-order test walks old
+# Tables a migration has dropped but a deployed database may still hold: the head drops a
+# column or table a release after every arm, and the migration-order test walks old
 # revisions. Each keeps its entry in the registry, so `publish` and `grants` classify it
 # wherever it still exists, while its model is gone. Remove both once no deployed
 # database can still hold the table.
@@ -215,9 +215,9 @@ REGISTRY = ReplicationRegistry(
         }
     ),
     shared_keys=MappingProxyType({"core.facility": ("slug",), "magpie.config": ("slug",)}),
-    # One publication until the primary prunes old rows. TRUNCATE is left out on
-    # purpose: no Canopy code truncates, so one typed on the primary by hand is a
-    # mistake the history copy shouldn't repeat.
+    # One publication until an arm prunes old rows. TRUNCATE is left out on
+    # purpose: no Canopy code truncates, so one typed on an arm by hand is a
+    # mistake the head's copy shouldn't repeat.
     publications=(
         Publication(
             name="canopy_history",
@@ -226,7 +226,7 @@ REGISTRY = ReplicationRegistry(
         ),
     ),
     # Reference tables keep their deletes: replacing a PV's tags deletes and re-inserts
-    # link rows, and without the delete the re-insert would collide on the mirror and
+    # link rows, and without the delete the re-insert would collide on the head and
     # stop replication. Time-series deletes come only from pruning (user deletes are
     # soft), and those must never reach history.
     split_publications=(

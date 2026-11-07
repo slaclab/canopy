@@ -19,8 +19,8 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    # A history mirror reports its backup, WAL-archive and drift checks here, on the
-    # primary; the prune job reads it. Local to each database: never published.
+    # A history head reports its backup, WAL-archive and drift checks here, on the arm it
+    # subscribes to; the arm's prune job reads it. Local to each database: never published.
     op.create_table(
         "history_heartbeat",
         sa.Column("name", sa.String(length=63), nullable=False),

@@ -54,7 +54,7 @@ HEARTBEAT = {
 
 
 def _with_copy(status: dict) -> dict:
-    """``status`` with a table's initial copy under way: a tablesync slot beside the mirror's."""
+    """``status`` with a table's initial copy under way: a tablesync slot beside the head's."""
     sync = {"slot_name": "pg_16399_sync_16388_7431", "kind": "tablesync", "active": True, "wal_status": "reserved"}
     return {**status, "slots": [*status["slots"], sync]}
 
