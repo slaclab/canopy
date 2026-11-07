@@ -12,7 +12,7 @@ table can't ship before someone decides whether the head gets it:
 ``time_series``
     Rows that only accumulate (snapshots and their values). Replicated with every
     operation in the single layout; in the split layout their publication carries
-    no deletes, so pruning the primary never removes history.
+    no deletes, so pruning an arm never removes the head's history.
 ``local``
     Rows that belong to one database and never replicate. API keys are local: a
     head mints and checks its own.
@@ -226,7 +226,7 @@ REGISTRY = ReplicationRegistry(
         ),
     ),
     # Reference tables keep their deletes: replacing a PV's tags deletes and re-inserts
-    # link rows, and without the delete the re-insert would collide on the mirror and
+    # link rows, and without the delete the re-insert would collide on the head and
     # stop replication. Time-series deletes come only from pruning (user deletes are
     # soft), and those must never reach history.
     split_publications=(

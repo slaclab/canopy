@@ -24,6 +24,7 @@ from collections.abc import Mapping
 
 import asyncpg
 
+from canopy.core.arms import _SUBSCRIPTION_PREFIX
 from canopy.core.replication.sql import (
     Refused,
     jsonable,
@@ -97,9 +98,10 @@ async def _subscription_walsenders(conn: asyncpg.Connection) -> list[dict]:
         FROM pg_replication_slots s
         LEFT JOIN pg_stat_activity a ON a.pid = s.active_pid
         WHERE s.slot_type = 'logical' AND s.database = current_database()
-          AND s.slot_name LIKE 'canopy\\_history\\_%'
+          AND starts_with(s.slot_name, $1)
         ORDER BY s.slot_name
-        """
+        """,
+        _SUBSCRIPTION_PREFIX,
     )
     return [
         {"slot": row["slot_name"], "active": row["active"], "publications": walsender_publications(row["command"])}

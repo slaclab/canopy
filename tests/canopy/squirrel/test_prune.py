@@ -135,7 +135,7 @@ async def test_a_run_stops_at_its_limit_and_the_next_one_continues(maker):
 
 async def test_without_a_window_nothing_is_pruned(maker):
     await _seed(maker, old={"age_days": 400})
-    unset = GateResult({"window_set": "set CANOPY_WINDOW_DAYS to the days of snapshots this primary keeps"})
+    unset = GateResult({"window_set": "set CANOPY_WINDOW_DAYS to the days of snapshots this arm keeps"})
 
     result = await prune(maker, window_days=None, config=PruneConfig(dry_run=False), check_gate=_gate(unset), now=NOW)
 
