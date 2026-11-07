@@ -43,8 +43,8 @@ class Settings(BaseSettings):
         (``canopy_history_<name>`` must fit a Postgres identifier). Required, and
         permanent once the instance holds data. Reported by ``GET /v1/instance``.
     history_url : str | None
-        Base URL of the read-only history instance holding this instance's full
-        history, reported by ``GET /v1/instance`` so clients can link to it.
+        Base URL of the history head holding this instance's full history,
+        reported by ``GET /v1/instance`` so clients can link to it.
     window_days : int | None
         Days of history this instance keeps, at least 1; ``None`` means it keeps
         everything. A blank value, as Helm and compose render an unset one, is ``None``
