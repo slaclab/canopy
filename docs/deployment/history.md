@@ -430,12 +430,16 @@ replication brings it back to the head unchanged. A capture for a read-only arm'
 facility is refused with 403 `not_owner` before anything is queued.
 
 The capture job's result names the arm: `{"type": "snapshot", "id", "arm"}`, with the
-values the arm left out under `skipped`. It waits up to `CANOPY_FORWARD__TIMEOUT_S`
-(30 s) for the snapshot to come back; one that takes longer is saved on the arm all
-the same. The captured import is idempotent on the id, so sending a bundle again
-saves nothing twice. When the arm refuses the snapshot (its facility is gone there,
-say), the job fails with the arm's reason. When it can't be reached, the snapshot
-waits in the head's outbox instead (below).
+values the arm left out under `skipped`, and its last message is "Saved on *arm*". It
+waits up to `CANOPY_FORWARD__TIMEOUT_S` (30 s) for the snapshot to come back. One that
+takes longer is saved on the arm all the same, and the head keeps its bundle in the
+outbox (below) until it replicates: the result adds `delivery` (`pending`, "Saved on
+*arm*; waiting for replication"), the message is "Saved on *arm*; waiting for it to
+replicate here", and the head serves it as pending meanwhile instead of answering 404.
+The captured import is idempotent on the id, so sending a bundle again saves nothing
+twice. When the arm refuses the snapshot (its facility is gone there, say), the job
+fails with the arm's reason. When it can't be reached, the snapshot waits in the head's
+outbox instead (below).
 
 ### When an arm is unreachable
 
@@ -459,7 +463,8 @@ capture job then completes with the snapshot's id and `delivery`
 **Pending and failed snapshots.** Until its arm has it, the head lists and serves a
 queued snapshot from its bundle, under the same id, with `delivery` set: `pending`
 while it waits (or is saved on the arm and not replicated back yet), `failed` when the
-arm refused it, with the arm's reason. Compare and export work on it. Edit and delete
+arm refused it, with the arm's reason. Compare and export work on it; the export gives
+each value its PV's addresses as the head holds them, as a stored snapshot's does. Edit and delete
 are refused with 409 `snapshot_pending`; so is a restore, except where the head has
 `CANOPY_MACHINE_ACCESS=write`, which restores it from its bundle, a failed one too.
 Once the snapshot replicates back, its outbox row goes and it is an ordinary snapshot.
@@ -475,10 +480,12 @@ never gives up. A refusal of the snapshot itself (facility gone, PVs moved, id c
 marks it failed, and the arm's queue goes on without it.
 
 **Caps.** Each arm's queue holds at most `CANOPY_SQUIRREL__OUTBOX__MAX_SNAPSHOTS`
-snapshots and `MAX_BYTES` bytes, failed rows included. A full snapshot is tens of MB,
-so size `MAX_BYTES` from the head's free disk and its number of arms. While an arm has
+snapshots and `MAX_BYTES` bytes, failed rows included, and so are snapshots saved on
+the arm that haven't replicated back. A full snapshot is tens of MB, so size
+`MAX_BYTES` from the head's free disk and its number of arms. While an arm has
 snapshots waiting and its queue is full, a capture for it is refused at once with 503
-`outbox_full`. The arm's API must accept request bodies that large (an ingress in
+`outbox_full`. A capture the arm saved is never refused for the caps: if keeping its
+copy would pass one, the head logs a warning and doesn't keep it. The arm's API must accept request bodies that large (an ingress in
 front of it often limits them by default).
 
 **Failed snapshots.** On the head, `python -m canopy.squirrel.outbox status` prints
@@ -488,6 +495,15 @@ each arm's queue and every failed snapshot with its reason. Once the cause is fi
 moved PVs' values. A snapshot that can't be saved can be exported
 (`GET /squirrel/v1/snapshots/<id>/export`) and then removed with `discard <id>`,
 which deletes it from the head for good.
+
+**Saved but not back.** A snapshot the arm saved that hasn't replicated back after 30
+minutes (the `canopy-outbox-not-back` alert) means the head's copy of that arm isn't
+moving. Check the arm's subscription with `python -m canopy.core.replication status`
+on the head and fix replication; the next delivery run removes the outbox row once
+the snapshot is here. If the subscription was rebuilt without a reseed, run
+`reseed --arm <arm>` (see [Slot lost](#slot-lost)). `discard <id>` takes such a row
+too, but it only drops the head's copy: the arm has the snapshot, and it reaches the
+head once replication from that arm is healthy.
 
 The gauges and alert rules are listed under
 [Snapshot outbox](../observability/metrics.md#snapshot-outbox): a snapshot waiting
