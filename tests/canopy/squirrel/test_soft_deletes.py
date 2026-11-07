@@ -111,7 +111,7 @@ async def test_meta_pv_still_blocks_delete(client: AsyncClient, sample_pv: dict)
 async def test_a_meta_pv_marker_names_only_live_owners(
     client: AsyncClient, as_instance, deleted: bool, status: int, code: str
 ):
-    # On a mirror the address may belong only to an arm's PV. A live one is the arm's to
+    # On a head the address may belong only to an arm's PV. A live one is the arm's to
     # mark; a deleted one can't be marked anywhere, so nobody is named.
     with as_instance("arm2"):
         theirs = (await client.post("/v1/pvs", headers=WRITE_HEADERS, json={"setpointAddress": "THEIRS:META"})).json()
@@ -170,8 +170,8 @@ async def test_registering_a_deleted_pv_again_restores_its_row(
 async def test_another_owners_deleted_pv_is_never_brought_back(
     client: AsyncClient, db_session: AsyncSession, as_instance, addresses: dict, bulk: bool
 ):
-    # A mirror holds its arms' rows, deleted ones included. Registering the same address
-    # there makes the mirror's own PV and leaves the arm's row as the arm left it.
+    # A head holds its arms' rows, deleted ones included. Registering the same address
+    # there makes the head's own PV and leaves the arm's row as the arm left it.
     with as_instance("arm2"):
         theirs = (await client.post("/v1/pvs", headers=WRITE_HEADERS, json=addresses)).json()
         assert (await client.delete(f"/v1/pvs/{theirs['id']}", headers=WRITE_HEADERS)).status_code == 200

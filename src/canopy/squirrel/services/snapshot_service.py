@@ -843,7 +843,7 @@ class SnapshotService:
     async def _importable_pv_ids(self, pv_ids: list[str], capture_scope: set[str] | None) -> set[str]:
         """The PV ids of a bundle that an import may keep values for.
 
-        A PV must exist here and be this instance's (deleted PVs included: a mirror
+        A PV must exist here and be this instance's (deleted PVs included: a head
         replicates its arms' PV rows, ids and all, but a snapshot's PVs share its owner,
         which is the importer), and the key must be able to restore it (``_pv_in_scope``).
         The new snapshot's export shows each value's PV addresses, so a value of a PV the
