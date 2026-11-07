@@ -10,7 +10,7 @@ reaches it holds only rows it wrote. The column has no server default, because
 the app stamps every insert, and replication carries the stamp to a mirror.
 
 Later data steps on owned tables run on every instance, filtered to
-``owner_instance = local_instance()``, rather than on a primary only.
+``owner_instance = local_instance()``.
 
 Revision ID: 89e21441c63c
 Revises: 18ac64c44669
