@@ -89,7 +89,6 @@ def config() -> ReplicationConfig:
         replicator_role=f"rt_replicator_{suffix}",
         reader_role=f"rt_reader_{suffix}",
         app_role=f"rt_app_{suffix}",
-        publisher_dsn=None,
     )
 
 
