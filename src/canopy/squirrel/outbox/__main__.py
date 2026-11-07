@@ -1,11 +1,11 @@
-"""``python -m canopy.squirrel.outbox`` — inspect a history head's snapshot outbox and act on failed rows.
+"""``python -m canopy.squirrel.outbox`` — inspect a history head's snapshot outbox and act on its rows.
 
 Run on the head, against ``CANOPY_DATABASE_URL``::
 
     python -m canopy.squirrel.outbox status                  # JSON on stdout: each arm's queue, failed rows
     python -m canopy.squirrel.outbox retry <id>... | --arm <arm> [--allow-skips]
                                                              # send failed rows again, at the next delivery run
-    python -m canopy.squirrel.outbox discard <id>            # delete one failed row and its bundle
+    python -m canopy.squirrel.outbox discard <id>            # delete one failed or delivered row and its bundle
 
 ``retry`` puts failed rows back in their arm's queue, in their original order, due at
 once; the worker's next delivery run (every ``CANOPY_SQUIRREL__OUTBOX__INTERVAL_S``)
@@ -15,11 +15,13 @@ the values of PVs that moved since the capture.
 
 ``discard`` deletes a failed row for good, bundle and all: it was never saved
 anywhere else. Export it first if it should be kept
-(``GET /squirrel/v1/snapshots/<id>/export`` on the head). Pending rows can't be
-discarded.
+(``GET /squirrel/v1/snapshots/<id>/export`` on the head). A delivered row is the
+head's copy of a snapshot its arm has saved, kept until replication brings the
+snapshot here; discarding it loses nothing, and the snapshot still arrives once
+replication from that arm is healthy. Pending rows can't be discarded.
 
 Logs go to stderr, so stdout carries only JSON. Exit status: 0 done, 1 the database
-step failed or the command was refused (an id that isn't a failed row).
+step failed or the command was refused (an id that isn't a failed or delivered row).
 """
 
 from __future__ import annotations
@@ -53,7 +55,8 @@ RETURNING id::text
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m canopy.squirrel.outbox",
-        description="Inspect a history head's snapshot outbox, and retry or discard snapshots an arm refused.",
+        description="Inspect a history head's snapshot outbox; retry or discard what an arm refused, or drop a "
+        "delivered copy that hasn't replicated back.",
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="command")
     commands.add_parser("status", help="each arm's queue and every failed row, as JSON on stdout")
@@ -66,8 +69,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="let the arm save them without the values of PVs that moved since the capture",
     )
-    discard = commands.add_parser("discard", help="delete one failed row and its bundle (export it first)")
-    discard.add_argument("id", help="the failed row to delete")
+    discard = commands.add_parser(
+        "discard", help="delete one failed row and its bundle (export it first), or a delivered row's copy"
+    )
+    discard.add_argument("id", help="the failed or delivered row to delete")
     return parser
 
 
@@ -117,7 +122,8 @@ async def _retry(conn: asyncpg.Connection, options: argparse.Namespace) -> int:
 
 async def _discard(conn: asyncpg.Connection, entry_id: str) -> int:
     row = await conn.fetchrow(
-        "DELETE FROM squirrel.snapshot_outbox WHERE id::text = $1 AND state = 'failed' RETURNING arm, size_bytes",
+        "DELETE FROM squirrel.snapshot_outbox WHERE id::text = $1 AND state IN ('failed', 'delivered')"
+        " RETURNING arm, size_bytes, state",
         entry_id,
     )
     if row is None:
@@ -125,10 +131,28 @@ async def _discard(conn: asyncpg.Connection, entry_id: str) -> int:
         if state is None:
             logger.error("refused: the outbox has no row %s", entry_id)
         else:
-            logger.error("refused: %s is %s, not failed; only a failed row can be discarded", entry_id, state)
+            logger.error(
+                "refused: %s is %s; only a failed or delivered row can be discarded, and a pending one is still "
+                "to be sent",
+                entry_id,
+                state,
+            )
         return 1
-    logger.warning("Discarded snapshot %s for %s (%d bytes); it is gone", entry_id, row["arm"], row["size_bytes"])
-    print(json.dumps({"discarded": entry_id, "arm": row["arm"], "bytes": row["size_bytes"]}, indent=2))
+    arm = row["arm"]
+    if row["state"] == "failed":
+        logger.warning("Discarded snapshot %s for %s (%d bytes); it is gone", entry_id, arm, row["size_bytes"])
+    else:
+        logger.warning(
+            "Removed this head's waiting copy of snapshot %s (%d bytes). %s still holds the snapshot; it reaches "
+            "this head once replication from %s is healthy (run `reseed --arm %s` if its subscription was "
+            "rebuilt without one)",
+            entry_id,
+            row["size_bytes"],
+            arm,
+            arm,
+            arm,
+        )
+    print(json.dumps({"discarded": entry_id, "arm": arm, "state": row["state"], "bytes": row["size_bytes"]}, indent=2))
     return 0
 
 

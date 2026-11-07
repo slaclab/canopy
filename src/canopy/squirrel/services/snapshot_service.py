@@ -300,11 +300,13 @@ def delivery_of(entry: SnapshotOutbox) -> SnapshotDeliveryDTO:
     )
 
 
-def pending_detail(entry: SnapshotOutbox, then: str) -> str:
-    """The ``snapshot_pending`` detail for a change to a snapshot held only in the outbox."""
+def pending_detail(entry: SnapshotOutbox, change: str) -> str:
+    """The ``snapshot_pending`` detail for a ``change`` ("change", "delete", "restore") to a snapshot held only in the outbox."""
     if entry.state == "failed":
         return f"Snapshot {entry.id} was not saved: its delivery to {entry.arm} failed: {entry.last_error}"
-    return f"Snapshot {entry.id} is waiting for delivery to {entry.arm}; {then}"
+    if entry.state == "delivered":
+        return f"Snapshot {entry.id} is saved on {entry.arm} but hasn't replicated here yet; {change} it once it has"
+    return f"Snapshot {entry.id} is waiting for delivery to {entry.arm}; {change} it once it's saved there"
 
 
 class SnapshotService:
@@ -657,7 +659,7 @@ class SnapshotService:
         # refused write must not have already landed.
         existing = await self.snapshot_repo.get_by_id(snapshot_id)
         if not existing:
-            await self._refuse_if_queued(snapshot_id, "change it once it's saved there")
+            await self._refuse_if_queued(snapshot_id, "change")
             return None
         require_owned(existing.owner_instance, f"Snapshot {snapshot_id}")
         await self._require_facility_write(existing.facility_id, "this snapshot")
@@ -970,7 +972,8 @@ class SnapshotService:
         """A live snapshot with all its values, for another instance to import.
 
         Each value carries its PV's addresses, read from the PV row even when the PV
-        has been deleted since the capture.
+        has been deleted since the capture. A snapshot a history head holds only in its
+        outbox exports from its bundle, its values' addresses read the same way.
 
         Parameters
         ----------
@@ -985,10 +988,12 @@ class SnapshotService:
         """
         snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
         if snapshot is None:
-            # A snapshot held only in the outbox exports as the bundle it waits with.
             if await self.queued(snapshot_id) is None:
                 return None
-            return SnapshotBundleDTO.model_validate(await self.outbox_repo.bundle(snapshot_id))
+            header = await self.outbox_repo.bundle_header(snapshot_id)
+            return SnapshotBundleDTO.model_validate(
+                {**header, "values": await self.outbox_repo.export_values(snapshot_id)}
+            )
         if not self._in_facility_scope(snapshot.facility_id):
             return None
         values = [
@@ -1614,7 +1619,7 @@ class SnapshotService:
         is no live snapshot to delete."""
         snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
         if not snapshot:
-            await self._refuse_if_queued(snapshot_id, "delete it once it's saved there")
+            await self._refuse_if_queued(snapshot_id, "delete")
             return False
         require_owned(snapshot.owner_instance, f"Snapshot {snapshot_id}")
         await self._require_facility_write(snapshot.facility_id, "this snapshot")

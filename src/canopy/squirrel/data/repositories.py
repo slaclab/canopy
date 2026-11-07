@@ -504,6 +504,11 @@ class OutboxRepository(BaseRepository[SnapshotOutbox]):
         rows, size = result.one()
         return int(rows), int(size)
 
+    async def is_stored(self, snapshot_id: str) -> bool:
+        """Whether ``squirrel.snapshot`` holds ``snapshot_id`` here, deleted or not: once it does, no row waits for it."""
+        result = await self.session.execute(select(exists().where(Snapshot.id == snapshot_id)))
+        return bool(result.scalar())
+
     async def has_backlog(self, arm: str) -> bool:
         """Whether the arm has a snapshot still waiting to be sent."""
         result = await self.session.execute(
@@ -524,10 +529,45 @@ class OutboxRepository(BaseRepository[SnapshotOutbox]):
         )
         return result.scalar_one_or_none()
 
-    async def bundle(self, entry_id: str) -> dict | None:
-        """A queued snapshot's whole bundle."""
-        result = await self.session.execute(select(SnapshotOutbox.bundle).where(SnapshotOutbox.id == entry_id))
+    async def bundle_header(self, entry_id: str) -> dict | None:
+        """A queued snapshot's bundle without its ``values``."""
+        result = await self.session.execute(
+            text("SELECT bundle - 'values' FROM squirrel.snapshot_outbox WHERE id = CAST(:id AS uuid)"),
+            {"id": entry_id},
+        )
         return result.scalar_one_or_none()
+
+    async def export_values(self, entry_id: str) -> list[dict]:
+        """A queued snapshot's bundle values with their PV's current addresses, ordered by ``pvName``.
+
+        The rule of ``SnapshotValueRepository.get_export_rows``, for a snapshot held only
+        here: the PV row (an arm's, replicated) is outer-joined and never filtered, so a
+        deleted PV still gives its addresses; a value whose PV row isn't here keeps the
+        bundle's. Each value is the bundle's wire JSON (camelCase).
+        """
+        result = await self.session.execute(
+            text(
+                "SELECT v.value, p.id IS NOT NULL AS known,"
+                " p.setpoint_address, p.readback_address, p.config_address"
+                " FROM squirrel.snapshot_outbox o"
+                f" CROSS JOIN LATERAL {_BUNDLE_VALUES}"
+                " LEFT JOIN squirrel.pv p ON p.id = CAST(v.value ->> 'pvId' AS uuid)"
+                " WHERE o.id = CAST(:id AS uuid)"
+                " ORDER BY v.value ->> 'pvName'"
+            ),
+            {"id": entry_id},
+        )
+        values = []
+        for row in result.all():
+            value = dict(row.value)
+            if row.known:
+                value |= {
+                    "setpointAddress": row.setpoint_address,
+                    "readbackAddress": row.readback_address,
+                    "configAddress": row.config_address,
+                }
+            values.append(value)
+        return values
 
     async def bundle_text(self, entry_id: str) -> str | None:
         """A queued snapshot's bundle as JSON text, to send on without parsing it here."""

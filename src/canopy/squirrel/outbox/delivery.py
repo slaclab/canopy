@@ -8,6 +8,8 @@ head's own key) and its retry backs off, doubling up to ``retry_max_s``; it neve
 gives up. A refusal of the snapshot itself (its facility went, its PVs moved, its id
 clashes) marks it failed with the arm's reason and the next row goes on. Once the
 arm has saved a row, the row stays until the snapshot is on the head, by replication.
+A capture the arm saved at once that hasn't replicated back when ``deliver_capture``
+stops waiting is kept the same way, as a row already delivered (``submit``).
 
 Every state change is committed in Postgres before the next send; Redis only ever
 triggers a run. A session advisory lock per arm keeps two runs (two workers, or a
@@ -23,7 +25,7 @@ import logging
 from typing import Any
 from datetime import UTC, datetime, timedelta
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from collections.abc import Callable, Awaitable, AsyncIterator
 
 from sqlalchemy import text
@@ -111,6 +113,46 @@ async def refuse_if_full(repo: OutboxRepository, arm: str, config: OutboxConfig)
         raise OutboxFull(reason)
 
 
+async def _keep(
+    repo: OutboxRepository,
+    *,
+    arm: str,
+    bundle: SnapshotBundleDTO,
+    document: str,
+    facility_id: str | None,
+    caller: dict,
+    config: OutboxConfig,
+    **state: Any,
+) -> str | None:
+    """Add ``bundle`` to the arm's outbox in the caller's transaction, if it fits the arm's caps.
+
+    Holds the arm's queue for the rest of the transaction, so two captures can't both
+    pass a cap. ``state`` sets columns beyond the bundle's own (a row delivered already).
+    Returns why it doesn't fit, with nothing added, or ``None`` once it's added.
+    """
+    size = len(document.encode())
+    await repo.lock_arm(arm)
+    rows, used = await repo.usage(arm)
+    if rows + 1 > config.max_snapshots or used + size > config.max_bytes:
+        return f"its outbox is full ({rows} snapshots, {used} of {config.max_bytes} bytes)"
+    await repo.add(
+        bundle_json=document,
+        id=str(bundle.id),
+        arm=arm,
+        facility_id=facility_id,
+        title=bundle.title,
+        description=bundle.description,
+        created_by=bundle.created_by,
+        # JSON may carry a naive time; asyncpg needs an aware one for timestamptz.
+        created_at=to_utc(bundle.created_date),
+        value_count=len(bundle.values),
+        size_bytes=size,
+        caller=caller,
+        **state,
+    )
+    return None
+
+
 async def enqueue(
     repo: OutboxRepository,
     *,
@@ -128,48 +170,91 @@ async def enqueue(
         When the snapshot would take the arm past either cap; nothing is queued.
     """
     document = bundle_json(bundle)
-    size = len(document.encode())
-    await repo.lock_arm(arm)
-    rows, used = await repo.usage(arm)
-    if rows + 1 > config.max_snapshots or used + size > config.max_bytes:
-        raise OutboxFull(
-            f"{arm} can't be reached and its outbox is full ({rows} snapshots, {used} of {config.max_bytes} bytes); "
-            "the snapshot was not saved"
-        )
-    await repo.add(
-        bundle_json=document,
-        id=str(bundle.id),
-        arm=arm,
-        facility_id=facility_id,
-        title=bundle.title,
-        description=bundle.description,
-        created_by=bundle.created_by,
-        # JSON may carry a naive time; asyncpg needs an aware one for timestamptz.
-        created_at=to_utc(bundle.created_date),
-        value_count=len(bundle.values),
-        size_bytes=size,
-        caller=caller,
+    full = await _keep(
+        repo, arm=arm, bundle=bundle, document=document, facility_id=facility_id, caller=caller, config=config
     )
-    logger.info("Snapshot %s queued for %s (%d values, %d bytes)", bundle.id, arm, len(bundle.values), size)
+    if full is not None:
+        raise OutboxFull(f"{arm} can't be reached and {full}; the snapshot was not saved")
+    logger.info(
+        "Snapshot %s queued for %s (%d values, %d bytes)", bundle.id, arm, len(bundle.values), len(document.encode())
+    )
+
+
+@dataclass(frozen=True)
+class Submitted:
+    """What became of a capture for an arm (``submit``).
+
+    ``result`` is the capture job's result, ``message`` its last progress message, and
+    ``queued`` whether it waits in the arm's queue, for a delivery run to send.
+    """
+
+    result: dict
+    message: str
+    queued: bool = False
+
+
+async def _saved(
+    arm: str, bundle: SnapshotBundleDTO, caller: Caller, result: dict, *, facility_id: str | None, config: OutboxConfig
+) -> Submitted:
+    """The arm saved the capture: done if it's here, else kept as a delivered row until it replicates.
+
+    The head then serves it as it serves a queued snapshot, pending, rather than not at
+    all; the sweep removes the row once the snapshot is here. A row that would pass a
+    cap isn't kept: the arm has the snapshot, so the capture still succeeds.
+    """
+    snapshot_id = str(bundle.id)
+    async with session_scope() as session:
+        repo = OutboxRepository(session)
+        if await repo.is_stored(snapshot_id):
+            return Submitted(result, f"Saved on {arm}")
+        now = datetime.now(UTC)
+        full = await _keep(
+            repo,
+            arm=arm,
+            bundle=bundle,
+            document=bundle_json(bundle),
+            facility_id=facility_id,
+            caller=asdict(caller),
+            config=config,
+            state="delivered",
+            attempts=1,
+            last_attempt_at=now,
+            delivered_at=now,
+        )
+        if full is not None:
+            logger.warning(
+                "Snapshot %s is saved on %s but hasn't replicated here, and isn't kept here meanwhile: %s",
+                snapshot_id,
+                arm,
+                full,
+            )
+            return Submitted(result, f"Saved on {arm}; it hasn't replicated here yet")
+        await session.commit()
+        entry = await repo.get(snapshot_id)
+    logger.info("Snapshot %s saved on %s; kept here until it replicates back", snapshot_id, arm)
+    delivery = delivery_of(entry).model_dump(mode="json", by_alias=True)
+    return Submitted({**result, "delivery": delivery}, f"Saved on {arm}; waiting for it to replicate here")
 
 
 async def submit(
     arm: str, bundle: SnapshotBundleDTO, caller: Caller, *, facility_id: str | None, config: OutboxConfig | None = None
-) -> dict:
-    """Save a capture on its arm now, or queue it; returns the capture job's result.
+) -> Submitted:
+    """Save a capture on its arm now, or queue it.
 
     A capture for an arm with snapshots already waiting queues behind them, so the arm
     gets its snapshots in the order they were taken. Otherwise it goes straight to the
     arm (``deliver_capture``). If that can't reach the arm, gets no answer, or meets a
     failure the outbox would retry, the snapshot is queued with the attempt recorded;
-    a refusal of the snapshot itself is raised, so the capture job fails with it.
+    a refusal of the snapshot itself is raised, so the capture job fails with it. A
+    snapshot the arm saved that hasn't replicated here yet is kept until it has.
 
     Returns
     -------
-    dict
-        ``deliver_capture``'s result when the arm saved it; for a queued one,
-        ``{"type": "snapshot", "id", "arm", "delivery"}`` with the same ``delivery``
-        object the snapshot API shows.
+    Submitted
+        Its ``result`` is ``deliver_capture``'s when the arm saved it, with
+        ``delivery`` added while the snapshot isn't back here; for a queued one,
+        ``{"type": "snapshot", "id", "arm", "delivery"}``. ``delivery`` is the object
+        the snapshot API shows.
 
     Raises
     ------
@@ -184,13 +269,15 @@ async def submit(
     attempted: str | None = None
     if not behind:
         try:
-            return await deliver_capture(arm, bundle, caller)
+            result = await deliver_capture(arm, bundle, caller)
         except PrimaryUnavailable as exc:  # and PrimaryTimeout, a 504 that may have been applied
             attempted = exc.detail
         except ArmRefused as exc:
             if not transient(exc):
                 raise
             attempted = refusal_reason(exc)
+        else:
+            return await _saved(arm, bundle, caller, result, facility_id=facility_id, config=config)
     snapshot_id = str(bundle.id)
     async with session_scope() as session:
         repo = OutboxRepository(session)
@@ -208,7 +295,11 @@ async def submit(
         await session.commit()
         entry = await repo.get(snapshot_id)
     delivery = delivery_of(entry).model_dump(mode="json", by_alias=True)
-    return {"type": "snapshot", "id": snapshot_id, "arm": arm, "delivery": delivery}
+    return Submitted(
+        {"type": "snapshot", "id": snapshot_id, "arm": arm, "delivery": delivery},
+        f"Captured; waiting for {arm}",
+        queued=True,
+    )
 
 
 def log_swept(rows: list) -> None:

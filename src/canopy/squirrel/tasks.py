@@ -144,13 +144,13 @@ async def _capture_for_arm(
             facility_id=facility_id,
         )
     await progress(captured.total_pvs, captured.total_pvs, f"Saving {len(bundle.values):,} PV values on {arm}...")
-    result = await outbox.submit(arm, bundle, Caller(**caller), facility_id=facility_id)
-    if "delivery" in result:
-        # Queued: the arm couldn't take it, or has older snapshots waiting. Redis only
-        # starts a delivery run sooner; the queue itself is in Postgres.
-        await progress(captured.total_pvs, captured.total_pvs, f"Captured; waiting for {arm}")
+    submitted = await outbox.submit(arm, bundle, Caller(**caller), facility_id=facility_id)
+    await progress(captured.total_pvs, captured.total_pvs, submitted.message)
+    if submitted.queued:
+        # The arm couldn't take it, or has older snapshots waiting. Redis only starts a
+        # delivery run sooner; the queue itself is in Postgres.
         await ctx["redis"].enqueue_job("deliver_outbox_task")
-    return result
+    return submitted.result
 
 
 async def deliver_outbox_task(ctx: dict) -> dict:

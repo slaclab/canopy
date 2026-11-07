@@ -340,8 +340,8 @@ async def restore_snapshot(
     ``not_owner`` for another instance's snapshot and ``machine_read_only`` for this
     one's.
 
-    A snapshot a history head holds only in its outbox (pending or failed) restores
-    from its bundle, and only where this instance writes the machine itself; elsewhere
+    A snapshot a history head holds only in its outbox (pending, failed, or saved on its
+    arm and not back yet) restores from its bundle, and only where this instance writes the machine itself; elsewhere
     it's a 409 ``snapshot_pending`` until its arm has it.
 
     Logs who asked (the key's name, or the user a history head forwarded it for): a
@@ -353,7 +353,7 @@ async def restore_snapshot(
         if (entry := await service.queued(snapshot_id)) is None:
             raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
         if not get_settings().machine_writes:
-            raise SnapshotPending(pending_detail(entry, "it can be restored once it's saved there"))
+            raise SnapshotPending(pending_detail(entry, "restore"))
     elif not get_settings().machine_writes:
         require_owned(snapshot_owner, f"Snapshot {snapshot_id}")
         require_machine_access()
