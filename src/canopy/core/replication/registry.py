@@ -12,7 +12,7 @@ table can't ship before someone decides whether the head gets it:
 ``time_series``
     Rows that only accumulate (snapshots and their values). Replicated with every
     operation in the single layout; in the split layout their publication carries
-    no deletes, so pruning the primary never removes history.
+    no deletes, so pruning an arm never removes the head's history.
 ``local``
     Rows that belong to one database and never replicate. API keys are local: a
     head mints and checks its own. So is a head's snapshot outbox: an arm's copy of a
@@ -25,8 +25,8 @@ head's own. ``shared_keys`` lists the columns unique across every owner, where t
 owners' rows can clash.
 
 Two publication layouts carry the same tables. ``publications`` is the single
-``canopy_history`` every primary starts with; ``split_publications`` is the pair a
-primary that prunes old rows switches to (``publish --split``): ``canopy_ref`` with
+``canopy_history`` every arm starts with; ``split_publications`` is the pair an
+arm that prunes old rows switches to (``publish --split``): ``canopy_ref`` with
 every operation and ``canopy_ts`` with inserts and updates only.
 
 Keys are ``"schema.table"`` strings rather than model classes, so ``canopy.core``
@@ -228,7 +228,7 @@ REGISTRY = ReplicationRegistry(
         ),
     ),
     # Reference tables keep their deletes: replacing a PV's tags deletes and re-inserts
-    # link rows, and without the delete the re-insert would collide on the mirror and
+    # link rows, and without the delete the re-insert would collide on the head and
     # stop replication. Time-series deletes come only from pruning (user deletes are
     # soft), and those must never reach history.
     split_publications=(

@@ -21,8 +21,8 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     # retain exempts a snapshot from pruning; imported_from is the id of the snapshot an
     # import copied, with no foreign key because that snapshot may exist only on a
-    # history mirror. A constant default needs no table rewrite on Postgres 11+. With a
-    # history mirror, run this there before the primary.
+    # history head. A constant default needs no table rewrite on Postgres 11+. With a
+    # history head, run this there before its arms.
     op.add_column(
         "snapshot",
         sa.Column("retain", sa.Boolean(), server_default=sa.text("false"), nullable=False),

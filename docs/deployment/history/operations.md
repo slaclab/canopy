@@ -408,8 +408,8 @@ next heartbeat.
 
 On the arm's worker, set `CANOPY_WINDOW_DAYS` and `CANOPY_PRUNE__ENABLED=true`. The job
 runs nightly at `CANOPY_PRUNE__HOUR` (UTC); a head's worker never schedules it, and the
-job refuses to run anywhere but on a primary. Until `CANOPY_PRUNE__DRY_RUN=false` it
-only counts what it would remove. Run it dry for a month while the arm's `drift-check`
+job refuses to run anywhere but on an arm (`CANOPY_ROLE=primary`). Until
+`CANOPY_PRUNE__DRY_RUN=false` it only counts what it would remove. Run it dry for a month while the arm's `drift-check`
 stays clean, then turn the dry run off.
 
 Each run removes snapshots older than the window that aren't retained, deleted or

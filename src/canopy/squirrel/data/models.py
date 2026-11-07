@@ -159,7 +159,7 @@ class Snapshot(UUIDMixin, TimestampMixin, OwnedMixin, SoftDeleteMixin, Base):
     Its facility and every PV its values reference share its ``owner_instance``.
     Deleting a snapshot sets ``deleted_at`` and keeps its values; the row keeps its
     owner. ``retain`` exempts it from any pruning of old snapshots. ``imported_from`` is
-    the id of the snapshot it was imported from, usually on a history mirror; no foreign
+    the id of the snapshot it was imported from, usually on a history head; no foreign
     key, since that snapshot may no longer exist here.
     """
 

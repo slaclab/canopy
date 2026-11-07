@@ -285,7 +285,7 @@ class PvService:
         """Look up and lock this instance's PV already holding an identity, live or deleted.
 
         Identities are unique per owner, so another instance's PV with the same address
-        (a mirror holds its arms' rows) is neither found nor brought back. The row stays
+        (a head holds its arms' rows) is neither found nor brought back. The row stays
         locked until the transaction ends, so a concurrent registration of the same
         address waits, then finds the PV live and is refused, instead of both bringing
         back the same deleted row.
