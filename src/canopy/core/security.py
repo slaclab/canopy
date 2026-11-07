@@ -46,9 +46,9 @@ class APIKey:
     ``DbKeyRegistry``) already passes it explicitly, so a future one that
     forgets to must fail loudly rather than silently granting every module.
 
-    `is_service` marks a key held by another Canopy instance (a forward
-    instance's key on its primary): only such a key may name the caller it acts
-    for in ``X-Canopy-On-Behalf-Of``. Only database keys can be service keys.
+    `is_service` marks a key held by another Canopy instance (a history head's
+    key on one of its arms): only such a key may name the caller it acts for in
+    ``X-Canopy-On-Behalf-Of``. Only database keys can be service keys.
     """
 
     read: bool
@@ -273,8 +273,8 @@ def _accept_on_behalf_of(value: str, facilities: str | None, key: APIKey) -> Non
 
     ``X-Canopy-On-Behalf-Of-Facilities`` must come with it: the caller's facility grant,
     a JSON list of slugs. The request then reaches only the facilities both the service
-    key and the caller reach (see ``forwarded_facilities``). Without it a forward
-    instance would widen every caller to the service key's grant, so it is required.
+    key and the caller reach (see ``forwarded_facilities``). Without it a head would
+    widen every caller to the service key's grant, so it is required.
     """
     settings = get_settings()
     if settings.role != "primary" or not settings.accept_forwarded_writes:

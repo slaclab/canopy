@@ -19,9 +19,9 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from canopy.core.db import get_engine
 from canopy.core.arms import get_arms_config, subscription_name
-from canopy.core.config import get_settings
 from canopy.core.errors import PrimaryTimeout, ServiceKeyRefused, PrimaryUnavailable
-from canopy.core.security import APIKey
+from canopy.core.security import MAX_ON_BEHALF_OF_LEN, APIKey
+from canopy.core.ownership import local_instance
 from canopy.core.forwarding.config import ForwardConfig, get_forward_config
 from canopy.core.forwarding.context import (
     ON_BEHALF_OF_HEADER,
@@ -43,11 +43,11 @@ _POLL_S = 0.05
 def on_behalf_of(key: APIKey) -> str:
     """The name an arm records for ``key``'s writes: ``<key name>@<instance>``.
 
-    Unprintable characters become ``?`` and the result is cut to 255 characters, the
-    arm's limit, so a key's odd name never turns into a 400 from the arm.
+    Unprintable characters become ``?`` and the result is cut to the arm's limit,
+    ``MAX_ON_BEHALF_OF_LEN``, so a key's odd name never turns into a 400 from the arm.
     """
-    name = f"{key.name}@{get_settings().instance}"
-    return "".join(char if char.isprintable() else "?" for char in name)[:255]
+    name = f"{key.name}@{local_instance()}"
+    return "".join(char if char.isprintable() else "?" for char in name)[:MAX_ON_BEHALF_OF_LEN]
 
 
 @dataclass(frozen=True)
@@ -95,7 +95,7 @@ def forwardable_arms() -> set[str]:
     return {name for name, arm in get_arms_config().arms.items() if arm.forwards}
 
 
-def check_forward_urls(config: ForwardConfig | None = None) -> None:
+def check_forward_urls() -> None:
     """Refuse an arm forward URL that isn't https, unless ``allow_insecure_http``.
 
     Raises
@@ -104,7 +104,7 @@ def check_forward_urls(config: ForwardConfig | None = None) -> None:
         Naming each arm whose URL is refused. Run at startup, so a head with a bad
         setting doesn't start.
     """
-    config = config or get_forward_config()
+    config = get_forward_config()
     bad = sorted(
         name
         for name, arm in get_arms_config().arms.items()
