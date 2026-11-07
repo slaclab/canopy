@@ -363,7 +363,7 @@ class SnapshotValueRepository(BaseRepository[SnapshotValue]):
 
         Plain columns rather than ORM objects, since a full save has 16k–100k values. The
         PV is outer-joined and never filtered: a deleted PV still exports its addresses,
-        and a value whose PV row is missing (foreign keys aren't checked when a mirror
+        and a value whose PV row is missing (foreign keys aren't checked when a head
         applies changes) still exports, without them.
         """
         result = await self.session.execute(
