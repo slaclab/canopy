@@ -33,12 +33,26 @@ from canopy.core.security import (
 
 
 @dataclass(frozen=True)
+class FacilityOf:
+    """Where a row's facilities are: the ``facility_id`` values of ``table`` rows whose ``key`` is the row's id."""
+
+    table: str
+    key: str
+
+
+@dataclass(frozen=True)
 class Row:
-    """The owner of an existing row: the ``table`` row whose ``column`` is the path parameter ``param``."""
+    """The owner of an existing row: the ``table`` row whose ``column`` is the path parameter ``param``.
+
+    ``facilities`` is set where the app gates the row by the caller's facility grant.
+    The head then forwards only for a caller whose grant reaches the row here, and
+    leaves any other caller to the app, which answers as it does on every instance.
+    """
 
     table: str
     param: str
     column: str = "id"
+    facilities: FacilityOf | None = None
 
 
 @dataclass(frozen=True)
@@ -113,14 +127,19 @@ class WriteRoute:
         return isinstance(self.owner, Facility | Facilities | Address) or self.unique is not None
 
     @property
+    def manages_facilities(self) -> bool:
+        """Whether the route edits the facility hierarchy, whose gate needs every facility."""
+        return require_wildcard_facility_access in self.gates
+
+    @property
     def module(self) -> str:
         """The module the route belongs to, which the caller's key must be scoped to."""
         mount = self.path.split("/", 2)[1]
         return "core" if mount == "v1" else mount
 
 
-_SNAPSHOT = Row("squirrel.snapshot", "snapshot_id")
-_PV = Row("squirrel.pv", "pv_id")
+_SNAPSHOT = Row("squirrel.snapshot", "snapshot_id", facilities=FacilityOf("squirrel.snapshot", "id"))
+_PV = Row("squirrel.pv", "pv_id", facilities=FacilityOf("squirrel.pv_facility", "pv_id"))
 _TAG_GROUP = Row("squirrel.tag_group", "group_id")
 _CONFIG = Row("magpie.config", "slug", column="slug")
 _FACILITY = Row("core.facility", "facility_slug", column="slug")
@@ -140,7 +159,7 @@ ROUTES: tuple[WriteRoute, ...] = (
     WriteRoute("POST", "/squirrel/v1/pvs/multi", Facilities("facilities", rows=True), owner_param=True),
     WriteRoute("PUT", "/squirrel/v1/pvs/{pv_id}", _PV),
     WriteRoute("DELETE", "/squirrel/v1/pvs/{pv_id}", _PV),
-    # A meta-PV marker is keyed by its PV's id.
+    # A meta-PV marker is keyed by its PV's id. The app doesn't gate markers by facility.
     WriteRoute("POST", "/squirrel/v1/pvs/meta", Address("pvName"), owner_param=True),
     WriteRoute("PATCH", "/squirrel/v1/pvs/meta/{id}", Row("squirrel.pv", "id")),
     WriteRoute("DELETE", "/squirrel/v1/pvs/meta/{id}", Row("squirrel.pv", "id")),

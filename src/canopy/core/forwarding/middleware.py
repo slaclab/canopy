@@ -35,6 +35,7 @@ from canopy.core.forwarding.client import (
     forward_target,
     forwardable_arms,
     wait_until_applied,
+    service_key_refusal,
 )
 from canopy.core.forwarding.config import get_forward_config
 from canopy.core.forwarding.context import (
@@ -50,7 +51,7 @@ logger = logging.getLogger(__name__)
 FORWARDED_REQUESTS = Counter(
     "canopy_forwarded_requests_total",
     "Writes a head sent to an arm, or refused on the way, by route template, arm, status code and outcome "
-    "(applied, stale, not_waited, refused, failed).",
+    "(applied, stale, not_waited, refused, key_refused, failed).",
     ["method", "route", "arm", "status", "outcome"],
 )
 
@@ -143,6 +144,11 @@ class ForwardingMiddleware:
         if owner is None or owner == local or owner not in arms or (arm := forward_target(owner)) is None:
             await self.app(scope, receive, send)
             return
+        if not await owners.caller_reaches(route, params, caller):
+            # The app here refuses it as any instance would, before naming the owner: the
+            # arm would hide the row too, and its 404 or an outage would say it exists.
+            await self.app(scope, receive, send)
+            return
         await self._forward(scope, receive, send, route, params, arm, caller, body, parsed)
 
     async def _forward(
@@ -175,6 +181,17 @@ class ForwardingMiddleware:
                 headers=dict(headers),
                 config=config,
             )
+            if refusal := service_key_refusal(arm.name, answer, manages_facilities=route.manages_facilities):
+                outcome = "key_refused"
+                logger.warning(
+                    "Arm %s refused this head's service key for %s %s: %d %s",
+                    arm.name,
+                    scope["method"],
+                    route.path,
+                    answer.status_code,
+                    answer.text[:500],
+                )
+                raise refusal
             if answer.status_code == 404 and await _pruned_on_arm(route, params, answer):
                 outcome = "refused"
                 raise ArchivedImmutable(

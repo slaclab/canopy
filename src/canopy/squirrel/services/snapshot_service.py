@@ -661,8 +661,9 @@ class SnapshotService:
         if not existing:
             await self._refuse_if_queued(snapshot_id, "change")
             return None
-        require_owned(existing.owner_instance, f"Snapshot {snapshot_id}")
+        # The facility gate first: a caller who can't reach the row isn't told its owner.
         await self._require_facility_write(existing.facility_id, "this snapshot")
+        require_owned(existing.owner_instance, f"Snapshot {snapshot_id}")
         snapshot = await self.snapshot_repo.update_metadata(
             snapshot_id, title=title, description=description, retain=retain
         )
@@ -1621,6 +1622,6 @@ class SnapshotService:
         if not snapshot:
             await self._refuse_if_queued(snapshot_id, "delete")
             return False
-        require_owned(snapshot.owner_instance, f"Snapshot {snapshot_id}")
         await self._require_facility_write(snapshot.facility_id, "this snapshot")
+        require_owned(snapshot.owner_instance, f"Snapshot {snapshot_id}")
         return await self.snapshot_repo.soft_delete(snapshot_id)

@@ -27,6 +27,11 @@ EVERY = frozenset({WILDCARD})
 WRITER = APIKey(token="writer", read=True, write=True, modules=EVERY, facilities=EVERY, name="console")
 OPS = APIKey(token="ops", read=True, write=True, admin=True, modules=EVERY, facilities=EVERY, name="ops")
 HEADERS = {"X-API-Key": "writer"}
+# Keys limited to one facility: the head's own, and arm1's.
+LAB = APIKey(token="lab", read=True, write=True, modules=EVERY, facilities=frozenset({"head-site"}), name="lab")
+ARM1_LAB = APIKey(
+    token="arm1-lab", read=True, write=True, modules=EVERY, facilities=frozenset({"arm1-site"}), name="a1"
+)
 
 
 @pytest_asyncio.fixture
@@ -189,3 +194,70 @@ class TestArchivedImmutable:
 
         assert resp.status_code == 404
         assert resp.json()["code"] == "snapshot_not_found"
+
+
+class TestOutsideTheCallersFacilities:
+    """A caller whose grant doesn't reach a row is answered here, as on any instance, and nothing is sent."""
+
+    @pytest.fixture(autouse=True)
+    def keys(self, copy, bind_keys):
+        bind_keys(WRITER, OPS, LAB, ARM1_LAB)
+
+    async def _unassigned_snapshot(self, as_instance, owner: str) -> str:
+        with as_instance(owner):
+            async with db.get_session_maker()() as session:
+                snapshot = Snapshot(title="unassigned")
+                session.add(snapshot)
+                await session.commit()
+                return snapshot.id
+
+    @pytest.mark.parametrize(("method", "suffix"), [("PATCH", ""), ("PUT", ""), ("DELETE", ""), ("POST", "/restore")])
+    @pytest.mark.parametrize("owner", ["arm1", "arm2"])
+    async def test_a_snapshot_is_a_404_as_on_get(self, http, copy, method, suffix, owner):
+        # arm1 forwards and arm2 doesn't: either way, not archived_immutable or not_owner.
+        path = f"/squirrel/v1/snapshots/{copy[owner]['snapshot']}"
+        get = await http.get(path, headers={"X-API-Key": "lab"})
+
+        resp = await http.request(method, path + suffix, json={}, headers={"X-API-Key": "lab"})
+
+        assert get.json()["code"] == "snapshot_not_found"
+        assert (resp.status_code, resp.json()["code"]) == (404, "snapshot_not_found"), resp.text
+
+    @pytest.mark.parametrize("owner", ["arm1", "arm2"])
+    async def test_an_unassigned_snapshot_is_for_unrestricted_keys(self, http, as_instance, owner):
+        snapshot = await self._unassigned_snapshot(as_instance, owner)
+
+        resp = await http.patch(f"/squirrel/v1/snapshots/{snapshot}", json={"title": "x"}, headers={"X-API-Key": "lab"})
+
+        assert (resp.status_code, resp.json()["code"]) == (403, "insufficient_facility_access")
+
+    @pytest.mark.parametrize("method", ["PUT", "DELETE"])
+    @pytest.mark.parametrize("owner", ["arm1", "arm2"])
+    async def test_a_pv_names_its_facilities_as_on_a_primary(self, http, copy, method, owner):
+        resp = await http.request(
+            method, f"/squirrel/v1/pvs/{copy[owner]['pv']}", json={"description": "x"}, headers={"X-API-Key": "lab"}
+        )
+
+        assert (resp.status_code, resp.json()["code"]) == (403, "insufficient_facility_access")
+        assert f"{owner}-site" in resp.json()["detail"]
+
+    async def test_a_caller_in_the_rows_facility_is_forwarded(self, http, copy, httpx_mock: HTTPXMock):
+        snapshot = copy["arm1"]["snapshot"]
+        httpx_mock.add_response(method="PATCH", url=f"{ARM1}/squirrel/v1/snapshots/{snapshot}", json={"id": snapshot})
+
+        resp = await http.patch(
+            f"/squirrel/v1/snapshots/{snapshot}", json={"title": "x"}, headers={"X-API-Key": "arm1-lab"}
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert json.loads(httpx_mock.get_request().headers["X-Canopy-On-Behalf-Of-Facilities"]) == ["arm1-site"]
+
+    async def test_an_arm2_row_in_the_callers_facility_is_still_not_owned(self, http, copy, bind_keys):
+        arm2_lab = APIKey(token="arm2-lab", read=True, write=True, modules=EVERY, facilities=frozenset({"arm2-site"}))
+        bind_keys(arm2_lab)
+
+        resp = await http.delete(
+            f"/squirrel/v1/snapshots/{copy['arm2']['snapshot']}", headers={"X-API-Key": "arm2-lab"}
+        )
+
+        assert (resp.status_code, resp.json()["code"]) == (403, "not_owner")

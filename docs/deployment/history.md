@@ -356,10 +356,19 @@ the head. Everything a forwarded write may change is that arm's own: the arm app
 its own rules to it, as for one of its local users, and the service key bounds the
 rest.
 
+The head checks the caller's grant first, for a snapshot change or a PV edit or
+delete. A caller whose grant shares no facility with the row gets the head's own
+answer, the same as on any instance, and nothing is sent to the arm: 404
+`snapshot_not_found` for a snapshot, as `GET` answers, and 403
+`insufficient_facility_access` for a PV or an unassigned snapshot. So the answer
+doesn't depend on the arm being up, and doesn't say who owns the row.
+
 Mint one service key on each arm, for that arm only, with the modules the head
 forwards to it (`-m squirrel`, and `-m magpie` for Magpie configs), every facility
 (`--facility '*'`) or only those the head's users work in. Each caller's own grant
-still limits its requests. Add `-a` only if the head should create, edit or delete the
+still limits its requests. A key limited to some facilities must cover every one the
+head's users reach on that arm. Otherwise the arm hides a snapshot outside them from the
+key with a 404, and the head reads that as a prune (`archived_immutable`). Add `-a` only if the head should create, edit or delete the
 arm's facilities: admin on the arm also manages that arm's API keys, and without it
 the arm refuses facility writes with 403 `insufficient_admin_access`. Only the CLI
 mints service keys:
@@ -449,6 +458,19 @@ came back; the write may have been applied, so check before sending it again. Re
 keep working from the head's own copy, and so do writes to the head's own rows and to
 other arms.
 
+An arm that refuses the head's service key answers a forwarded write with 502
+`service_key_refused`. That covers a 401, or a 403 for the key's scope, modules or
+admin access (and on facility routes, for its facilities). The caller's own key is fine:
+the head checked it first. The detail names the arm and relays its answer, for example
+"Arm 'arm1' refused this head's service key for it (401 invalid_api_key: Invalid API
+key)". `canopy_forwarded_requests_total` counts these with `outcome="key_refused"`.
+
+To fix it, mint the arm's service key again with the modules and access the head
+forwards (see [Who wrote it](#who-wrote-it)), and set it as
+`CANOPY_ARMS__<arm>__SERVICE_KEY` on the head. A refusal that comes from the caller's
+own facility grant, and `forwarded_write_refused`, reach the caller as the arm sent
+them.
+
 Snapshots are the one exception: the machine's state at 14:02 can't be taken again at
 14:30, so a capture for an arm that can't take it is kept on the head and saved there
 later. Every other write to that arm is refused as above.
@@ -464,9 +486,10 @@ capture job then completes with the snapshot's id and `delivery`
 queued snapshot from its bundle, under the same id, with `delivery` set: `pending`
 while it waits (or is saved on the arm and not replicated back yet), `failed` when the
 arm refused it, with the arm's reason. Compare and export work on it; the export gives
-each value its PV's addresses as the head holds them, as a stored snapshot's does. Edit and delete
-are refused with 409 `snapshot_pending`; so is a restore, except where the head has
-`CANOPY_MACHINE_ACCESS=write`, which restores it from its bundle, a failed one too.
+each value its PV's addresses as the head holds them, as a stored snapshot's does.
+Edit and delete are refused with 409 `snapshot_pending`; so is a restore, except where
+the head has `CANOPY_MACHINE_ACCESS=write`, which restores it from its bundle, a failed
+one too.
 Once the snapshot replicates back, its outbox row goes and it is an ordinary snapshot.
 
 **Delivery.** The head's worker sends each arm's queue oldest first, every
@@ -484,9 +507,9 @@ snapshots and `MAX_BYTES` bytes, failed rows included, and so are snapshots save
 the arm that haven't replicated back. A full snapshot is tens of MB, so size
 `MAX_BYTES` from the head's free disk and its number of arms. While an arm has
 snapshots waiting and its queue is full, a capture for it is refused at once with 503
-`outbox_full`. A capture the arm saved is never refused for the caps: if keeping its
-copy would pass one, the head logs a warning and doesn't keep it. The arm's API must accept request bodies that large (an ingress in
-front of it often limits them by default).
+`outbox_full`. The arm's API must accept request bodies that large (an ingress in
+front of it often limits them by default). A capture the arm saved is never refused for
+the caps: if keeping its copy would pass one, the head logs a warning and doesn't keep it.
 
 **Failed snapshots.** On the head, `python -m canopy.squirrel.outbox status` prints
 each arm's queue and every failed snapshot with its reason. Once the cause is fixed,

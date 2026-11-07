@@ -15,6 +15,8 @@ from sqlalchemy import text
 
 from canopy.core.db import session_scope
 from canopy.core.errors import FacilitySlugConflict
+from canopy.core.security import APIKey
+from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.replication.sql import qualified, owner_join, quote_ident
 from canopy.core.forwarding.routes import (
     Row,
@@ -90,6 +92,38 @@ async def owner_of(
         return None
     owner = owners.pop()
     return owner if requested is None or requested == owner else None
+
+
+async def caller_reaches(route: WriteRoute, params: dict[str, str], key: APIKey) -> bool:
+    """Whether ``key``'s facility grant reaches the row ``route`` writes, in this instance's copy.
+
+    The rule the app hides rows by: an unrestricted key reaches every row, and a
+    restricted one needs one of the row's facilities, so a row with none is outside
+    every restricted grant. Every app gate the router hands a refused caller to also
+    refuses it, before naming the row's owner. True for a route whose rows have no
+    facility, and for a malformed id, which the app answers with its own 404.
+    """
+    rule = route.owner
+    if not isinstance(rule, Row) or rule.facilities is None or key.unrestricted_facilities:
+        return True
+    try:
+        row_id = str(UUID(params[rule.param]))
+    except ValueError:
+        return True
+    scope = await facilities_gateway.resolve_key_facility_scope(key.facilities)
+    if scope is None:
+        return True
+    where = rule.facilities
+    async with session_scope() as session:
+        rows = await session.scalars(
+            text(
+                f"SELECT facility_id FROM {qualified(where.table)} "
+                f"WHERE {quote_ident(where.key)} = CAST(:id AS uuid) AND facility_id IS NOT NULL"
+            ),
+            {"id": row_id},
+        )
+        facility_ids = {str(facility_id) for facility_id in rows}
+    return bool(facility_ids & scope)
 
 
 async def require_unused(route: WriteRoute, body: object) -> None:
