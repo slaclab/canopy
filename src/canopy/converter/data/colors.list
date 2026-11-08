@@ -8,11 +8,11 @@
 # fidelity.
 #
 # Provenance: the base palette below (version/settings/aliases, static
-# indices 0-83, rules and alarm map) is copied VERBATIM from the SLAC EDM
-# display corpus, file display/bcs/config/colors.list. A synthetic extension
-# block at the end of this file adds neutral placeholders for the 17 residual
-# indices (84..193) that corpus screens reference beyond the base palette —
-# the full site palette is not redistributed here.
+# indices 0-83, rules 84-114 and alarm map) is copied VERBATIM from a
+# colors.list in the SLAC EDM display corpus. A synthetic extension block at
+# the end of this file adds neutral placeholders for the 5 residual indices
+# (128..193) that corpus screens reference beyond the base palette — the full
+# site palette is not redistributed here.
 #
 # Format: a version line ("major minor release"), "key = value" settings,
 # 'alias' lines, then 'static <index> "<name>" { r g b }' entries (6
@@ -494,18 +494,9 @@ alarm {
 # corpus screens reference beyond the base palette above. They keep index
 # resolution deterministic; replace by overriding
 # CANOPY_CONVERTER__COLORS_LIST_PATH with the full site palette.
-static 84  "site-ext-84"  { 32639 32639 32639 }
-static 86  "site-ext-86"  { 32639 32639 32639 }
-static 87  "site-ext-87"  { 32639 32639 32639 }
-static 88  "site-ext-88"  { 32639 32639 32639 }
-static 89  "site-ext-89"  { 32639 32639 32639 }
-static 90  "site-ext-90"  { 32639 32639 32639 }
-static 91  "site-ext-91"  { 32639 32639 32639 }
-static 92  "site-ext-92"  { 32639 32639 32639 }
-static 93  "site-ext-93"  { 32639 32639 32639 }
-static 103 "site-ext-103" { 32639 32639 32639 }
-static 113 "site-ext-113" { 32639 32639 32639 }
-static 114 "site-ext-114" { 32639 32639 32639 }
+# Only an index with neither a static nor a rule above gets a placeholder:
+# EDM refuses a palette that defines an index twice, and the converter would
+# resolve the static first, painting the rule's colours grey.
 static 128 "site-ext-128" { 32639 32639 32639 }
 static 129 "site-ext-129" { 32639 32639 32639 }
 static 153 "site-ext-153" { 32639 32639 32639 }
