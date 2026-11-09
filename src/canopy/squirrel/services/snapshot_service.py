@@ -16,7 +16,6 @@ from collections.abc import Callable
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from canopy.core.config import get_settings
 from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
 from canopy.core.ownership import require_owned, local_instance, require_create_owner
 from canopy.core.facilities import gateway as facilities_gateway
@@ -79,6 +78,20 @@ def _describe_skipped(skipped: list[SkippedValueDTO]) -> str:
         f"{len(skipped)} value(s) would be skipped, since their PVs can't be imported here: {named}{more}. "
         "Nothing was saved"
     )
+
+
+@dataclass
+class CapturedValues:
+    """What a capture read, before it is saved here or bundled for the snapshot's owner.
+
+    ``rows`` are ``bulk_insert_snapshot_values`` dicts without ``snapshot_id``, one per
+    PV; ``total_pvs`` is how many PVs the capture looked at, and ``taken_at`` the time
+    the read finished, which becomes the snapshot's creation time.
+    """
+
+    rows: list[dict]
+    total_pvs: int
+    taken_at: datetime
 
 
 @dataclass
@@ -491,13 +504,18 @@ class SnapshotService:
             total_count=total_count,
         )
 
-    async def snapshot_exists(self, snapshot_id: str) -> bool:
-        """Lightweight check (no value load) used before enqueueing a restore: the snapshot
+    async def restorable_owner(self, snapshot_id: str) -> str | None:
+        """The owner of a snapshot the key may restore, or ``None`` when it can't.
+
+        A lightweight check (no value load) used before enqueueing a restore: the snapshot
         exists, isn't deleted, and is in the key's facility scope, the same rule as
         ``get_by_id``. A snapshot the key can't view doesn't exist for it, so it can't be
-        restored either."""
+        restored either.
+        """
         snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
-        return snapshot is not None and self._in_facility_scope(snapshot.facility_id)
+        if snapshot is None or not self._in_facility_scope(snapshot.facility_id):
+            return None
+        return snapshot.owner_instance
 
     async def get_by_id(self, snapshot_id: str, limit: int | None = None, offset: int = 0) -> SnapshotDTO | None:
         """Get a snapshot with its values (values optionally paginated)."""
@@ -591,38 +609,65 @@ class SnapshotService:
         facility_id: str | None = None,
         pv_cache: PVCacheReader | None = None,
     ) -> SnapshotSummaryDTO:
-        """Create a snapshot by reading PVs from EPICS (the hot read path).
+        """Create a snapshot by reading PVs from EPICS (the hot read path), and save it here.
 
-        A facility snapshot captures only the PVs assigned to that facility or one of its
-        descendants; unassigned PVs are left out. A snapshot with no facility captures
-        every registered PV.
+        ``capture_values`` then ``save_captured``, with an id and time assigned here at
+        capture. A facility snapshot captures only the PVs assigned to that facility or
+        one of its descendants; unassigned PVs are left out. A snapshot with no facility
+        captures every PV this instance owns.
 
         ``facility_id`` lets a caller that already resolved ``data.facility`` pass the id
         straight through. The route does that — it has to resolve the slug anyway to gate
         the write, and passing the id over the job queue avoids re-resolving it.
+        """
+        logger.info("Creating snapshot: %s", data.title)
+        facility_id = await self._capture_facility(data.facility, facility_id)
+        captured = await self.capture_values(
+            facility_id, owner=local_instance(), progress_callback=progress_callback, pv_cache=pv_cache
+        )
+        return await self.save_captured(
+            captured,
+            snapshot_id=str(uuid4()),
+            title=data.title,
+            description=data.description,
+            created_by=created_by,
+            facility_id=facility_id,
+            progress_callback=progress_callback,
+        )
+
+    async def _capture_facility(self, slug: str | None, facility_id: str | None) -> str | None:
+        # The snapshot's own facility is a specific node, so this goes through
+        # `id_by_slug`. An unknown slug here is the same hard `FacilityNotFound` a
+        # read filter naming one now gets, too.
+        if facility_id is None and slug is not None:
+            facility_id = await facilities_gateway.id_by_slug(slug)
+            if facility_id is None:
+                raise FacilityNotFound(f"Facility '{slug}' not found")
+        return facility_id
+
+    async def capture_values(
+        self,
+        facility_id: str | None,
+        *,
+        owner: str,
+        progress_callback: Callable | None = None,
+        pv_cache: PVCacheReader | None = None,
+    ) -> CapturedValues:
+        """Read from EPICS the PVs of ``owner`` in the facility's subtree (every PV of ``owner`` without one).
+
+        Writes nothing. ``owner`` is the snapshot's owner: a snapshot's values reference
+        PVs of its own owner, and a mirror holds its arms' PVs beside its own. A
+        facility's tree is one owner already.
 
         With ``pv_cache``, values the worker's PV cache can vouch for are taken from it
         and only the rest are read live. The stored snapshot has the same shape either
         way, but a cached value is the PV's last monitor update, which can trail a live
         read by up to the record's monitor deadband (MDEL).
         """
-        logger.info("Creating snapshot: %s", data.title)
         start_time = datetime.now(UTC)
-
-        # The snapshot's own facility is a specific node, so this goes through
-        # `id_by_slug`. An unknown slug here is the same hard `FacilityNotFound` a
-        # read filter naming one now gets, too.
-        if facility_id is None and data.facility is not None:
-            facility_id = await facilities_gateway.id_by_slug(data.facility)
-            if facility_id is None:
-                raise FacilityNotFound(f"Facility '{data.facility}' not found")
         capture_scope = await facilities_gateway.descendant_ids(facility_id) if facility_id is not None else None
-
-        # Only this instance's PVs: a mirror holds its arms' PVs too, and a snapshot's
-        # values reference PVs of its own owner. A facility's tree is one owner already.
-        pv_addresses = await self.pv_repo.get_all_addresses(capture_scope, owner=local_instance())
+        pv_addresses = await self.pv_repo.get_all_addresses(capture_scope, owner=owner)
         total_pv_count = len(pv_addresses)
-
         # Collect the unique addresses to read (config addresses are not snapshotted).
         # An address can belong to more than one PV (only setpoint_address is unique;
         # readback addresses may be shared), so map each address to a *list* of pv_ids —
@@ -672,21 +717,6 @@ class SnapshotService:
         if progress_callback:
             await progress_callback(total_pv_count, total_pv_count, "Processing results...")
 
-        # The save: a snapshot is owned by its facility's owner, and this instance writes
-        # only its own rows. The create route checked this before enqueueing; this is
-        # the backstop on the write itself.
-        if facility_id is not None:
-            facility_owner = (await facilities_gateway.owners_by_id({facility_id})).get(facility_id)
-            if facility_owner is not None:
-                require_owned(facility_owner, f"A snapshot of facility {data.facility or facility_id}")
-
-        # Create the snapshot row. The flush puts it in the open transaction so the
-        # COPY below (same connection) sees it for the FK — no commit needed here.
-        snapshot = Snapshot(
-            title=data.title, description=data.description, created_by=created_by, facility_id=facility_id
-        )
-        snapshot = await self.snapshot_repo.create(snapshot)
-
         # Group the readings by PV, keeping only connected reads.
         pv_data: dict[str, dict] = {}  # pv_id -> {setpoint, readback, address}
 
@@ -725,7 +755,6 @@ class SnapshotService:
             alarm_source = setpoint or readback
             snapshot_values_data.append(
                 {
-                    "snapshot_id": snapshot.id,
                     "pv_id": pv_id,
                     "pv_name": data_dict.get("address", ""),
                     "setpoint_value": setpoint,
@@ -736,30 +765,90 @@ class SnapshotService:
                 }
             )
 
+        return CapturedValues(rows=snapshot_values_data, total_pvs=total_pv_count, taken_at=now)
+
+    async def save_captured(
+        self,
+        captured: CapturedValues,
+        *,
+        snapshot_id: str,
+        title: str,
+        description: str | None,
+        created_by: str | None,
+        facility_id: str | None,
+        progress_callback: Callable | None = None,
+    ) -> SnapshotSummaryDTO:
+        """Save what ``capture_values`` read as this instance's snapshot ``snapshot_id``, taken at its time.
+
+        Raises
+        ------
+        NotOwner
+            When the facility is another instance's: the backstop on the write itself,
+            after the create route's check.
+        """
+        start_time = datetime.now(UTC)
+        if facility_id is not None:
+            facility_owner = (await facilities_gateway.owners_by_id({facility_id})).get(facility_id)
+            if facility_owner is not None:
+                require_owned(facility_owner, f"A snapshot of facility {facility_id}")
         if progress_callback:
             await progress_callback(
-                total_pv_count, total_pv_count, f"Saving {len(snapshot_values_data):,} PV values to database..."
+                captured.total_pvs, captured.total_pvs, f"Saving {len(captured.rows):,} PV values to database..."
             )
-
-        count = await bulk_insert_snapshot_values(
-            self.session, snapshot_values_data, progress_callback=progress_callback
+        count = await self._save_snapshot(
+            snapshot_id,
+            title=title,
+            description=description,
+            created_by=created_by,
+            facility_id=facility_id,
+            rows=captured.rows,
+            created_at=captured.taken_at,
+            progress_callback=progress_callback,
         )
+        if count is None:
+            raise SnapshotIdConflict(f"Snapshot {snapshot_id} is already here")
+        logger.info("Snapshot saved in %.2fs (%d values)", (datetime.now(UTC) - start_time).total_seconds(), count)
+        snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
+        return await self._summary(snapshot, pv_count=count)
 
-        logger.info("Snapshot created in %.2fs (%d values)", (datetime.now(UTC) - start_time).total_seconds(), count)
+    async def bundle_captured(
+        self,
+        captured: CapturedValues,
+        *,
+        snapshot_id: str,
+        title: str,
+        description: str | None,
+        created_by: str | None,
+        facility_id: str | None,
+    ) -> SnapshotBundleDTO:
+        """What ``capture_values`` read, as a bundle for the owner's captured import.
 
-        meta_pvs = [pv.pv_id for pv in await self.meta_pv_repo.get(active=True)]
-        return SnapshotSummaryDTO(
-            id=snapshot.id,
-            owner_instance=snapshot.owner_instance,
-            title=snapshot.title,
-            description=snapshot.description,
-            created_date=snapshot.created_at,
-            created_by=snapshot.created_by,
-            pv_count=count,
-            facility=await self._facility_slug(snapshot.facility_id),
-            retain=snapshot.retain,
-            imported_from=snapshot.imported_from,
-            meta_pvs=await self._get_meta_pv_values_for_snapshot(snapshot.id, meta_pvs),
+        The id and creation time are this instance's, assigned at capture; values
+        carry their PV ids, which are the owner's, since a mirror's PV rows are its
+        arms' copies.
+        """
+        return SnapshotBundleDTO(
+            format=BUNDLE_FORMAT,
+            version=1,
+            source_instance=local_instance(),
+            id=snapshot_id,
+            title=title,
+            description=description,
+            created_date=captured.taken_at,
+            created_by=created_by,
+            facility=await self._facility_slug(facility_id),
+            values=[
+                BundleValueDTO(
+                    pv_id=row["pv_id"],
+                    pv_name=row["pv_name"],
+                    setpoint_value=row["setpoint_value"],
+                    readback_value=row["readback_value"],
+                    status=row["status"],
+                    severity=row["severity"],
+                    timestamp=row["timestamp"],
+                )
+                for row in captured.rows
+            ],
         )
 
     async def plan_restore(
@@ -831,7 +920,7 @@ class SnapshotService:
         return SnapshotBundleDTO(
             format=BUNDLE_FORMAT,
             version=1,
-            source_instance=get_settings().instance,
+            source_instance=local_instance(),
             id=snapshot.id,
             title=snapshot.title,
             description=snapshot.description,
@@ -1015,6 +1104,7 @@ class SnapshotService:
         rows: list[dict],
         created_at: datetime | None = None,
         imported_from: str | None = None,
+        progress_callback: Callable | None = None,
     ) -> int | None:
         """Insert this instance's snapshot with a given id, and its values, unless that id is taken.
 
@@ -1040,7 +1130,7 @@ class SnapshotService:
             return None
         for row in rows:
             row["snapshot_id"] = snapshot_id
-        return await bulk_insert_snapshot_values(self.session, rows)
+        return await bulk_insert_snapshot_values(self.session, rows, progress_callback=progress_callback)
 
     async def _already_saved(self, existing: Snapshot, bundle: SnapshotBundleDTO) -> SnapshotImportResultDTO:
         """The answer to a captured import whose id is already here: what was saved, unchanged.
@@ -1109,7 +1199,6 @@ class SnapshotService:
             (``MagnetTrimHook`` for the ``magnet_trim`` provider, and so on).
         """
         logger.info("Restoring snapshot: %s", snapshot_id)
-        start_time = datetime.now(UTC)
 
         # A deleted snapshot keeps its values, so check first: one deleted after its restore
         # was queued restores nothing, the same as a snapshot that doesn't exist.
@@ -1120,7 +1209,21 @@ class SnapshotService:
             values = await self.value_repo.get_by_snapshot_and_pvs(snapshot_id, request.pv_ids)
         else:
             values = await self.value_repo.get_by_snapshot(snapshot_id)
+        return await self.restore_values(values, progress_callback=progress_callback)
 
+    async def restore_values(
+        self,
+        values: list[Any],
+        progress_callback: Callable | None = None,
+    ) -> RestoreResultDTO:
+        """Restore stored values' setpoints to EPICS: ``restore_snapshot`` without the load.
+
+        ``values`` are rows with a ``pv_id`` and a ``setpoint_value`` (the stored JSONB
+        blob, or its text): a snapshot's values here, or a bundle's adapted to that
+        shape for one that isn't saved here yet. Everything else is as
+        ``restore_snapshot`` describes.
+        """
+        start_time = datetime.now(UTC)
         if not values:
             return RestoreResultDTO(total_pvs=0, success_count=0, failure_count=0, failures=[])
 

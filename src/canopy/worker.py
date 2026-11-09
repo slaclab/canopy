@@ -16,7 +16,7 @@ from arq import cron
 from arq.connections import RedisSettings
 
 from canopy.core.db import dispose_engine
-from canopy.core.config import get_settings
+from canopy.core.config import Settings, get_settings
 from canopy.core.logging import configure_logging
 from canopy.epics.config import get_epics_config
 from canopy.epics.gateway import build_connector
@@ -84,6 +84,21 @@ async def on_shutdown(ctx: dict) -> None:
 
 # Task functions registered with Arq. Each module appends its tasks here.
 FUNCTIONS = [ping, convert_batch, create_snapshot_task, restore_snapshot_task]
+# Tasks that write to the machine, registered only with CANOPY_MACHINE_ACCESS=write.
+MACHINE_FUNCTIONS = [restore_snapshot_task]
+
+
+def worker_functions(settings: Settings) -> list:
+    """The task functions a worker registers: every one, less the machine writes without machine access.
+
+    A capture only reads EPICS, so every worker registers it. A restore that reaches a
+    queue whose worker has no machine access fails as an unknown task rather than run;
+    the API refuses or forwards it before it is queued. That is also why each instance
+    needs its own Redis (or database number).
+    """
+    if settings.machine_writes:
+        return FUNCTIONS
+    return [function for function in FUNCTIONS if function not in MACHINE_FUNCTIONS]
 
 
 def worker_cron_jobs(role: str) -> list:
@@ -111,7 +126,7 @@ def worker_cron_jobs(role: str) -> list:
 
 
 class WorkerSettings:
-    functions = FUNCTIONS
+    functions = worker_functions(get_settings())
     cron_jobs = worker_cron_jobs(get_settings().role)
     on_startup = on_startup
     on_shutdown = on_shutdown

@@ -173,8 +173,9 @@ def test_owner_param_matches_the_apps_query(route):
 
 
 def test_the_owner_param_creates():
+    # A capture takes ?owner= too, but is never routed: it is taken here (canopy.squirrel.capture).
+    assert ("POST", "/squirrel/v1/snapshots") in LOCAL
     assert {(r.method, r.path) for r in ROUTES if r.owner_param} == {
-        ("POST", "/squirrel/v1/snapshots"),
         ("POST", "/squirrel/v1/pvs"),
         ("POST", "/squirrel/v1/pvs/multi"),
         ("POST", "/squirrel/v1/pvs/meta"),
@@ -205,8 +206,15 @@ def test_only_the_captured_import_stays_by_mode():
     }
 
 
-def test_reads_and_unknown_paths_are_never_routed():
+def test_only_a_restore_writes_the_machine():
+    assert {(r.method, r.path) for r in ROUTES if r.machine} == {
+        ("POST", "/squirrel/v1/snapshots/{snapshot_id}/restore")
+    }
+
+
+def test_reads_captures_and_unknown_paths_are_never_routed():
     assert match("GET", "/squirrel/v1/snapshots") is None
+    assert match("POST", "/squirrel/v1/snapshots") is None
     assert match("PUT", "/hare/v1/pvs/SOME:PV") is None
     assert match("POST", "/elog/v1/apps/squirrel/entries") is None
 

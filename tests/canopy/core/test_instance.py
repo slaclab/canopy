@@ -50,6 +50,7 @@ def test_primary_defaults(client):
         "historyUrl": None,
         "windowDays": None,
         "alembicHead": SHIPPED_HEAD,
+        "machineAccess": "write",
         "arms": [],
     }
 
@@ -64,6 +65,7 @@ def test_mirror_reports_its_role_and_history_fields(client, history_settings):
         "historyUrl": "https://history.example.org",
         "windowDays": None,
         "alembicHead": SHIPPED_HEAD,
+        "machineAccess": "read",
         "arms": [],
     }
 

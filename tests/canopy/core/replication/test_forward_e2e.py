@@ -7,6 +7,7 @@ grants the docs name. Opt-in like the other end-to-end tests (the ``octopus`` fi
 """
 
 from uuid import uuid4
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import text
@@ -19,7 +20,9 @@ from canopy.core.arms import subscription_name
 from canopy.core.config import get_settings
 from canopy.core.forwarding.client import lsn_value, wait_until_applied
 from canopy.core.forwarding.context import ForwardedWrite, forwarded_write
+from canopy.squirrel.schemas.snapshot import BundleValueDTO, SnapshotBundleDTO
 from canopy.core.replication.subscriber import applied_lsn
+from canopy.squirrel.services.snapshot_service import SnapshotService
 
 from .conftest import Octopus, eventually, server_dsn, _subscribed
 
@@ -134,3 +137,75 @@ async def test_the_heads_own_rows_stay_on_the_head(octopus: Octopus, head_app):
     assert await eventually(landed) == head.name
     for arm in (arm1, arm2):
         assert await arm.admin.fetchval("SELECT count(*) FROM squirrel.tag_group WHERE id = $1", group_id) == 0
+
+
+async def _captured_import(octopus: Octopus, arm: str, bundle: SnapshotBundleDTO, monkeypatch) -> tuple[bool, str]:
+    """Save ``bundle`` on ``arm`` the way its captured import does, as a forwarded request.
+
+    Returns whether it saved anything, and the position the arm would answer with.
+    """
+    monkeypatch.setenv("CANOPY_INSTANCE", arm)
+    get_settings.cache_clear()
+    engine = create_async_engine(
+        make_url(octopus.arms[arm].dsn).set(drivername="postgresql+asyncpg").render_as_string(hide_password=False),
+        poolclass=NullPool,
+    )
+    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False, autoflush=False)
+    write = ForwardedWrite(on_behalf_of="operator@head", report_position=True)
+    token = forwarded_write.set(write)
+    original = db.get_session_maker
+    db.get_session_maker = lambda: maker
+    try:
+        sessions = db.get_session()
+        session = await anext(sessions)
+        result = await SnapshotService(session, None).import_bundle(bundle, captured=True, created_by="operator@head")
+        with pytest.raises(StopAsyncIteration):
+            await anext(sessions)
+    finally:
+        db.get_session_maker = original
+        forwarded_write.reset(token)
+        await engine.dispose()
+        monkeypatch.setenv("CANOPY_INSTANCE", octopus.head.name)
+        get_settings.cache_clear()
+    return result.created, write.commit_lsn
+
+
+async def test_a_snapshot_taken_on_the_head_comes_back_from_its_arm(octopus: Octopus, head_app, monkeypatch):
+    arm1, _ = octopus.arms.values()
+    ids = await _subscribed(octopus, arm1.name)
+    head = octopus.head
+    await head.admin.execute(f'GRANT SELECT ON pg_replication_origin_status TO "{head.app}"')
+    await head.admin.execute(f'GRANT EXECUTE ON FUNCTION pg_show_replication_origin_status() TO "{head.app}"')
+    snapshot_id = str(uuid4())
+    bundle = SnapshotBundleDTO(
+        format="canopy.squirrel.snapshot-bundle",
+        version=1,
+        source_instance=head.name,
+        id=snapshot_id,
+        title="Taken on the head",
+        created_date=datetime(2026, 11, 6, 14, 2, tzinfo=UTC),
+        facility=f"fac_{arm1.name}",
+        values=[BundleValueDTO(pv_id=ids["pv"], pv_name="SIM:PV:1:SETPOINT", setpoint_value={"value": 2.0})],
+    )
+    subscription = subscription_name(arm1.name)
+
+    async def is_here(conn) -> bool:
+        return bool(await conn.fetchval("SELECT 1 FROM squirrel.snapshot WHERE id = $1::uuid", snapshot_id))
+
+    created, position = await _captured_import(octopus, arm1.name, bundle, monkeypatch)
+    assert created and position
+    assert await wait_until_applied(position, 30.0, subscription=subscription, until=is_here) is True
+    row = await head.conn.fetchrow(
+        "SELECT owner_instance, created_by, created_at FROM squirrel.snapshot WHERE id = $1", snapshot_id
+    )
+    assert (row["owner_instance"], row["created_by"]) == (arm1.name, "operator@head")
+    assert row["created_at"] == bundle.created_date
+
+    # A resend saves nothing, and still answers with a position: the arm's current one.
+    again, replay_position = await _captured_import(octopus, arm1.name, bundle, monkeypatch)
+    assert not again
+    assert lsn_value(replay_position) >= lsn_value(position)
+    # The snapshot is already here, so the wait ends at once even if unpublished WAL
+    # keeps the position ahead of anything that replicates.
+    assert await wait_until_applied(replay_position, 5.0, subscription=subscription, until=is_here) is True
+    assert await arm1.admin.fetchval("SELECT count(*) FROM squirrel.snapshot WHERE id = $1", snapshot_id) == 1
