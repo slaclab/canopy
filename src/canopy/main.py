@@ -36,6 +36,8 @@ from canopy.analytics.app import app as analytics_app
 from canopy.analytics.app import analytics_lifespan
 from canopy.converter.app import app as converter_app
 from canopy.converter.app import converter_lifespan
+from canopy.core.instance import router as instance_router
+from canopy.core.instance import shipped_alembic_head
 from canopy.core.security import bind_key_registry
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.keys.routes import router as api_keys_router
@@ -85,6 +87,8 @@ async def lifespan(app: FastAPI):
     # an unexplained 401 on the first request.
     settings = get_settings()
     bind_key_registry(build_key_registry(settings))
+    # Read the shipped migrations head now, off the request path; /v1/instance serves the cached value.
+    shipped_alembic_head()
     facilities_gateway.register_in_use_checker(_facility_granted_to_key, "API key grants")
     async with (
         mole_lifespan(),
@@ -130,6 +134,7 @@ tag_module(app, "core")
 
 app.include_router(api_keys_router)
 app.include_router(facilities_router)
+app.include_router(instance_router)
 
 app.mount("/mole", mole_app)
 app.mount("/hare", hare_app)

@@ -43,6 +43,7 @@ they live in a `.env` file next to it, which compose reads both for its own
 |----------|----------|---------|
 | `IMAGE` | Compose | `ghcr.io/slaclab/canopy:<tag>` |
 | `API_PORT` | Compose | Port the API listens on, on the host. Default `8000` |
+| `CANOPY_INSTANCE` | Yes | This instance's permanent name, e.g. `arm1`: lowercase letters, digits and underscores, at most 48. Set it before the first `alembic upgrade head` |
 | `CANOPY_DATABASE_URL` | Yes | `postgresql+asyncpg://user:pass@host:port/db` |
 | `CANOPY_REDIS_URL` | Yes | `redis://[:password@]host:port/0` |
 | `CANOPY_API_KEYS` | Yes | The long-lived env keys. See [API keys](api-keys.md) |
@@ -62,6 +63,7 @@ cover every other setting. Each value must be a single line.
 # .env
 IMAGE=ghcr.io/slaclab/canopy:1.2.0
 API_PORT=8000
+CANOPY_INSTANCE=<instance name>
 CANOPY_DATABASE_URL=postgresql+asyncpg://canopy:<pg-password>@<pg-host>:5432/canopy
 CANOPY_REDIS_URL=redis://:<redis-password>@<redis-host>:6379/0
 CANOPY_API_KEYS=<display-read-token>:read@*,<ops-admin-token>:admin@*
