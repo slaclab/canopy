@@ -3,7 +3,6 @@
 A fake connector stands in for ``canopy.epics`` — no IOCs, no DB.
 """
 
-import time
 import asyncio
 from typing import Any
 from datetime import UTC, datetime
@@ -111,23 +110,34 @@ async def test_get_many_progress_is_chunked():
 class SlowConnector:
     """Reads that take `delay[addr]` seconds (0 by default), tracking how many are in flight.
 
-    With `gate` set, every read waits on it first, so reads can be held open.
+    With `gate` set, reads wait on it first, so they can be held open: the reads in
+    `held`, or every read if `held` isn't given.
     """
 
-    def __init__(self, delay: dict[str, float] | None = None, gate: asyncio.Event | None = None):
+    def __init__(
+        self,
+        delay: dict[str, float] | None = None,
+        gate: asyncio.Event | None = None,
+        held: set[str] | None = None,
+    ):
         self.delay = delay or {}
         self.gate = gate
-        self.inflight = 0
+        self.held = held
+        self.open: set[str] = set()
         self.max_inflight = 0
         self.started = 0
         self.cancelled = 0
 
+    @property
+    def inflight(self) -> int:
+        return len(self.open)
+
     async def get(self, addr: str, *, timeout=None) -> PVValue:
-        self.inflight += 1
+        self.open.add(addr)
         self.started += 1
         self.max_inflight = max(self.max_inflight, self.inflight)
         try:
-            if self.gate is not None:
+            if self.gate is not None and (self.held is None or addr in self.held):
                 await self.gate.wait()
             await asyncio.sleep(self.delay.get(addr, 0))
             return _pv(addr, 1.0)
@@ -135,18 +145,23 @@ class SlowConnector:
             self.cancelled += 1
             raise
         finally:
-            self.inflight -= 1
+            self.open.discard(addr)
 
 
 async def test_get_many_slow_pvs_do_not_stall_the_rest():
-    # One slow PV in each of what used to be three chunks. Chunk by chunk this took
-    # three delays in a row; in one pool the slow reads overlap.
+    # One read held open in each of what used to be three chunks. Chunk by chunk, the
+    # first chunk waited on its held read and the next two never started; in one pool
+    # all three are open at once.
     addrs = [f"P{i}" for i in range(6)]
-    conn = SlowConnector(delay={"P0": 0.3, "P2": 0.3, "P4": 0.3})
-    start = time.perf_counter()
-    out = await EpicsIO(conn, concurrency=4, chunk_size=2).get_many(addrs)
-    assert time.perf_counter() - start < 0.6
-    assert set(out) == set(addrs)
+    held = {"P0", "P2", "P4"}
+    gate = asyncio.Event()
+    conn = SlowConnector(gate=gate, held=held)
+    task = asyncio.create_task(EpicsIO(conn, concurrency=4, chunk_size=2).get_many(addrs))
+    async with asyncio.timeout(5):  # only stops a failing run from hanging
+        while conn.open != held:
+            await asyncio.sleep(0)
+    gate.set()
+    assert set(await task) == set(addrs)
 
 
 async def test_get_many_progress_counts_completions_in_order():
