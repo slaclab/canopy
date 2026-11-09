@@ -555,9 +555,10 @@ class PvService:
         pv = await self.pv_repo.get_by_id(pv_id)
         if not pv:
             return None
-        require_owned(pv.owner_instance, f"PV {pv_id}")
+        # The facility gate first: a caller who can't reach the row isn't told its owner.
         facility_ids = await self.pv_repo.facility_ids_for(pv_id)
         await self._require_facility_write(facility_ids, "this PV")
+        require_owned(pv.owner_instance, f"PV {pv_id}")
         if data.facilities is not None:
             new_ids = set((await self._resolve_slugs(data.facilities)).values())
             # A restricted key may not strip a PV down to unassigned: that would hide it
@@ -611,8 +612,8 @@ class PvService:
         # Locked, so a meta-PV marker can't be added between the check below and the delete.
         if (pv := await self.pv_repo.get_by_id(pv_id, for_update=True)) is None:
             return False
-        require_owned(pv.owner_instance, f"PV {pv_id}")
         await self._require_facility_write(await self.pv_repo.facility_ids_for(pv_id), "this PV")
+        require_owned(pv.owner_instance, f"PV {pv_id}")
         if await self.meta_pv_repo.get_one(pv_id) is not None:
             raise BadRequest(
                 "Cannot delete a PV that is still registered as a meta-PV; remove the meta-PV marker first"

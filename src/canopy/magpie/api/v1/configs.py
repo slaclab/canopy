@@ -17,7 +17,11 @@ from typing import Annotated
 
 from fastapi import Path, Query, Security, APIRouter
 
-from canopy.core.security import require_read_access, require_write_access
+from canopy.core.security import (
+    forwarded_for,
+    require_read_access,
+    require_write_access,
+)
 from canopy.magpie.errors import ConfigNotFound, InvalidAppName
 from canopy.core.app_names import APP_NAME_RULE, is_app
 from canopy.core.ownership import OwnerQuery
@@ -48,8 +52,14 @@ def _validate_app_name(app: str) -> None:
 async def create_config(
     app: AppPath, data: NewConfigDTO, service: ConfigServiceDep, owner: OwnerQuery = None
 ) -> ConfigDTO:
-    """Create a config under ``app``, owned by ``owner`` or this instance."""
+    """Create a config under ``app``, owned by ``owner`` or this instance.
+
+    ``createdBy`` is the client's to set, except on a write a history head forwarded
+    on someone's behalf: that one records the name it gave.
+    """
     _validate_app_name(app)
+    if (caller := forwarded_for()) is not None:
+        data = data.model_copy(update={"created_by": caller})
     return await service.create(app, data, owner)
 
 

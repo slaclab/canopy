@@ -49,6 +49,10 @@ class Settings(BaseSettings):
         Days of history this instance keeps, at least 1; ``None`` means it keeps
         everything. A blank value, as Helm and compose render an unset one, is ``None``
         here and for ``history_url``.
+    accept_forwarded_writes : bool
+        On a primary (an arm), trust ``X-Canopy-On-Behalf-Of`` from service keys, so
+        writes a history head forwards are recorded under the user it sent them for.
+        Off by default: the header is then refused from every key.
     """
 
     model_config = SettingsConfigDict(
@@ -99,6 +103,9 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    # Primary (arm) only: accept writes a history head forwards on a user's behalf.
+    accept_forwarded_writes: bool = False
 
 
 @lru_cache

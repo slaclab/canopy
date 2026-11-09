@@ -368,13 +368,20 @@ async def test_create_enqueues_job(client: AsyncClient, enqueued: list):
     assert r.status_code == 200
     assert r.json() == {"jobId": "test-job-id", "statusUrl": "/jobs/v1/test-job-id"}
     assert enqueued[0][0] == "create_snapshot_task"
-    assert enqueued[0][2] == {"title": "T", "description": "D", "facility_id": None}
+    # The key's name, since nothing forwarded this request (test-write is CANOPY_API_KEYS entry #2).
+    assert enqueued[0][2] == {"title": "T", "description": "D", "facility_id": None, "created_by": "env:2"}
 
 
 async def test_create_with_use_cache_asks_the_worker_for_a_cached_snapshot(client: AsyncClient, enqueued: list):
     r = await client.post("/v1/snapshots?useCache=true", headers=WRITE_HEADERS, json={"title": "T", "description": "D"})
     assert r.status_code == 200
-    assert enqueued[0][2] == {"title": "T", "description": "D", "facility_id": None, "use_cache": True}
+    assert enqueued[0][2] == {
+        "title": "T",
+        "description": "D",
+        "facility_id": None,
+        "created_by": "env:2",
+        "use_cache": True,
+    }
 
 
 async def test_restore_existing_enqueues_with_pv_ids(client: AsyncClient, db_session: AsyncSession, enqueued: list):
