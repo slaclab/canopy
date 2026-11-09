@@ -99,8 +99,8 @@ synthetic value and writes always succeed unless configured to fail (see
       "failures": [
         {
           "pvId": "41a7...",
-          "pvName": "QUAD:LI21:201:BDES",
-          "error": "simulated put failure for QUAD:LI21:201:BDES",
+          "pvName": "QUAD:SIM:01:BDES",
+          "error": "simulated put failure for QUAD:SIM:01:BDES",
           "phase": "Setpoints"
         }
       ]
