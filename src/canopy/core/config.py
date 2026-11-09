@@ -1,8 +1,8 @@
 from typing import Literal
 from functools import lru_cache
 
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, ValidationError, field_validator
+from pydantic_settings import BaseSettings, SettingsError, SettingsConfigDict
 
 INSTANCE_NAME_PATTERN = r"^[a-z0-9_]{1,48}$"
 """An instance name: ``CANOPY_INSTANCE``, an arm's name and every owner stamp."""
@@ -104,3 +104,18 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def describe_settings_error(exc: ValidationError | SettingsError, prefix: str = "CANOPY_") -> str:
+    """Which settings are wrong and why, never their values.
+
+    A ``ValidationError``'s own text (``str`` and ``repr``) echoes its input, which
+    may hold a password, so only each error's variable and message are kept. A
+    ``SettingsError`` names only the field and its source (a value that isn't JSON).
+    """
+    if isinstance(exc, SettingsError):
+        return str(exc)
+    return "; ".join(
+        f"{prefix}{'__'.join(str(part) for part in error['loc']).upper()}: {error['msg']}"
+        for error in exc.errors(include_input=False, include_url=False, include_context=False)
+    )
