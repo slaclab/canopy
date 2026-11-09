@@ -8,6 +8,7 @@ Run::
     python -m canopy.core.replication subscribe   # head: once per arm, after its first migration
     python -m canopy.core.replication status      # either side: JSON on stdout
     python -m canopy.core.replication drift-check # head: compare with each arm, hourly after `refresh`
+    python -m canopy.core.replication reseed --arm <arm> --since <time>  # head: refill one arm's gap
 
 The database is ``CANOPY_DATABASE_URL`` and the side is ``CANOPY_ROLE`` (each
 command refuses on the wrong one): an arm is a ``primary``, a head a ``mirror``.
@@ -20,7 +21,8 @@ Logs go to stderr (JSON with ``CANOPY_LOG_FORMAT=json``), so stdout carries only
 ``status`` output. Exit status: 0 done (including "nothing to do"), 1 a database
 step failed, 2 refused (wrong role or a failed precondition; nothing changed).
 ``drift-check`` differs: 0 every table of every arm in step, 1 drift found, 2 the
-check couldn't be completed (see ``canopy.core.replication.drift``).
+check couldn't be completed (see ``canopy.core.replication.drift``). ``reseed``
+acts on the one arm its ``--arm`` names (see ``canopy.core.replication.reseed``).
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ import pydantic
 from canopy.core.arms import ArmsConfigError, get_arms_config
 from canopy.core.config import get_settings, describe_settings_error
 from canopy.core.logging import JsonFormatter
-from canopy.core.replication import drift
+from canopy.core.replication import drift, reseed
 from canopy.core.replication.sql import (
     Refused,
     ReplicationError,
@@ -86,6 +88,24 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="how long, per arm, to wait for that arm's slot to confirm its position and retry tables "
         "that came out inconclusive (default 30)",
+    )
+    fill = commands.add_parser(
+        "reseed", help="head: copy what one arm changed since a time, then resume its replication from now"
+    )
+    fill.add_argument("--arm", required=True, metavar="ARM", help="the arm to re-seed; other arms are untouched")
+    fill.add_argument(
+        "--since",
+        required=True,
+        type=reseed.parse_since,
+        metavar="TIME",
+        help="ISO 8601 time (UTC if no zone), no later than the newest snapshot the head holds from that arm",
+    )
+    fill.add_argument(
+        "--cut-wait",
+        type=float,
+        default=reseed.CUT_WAIT_S,
+        metavar="SECONDS",
+        help="how long to keep trying for an exact cut while the arm writes, before refusing (default 60)",
     )
     return parser
 
@@ -178,6 +198,8 @@ def main(argv: list[str] | None = None) -> int:
     _configure_logging(settings.log_format)
     if args.command == "drift-check":
         return asyncio.run(drift.run(args))
+    if args.command == "reseed":
+        return asyncio.run(reseed.run(args))
     return asyncio.run(run(args.command, getattr(args, "arm", None)))
 
 

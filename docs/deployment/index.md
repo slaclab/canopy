@@ -18,6 +18,8 @@ Two deployment paths are documented here:
   production compose file.
 - [Deploy at your facility](production.md) — image tags, required
   configuration, migrations, and health checks for a production instance.
+- [History mirror](history.md) — a head that copies its arms over Postgres
+  logical replication: topology, roles, release order, and runbooks.
 
 ## Configuration
 
@@ -39,7 +41,7 @@ essentials:
 | `CANOPY_INSTANCE` | **Required.** This instance's name: lowercase letters, digits and underscores, at most 48 (e.g. `arm1`). It is stamped on every row the instance creates, so it is permanent once the instance holds data: on a primary, `alembic` refuses to run when the database holds rows stamped with another name. Set it on the API, the worker and every `alembic` run. Reported by `GET /v1/instance` |
 | `CANOPY_HISTORY_URL`, `CANOPY_WINDOW_DAYS` | Optional. Reported by `GET /v1/instance` with the role, the instance name and the Alembic head shipped in the image: the URL of the instance's read-only history copy, and how many days of history it keeps (a whole number of at least 1; unset means all). A blank value counts as unset |
 | `CANOPY_ARMS__<arm>__PUBLISHER_DSN` | History head only (`CANOPY_ROLE=mirror`): one per arm, named after that arm's `CANOPY_INSTANCE` (lowercase letters, digits and underscores, at most 48). The libpq connection string (key=value or URI) the head's subscription `canopy_history_<arm>` uses to reach the arm as its replication role. `subscribe` and `refresh` also open it themselves before an initial copy, to refuse facility or Magpie slugs the head already holds, so the CLI's network must reach the arm at that address too. Supply it from a secret; the CLI never prints it. The arms can also be set as JSON in `CANOPY_ARMS` |
-| `CANOPY_ARMS__<arm>__READER_DSN` | History head only, for `python -m canopy.core.replication drift-check`: a `postgresql://` URI to that arm as its read-only reader role (asyncpg needs the URI form). A secret, like the publisher DSN |
+| `CANOPY_ARMS__<arm>__READER_DSN` | History head only, for `python -m canopy.core.replication drift-check` and `reseed`: a `postgresql://` URI to that arm as its read-only reader role (asyncpg needs the URI form). A secret, like the publisher DSN |
 | `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_ROLE`, `__APP_ROLE` | Role names for the replication CLI: on a primary, `publish` grants the replication role (default `replicator`) and the reader role (default `canopy_reader`) SELECT on the published tables; on a history head, `grants` lets the app role (default `canopy_app`) read every row and write only the head's own: row-level security on the tables that name a row's owner (facilities, PVs, snapshots, tag groups, Magpie configs) limits its writes to rows whose `owner_instance` is the head's `CANOPY_INSTANCE`, and any other role but the tables' owner sees none of those tables' rows. It also gets read-write on API keys |
 | `CANOPY_<MODULE>__<FIELD>` | Per-module tuning (e.g. `CANOPY_VOLE__GLOBAL_BYTES_MAX`) |
 
@@ -114,7 +116,7 @@ publication in step with the tables. The head runs `alembic upgrade head`, then
 `grants` and `refresh`, before any of its arms deploys; `subscribe` runs once per
 arm. On the head, `subscribe`, `refresh`, `status` and `drift-check` act on every
 arm in `CANOPY_ARMS__<arm>__…`, or on one with `--arm <arm>`. `status` reports
-either side as JSON. `drift-check`, run on the head after the hourly `refresh`,
+either side as JSON (see [History mirror](history.md)). `drift-check`, run on the head after the hourly `refresh`,
 compares each arm's rows with the head's copy, then checks that every reference on
 the head finds its parent. Per arm it exits 0 only when every table was compared and
 is in step, 1 on drift, 2 when it couldn't check everything; a run exits with the
