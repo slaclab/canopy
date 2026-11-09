@@ -4,6 +4,9 @@ from functools import lru_cache
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+INSTANCE_NAME_PATTERN = r"^[a-z0-9_]{1,48}$"
+"""An instance name: ``CANOPY_INSTANCE``, an arm's name and every owner stamp."""
+
 
 class Settings(BaseSettings):
     """Core application settings, read from the environment with the ``CANOPY_`` prefix.
@@ -30,16 +33,18 @@ class Settings(BaseSettings):
     redis_url : str
         Redis DSN backing the Arq job queue and per-job progress.
     role : {"primary", "mirror"}
-        ``"mirror"`` makes this instance a read-only copy of a primary's data: write
-        and admin routes refuse with ``read_only_instance`` (API-key management
-        excepted) and the worker registers only stateless tasks.
+        Which side of history replication this instance's database is on. A
+        ``"primary"`` holds only rows it owns, publishes them and may prune. A
+        ``"mirror"`` (the head) subscribes to its arms and holds their rows beside
+        its own. Either way an instance writes only rows it owns
+        (``canopy.core.ownership``).
     instance : str
         This instance's name: lowercase letters, digits and underscores, at most 48
         (``canopy_history_<name>`` must fit a Postgres identifier). Required, and
         permanent once the instance holds data. Reported by ``GET /v1/instance``.
     history_url : str | None
-        Base URL of the read-only history instance holding this instance's full
-        history, reported by ``GET /v1/instance`` so clients can link to it.
+        Base URL of the history head holding this instance's full history,
+        reported by ``GET /v1/instance`` so clients can link to it.
     window_days : int | None
         Days of history this instance keeps, at least 1; ``None`` means it keeps
         everything. A blank value, as Helm and compose render an unset one, is ``None``
@@ -79,11 +84,11 @@ class Settings(BaseSettings):
     # Redis — Arq job queue + per-job progress; used by canopy-worker and the jobs module.
     redis_url: str = "redis://localhost:6379/0"
 
-    # Instance role. A "mirror" serves a read-only copy of a primary's database
-    # (fed by Postgres logical replication), so nothing here may write the
-    # replicated tables. Reported, with the fields below, by GET /v1/instance.
+    # Instance identity. ``instance`` is stamped on every row this instance
+    # creates (``owner_instance``), so it can't change once the instance holds
+    # data. Reported, with the fields below, by GET /v1/instance.
     role: Literal["primary", "mirror"] = "primary"
-    instance: str = Field(pattern=r"^[a-z0-9_]{1,48}$")
+    instance: str = Field(pattern=INSTANCE_NAME_PATTERN)
     history_url: str | None = None
     window_days: int | None = Field(None, ge=1)
 

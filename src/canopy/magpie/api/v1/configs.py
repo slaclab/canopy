@@ -20,6 +20,7 @@ from fastapi import Path, Query, Security, APIRouter
 from canopy.core.security import require_read_access, require_write_access
 from canopy.magpie.errors import ConfigNotFound, InvalidAppName
 from canopy.core.app_names import APP_NAME_RULE, is_app
+from canopy.core.ownership import OwnerQuery
 from canopy.core.validation import parse_continuation_token
 from canopy.magpie.dependencies import ConfigServiceDep
 from canopy.contracts.pagination import PagedResult
@@ -44,10 +45,12 @@ def _validate_app_name(app: str) -> None:
 
 
 @router.post("/{app}", dependencies=[Security(require_write_access)])
-async def create_config(app: AppPath, data: NewConfigDTO, service: ConfigServiceDep) -> ConfigDTO:
-    """Create a config under ``app``."""
+async def create_config(
+    app: AppPath, data: NewConfigDTO, service: ConfigServiceDep, owner: OwnerQuery = None
+) -> ConfigDTO:
+    """Create a config under ``app``, owned by ``owner`` or this instance."""
     _validate_app_name(app)
-    return await service.create(app, data)
+    return await service.create(app, data, owner)
 
 
 @router.get("/{app}", dependencies=[Security(require_read_access)])

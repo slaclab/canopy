@@ -41,6 +41,8 @@ class ConfigDTO(ConfigBase):
     """Full config response DTO."""
 
     id: str
+    # The instance that created the config and alone writes it (``canopy.core.ownership``).
+    owner_instance: str
     app: str
     slug: str
     created_date: datetime
