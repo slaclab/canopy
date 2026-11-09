@@ -174,12 +174,15 @@ async def test_get_many_cancelled_cancels_reads_in_flight():
     task = asyncio.create_task(EpicsIO(conn, concurrency=4).get_many([f"P{i}" for i in range(20)]))
     while conn.inflight < 4:
         await asyncio.sleep(0)
+    # Only the 4 reads in flight have tasks; the other 16 don't exist yet.
+    reads = [t for t in asyncio.all_tasks() if t not in (asyncio.current_task(), task)]
+    assert len(reads) == 4
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert conn.inflight == 0
     assert conn.cancelled == conn.started == 4
-    # Reads still queued on the semaphore never reach the connector, and none is left over.
+    # Reads not yet started never reach the connector, and no task is left over.
     leftover = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
     assert leftover == []
 
