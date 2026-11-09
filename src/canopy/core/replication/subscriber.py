@@ -10,6 +10,13 @@ Order on a head's deploy: ``alembic upgrade head``, then ``grants``, then
 no-op for an arm already subscribed. The head always migrates before its arms, so
 it never lacks a table an arm publishes.
 
+Two commands reach one arm's Postgres over its ``CANOPY_ARMS__<arm>__HEARTBEAT_DSN``
+rather than through the subscription: ``heartbeat`` records the head's backup,
+WAL-archive and drift checks for that arm there, and ``switch`` (once, when the arm
+moves to the split layout) reads the arm's slot position before moving the
+subscription. Arms may differ: one on the split pair and pruning, another on
+``canopy_history``.
+
 Postgres runs ``CREATE SUBSCRIPTION`` (when it creates the slot) and
 ``ALTER SUBSCRIPTION ... REFRESH`` only outside a transaction, which is how asyncpg
 executes a bare statement.
@@ -17,6 +24,7 @@ executes a bare statement.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Mapping, Callable, Awaitable
 
@@ -132,15 +140,23 @@ async def _subscribed_tables(conn: asyncpg.Connection, subid: int) -> dict[str, 
     return {row["name"]: _TABLE_STATES.get(row["state"], row["state"]) for row in rows}
 
 
+def _layout(publications: list[str], registry: ReplicationRegistry) -> str | None:
+    """``"single"`` or ``"split"`` when ``publications`` are exactly that layout's, else ``None``."""
+    for layout, expected in (("single", registry.publications), ("split", registry.split_publications)):
+        if sorted(publications) == sorted(p.name for p in expected):
+            return layout
+    return None
+
+
 def _warn_on_drift(sub: asyncpg.Record, registry: ReplicationRegistry) -> None:
     """Log where an existing subscription differs from what ``subscribe`` would create."""
-    expected = sorted(p.name for p in registry.publications)
-    if sorted(sub["subpublications"]) != expected:
+    if _layout(sub["subpublications"], registry) is None:
         logger.warning(
-            "Subscription %s reads publications %s; the registry expects %s",
+            "Subscription %s reads publications %s; the registry expects %s or %s",
             sub["subname"],
             ", ".join(sub["subpublications"]),
-            ", ".join(expected),
+            ", ".join(p.name for p in registry.publications),
+            ", ".join(p.name for p in registry.split_publications),
         )
     if sub["substream"] != "p":
         logger.warning(
@@ -245,6 +261,7 @@ async def subscribe(
     registry: ReplicationRegistry = REGISTRY,
     connect_arm: ArmConnector | None = None,
     copy_data: bool = True,
+    split: bool = False,
 ) -> dict:
     """Create the head's subscription to each arm, copying every table the arm publishes.
 
@@ -289,6 +306,9 @@ async def subscribe(
         ``publisher_dsn``, the way the subscription connects.
     copy_data : bool
         ``False`` for disabled subscriptions without the initial copy.
+    split : bool
+        Subscribe to the split pair, for an arm that has already switched layouts.
+        Layouts are per arm, so this needs ``only``.
 
     Returns
     -------
@@ -299,14 +319,17 @@ async def subscribe(
     Raises
     ------
     Refused
-        Wrong role, no arm (or an unknown one), an arm without a ``publisher_dsn`` or
-        with the head's name, Postgres older than 16, insufficient privileges, rows
-        of the arm already here, or a key clash. Nothing was created.
+        Wrong role, no arm (or an unknown one), ``split`` without ``only``, an arm
+        without a ``publisher_dsn`` or with the head's name, Postgres older than 16,
+        insufficient privileges, rows of the arm already here, or a key clash.
+        Nothing was created.
     ReplicationError
         An arm couldn't be reached for its check, or ``CREATE SUBSCRIPTION`` failed
         for it (messages redacted); the other arms were created.
     """
     require_role("subscribe", "mirror", role)
+    if split and only is None:
+        raise Refused("the split layout is one arm's; name it with --arm")
     selected = _selected_arms(arms, only, head)
     if lacking := [
         arm for arm in selected if not (arms[arm].publisher_dsn and arms[arm].publisher_dsn.get_secret_value())
@@ -371,7 +394,7 @@ async def subscribe(
             "with its connection string; set log_min_error_statement = panic on this role to prevent it"
         )
 
-    publications = ", ".join(quote_ident(p.name) for p in registry.publications)
+    publications = ", ".join(quote_ident(p.name) for p in registry.layout(split))
     options = "copy_data = true" if copy_data else "copy_data = false, enabled = false"
     for arm in checked:
         name = subscription_name(arm)
@@ -672,7 +695,8 @@ async def _arm_status(conn: asyncpg.Connection, arm: str, registry: ReplicationR
         "enabled": sub["subenabled"],
         "owner": sub["owner"],
         "publications": list(sub["subpublications"]),
-        "expected_publications": [p.name for p in registry.publications],
+        "layout": (layout := _layout(sub["subpublications"], registry)),
+        "expected_publications": [p.name for p in registry.layout(layout == "split")],
         "streaming": sub["substream"],
         "slot_name": sub["subslotname"],
         "worker": jsonable(worker) if worker else None,
@@ -721,3 +745,197 @@ async def subscriber_status(
         "subscriptions": [await _arm_status(conn, arm, registry) for arm in selected],
         "unexpected": _unexpected(await _history_subscriptions(conn), arms),
     }
+
+
+async def _connect_arm(name: str, arm: Arm, command: str) -> tuple[asyncpg.Connection, str]:
+    """A connection to arm ``name`` over its ``heartbeat_dsn``, and the DSN (for redaction)."""
+    if arm.heartbeat_dsn is None or not arm.heartbeat_dsn.get_secret_value():
+        raise Refused(
+            f"{command} needs CANOPY_ARMS__{name.upper()}__HEARTBEAT_DSN, a URI to arm {name} as its heartbeat role"
+        )
+    dsn = arm.heartbeat_dsn.get_secret_value()
+    try:
+        return await asyncpg.connect(dsn, server_settings={"application_name": "canopy-replication"}), dsn
+    except (OSError, asyncpg.PostgresError) as exc:
+        raise ReplicationError(f"cannot connect to arm {name}: {redact(str(exc), [dsn])}") from None
+
+
+async def switch(
+    conn: asyncpg.Connection,
+    *,
+    role: str,
+    arm: str,
+    arms: Mapping[str, Arm],
+    registry: ReplicationRegistry = REGISTRY,
+    timeout: float = 120.0,
+) -> dict:
+    """Move the head's subscription to ``arm`` from ``canopy_history`` to the split pair.
+
+    Run it once per arm, after ``publish --split`` on that arm has created the split
+    pair. It waits until the subscription's slot on the arm has confirmed a WAL
+    position taken after the pair existed: a subscription whose slot is still behind
+    a publication's creation fails to find it and retries forever. Then it sets the
+    publications without copying, since every table already has its rows. A no-op
+    when the subscription already reads the split pair. Other arms are untouched.
+
+    Parameters
+    ----------
+    conn : asyncpg.Connection
+        Connection to the head's database, as the subscription's owner.
+    role : str
+        This instance's ``CANOPY_ROLE``; must be ``"mirror"``.
+    arm : str
+        The arm whose subscription moves.
+    arms : Mapping[str, Arm]
+        The configured arms; ``arm``'s ``heartbeat_dsn`` is used only to read the slot's position.
+    registry : ReplicationRegistry
+        The split publications to move to.
+    timeout : float
+        Seconds to wait for the slot to catch up.
+
+    Returns
+    -------
+    dict
+        ``arm``, ``name``, ``switched`` and, when just switched, the position waited for.
+
+    Raises
+    ------
+    Refused
+        Wrong role; an unknown arm; no subscription; it is disabled; the arm lacks the
+        split pair; or the slot didn't catch up within ``timeout``. Nothing is changed.
+    ReplicationError
+        The arm couldn't be reached (message redacted).
+    """
+    require_role("switch", "mirror", role)
+    _selected_arms(arms, arm)
+    name = subscription_name(arm)
+    if (sub := await _subscription(conn, name)) is None:
+        raise Refused(f"no subscription {name}; for an arm already split, run `subscribe --split --arm {arm}` instead")
+    target = [p.name for p in registry.split_publications]
+    if _layout(sub["subpublications"], registry) == "split":
+        logger.info("Subscription %s already reads %s; nothing to do", name, ", ".join(target))
+        return {"arm": arm, "name": name, "switched": False}
+    if not sub["subenabled"]:
+        raise Refused(f"subscription {name} is disabled; enable it so its slot can catch up, then switch")
+
+    primary, dsn = await _connect_arm(arm, arms[arm], "switch")
+    try:
+        absent = [
+            publication
+            for publication in target
+            if not await primary.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = $1)", publication
+            )
+        ]
+        if absent:
+            raise Refused(f"arm {arm} has no {', '.join(absent)} yet; run `publish --split` there first")
+        position = await primary.fetchval("SELECT pg_current_wal_lsn()::text")
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not await primary.fetchval(
+            "SELECT confirmed_flush_lsn >= $1::text::pg_lsn FROM pg_replication_slots WHERE slot_name = $2",
+            position,
+            sub["subslotname"],
+        ):
+            if asyncio.get_running_loop().time() >= deadline:
+                raise Refused(
+                    f"slot {sub['subslotname']} hasn't confirmed {position} within {timeout:g} s; "
+                    f"check the subscription is streaming (`status --arm {arm}`) and try again"
+                )
+            await asyncio.sleep(1)
+    except asyncpg.PostgresError as exc:
+        raise ReplicationError(f"reading arm {arm} failed: {redact(str(exc), [dsn])}") from None
+    finally:
+        await primary.close()
+
+    publications = ", ".join(quote_ident(p) for p in target)
+    await conn.execute(
+        f"ALTER SUBSCRIPTION {quote_ident(name)} SET PUBLICATION {publications} WITH (copy_data = false)"
+    )
+    logger.info(
+        "Subscription %s now reads %s (slot confirmed %s). Next: `publish --split` on arm %s",
+        name,
+        ", ".join(target),
+        position,
+        arm,
+    )
+    return {"arm": arm, "name": name, "switched": True, "publications": target, "confirmed": position}
+
+
+async def heartbeat(
+    conn: asyncpg.Connection,
+    *,
+    role: str,
+    arm: str,
+    arms: Mapping[str, Arm],
+    backup_ok: bool,
+    wal_archive_ok: bool,
+    drift_ok: bool,
+    registry: ReplicationRegistry = REGISTRY,
+) -> dict:
+    """Record the head's latest checks for ``arm`` in that arm's ``core.history_heartbeat``.
+
+    The head's CronJob runs it per arm, after the backup, WAL-archive and drift
+    checks, passing each result: the backup and WAL archive are the head's own, so
+    every arm gets the same two, and the drift check is that arm's. A check not
+    passed as OK is recorded as failed. The drift check is also recorded as failed
+    while the arm's subscription is disabled or any of its tables is still copying:
+    those tables weren't compared, and rows pruned before their copy would never
+    reach history. The arm's prune job deletes nothing while the latest heartbeat is
+    old, predates the current stream, or reports a failure. ``applied_lsn`` comes
+    from ``subscriber_status`` and is ``None`` when this role may not read it. The
+    row is keyed by the subscription's name (the arm's slot) and timed by the arm's clock.
+
+    Raises
+    ------
+    Refused
+        Wrong role, an unknown arm, no subscription to it, or no ``heartbeat_dsn`` for it.
+    ReplicationError
+        The arm couldn't be reached or refused the write (message redacted).
+    """
+    require_role("heartbeat", "mirror", role)
+    [status] = (await subscriber_status(conn, arms=arms, only=arm, registry=registry))["subscriptions"]
+    if not status["exists"]:
+        raise Refused(f"no subscription {status['name']}; the head reports an arm's checks only once it replicates it")
+    if drift_ok and not status["enabled"]:
+        logger.warning("Subscription %s is disabled; recording the drift check as failed", status["name"])
+        drift_ok = False
+    elif drift_ok and status["tables_not_ready"]:
+        logger.warning(
+            "Tables still copying from arm %s (%s); recording the drift check as failed",
+            arm,
+            ", ".join(f"{table}: {state}" for table, state in status["tables_not_ready"].items()),
+        )
+        drift_ok = False
+    row = {
+        "name": status["name"],
+        "backup_ok": backup_ok,
+        "wal_archive_ok": wal_archive_ok,
+        "drift_ok": drift_ok,
+        "applied_lsn": status["applied_lsn"],
+    }
+    primary, dsn = await _connect_arm(arm, arms[arm], "heartbeat")
+    try:
+        written_at = await primary.fetchval(
+            """
+            INSERT INTO core.history_heartbeat AS h (name, backup_ok, wal_archive_ok, drift_ok, applied_lsn, written_at)
+            VALUES ($1, $2, $3, $4, $5, now())
+            ON CONFLICT (name) DO UPDATE SET
+                backup_ok = excluded.backup_ok, wal_archive_ok = excluded.wal_archive_ok,
+                drift_ok = excluded.drift_ok, applied_lsn = excluded.applied_lsn, written_at = excluded.written_at
+            RETURNING h.written_at
+            """,
+            *row.values(),
+        )
+    except asyncpg.PostgresError as exc:
+        raise ReplicationError(f"writing the heartbeat to arm {arm} failed: {redact(str(exc), [dsn])}") from None
+    finally:
+        await primary.close()
+    level = logging.INFO if backup_ok and wal_archive_ok and drift_ok else logging.WARNING
+    logger.log(
+        level,
+        "Heartbeat %s: backup %s, WAL archive %s, drift %s, applied %s",
+        row["name"],
+        *("ok" if ok else "FAILED" for ok in (backup_ok, wal_archive_ok, drift_ok)),
+        row["applied_lsn"] or "unknown",
+    )
+    return {"arm": arm, **row, "written_at": written_at.isoformat()}

@@ -17,9 +17,18 @@ canopy.core.replication`` (see ``__main__``) applies them:
 * head, once per arm: ``subscribe``, as the tables' owner with
   ``pg_create_subscription`` (or a superuser), with each arm's
   ``CANOPY_ARMS__<arm>__PUBLISHER_DSN`` from a secret (``canopy.core.arms``).
+* head, hourly per arm after its backup, WAL-archive and drift checks:
+  ``heartbeat --arm <arm>``, which records them on that arm over
+  ``CANOPY_ARMS__<arm>__HEARTBEAT_DSN`` (a role that may write only
+  ``core.history_heartbeat``; the arm's ``publish`` grants it).
 
 ``status`` reports either side as JSON; on a head, per arm. ``drift-check`` runs on
 a head, hourly after ``refresh``: it compares each arm's rows with the head's copy
 over that arm's read-only connection (``CANOPY_ARMS__<arm>__READER_DSN``), then
 checks every reference on the head (see ``drift``).
+
+An arm that prunes old rows (see ``gate``) first moves to the split layout:
+``publish --split`` on the arm, ``switch --arm <arm>`` on the head, ``publish
+--split`` on the arm again. Afterwards time-series deletes no longer reach the head.
+The head never prunes.
 """
