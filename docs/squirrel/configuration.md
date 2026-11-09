@@ -66,10 +66,10 @@ the snapshot, but with no saved value; in a restore, it is listed as a failure.
 ### Progress updates (`EPICS_CHUNK_SIZE`)
 
 A capture reads all its PVs as one pool, `EPICS_CONCURRENCY` at a time, and
-reports progress after every this many completed reads. A restore writes in
-chunks of this many PVs, finishing each chunk before starting the next, and
-reports progress after each chunk. Smaller values give smoother progress bars
-at the cost of more Redis writes.
+reports progress after every `EPICS_CHUNK_SIZE` completed reads and once more
+at the end. A restore writes in chunks of `EPICS_CHUNK_SIZE` PVs, finishing
+each chunk before starting the next, and reports progress after each chunk.
+Smaller values give smoother progress bars at the cost of more Redis writes.
 
 ### Time limit
 
