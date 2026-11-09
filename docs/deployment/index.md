@@ -113,7 +113,10 @@ publication in step with the tables. The head runs `alembic upgrade head`, then
 `grants` and `refresh`, before any of its arms deploys; `subscribe` runs once per
 arm. On the head, `subscribe`, `refresh` and `status` act on every arm in
 `CANOPY_ARMS__<arm>__…`, or on one with `--arm <arm>`. `status` reports either
-side as JSON.
+side as JSON. Run each instance's migrations with its own `CANOPY_ROLE` and
+`CANOPY_INSTANCE`: a few migration steps run on an arm or on the head only, and data
+steps change only the rows the instance owns (see "Database Migrations" in
+`CONTRIBUTING.md`).
 
 ## Health checks
 
