@@ -1,9 +1,16 @@
 """Snapshot DTOs."""
 
-from typing import Any
+from uuid import UUID
+from typing import Any, Literal
 from datetime import datetime
 
-from pydantic import Field, ConfigDict
+from pydantic import (
+    Field,
+    ConfigDict,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from canopy.contracts.base import CanopyModel
 
@@ -71,7 +78,11 @@ class NewSnapshotDTO(SnapshotBase):
 
 
 class SnapshotSummaryDTO(SnapshotBase):
-    """Summary DTO for listing snapshots."""
+    """Summary DTO for listing snapshots.
+
+    ``retain`` exempts the snapshot from pruning of old snapshots. ``imported_from`` is
+    the id of the snapshot it was imported from (``POST /snapshots/import``), else ``None``.
+    """
 
     id: str
     # The owner of the snapshot's facility and PVs, the one instance that writes it
@@ -81,6 +92,8 @@ class SnapshotSummaryDTO(SnapshotBase):
     created_by: str | None = None
     pv_count: int = 0
     facility: str | None = None  # slug
+    retain: bool = False
+    imported_from: str | None = None
     meta_pvs: list[MetaPVValueDTO] = Field(default_factory=list)
 
 
@@ -91,8 +104,99 @@ class SnapshotDTO(SnapshotSummaryDTO):
 
 
 class UpdateSnapshotDTO(CanopyModel):
+    """Partial update: fields left out (or ``null``) keep their value."""
+
     title: str | None = Field(None, min_length=1, max_length=255)
     description: str | None = None
+    retain: bool | None = None
+
+
+BUNDLE_FORMAT = "canopy.squirrel.snapshot-bundle"
+
+
+class BundleValueDTO(CanopyModel):
+    """One value in a snapshot bundle, with the addresses its PV had when exported.
+
+    ``setpoint_value`` and ``readback_value`` are the stored JSONB blobs, unchanged. The
+    fields ``EpicsValueDTO`` models must parse, so the imported snapshot can be read back;
+    keys it doesn't model are kept as they are.
+    """
+
+    pv_id: UUID
+    pv_name: str = Field(..., max_length=255)
+    setpoint_address: str | None = Field(None, max_length=255)
+    readback_address: str | None = Field(None, max_length=255)
+    config_address: str | None = Field(None, max_length=255)
+    setpoint_value: dict[str, Any] | None = None
+    readback_value: dict[str, Any] | None = None
+    status: int | None = None
+    severity: int | None = None
+    timestamp: datetime | None = None
+
+    @field_validator("setpoint_value", "readback_value")
+    @classmethod
+    def _readable(cls, blob: dict[str, Any] | None) -> dict[str, Any] | None:
+        if blob is not None:
+            try:
+                EpicsValueDTO.model_validate(blob)
+            except ValidationError as exc:
+                problems = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
+                raise ValueError(problems) from None
+        return blob
+
+
+class SnapshotBundleDTO(CanopyModel):
+    """A snapshot with all its values, as one instance exports it for another to import.
+
+    ``GET /snapshots/{id}/export`` writes it, typically on a history head;
+    ``POST /snapshots/import`` reads it on the arm that owns the facility.
+    ``source_instance`` is the exporter's ``CANOPY_INSTANCE``. ``facility`` is the
+    snapshot's facility slug: slugs don't change and ``core.facility`` replicates, so it
+    names the same facility on the head and on its arm.
+    """
+
+    format: Literal["canopy.squirrel.snapshot-bundle"]
+    version: Literal[1]
+    source_instance: str | None = None
+    id: UUID
+    title: str = Field(..., min_length=1, max_length=255)
+    description: str | None = None
+    created_date: datetime
+    created_by: str | None = Field(None, max_length=255)
+    facility: str | None = Field(None, max_length=64)
+    values: list[BundleValueDTO] = []
+
+    @model_validator(mode="after")
+    def _one_value_per_pv(self) -> "SnapshotBundleDTO":
+        """Refuse a bundle that gives a PV two values: restore would write whichever came last."""
+        seen: set[UUID] = set()
+        repeated: set[str] = set()
+        for value in self.values:
+            if value.pv_id in seen:
+                repeated.add(str(value.pv_id))
+            seen.add(value.pv_id)
+        if repeated:
+            raise ValueError(f"values repeat pvId {', '.join(sorted(repeated)[:10])}")
+        return self
+
+
+class SkippedValueDTO(CanopyModel):
+    """A bundle value that wasn't imported, because its PV isn't here or can't be imported here."""
+
+    pv_id: str
+    pv_name: str
+
+
+class SnapshotImportResultDTO(CanopyModel):
+    """The snapshot an import saved, the bundle values it left out, and whether this call saved it.
+
+    ``created`` is false only for a captured import whose snapshot was already here: the
+    answer then describes what was saved before.
+    """
+
+    snapshot: SnapshotSummaryDTO
+    skipped: list[SkippedValueDTO] = []
+    created: bool = True
 
 
 class RestoreRequestDTO(CanopyModel):

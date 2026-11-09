@@ -15,6 +15,7 @@ from collections.abc import Callable, Awaitable
 
 from sqlalchemy import (
     ARRAY,
+    Row,
     Select,
     ColumnElement,
     or_,
@@ -31,6 +32,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import noload, raiseload, selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from canopy.core.db import BaseRepository
 from canopy.squirrel.data.models import (
@@ -72,6 +74,20 @@ class SnapshotRepository(BaseRepository[Snapshot]):
             query = query.where(Snapshot.deleted_at.is_(None))
         result = await self.session.execute(query)
         return result.scalar_one_or_none()
+
+    async def insert_unless_taken(self, fields: dict) -> bool:
+        """Insert a snapshot row with ``fields`` (``id`` included) unless that id exists.
+
+        Returns whether it was inserted. A concurrent insert of the same id waits for
+        the other transaction, then finds the id taken if that one committed.
+        """
+        inserted = await self.session.scalar(
+            pg_insert(Snapshot)
+            .values(**fields)
+            .on_conflict_do_nothing(index_elements=[Snapshot.id])
+            .returning(Snapshot.id)
+        )
+        return inserted is not None
 
     async def is_live(self, snapshot_id: str) -> bool:
         """Whether ``snapshot_id`` exists and hasn't been deleted."""
@@ -118,8 +134,9 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         *,
         title: str | None = None,
         description: str | None = None,
+        retain: bool | None = None,
     ) -> Snapshot | None:
-        """Update a live snapshot's title and/or description."""
+        """Update a live snapshot's title, description and/or ``retain`` flag."""
         snapshot = await self.get_by_id(snapshot_id)
         if not snapshot:
             return None
@@ -128,6 +145,8 @@ class SnapshotRepository(BaseRepository[Snapshot]):
             snapshot.title = title
         if description is not None:
             snapshot.description = description
+        if retain is not None:
+            snapshot.retain = retain
 
         await self.session.flush()
         return snapshot
@@ -338,6 +357,33 @@ class SnapshotValueRepository(BaseRepository[SnapshotValue]):
             )
         )
         return list(result.scalars().all())
+
+    async def get_export_rows(self, snapshot_id: str) -> list[Row]:
+        """A snapshot's values with their PV's current addresses, ordered by ``pv_name``.
+
+        Plain columns rather than ORM objects, since a full save has 16k–100k values. The
+        PV is outer-joined and never filtered: a deleted PV still exports its addresses,
+        and a value whose PV row is missing (foreign keys aren't checked when a head
+        applies changes) still exports, without them.
+        """
+        result = await self.session.execute(
+            select(
+                SnapshotValue.pv_id,
+                SnapshotValue.pv_name,
+                Pv.setpoint_address,
+                Pv.readback_address,
+                Pv.config_address,
+                SnapshotValue.setpoint_value,
+                SnapshotValue.readback_value,
+                SnapshotValue.status,
+                SnapshotValue.severity,
+                SnapshotValue.timestamp,
+            )
+            .outerjoin(Pv, Pv.id == SnapshotValue.pv_id)
+            .where(SnapshotValue.snapshot_id == snapshot_id)
+            .order_by(SnapshotValue.pv_name)
+        )
+        return list(result.all())
 
 
 class PvRepository(BaseRepository[Pv]):
@@ -715,6 +761,20 @@ class PvRepository(BaseRepository[Pv]):
         rows = [{"pv_id": pv_id, "facility_id": fid} for pv_id, fids in assignments for fid in sorted(fids)]
         if rows:
             await self.session.execute(insert(pv_facility), rows)
+
+    async def get_existing_ids(
+        self, ids: list[str], *, include_deleted: bool = False, owner: str | None = None
+    ) -> set[str]:
+        """The subset of ``ids`` that are PVs here, without loading the rows; ``owner``'s only, if given."""
+        existing: set[str] = set()
+        for i in range(0, len(ids), PARAM_BATCH_SIZE):
+            query = select(Pv.id).where(Pv.id.in_(ids[i : i + PARAM_BATCH_SIZE]))
+            if not include_deleted:
+                query = query.where(Pv.deleted_at.is_(None))
+            if owner is not None:
+                query = query.where(Pv.owner_instance == owner)
+            existing.update((await self.session.execute(query)).scalars())
+        return existing
 
     async def get_by_ids(self, ids: list[str], *, include_deleted: bool = False) -> list[Pv]:
         """Get many PVs by id, batched under the Postgres parameter limit.
