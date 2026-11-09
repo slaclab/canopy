@@ -116,7 +116,8 @@ docker compose ps        # api healthy, both workers up
 curl -H "X-API-Key: <read-token>" http://localhost:<API_PORT>/elog/v1/health/summary
 ```
 
-`/health` is process liveness, the same probe the compose healthcheck uses.
+`/health` is process liveness, the same probe the compose healthcheck uses;
+`/health/ready` also checks the database.
 Each module also has `GET /<module>/v1/health/watchdog`; see
 [Health checks](index.md#health-checks). Confirm the WebSocket `heartbeat`
 frame reports the `epics` backend, not `simulation`.
