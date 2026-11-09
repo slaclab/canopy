@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+from dataclasses import dataclass
 from collections.abc import Callable, Awaitable
 
 from sqlalchemy import (
@@ -22,16 +23,19 @@ from sqlalchemy import (
     and_,
     any_,
     func,
+    text,
+    column,
     delete,
+    exists,
     insert,
     select,
     tuple_,
     update,
     literal,
 )
-from sqlalchemy.orm import noload, raiseload, selectinload
+from sqlalchemy.orm import defer, noload, raiseload, selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from canopy.core.db import BaseRepository
@@ -42,6 +46,7 @@ from canopy.squirrel.data.models import (
     Snapshot,
     TagGroup,
     SnapshotValue,
+    SnapshotOutbox,
     pv_tag,
     pv_facility,
 )
@@ -189,6 +194,48 @@ class SnapshotRepository(BaseRepository[Snapshot]):
 
         return query
 
+    @staticmethod
+    def _queued_filtered(
+        query: Select,
+        title: str | None,
+        tag_ids: list[str] | None,
+        start: datetime | None,
+        end: datetime | None,
+        facility_ids: set[str] | None,
+    ) -> Select:
+        """The listing filters for snapshots a history head holds only in its outbox.
+
+        A row whose snapshot has come back (but isn't swept yet) is left out, so each id
+        is listed once. A queued snapshot matches ``tag_ids`` when a PV in its bundle
+        carries one of them.
+        """
+        query = query.where(~exists().where(Snapshot.id == SnapshotOutbox.id))
+        if title:
+            query = query.where(SnapshotOutbox.title.ilike(f"%{title}%"))
+        if tag_ids:
+            value = (
+                func.jsonb_array_elements(SnapshotOutbox.bundle["values"])
+                .table_valued(column("value", JSONB))
+                .alias("v")
+            )
+            query = query.where(
+                exists()
+                .select_from(value)
+                .where(
+                    exists().where(
+                        pv_tag.c.pv_id == func.cast(value.c.value["pvId"].astext, UUID(as_uuid=False)),
+                        pv_tag.c.tag_id.in_(tag_ids),
+                    )
+                )
+            )
+        if start is not None:
+            query = query.where(SnapshotOutbox.created_at >= start)
+        if end is not None:
+            query = query.where(SnapshotOutbox.created_at <= end)
+        if facility_ids is not None:
+            query = query.where(SnapshotOutbox.facility_id.in_(facility_ids))
+        return query
+
     async def search(
         self,
         title: str | None = None,
@@ -198,7 +245,7 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         limit: int = 100,
         after: tuple[datetime, str] | None = None,
         facility_ids: set[str] | None = None,
-    ) -> tuple[list[Snapshot], tuple[datetime, str] | None, int]:
+    ) -> tuple[list[Snapshot | SnapshotOutbox], tuple[datetime, str] | None, int]:
         """Keyset-paginated search by title, tags, creation time, and/or facility.
 
         Returns ``(results, next_cursor, total_count)``, newest first. A page starts after
@@ -207,6 +254,11 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         ``id`` breaks ties between equal ``created_at`` values (bulk imports can share a
         capture time). The cursor is a sort position, not a row reference, so it stays
         valid even when the snapshot it came from has been deleted.
+
+        On a history head the page also holds the snapshots its outbox keeps for arms,
+        under the same filters, each where its capture time puts it. Both are read with
+        the same cursor and merged here: the stored snapshots' query keeps its plan (an
+        index scan, no sort), and the outbox holds at most a few hundred rows per arm.
 
         Parameters
         ----------
@@ -227,9 +279,10 @@ class SnapshotRepository(BaseRepository[Snapshot]):
 
         Returns
         -------
-        tuple[list[Snapshot], tuple[datetime, str] | None, int]
-            The page ordered by ``created_at`` then ``id``, both descending; the cursor for
-            the next page, or ``None`` on the last page; and the count of all matching rows.
+        tuple[list[Snapshot | SnapshotOutbox], tuple[datetime, str] | None, int]
+            The page ordered by ``created_at`` then ``id``, both descending, with queued
+            snapshots as their outbox rows (bundle not loaded); the cursor for the next
+            page, or ``None`` on the last page; and the count of all matching rows.
         """
         filters = (title, tag_ids, start, end, facility_ids)
         # ``noload`` skips the relationship's selectin default: listing needs only snapshot
@@ -237,33 +290,37 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         # machine save) dominated the response time.
         query = self._filtered(select(Snapshot).options(noload(Snapshot.values)), *filters)
         count_query = self._filtered(select(func.count()).select_from(Snapshot), *filters)
+        queued_query = self._queued_filtered(select(SnapshotOutbox).options(defer(SnapshotOutbox.bundle)), *filters)
+        queued_count_query = self._queued_filtered(select(func.count()).select_from(SnapshotOutbox), *filters)
 
         if after is not None:
-            query = query.where(
-                tuple_(Snapshot.created_at, Snapshot.id)
-                < tuple_(
-                    # Typed like the columns: a bare string binds as VARCHAR, and
-                    # Postgres has no ``uuid < varchar`` operator.
-                    literal(after[0], Snapshot.created_at.type),
-                    literal(after[1], Snapshot.id.type),
-                )
-            )
+            # Typed like the columns: a bare string binds as VARCHAR, and Postgres has no
+            # ``uuid < varchar`` operator.
+            cursor = tuple_(literal(after[0], Snapshot.created_at.type), literal(after[1], Snapshot.id.type))
+            query = query.where(tuple_(Snapshot.created_at, Snapshot.id) < cursor)
+            queued_query = queued_query.where(tuple_(SnapshotOutbox.created_at, SnapshotOutbox.id) < cursor)
 
         # +1 to detect a next page
         query = query.order_by(Snapshot.created_at.desc(), Snapshot.id.desc()).limit(limit + 1)
+        queued_query = queued_query.order_by(SnapshotOutbox.created_at.desc(), SnapshotOutbox.id.desc()).limit(
+            limit + 1
+        )
 
         result = await self.session.execute(query)
-        snapshots = list(result.scalars().all())
+        rows: list[Snapshot | SnapshotOutbox] = list(result.scalars().all())
+        rows += (await self.session.execute(queued_query)).scalars().all()
+        # Lowercase UUID text sorts as Postgres sorts the uuid values.
+        rows.sort(key=lambda row: (row.created_at, row.id), reverse=True)
 
         count_result = await self.session.execute(count_query)
-        total_count = count_result.scalar() or 0
+        total_count = (count_result.scalar() or 0) + ((await self.session.execute(queued_count_query)).scalar() or 0)
 
         next_cursor = None
-        if len(snapshots) > limit:
-            snapshots = snapshots[:limit]
-            next_cursor = (snapshots[-1].created_at, snapshots[-1].id)
+        if len(rows) > limit:
+            rows = rows[:limit]
+            next_cursor = (rows[-1].created_at, rows[-1].id)
 
-        return snapshots, next_cursor, total_count
+        return rows, next_cursor, total_count
 
     async def get_value_count(self, snapshot_id: str) -> int:
         result = await self.session.execute(
@@ -382,6 +439,173 @@ class SnapshotValueRepository(BaseRepository[SnapshotValue]):
             .outerjoin(Pv, Pv.id == SnapshotValue.pv_id)
             .where(SnapshotValue.snapshot_id == snapshot_id)
             .order_by(SnapshotValue.pv_name)
+        )
+        return list(result.all())
+
+
+@dataclass(frozen=True)
+class BundleValueRow:
+    """One value of a queued snapshot's bundle, shaped like the ``SnapshotValue`` columns
+    the read and restore paths use, so they serve a queued snapshot unchanged."""
+
+    pv_id: str
+    pv_name: str
+    setpoint_value: dict | None
+    readback_value: dict | None
+    status: int | None
+    severity: int | None
+    timestamp: datetime | None
+
+
+# The ``values`` array of a queued snapshot's bundle, one row per value.
+_BUNDLE_VALUES = "jsonb_array_elements(o.bundle -> 'values') AS v(value)"
+
+# A bundle value's fields (wire JSON, camelCase) as the ``SnapshotValue`` columns of the same names.
+_BUNDLE_VALUE_COLUMNS = (
+    "v.value ->> 'pvId' AS pv_id, v.value ->> 'pvName' AS pv_name,"
+    " v.value -> 'setpointValue' AS setpoint_value, v.value -> 'readbackValue' AS readback_value,"
+    " CAST(v.value ->> 'status' AS integer) AS status, CAST(v.value ->> 'severity' AS integer) AS severity,"
+    " CAST(v.value ->> 'timestamp' AS timestamptz) AS timestamp"
+)
+
+
+class OutboxRepository(BaseRepository[SnapshotOutbox]):
+    """A history head's queue of snapshots for its arms (``squirrel.snapshot_outbox``).
+
+    Rows are read without their bundle unless a method says otherwise: a bundle is the
+    whole snapshot, tens of MB for a full save. Values are read out of a bundle in SQL.
+    """
+
+    def __init__(self, session: AsyncSession):
+        super().__init__(SnapshotOutbox, session)
+
+    async def lock_arm(self, arm: str) -> None:
+        """Hold the arm's queue for the rest of the transaction, so two captures can't both pass a cap."""
+        await self.session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext('canopy.squirrel.outbox:' || :arm))"), {"arm": arm}
+        )
+
+    async def usage(self, arm: str) -> tuple[int, int]:
+        """``(rows, bundle bytes)`` the arm has queued, in every state."""
+        result = await self.session.execute(
+            select(func.count(), func.coalesce(func.sum(SnapshotOutbox.size_bytes), 0)).where(SnapshotOutbox.arm == arm)
+        )
+        rows, size = result.one()
+        return int(rows), int(size)
+
+    async def has_backlog(self, arm: str) -> bool:
+        """Whether the arm has a snapshot still waiting to be sent."""
+        result = await self.session.execute(
+            select(exists().where(SnapshotOutbox.arm == arm, SnapshotOutbox.state == "pending"))
+        )
+        return bool(result.scalar())
+
+    async def add(self, *, bundle_json: str, **columns) -> None:
+        """Insert a row with ``bundle_json`` as its bundle, passed to Postgres as text."""
+        await self.session.execute(
+            insert(SnapshotOutbox).values(**columns, bundle=func.cast(literal(bundle_json), JSONB))
+        )
+
+    async def get(self, entry_id: str) -> SnapshotOutbox | None:
+        """A queued snapshot without its bundle, or ``None`` once it's gone (or never was)."""
+        result = await self.session.execute(
+            select(SnapshotOutbox).where(SnapshotOutbox.id == entry_id).options(defer(SnapshotOutbox.bundle))
+        )
+        return result.scalar_one_or_none()
+
+    async def bundle_header(self, entry_id: str) -> dict | None:
+        """A queued snapshot's bundle without its ``values``."""
+        result = await self.session.execute(
+            text("SELECT bundle - 'values' FROM squirrel.snapshot_outbox WHERE id = CAST(:id AS uuid)"),
+            {"id": entry_id},
+        )
+        return result.scalar_one_or_none()
+
+    async def export_rows(self, entry_id: str) -> list[Row]:
+        """A queued snapshot's values as ``SnapshotValueRepository.get_export_rows`` gives a stored one's.
+
+        The same columns and order, and the same rule for addresses: the PV row (an
+        arm's, replicated) is outer-joined and never filtered, so a deleted PV still
+        gives its addresses. A value whose PV row isn't here keeps the bundle's.
+        """
+        addresses = ", ".join(
+            f"CASE WHEN p.id IS NULL THEN v.value ->> '{key}' ELSE p.{column} END AS {column}"
+            for key, column in (
+                ("setpointAddress", "setpoint_address"),
+                ("readbackAddress", "readback_address"),
+                ("configAddress", "config_address"),
+            )
+        )
+        result = await self.session.execute(
+            text(
+                f"SELECT {_BUNDLE_VALUE_COLUMNS}, {addresses}"
+                " FROM squirrel.snapshot_outbox o"
+                f" CROSS JOIN LATERAL {_BUNDLE_VALUES}"
+                " LEFT JOIN squirrel.pv p ON p.id = CAST(v.value ->> 'pvId' AS uuid)"
+                " WHERE o.id = CAST(:id AS uuid)"
+                " ORDER BY v.value ->> 'pvName'"
+            ),
+            {"id": entry_id},
+        )
+        return list(result.all())
+
+    async def bundle_text(self, entry_id: str) -> str | None:
+        """A queued snapshot's bundle as JSON text, to send on without parsing it here."""
+        result = await self.session.execute(
+            text("SELECT bundle::text FROM squirrel.snapshot_outbox WHERE id = CAST(:id AS uuid)"), {"id": entry_id}
+        )
+        return result.scalar_one_or_none()
+
+    async def values(
+        self, entry_id: str, *, pv_ids: list[str] | None = None, limit: int | None = None, offset: int = 0
+    ) -> list[BundleValueRow]:
+        """A queued snapshot's values, ordered by ``pv_name`` like ``SnapshotRepository.get_with_values``.
+
+        ``pv_ids`` keeps only those PVs' values; ``limit`` and ``offset`` page them.
+        """
+        query = (
+            f"SELECT {_BUNDLE_VALUE_COLUMNS} FROM squirrel.snapshot_outbox o, {_BUNDLE_VALUES}"
+            " WHERE o.id = CAST(:id AS uuid)"
+        )
+        params: dict = {"id": entry_id, "offset": offset}
+        if pv_ids is not None:
+            query += " AND v.value ->> 'pvId' = ANY(CAST(:pv_ids AS text[]))"
+            params["pv_ids"] = [str(pv_id) for pv_id in pv_ids]
+        query += " ORDER BY v.value ->> 'pvName' OFFSET :offset"
+        if limit is not None:
+            query += " LIMIT :limit"
+            params["limit"] = limit
+        result = await self.session.execute(text(query), params)
+        return [BundleValueRow(**row._mapping) for row in result.all()]
+
+    async def next_pending(self, arm: str) -> SnapshotOutbox | None:
+        """The arm's oldest snapshot still to send, whether or not its retry is due yet."""
+        result = await self.session.execute(
+            select(SnapshotOutbox)
+            .where(SnapshotOutbox.arm == arm, SnapshotOutbox.state == "pending")
+            .order_by(SnapshotOutbox.seq)
+            .limit(1)
+            .options(defer(SnapshotOutbox.bundle))
+        )
+        return result.scalar_one_or_none()
+
+    async def update_state(self, entry_id: str, **values) -> None:
+        """Set columns of one row (its state, attempt count, times, error)."""
+        await self.session.execute(update(SnapshotOutbox).where(SnapshotOutbox.id == entry_id).values(**values))
+
+    async def sweep(self, entry_id: str | None = None) -> list[Row]:
+        """Delete rows whose snapshot is in ``squirrel.snapshot`` now, and return them.
+
+        Whatever the row's state: a snapshot that came back ends its wait, a 504 that was
+        applied included. The caller logs a failed row that came back.
+        """
+        query = delete(SnapshotOutbox).where(
+            exists().where(Snapshot.id == SnapshotOutbox.id),
+        )
+        if entry_id is not None:
+            query = query.where(SnapshotOutbox.id == entry_id)
+        result = await self.session.execute(
+            query.returning(SnapshotOutbox.id, SnapshotOutbox.arm, SnapshotOutbox.state, SnapshotOutbox.last_error)
         )
         return list(result.all())
 

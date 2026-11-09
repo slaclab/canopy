@@ -21,8 +21,12 @@ from sqlalchemy import (
     Boolean,
     Integer,
     DateTime,
+    Identity,
+    BigInteger,
     ForeignKey,
+    CheckConstraint,
     UniqueConstraint,
+    func,
     text,
 )
 from sqlalchemy.orm import Mapped, relationship, mapped_column
@@ -231,3 +235,62 @@ class MetaPv(Base):
     pv_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey(_fk("pv.id")), primary_key=True)
     display_name: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("''"))
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+
+
+# --------------------------------------------------------------------------- #
+# Snapshot outbox (a history head only; never replicated)
+# --------------------------------------------------------------------------- #
+
+OUTBOX_STATES = ("pending", "delivered", "failed")
+
+
+class SnapshotOutbox(Base):
+    """A snapshot the head captured for an arm it couldn't hand it to yet.
+
+    The row holds the snapshot's bundle until the arm has saved it under the same
+    id and the snapshot has replicated back to the head; then it goes. The registry
+    classifies the table ``local``: an arm never receives the head's queue, and an
+    arm's copy of a snapshot can't collide with a row here.
+
+    ``state`` is ``pending`` (waiting, or backing off after a transient failure),
+    ``delivered`` (the arm saved it; waiting for replication) or ``failed`` (the arm
+    refused it, for the reason in ``last_error``). Each arm's rows are delivered in
+    ``seq`` order. ``facility_id`` is ``None`` for a snapshot of every PV the arm
+    owns, and has no foreign key: ``core.facility`` is a replica on the head, and a
+    reference from a local row would stop an arm's facility delete from applying,
+    and with it that arm's replication.
+
+    ``caller`` is who the capture was taken for, as the capture job carried it:
+    delivery sends that user and facility grant, not whatever holds when it runs.
+    ``strict`` asks the arm to refuse a bundle it would save with values left out.
+    """
+
+    __tablename__ = "snapshot_outbox"
+    __table_args__ = (
+        CheckConstraint(f"state IN {OUTBOX_STATES!r}", name="ck_snapshot_outbox_state"),
+        Index("ix_squirrel_snapshot_outbox_arm_state_seq", "arm", "state", "seq"),
+        {"schema": SQUIRREL_SCHEMA},
+    )
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), nullable=False)
+    arm: Mapped[str] = mapped_column(String(48), nullable=False)
+    facility_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False))
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    bundle: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    value_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    caller: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    strict: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    state: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'pending'"))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    queued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)

@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from canopy.core.db import session_scope
 from canopy.core.errors import register_canopy_error_handler
 from canopy.core.facilities import gateway as facilities_gateway
+from canopy.squirrel.outbox import metrics as outbox_metrics
 from canopy.squirrel.runtime import mark_started
 from canopy.squirrel.api.v1.router import router as v1_router
 from canopy.squirrel.data.repositories import facility_in_use
@@ -45,3 +46,5 @@ app = FastAPI(
 
 register_canopy_error_handler(app)
 app.include_router(v1_router)
+
+outbox_metrics.register()

@@ -13,6 +13,7 @@ from dataclasses import asdict
 from fastapi import Query, Security, APIRouter
 
 from canopy.jobs import gateway as jobs_gateway
+from canopy.core.db import session_scope
 from canopy.core.config import get_settings
 from canopy.core.errors import (
     BadRequest,
@@ -34,11 +35,13 @@ from canopy.core.ownership import OwnerQuery, require_owned
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.time_parse import DateTimeBound
 from canopy.core.validation import require_uuid
-from canopy.squirrel.errors import SnapshotNotFound
+from canopy.squirrel.config import get_squirrel_config
+from canopy.squirrel.errors import SnapshotPending, SnapshotNotFound
 from canopy.squirrel.capture import capture_target
 from canopy.contracts.pagination import PagedResult
 from canopy.squirrel.dependencies import FacilityScopeDep, SnapshotServiceDep
 from canopy.core.forwarding.client import Caller
+from canopy.squirrel.outbox.delivery import refuse_if_full
 from canopy.squirrel.schemas.snapshot import (
     SnapshotDTO,
     NewSnapshotDTO,
@@ -49,6 +52,8 @@ from canopy.squirrel.schemas.snapshot import (
     ComparisonResultDTO,
     SnapshotImportResultDTO,
 )
+from canopy.squirrel.data.repositories import OutboxRepository
+from canopy.squirrel.services.snapshot_service import pending_detail
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +169,9 @@ async def create_snapshot(
     On a history head a snapshot of a forwardable arm's facility (or with ``owner`` naming
     one) is still taken here, then saved on that arm under the id and time it got here
     (``canopy.squirrel.capture``); the job's result names the arm. Any other owner is
-    refused with ``not_owner``.
+    refused with ``not_owner``. When that arm has snapshots waiting in the head's outbox
+    and the outbox is full, the capture is refused at once with 503 ``outbox_full``:
+    it could only queue, and the queue has no room.
 
     ``createdBy`` records the key's name, or the user a history head forwarded the
     request for.
@@ -180,6 +187,9 @@ async def create_snapshot(
             raise FacilityNotFound(f"Facility '{data.facility}' not found")
         facility_owner = (await facilities_gateway.owners_by_id({facility_id})).get(facility_id)
     target = capture_target(facility_owner, owner, f"A snapshot of {data.facility or 'every PV'}")
+    if target.arm is not None:
+        async with session_scope() as session:
+            await refuse_if_full(OutboxRepository(session), target.arm, get_squirrel_config().outbox)
 
     if key_scope is not None:
         # A facility-restricted key must name a facility it holds. Unlike mutating an
@@ -330,14 +340,21 @@ async def restore_snapshot(
     ``not_owner`` for another instance's snapshot and ``machine_read_only`` for this
     one's.
 
+    A snapshot a history head holds only in its outbox (pending, failed, or saved on its
+    arm and not back yet) restores from its bundle, and only where this instance writes the machine itself; elsewhere
+    it's a 409 ``snapshot_pending`` until its arm has it.
+
     Logs who asked (the key's name, or the user a history head forwarded it for): a
     restore changes the machine and stores no row of its own.
     """
     snapshot_id = require_uuid(snapshot_id, SnapshotNotFound, f"Snapshot {snapshot_id} not found")
     snapshot_owner = await service.restorable_owner(snapshot_id)
     if snapshot_owner is None:
-        raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
-    if not get_settings().machine_writes:
+        if (entry := await service.queued(snapshot_id)) is None:
+            raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
+        if not get_settings().machine_writes:
+            raise SnapshotPending(pending_detail(entry, "restore"))
+    elif not get_settings().machine_writes:
         require_owned(snapshot_owner, f"Snapshot {snapshot_id}")
         require_machine_access()
     # Narrow the write set to the key's facilities here, pre-enqueue — the worker has no
