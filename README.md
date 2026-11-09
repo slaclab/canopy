@@ -248,7 +248,7 @@
 | src/canopy/raccoon/services/directory\_service.py            |      107 |        5 |     95% |83, 136, 192-198 |
 | src/canopy/squirrel/\_\_init\_\_.py                          |        0 |        0 |    100% |           |
 | src/canopy/squirrel/adapters/\_\_init\_\_.py                 |        0 |        0 |    100% |           |
-| src/canopy/squirrel/adapters/epics\_io.py                    |       84 |        1 |     99% |       172 |
+| src/canopy/squirrel/adapters/epics\_io.py                    |       93 |        1 |     99% |       199 |
 | src/canopy/squirrel/api/\_\_init\_\_.py                      |        0 |        0 |    100% |           |
 | src/canopy/squirrel/api/v1/\_\_init\_\_.py                   |        0 |        0 |    100% |           |
 | src/canopy/squirrel/api/v1/health.py                         |       73 |        2 |     97% |   106-107 |
@@ -314,7 +314,7 @@
 | src/canopy/vole/services/hare\_ingest.py                     |       92 |       11 |     88% |47-48, 55, 77, 103, 121, 131-132, 152-155 |
 | src/canopy/vole/services/notifier.py                         |       35 |        2 |     94% |     33-34 |
 | src/canopy/worker.py                                         |       47 |        1 |     98% |        34 |
-| **TOTAL**                                                    | **9860** |  **733** | **93%** |           |
+| **TOTAL**                                                    | **9869** |  **733** | **93%** |           |
 
 
 ## Setup coverage badge
