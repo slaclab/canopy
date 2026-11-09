@@ -7,17 +7,20 @@ Run::
     python -m canopy.core.replication refresh     # head: after `grants`, and hourly
     python -m canopy.core.replication subscribe   # head: once per arm, after its first migration
     python -m canopy.core.replication status      # either side: JSON on stdout
+    python -m canopy.core.replication drift-check # head: compare with each arm, hourly after `refresh`
 
 The database is ``CANOPY_DATABASE_URL`` and the side is ``CANOPY_ROLE`` (each
 command refuses on the wrong one): an arm is a ``primary``, a head a ``mirror``.
-On a head, ``subscribe``, ``refresh`` and ``status`` act on every arm in
-``CANOPY_ARMS__<arm>__…``, or on one with ``--arm <arm>``. ``subscribe`` reads each
+On a head, ``subscribe``, ``refresh``, ``status`` and ``drift-check`` act on every
+arm in ``CANOPY_ARMS__<arm>__…``, or on one with ``--arm <arm>``. ``subscribe`` reads each
 arm's connection string from ``CANOPY_ARMS__<arm>__PUBLISHER_DSN``, never from the
 command line, and nothing the CLI prints contains it.
 
 Logs go to stderr (JSON with ``CANOPY_LOG_FORMAT=json``), so stdout carries only
 ``status`` output. Exit status: 0 done (including "nothing to do"), 1 a database
 step failed, 2 refused (wrong role or a failed precondition; nothing changed).
+``drift-check`` differs: 0 every table of every arm in step, 1 drift found, 2 the
+check couldn't be completed (see ``canopy.core.replication.drift``).
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ import pydantic
 from canopy.core.arms import ArmsConfigError, get_arms_config
 from canopy.core.config import get_settings, describe_settings_error
 from canopy.core.logging import JsonFormatter
+from canopy.core.replication import drift
 from canopy.core.replication.sql import (
     Refused,
     ReplicationError,
@@ -68,11 +72,29 @@ def build_parser() -> argparse.ArgumentParser:
         ("subscribe", "head: create the subscription to each arm (once per arm)"),
         ("refresh", "head: copy tables each arm has started publishing"),
         ("status", "either side: replication state as JSON on stdout (per arm on a head)"),
+        ("drift-check", "head: compare each arm's rows; exit 1 on drift, 2 when not everything was checked"),
     ):
         sub = commands.add_parser(command, help=help_text)
         sub.add_argument("--arm", metavar="ARM", help="act on this arm only (default: every configured arm)")
     commands.add_parser("grants", help="head: the app role reads every row and writes only the head's own")
+    check = commands.choices["drift-check"]
+    check.add_argument("--days", type=_positive_int, help="compare time-series rows from the last DAYS days only")
+    check.add_argument(
+        "--settle",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="how long, per arm, to wait for that arm's slot to confirm its position and retry tables "
+        "that came out inconclusive (default 30)",
+    )
     return parser
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, not {number}")
+    return number
 
 
 def _configure_logging(log_format: str) -> None:
@@ -154,6 +176,8 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("refused: %s", describe_settings_error(exc))
         return 2
     _configure_logging(settings.log_format)
+    if args.command == "drift-check":
+        return asyncio.run(drift.run(args))
     return asyncio.run(run(args.command, getattr(args, "arm", None)))
 
 
