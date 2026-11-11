@@ -431,21 +431,63 @@ config. Two PVs with the same identifying address are duplicates.
 ### Create PVs in bulk
 
 ```
-POST /squirrel/v1/pvs/multi
+POST /squirrel/v1/pvs/multi?onConflict=error|skip|update
 ```
 
 Takes a list of PVs shaped like [Create a PV](#create-a-pv) and returns the
 created PVs in the same order. Requires `write`. The import is all-or-nothing:
-if any row is rejected, no PV is created.
+if any row is rejected, no PV is created or changed.
 
 Unlike [Create a PV](#create-a-pv), a tag id that doesn't exist isn't an
-error here: it is ignored, and the PV is created without that tag.
+error on a row that creates a PV: it is ignored, and the PV is created without
+that tag.
+
+`onConflict` decides what happens to a row whose identifying address is
+already registered:
+
+- `error` (the default): the whole import is refused with a `409`. The
+  response is the plain list of created PVs.
+- `skip`: the registered PV is left as it is, and the other rows are created.
+- `update`: the registered PV is changed the way
+  [Update a PV](#update-a-pv) changes one, and the other rows are created.
+  Only the fields the row includes are applied, so a column missing from the
+  row keeps its stored value even where creating a PV would use a default
+  (tolerances, `tags`, `facilities`); a `null` `device` or `description` also
+  leaves it alone. `tags` replaces the tag list, and an unknown tag id on such
+  a row is a `400`. `facilities` replaces the assignments. Addresses are never
+  changed: a non-identifying address that differs from the stored one is kept
+  as stored and reported in `addressMismatches`. An address the row leaves
+  out isn't a mismatch.
+
+With `skip` or `update` the response is an object instead of a list. Each
+list is in request order, and `row` is the row's 1-based position in the
+request:
+
+??? example "Response (`onConflict=update`)"
+    ```json
+    {
+      "created": [{"id": "…", "setpointAddress": "SIM:DEV:00002:SET", "…": "…"}],
+      "updated": [{"id": "…", "setpointAddress": "SIM:DEV:00001:SET", "…": "…"}],
+      "skipped": [],
+      "addressMismatches": [
+        {"row": 1, "kind": "readback", "requested": "SIM:DEV:00001:RBV2", "stored": "SIM:DEV:00001:RBV"}
+      ]
+    }
+    ```
+
+`skipped` lists `{"row", "kind", "address"}` for each skipped row, where
+`kind` is the identifying address's kind (`setpoint`, `readback` or
+`config`). `updated` and `addressMismatches` are always empty for `skip`, and
+`skipped` is always empty for `update`.
+
+Two rows sharing an identifying address are a `400` in every mode.
 
 | Status | Code | Condition |
 |--------|------|-----------|
-| 400 | `bad_request` | Two rows share an identifying address |
-| 409 | `pv_already_exists` | A row's identifying address is already registered |
-| 422 | — | A row has no address |
+| 400 | `bad_request` | Two rows share an identifying address, or an `update` row names an unknown tag id |
+| 403 | `insufficient_facility_access` | See [API keys](../deployment/api-keys.md) |
+| 409 | `pv_already_exists` | With `onConflict=error`, a row's identifying address is already registered |
+| 422 | — | A row has no address, or `onConflict` isn't one of the three values |
 
 ### Update a PV
 

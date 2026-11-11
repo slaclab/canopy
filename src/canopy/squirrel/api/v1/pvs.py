@@ -15,9 +15,11 @@ from canopy.core.security import require_read_access, require_write_access
 from canopy.core.validation import require_uuid, parse_continuation_token
 from canopy.squirrel.errors import PvNotFound
 from canopy.squirrel.schemas.pv import (
+    OnConflict,
     PVElementDTO,
     NewPVElementDTO,
     PVSearchResponse,
+    PVImportResultDTO,
     UpdatePVElementDTO,
 )
 from canopy.contracts.pagination import PagedResult
@@ -123,9 +125,27 @@ async def create_pv(data: NewPVElementDTO, service: PvServiceDep) -> PVElementDT
 
 
 @router.post("/multi", dependencies=[Security(require_write_access)])
-async def create_multiple_pvs(data: list[NewPVElementDTO], service: PvServiceDep) -> list[PVElementDTO]:
-    """Bulk-create PVs (CSV import)."""
-    return await service.create_many(data)
+async def create_multiple_pvs(
+    data: list[NewPVElementDTO],
+    service: PvServiceDep,
+    onConflict: OnConflict = Query(
+        "error",
+        description=(
+            "What to do with a row whose identifying address is already registered: "
+            "'error' refuses the import (409), 'skip' leaves the registered PV alone, "
+            "'update' applies the row's provided fields to it"
+        ),
+    ),
+) -> list[PVElementDTO] | PVImportResultDTO:
+    """Bulk-create PVs (CSV import), all in one transaction.
+
+    With the default ``onConflict=error`` the response is the list of created PVs. With
+    ``skip`` or ``update`` it is a ``PVImportResultDTO`` listing created, updated and
+    skipped rows; see ``PvService.import_many``.
+    """
+    if onConflict == "error":
+        return await service.create_many(data)
+    return await service.import_many(data, onConflict)
 
 
 @router.put("/{pv_id}", dependencies=[Security(require_write_access)])
