@@ -66,9 +66,10 @@ def test_ws_subscribe_with_invalid_name_does_not_crash_connection():
 
             assert got_valid, "valid PV should still stream despite the invalid name"
 
-            # Connection is still alive and responsive.
+            # Connection is still alive and responsive. The flush that sent the
+            # PV's initial frame also sends its diff, so skip any data frames.
             ws.send_json({"type": "ping"})
-            assert ws.receive_json()["type"] == "pong"
+            _read_until(ws, lambda m: m["type"] == "pong", budget_s=5.0)
 
 
 def test_ws_ping_pong():

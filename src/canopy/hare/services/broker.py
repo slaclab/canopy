@@ -6,7 +6,8 @@ on demand: the first subscriber to a PV starts an EPICS monitor, the last to
 leave stops it. Updates are buffered and flushed as diffs every
 ``ws_batch_interval_ms`` to the clients subscribed to each PV. A newly
 subscribed PV is seeded by its monitor's first update and a background
-describe, so a subscribe never waits on the connector.
+describe, so a subscribe never waits on the connector; PVs that become ready
+are queued and sent in the same flush, as ``initial`` frames ahead of the diff.
 """
 
 import time
@@ -70,11 +71,16 @@ class PVBroker:
         self._seed_sem = asyncio.Semaphore(config.seed_concurrency)
         self._connect_timers: dict[str, asyncio.Task] = {}
         self._describe_tasks: dict[str, asyncio.Task] = {}
-        # PVs whose running describe task must run again after its fan-out,
-        # because the channel reconnected while that fan-out was in progress.
+        # PVs whose running describe task must run again after its current
+        # attempt, because the channel reconnected while that attempt was pending.
         self._describe_again: set[str] = set()
         self._buffer: dict[str, PVValue] = {}
         self._buffer_lock = asyncio.Lock()
+        # PVs whose describe or connect timer has finished since the last flush,
+        # each with the seed lock it was queued under. They are sent with the
+        # next flush rather than one frame per PV, so a large subscribe does not
+        # turn into one WebSocket frame per PV as its channels connect.
+        self._pending_initial: dict[str, asyncio.Lock] = {}
         # Bounded so a fast producer can't grow the queue without limit; the
         # QueueFull path in _on_event then applies backpressure by dropping.
         self._queue: asyncio.Queue[tuple[PVValue, asyncio.Lock]] = asyncio.Queue(maxsize=config.event_queue_maxsize)
@@ -146,6 +152,7 @@ class PVBroker:
             task.cancel()
         await self.drain_seeds()
         self._describe_again.clear()
+        self._pending_initial.clear()
         for pv, sub in list(self._monitors.items()):
             try:
                 await sub.close()
@@ -251,10 +258,11 @@ class PVBroker:
         static metadata the broker already holds for the batch. Every accepted
         PV still missing either half is then seeded in the background (see
         `_schedule_seed`): its value arrives through its monitor's first update,
-        its metadata through a describe started once the channel is connected,
-        and each lands in a further one-PV ``initial`` frame. A channel that
-        delivers no value within ``seed_timeout_s`` is reported
-        ``connected: false``. No connector call is made on the subscribe path,
+        its metadata through a describe started once the channel is connected.
+        A channel that delivers no value within ``seed_timeout_s`` is reported
+        ``connected: false``. Each PV seeded this way is queued and sent in the
+        next flush's ``initial`` frames, together with every other PV that
+        became ready meanwhile (see `_flush`). No connector call is made on the subscribe path,
         so a channel that never connects delays neither the other PVs in the
         batch nor the client's later frames.
 
@@ -414,7 +422,7 @@ class PVBroker:
                 connected=False,
                 error=f"no value within {self._config.seed_timeout_s:g}s of subscribing",
             )
-            await self._fan_out(pv, lock)
+            self._queue_initial(pv, lock)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -424,8 +432,8 @@ class PVBroker:
         """Start a PV's background describe unless one is already running.
 
         The task takes a broker-wide ``seed_concurrency`` slot and the PV's seed
-        lock, runs `_describe_pv`, and then sends every current subscriber of
-        the PV a one-PV ``initial`` frame with its value and metadata. One task
+        lock, runs `_describe_pv`, and then queues the PV for the next flush's
+        ``initial`` frames to its subscribers (see `_queue_initial`). One task
         serves every subscriber; `_stop_monitors` cancels it when the PV is
         released. A PV with no seed lock has already been released and is
         skipped.
@@ -436,8 +444,8 @@ class PVBroker:
             Validated name of a subscribed PV.
         again_if_running : bool, optional
             When a task is already running, ask it to describe once more after
-            its fan-out instead of doing nothing. Used for a channel that
-            reconnects while its task is still sending the previous result.
+            the current attempt instead of doing nothing. Used for a channel
+            that reconnects while its describe is still pending.
         """
         running = self._describe_tasks.get(pv)
         if running is not None and not running.done():
@@ -458,7 +466,7 @@ class PVBroker:
             del tasks[pv]
 
     async def _run_describe(self, pv: str, lock: asyncio.Lock) -> None:
-        """Describe one connected PV under the concurrency bound, then fan the result out to its subscribers.
+        """Describe one connected PV under the concurrency bound, then queue the result for its subscribers.
 
         The describe is skipped when the cached value no longer shows the
         channel connected, since describing a channel that is not answering
@@ -483,7 +491,7 @@ class PVBroker:
                     if cached is None or not cached.connected:
                         return
                     await self._describe_pv(pv, lock)
-                await self._fan_out(pv, lock)
+                self._queue_initial(pv, lock)
                 if self._seed_locks.get(pv) is not lock or pv not in self._describe_again:
                     return
         except asyncio.CancelledError:
@@ -521,33 +529,31 @@ class PVBroker:
             self._meta[pv] = meta
             self._seed_retry_after.pop(pv, None)
 
-    async def _fan_out(self, pv: str, lock: asyncio.Lock) -> None:
-        """Send the PV's current subscribers a one-PV ``initial`` frame.
+    def _queue_initial(self, pv: str, lock: asyncio.Lock) -> None:
+        """Queue a PV for the next flush's ``initial`` frames to its subscribers.
 
-        An earlier client's send can block while another client unsubscribes
-        or the PV is released, so the PV's lock and the client's membership are
-        re-checked before each send.
+        Nothing is sent here: the flush reads the subscribers, value and
+        metadata current at flush time, so a client that unsubscribes or a PV
+        released before then is skipped. A PV whose seed lock has already been
+        replaced is not queued.
 
         Parameters
         ----------
         pv : str
             Validated name of a subscribed PV.
         lock : asyncio.Lock
-            The PV's seed lock when the sending task started.
+            The PV's seed lock when the queuing task started.
         """
-        for client_id in list(self._registry.subscribers(pv)):
-            if self._seed_locks.get(pv) is not lock:
-                return
-            if client_id in self._registry.subscribers(pv):
-                await self._send_initial(client_id, [pv])
+        if self._seed_locks.get(pv) is lock:
+            self._pending_initial[pv] = lock
 
     @staticmethod
     def _cancel_task(tasks: dict[str, asyncio.Task], pv: str) -> None:
         """Forget a PV's task in ``tasks`` and cancel it, unless it is the task running now.
 
-        A task can release its own PV when the send to the PV's last subscriber
-        fails. Cancelling itself there would abort the release half-way, so it
-        is left to finish; its stale lock stops it caching or sending anything.
+        A task that released its own PV and cancelled itself would abort the
+        release half-way, so the running task is left to finish; its stale lock
+        stops it caching or queuing anything.
 
         Parameters
         ----------
@@ -618,9 +624,9 @@ class PVBroker:
 
         A monitor that fails to close is logged and does not stop the rest of
         the batch. The cached value, static metadata, describe retry deadline,
-        seed lock, connect timer and pending describe of every given PV are
-        dropped whether or not it had a monitor, so a later subscribe seeds the
-        PV afresh.
+        seed lock, connect timer, pending describe and queued ``initial`` of
+        every given PV are dropped whether or not it had a monitor, so a later
+        subscribe seeds the PV afresh.
 
         Parameters
         ----------
@@ -639,6 +645,7 @@ class PVBroker:
             self._seed_retry_after.pop(pv, None)
             self._seed_locks.pop(pv, None)
             self._describe_again.discard(pv)
+            self._pending_initial.pop(pv, None)
             self._cancel_task(self._connect_timers, pv)
             self._cancel_task(self._describe_tasks, pv)
 
@@ -685,8 +692,7 @@ class PVBroker:
         disconnected, starts a background describe through
         `_ensure_describe_task` regardless of any retry deadline: the channel
         has just connected, so its metadata is available now. If the PV's
-        describe task is still sending its previous result, the task runs again
-        afterwards instead. Later connected updates do not repeat a describe
+        describe task is still running, it describes again afterwards instead. Later connected updates do not repeat a describe
         that failed.
 
         Parameters
@@ -719,19 +725,93 @@ class PVBroker:
                 logger.exception("broker flush loop iteration failed")
 
     async def _flush(self) -> None:
+        """Send each client the PVs that became ready and the updates buffered since the last flush.
+
+        A client gets its queued PVs first, in ``initial`` frames of at most
+        ``initial_frame_max_pvs`` PVs carrying the value and metadata of each,
+        then one ``diff`` frame. Both are built from one snapshot taken before
+        any send, so a PV in both carries the same value in each and a client
+        applying frames in order never ends on an older value; the PV stays in
+        the diff so a client that reads only diffs still sees it.
+
+        Sends to earlier clients can await while a client unsubscribes or a PV
+        is released, so before each ``initial`` frame its PVs are re-checked
+        against their seed lock and the client's subscriptions.
+        """
         async with self._buffer_lock:
-            if not self._buffer:
+            if not self._buffer and not self._pending_initial:
                 return
             updates = self._buffer
             self._buffer = {}
-        per_client: dict[str, dict[str, dict]] = defaultdict(dict)
-        for pv, value in updates.items():
-            payload = value.model_dump(by_alias=True)
-            for client_id in self._registry.subscribers(pv):
-                per_client[client_id][pv] = payload
-        for client_id, data in per_client.items():
-            frame = {"type": "diff", "data": data, "count": len(data), "timestamp": time.time()}
-            await self._send(client_id, frame)
+            pending = self._pending_initial
+            self._pending_initial = {}
+            # Snapshot under the lock, with no await, so the initial and diff
+            # payloads come from the same instant and each PV is dumped once
+            # however many clients receive it.
+            diff_payloads = {pv: value.model_dump(by_alias=True) for pv, value in updates.items()}
+            ready: dict[str, tuple[asyncio.Lock, dict | None, dict | None]] = {}
+            for pv, lock in pending.items():
+                if self._seed_locks.get(pv) is not lock:
+                    continue
+                value = self._latest.get(pv)
+                meta = self._meta.get(pv)
+                if value is None and meta is None:
+                    continue
+                ready[pv] = (
+                    lock,
+                    None if value is None else value.model_dump(by_alias=True),
+                    None if meta is None else meta.model_dump(by_alias=True),
+                )
+            per_client_initial: dict[str, list[str]] = defaultdict(list)
+            for pv in ready:
+                for client_id in self._registry.subscribers(pv):
+                    per_client_initial[client_id].append(pv)
+            per_client_diff: dict[str, dict[str, dict]] = defaultdict(dict)
+            for pv, payload in diff_payloads.items():
+                for client_id in self._registry.subscribers(pv):
+                    per_client_diff[client_id][pv] = payload
+        cap = max(1, self._config.initial_frame_max_pvs)
+        for client_id in dict.fromkeys([*per_client_initial, *per_client_diff]):
+            pvs = per_client_initial.get(client_id, [])
+            for offset in range(0, len(pvs), cap):
+                await self._send_ready(client_id, pvs[offset : offset + cap], ready)
+            data = per_client_diff.get(client_id)
+            if data:
+                frame = {"type": "diff", "data": data, "count": len(data), "timestamp": time.time()}
+                await self._send(client_id, frame)
+
+    async def _send_ready(
+        self, client_id: str, pvs: list[str], ready: dict[str, tuple[asyncio.Lock, dict | None, dict | None]]
+    ) -> None:
+        """Send a client one ``initial`` frame with the snapshot of the given ready PVs it still holds.
+
+        PVs released, or no longer subscribed by the client, since the snapshot
+        are left out; nothing is sent when none remain.
+
+        Parameters
+        ----------
+        client_id : str
+            Identifier of a client registered with `add_client`.
+        pvs : list[str]
+            Ready PVs queued for this client, at most ``initial_frame_max_pvs``.
+        ready : dict[str, tuple[asyncio.Lock, dict | None, dict | None]]
+            Per PV, the seed lock it was queued under and its value and
+            metadata payloads at snapshot time.
+        """
+        held = self._registry.client_pvs(client_id)
+        data: dict[str, dict] = {}
+        meta: dict[str, dict] = {}
+        for pv in pvs:
+            lock, value, pv_meta = ready[pv]
+            if self._seed_locks.get(pv) is not lock or pv not in held:
+                continue
+            if value is not None:
+                data[pv] = value
+            if pv_meta is not None:
+                meta[pv] = pv_meta
+        if not data and not meta:
+            return
+        await self._send(client_id, {"type": "initial", "data": data, "meta": meta, "count": len(data)})
 
     async def _heartbeat_loop(self) -> None:
         while self._running:
