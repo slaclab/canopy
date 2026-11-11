@@ -1,5 +1,6 @@
 """PV registry DTOs."""
 
+from typing import Literal
 from datetime import datetime
 
 from pydantic import Field, model_validator
@@ -66,3 +67,44 @@ class PVSearchResponse(CanopyModel):
     total_count: int
     limit: int
     offset: int
+
+
+# How ``POST /v1/pvs/multi`` treats a row whose identifying address is already registered:
+# refuse the whole import (``error``), leave the stored PV alone (``skip``), or apply the
+# row's provided fields to it (``update``).
+OnConflict = Literal["error", "skip", "update"]
+
+AddressKind = Literal["setpoint", "readback", "config"]
+
+
+class PVImportSkippedRowDTO(CanopyModel):
+    """A row of a bulk import left out because its identifying address is already registered."""
+
+    row: int  # 1-based position in the request
+    kind: AddressKind  # which address identifies the PV
+    address: str
+
+
+class PVAddressMismatchDTO(CanopyModel):
+    """A non-identifying address on an update row that differs from the stored PV's.
+
+    Addresses are never changed by an import, so the stored value is kept.
+    """
+
+    row: int  # 1-based position in the request
+    kind: AddressKind
+    requested: str
+    stored: str | None
+
+
+class PVImportResultDTO(CanopyModel):
+    """Response of ``POST /v1/pvs/multi`` with ``onConflict=skip`` or ``onConflict=update``.
+
+    Each list is in request order. ``updated`` and ``address_mismatches`` are always
+    empty for ``skip``.
+    """
+
+    created: list[PVElementDTO]
+    updated: list[PVElementDTO]
+    skipped: list[PVImportSkippedRowDTO]
+    address_mismatches: list[PVAddressMismatchDTO]

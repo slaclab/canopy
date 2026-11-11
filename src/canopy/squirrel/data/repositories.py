@@ -560,9 +560,104 @@ class PvRepository(BaseRepository[Pv]):
             return []
         self.session.add_all(pvs)
         await self.session.flush()
+        return await self._reload_in_order(pvs)
+
+    async def update_many(self, pvs: list[Pv]) -> list[Pv]:
+        """Flush changes made to loaded PVs and reload them in one batched pass.
+
+        The many-row counterpart of ``update``: the reload replaces a ``refresh`` per row,
+        and picks up ``updated_at``, which the database sets on update.
+
+        Parameters
+        ----------
+        pvs : list[Pv]
+            PVs already in the session, with their changes applied.
+
+        Returns
+        -------
+        list[Pv]
+            The same PVs, reloaded, in the order given.
+        """
+        if not pvs:
+            return []
+        await self.session.flush()
+        return await self._reload_in_order(pvs)
+
+    async def _reload_in_order(self, pvs: list[Pv]) -> list[Pv]:
+        """Reload flushed PVs (columns and tags) and return them in the order given."""
         ids = [pv.id for pv in pvs]
         by_id = {pv.id: pv for pv in await self.get_by_ids(ids, populate_existing=True)}
         return [by_id[pv_id] for pv_id in ids]
+
+    async def _get_by_identity(self, address_column, addresses: list[str], *conditions) -> dict[str, Pv]:
+        """``{address: Pv}`` for the PVs whose ``address_column`` is one of ``addresses``.
+
+        Batched under the Postgres parameter limit, with tags eager-loaded. Only setpoint
+        addresses are unique in the database; when several PVs share another identifying
+        address, the one with the lowest id is returned.
+        """
+        found: dict[str, Pv] = {}
+        for i in range(0, len(addresses), PARAM_BATCH_SIZE):
+            batch = addresses[i : i + PARAM_BATCH_SIZE]
+            result = await self.session.execute(
+                select(Pv)
+                .options(selectinload(Pv.tags).selectinload(Tag.group))
+                .where(*conditions, address_column.in_(batch))
+                .order_by(Pv.id)
+            )
+            for pv in result.scalars().all():
+                found.setdefault(getattr(pv, address_column.key), pv)
+        return found
+
+    async def get_by_setpoints(self, setpoint_addresses: list[str]) -> dict[str, Pv]:
+        """The registered PVs holding these setpoint addresses.
+
+        Parameters
+        ----------
+        setpoint_addresses : list[str]
+            Setpoint addresses to look up.
+
+        Returns
+        -------
+        dict[str, Pv]
+            Each found address mapped to its PV, tags loaded. Absent addresses are left out.
+        """
+        return await self._get_by_identity(Pv.setpoint_address, setpoint_addresses)
+
+    async def get_by_readbacks_without_setpoint(self, readback_addresses: list[str]) -> dict[str, Pv]:
+        """The setpoint-less PVs holding these readback addresses.
+
+        Parameters
+        ----------
+        readback_addresses : list[str]
+            Readback addresses to look up.
+
+        Returns
+        -------
+        dict[str, Pv]
+            Each found address mapped to a PV whose ``setpoint_address`` is NULL, tags
+            loaded. If several such PVs share an address, the one with the lowest id.
+        """
+        return await self._get_by_identity(Pv.readback_address, readback_addresses, Pv.setpoint_address.is_(None))
+
+    async def get_by_config_only(self, config_addresses: list[str]) -> dict[str, Pv]:
+        """The config-only PVs holding these config addresses.
+
+        Parameters
+        ----------
+        config_addresses : list[str]
+            Config addresses to look up.
+
+        Returns
+        -------
+        dict[str, Pv]
+            Each found address mapped to a PV whose ``setpoint_address`` and
+            ``readback_address`` are both NULL, tags loaded. If several such PVs share an
+            address, the one with the lowest id.
+        """
+        return await self._get_by_identity(
+            Pv.config_address, config_addresses, Pv.setpoint_address.is_(None), Pv.readback_address.is_(None)
+        )
 
     async def facility_ids_for(self, pv_id: str) -> set[str]:
         """The facility ids a PV is assigned to — empty if it's unassigned.
@@ -602,6 +697,19 @@ class PvRepository(BaseRepository[Pv]):
         rows = [{"pv_id": pv_id, "facility_id": fid} for pv_id, fids in assignments for fid in sorted(fids)]
         if rows:
             await self.session.execute(insert(pv_facility), rows)
+
+    async def set_facilities_many(self, assignments: list[tuple[str, set[str]]]) -> None:
+        """Replace the facility assignments of many PVs, as ``set_facilities`` does for one.
+
+        One delete for every listed PV, then one bulk insert; an empty set clears a PV's
+        assignments.
+        """
+        if not assignments:
+            return
+        await self.session.execute(
+            delete(pv_facility).where(pv_facility.c.pv_id == any_(_uuid_array([pv_id for pv_id, _ in assignments])))
+        )
+        await self.add_facilities_many(assignments)
 
     async def get_by_ids(self, ids: list[str], *, populate_existing: bool = False) -> list[Pv]:
         """Get many PVs by id, batched under the Postgres parameter limit.
