@@ -539,11 +539,30 @@ class PvRepository(BaseRepository[Pv]):
         return list(result.tuples().all())
 
     async def bulk_create(self, pvs: list[Pv]) -> list[Pv]:
+        """Insert PVs and reload them from the database.
+
+        The reload is batched (``get_by_ids``) rather than one ``refresh`` per row, so a
+        large import costs a handful of queries instead of one per PV. It overwrites the
+        identity-map copies like ``refresh`` would, leaving every column and each PV's
+        tags loaded for use outside an async lazy load.
+
+        Parameters
+        ----------
+        pvs : list[Pv]
+            New, not yet persisted PVs.
+
+        Returns
+        -------
+        list[Pv]
+            The created PVs, in the order given.
+        """
+        if not pvs:
+            return []
         self.session.add_all(pvs)
         await self.session.flush()
-        for pv in pvs:
-            await self.session.refresh(pv)
-        return pvs
+        ids = [pv.id for pv in pvs]
+        by_id = {pv.id: pv for pv in await self.get_by_ids(ids, populate_existing=True)}
+        return [by_id[pv_id] for pv_id in ids]
 
     async def facility_ids_for(self, pv_id: str) -> set[str]:
         """The facility ids a PV is assigned to — empty if it's unassigned.
@@ -584,16 +603,22 @@ class PvRepository(BaseRepository[Pv]):
         if rows:
             await self.session.execute(insert(pv_facility), rows)
 
-    async def get_by_ids(self, ids: list[str]) -> list[Pv]:
-        """Get many PVs by id, batched under the Postgres parameter limit."""
+    async def get_by_ids(self, ids: list[str], *, populate_existing: bool = False) -> list[Pv]:
+        """Get many PVs by id, batched under the Postgres parameter limit.
+
+        Rows come back in database order, not in the order of ``ids``. With
+        ``populate_existing``, PVs already in the session are overwritten with the
+        database's values, as ``session.refresh`` would.
+        """
         if not ids:
             return []
         all_pvs: list[Pv] = []
         for i in range(0, len(ids), PARAM_BATCH_SIZE):
             batch_ids = ids[i : i + PARAM_BATCH_SIZE]
-            result = await self.session.execute(
-                select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.id.in_(batch_ids))
-            )
+            query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.id.in_(batch_ids))
+            if populate_existing:
+                query = query.execution_options(populate_existing=True)
+            result = await self.session.execute(query)
             all_pvs.extend(result.scalars().all())
         return all_pvs
 
