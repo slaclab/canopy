@@ -1141,8 +1141,9 @@ class TestBatchedInitialFrames:
         await broker._drain_nowait()
         stale = broker._seed_locks["SIM:FLIP"]
         await broker.unsubscribe("c1", ["SIM:FLIP"])
-        # Left queued under the released lock, as a seed finishing in the same
-        # loop turn as the release could leave it; the flush must skip it.
+        # No code path leaves a PV queued under a released lock (_queue_initial
+        # checks the lock and the release pops the entry), so the check in
+        # _flush is defensive and this test writes the stale entry by hand.
         broker._pending_initial["SIM:FLIP"] = stale
 
         second = FakeWebSocket()
