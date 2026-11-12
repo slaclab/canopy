@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from canopy.analytics import gateway
 from canopy.core.errors import register_canopy_error_handler
+from canopy.core.modules import tag_module
 from canopy.analytics.config import get_analytics_config
 from canopy.analytics.runtime import mark_started
 from canopy.analytics.api.v1.router import router as v1_router
@@ -42,4 +43,5 @@ app = FastAPI(
 )
 
 register_canopy_error_handler(app)
+tag_module(app, "analytics")
 app.include_router(v1_router)
