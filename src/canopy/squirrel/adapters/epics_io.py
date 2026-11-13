@@ -19,6 +19,7 @@ JSONB value blob, enriching later needs no migration.
 from __future__ import annotations
 
 import asyncio
+import itertools
 from typing import Any
 from datetime import UTC, datetime
 from dataclasses import dataclass
@@ -99,9 +100,11 @@ def _to_epics_value(pv: PVValue) -> EpicsValue:
 class EpicsIO:
     """Batch EPICS reads/writes over a ``canopy.epics`` connector.
 
-    Concurrency is bounded by a semaphore; progress is reported on a chunk cadence.
-    The connector is shared and already started (typically the one the worker builds
-    at startup and stashes in the Arq context).
+    At most ``concurrency`` reads or writes are in flight at once. Reads run as one
+    pool, refilled as each read finishes; writes go chunk by chunk under a semaphore,
+    each chunk finishing before the next starts. Progress is reported every
+    ``chunk_size`` items either way. The connector is shared and already started
+    (typically the one the worker builds at startup and stashes in the Arq context).
     """
 
     def __init__(
@@ -125,28 +128,52 @@ class EpicsIO:
     async def get_many_with_progress(
         self, pv_names: list[str], progress_callback: ProgressCallback | None = None
     ) -> dict[str, EpicsValue]:
+        """Read every PV, at most ``concurrency`` at a time.
+
+        All reads share one pool rather than running chunk by chunk, so a PV that only
+        answers with a timeout (disconnected, retired, misspelled) holds up its own
+        slot and nothing else. Chunked, every chunk waited for its slowest read, and a
+        few dead PVs scattered through a large facility cost a full timeout per chunk.
+
+        ``progress_callback`` is awaited after every ``chunk_size`` completed reads and
+        once more at the end, in order, from this coroutine alone. If this coroutine is
+        cancelled (a job timing out), the reads still in flight are cancelled with it.
+        """
         results: dict[str, EpicsValue] = {}
         total = len(pv_names)
         if total == 0:
             return results
-        sem = asyncio.Semaphore(self._concurrency)
+        # Only the reads in flight have tasks, and each finished one is replaced by the
+        # next. A task per PV queued on a semaphore would read the same, but on Python
+        # 3.13+ cancelling thousands of semaphore waiters at once is quadratic in their
+        # number and blocks the event loop for all of it.
+        remaining = iter(pv_names)
+        in_flight: set[asyncio.Task[tuple[str, EpicsValue]]] = set()
         done = 0
-        for start in range(0, total, self._chunk_size):
-            chunk = pv_names[start : start + self._chunk_size]
-            pairs = await asyncio.gather(*(self._read_one(sem, addr) for addr in chunk))
-            results.update(dict(pairs))
-            done += len(chunk)
-            if progress_callback:
-                await progress_callback(done, total, f"Read {done}/{total} PVs...")
+        try:
+            while done < total:
+                for addr in itertools.islice(remaining, self._concurrency - len(in_flight)):
+                    in_flight.add(asyncio.create_task(self._read_one(addr)))
+                finished, in_flight = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+                for task in finished:
+                    addr, value = task.result()
+                    results[addr] = value
+                    done += 1
+                    if progress_callback and (done % self._chunk_size == 0 or done == total):
+                        await progress_callback(done, total, f"Read {done}/{total} PVs...")
+        finally:
+            for task in in_flight:
+                task.cancel()
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
         return results
 
-    async def _read_one(self, sem: asyncio.Semaphore, addr: str) -> tuple[str, EpicsValue]:
-        async with sem:
-            try:
-                pv = await self._connector.get(addr, timeout=self._timeout)
-                return addr, _to_epics_value(pv)
-            except Exception as exc:  # normalize any per-PV failure; never break the batch
-                return addr, EpicsValue(value=None, connected=False, error=str(exc))
+    async def _read_one(self, addr: str) -> tuple[str, EpicsValue]:
+        try:
+            pv = await self._connector.get(addr, timeout=self._timeout)
+            return addr, _to_epics_value(pv)
+        except Exception as exc:  # normalize any per-PV failure; never break the batch
+            return addr, EpicsValue(value=None, connected=False, error=str(exc))
 
     # --- writes ---------------------------------------------------------- #
 

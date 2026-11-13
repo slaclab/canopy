@@ -58,16 +58,18 @@ setting.
 
 A PV that doesn't answer holds a slot for the whole timeout. With the
 connector's 5-second default, many disconnected PVs can slow a capture down
-considerably. A shorter timeout makes captures of a machine with many
-disconnected PVs finish faster, at the risk of missing slow IOCs. In a
-capture, a PV that times out is still part of the snapshot, but with no saved
-value; in a restore, it is listed as a failure.
+considerably, since each one costs a slot for five seconds. A shorter timeout
+makes captures of a machine with many disconnected PVs finish faster, at the
+risk of missing slow IOCs. In a capture, a PV that times out is still part of
+the snapshot, but with no saved value; in a restore, it is listed as a failure.
 
 ### Progress updates (`EPICS_CHUNK_SIZE`)
 
-Reads and writes are done in chunks of this many PVs, and progress is
-reported after each chunk. Smaller chunks give smoother progress bars at
-the cost of more Redis writes.
+A capture reads all its PVs as one pool, `EPICS_CONCURRENCY` at a time, and
+reports progress after every `EPICS_CHUNK_SIZE` completed reads and once more
+at the end. A restore writes in chunks of `EPICS_CHUNK_SIZE` PVs, finishing
+each chunk before starting the next, and reports progress after each chunk.
+Smaller values give smoother progress bars at the cost of more Redis writes.
 
 ### Time limit
 
