@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from canopy.epics.pv_protocol import parse_pv_name
-from canopy.squirrel.restore_hooks.base import RestoreHook, RestoreHookError
+from canopy.squirrel.restore_hooks.base import RestoreHook
 
 # Colon-separated first-segment markers identifying magnet PVs.
 MAGNET_PREFIXES: frozenset[str] = frozenset({"BEND", "QUAD", "SEXT", "SOLN", "BTRM", "XCOR", "YCOR"})
@@ -47,18 +47,12 @@ def derive_magnet_address(address: str, segment: str) -> str | None:
     """
     _protocol, stripped = parse_pv_name(address)
     segments = stripped.split(":")
-    if not segments or segments[0] not in MAGNET_PREFIXES:
+    if segments and segments[0] in MAGNET_PREFIXES and segments[-1] == BDES_SEGMENT:
+        segments[-1] = segment
+        prefix = address[: len(address) - len(stripped)]
+        return prefix + ":".join(segments)
+    else:
         return None
-
-    if segments[-1] != BDES_SEGMENT:
-        raise RestoreHookError(
-            f"Magnet PV {address} is not a {BDES_SEGMENT} setpoint "
-            f"(expected a trailing :{BDES_SEGMENT}); cannot derive its {segment} PV"
-        )
-
-    segments[-1] = segment
-    prefix = address[: len(address) - len(stripped)]
-    return prefix + ":".join(segments)
 
 
 class MagnetTrimHook(RestoreHook):
