@@ -38,12 +38,9 @@ def derive_magnet_address(address: str, segment: str) -> str | None:
     Returns
     -------
     str | None
-        The rewritten address, or ``None`` when ``address`` is not a magnet PV.
-
-    Raises
-    ------
-    RestoreHookError
-        When ``address`` is a magnet PV whose trailing segment is not ``BDES``.
+        The rewritten address, or ``None`` when ``address`` is not a magnet PV or
+        its trailing segment is not ``BDES`` (e.g. an ``EDES`` setpoint, which
+        needs no trim).
     """
     _protocol, stripped = parse_pv_name(address)
     segments = stripped.split(":")
@@ -73,11 +70,6 @@ class MagnetTrimHook(RestoreHook):
         -------
         list[tuple[str, Any]]
             ``[(<CTRL address>, "TRIM")]`` for a magnet BDES setpoint, empty otherwise.
-
-        Raises
-        ------
-        RestoreHookError
-            When ``address`` is a magnet PV without a trailing ``BDES`` segment.
         """
         ctrl_addr = derive_magnet_address(address, CTRL_SEGMENT)
         if ctrl_addr is None:
