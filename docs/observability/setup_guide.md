@@ -72,7 +72,10 @@ exported.
 **Grafana** — open <http://localhost:3000> (admin/admin unless overridden via
 `GRAFANA_ADMIN_USER`/`GRAFANA_ADMIN_PASSWORD`). The Loki and Prometheus datasources and the
 *Canopy Frontend Analytics* / *Canopy Error Reporting* dashboards are
-provisioned automatically under the **Canopy** folder.
+provisioned automatically under the **Canopy** folder. So are the replication
+alert rules (**Alerting → Alert rules**, group *Replication*), which stay at
+"no data" unless the database has a replication slot or a subscription. See
+[Replication](metrics.md#replication).
 
 ## 4. Simulate a frontend error
 

@@ -17,6 +17,7 @@ from sqlalchemy.engine import make_url
 
 from canopy.core.arms import Arm, subscription_name
 from canopy.core.replication.sql import Refused, ReplicationError, owner_join
+from canopy.core.replication.metrics import read_status
 from canopy.core.replication.registry import (
     REGISTRY,
     OwnerPath,
@@ -31,7 +32,14 @@ from canopy.core.replication.subscriber import (
     subscriber_status,
 )
 
-from .conftest import Octopus, copied, seed_rows, eventually, build_schema
+from .conftest import (
+    Octopus,
+    copied,
+    seed_rows,
+    eventually,
+    build_schema,
+    metric_samples,
+)
 
 PRESENT = sorted(REGISTRY.replicated)
 one_arm = pytest.mark.parametrize("octopus", [1], indirect=True)
@@ -332,3 +340,110 @@ async def test_bare_octopus_has_its_roles_and_no_tables(bare_octopus: Octopus):
     # The head's owner can create the schema itself and subscribe, as in production.
     assert await o.head.conn.fetchval("SELECT pg_has_role(current_user, 'pg_create_subscription', 'MEMBER')")
     assert await o.head.conn.fetchval("SELECT has_database_privilege(current_database(), 'CREATE')")
+
+
+async def test_gauges_on_the_arms_and_per_arm_on_the_head(octopus: Octopus, monkeypatch):
+    o = octopus
+    first, second = o.arms.values()
+    monkeypatch.setattr("canopy.core.replication.metrics.get_arms_config", lambda: o.arms_config)
+    for arm in o.arms.values():
+        await publish(arm.admin, role="primary", config=o.config)
+    await seed_rows(first.admin, first.name)
+    await grants(o.head.conn, role="mirror", head=o.head.name, config=o.config)
+    await _subscribe(o, only=first.name)  # the second arm stays listed without a subscription
+    await eventually(lambda: copied(o, first.name))
+    # One streamed change, so the applied position moves past the initial copy's 0/0.
+    await first.admin.execute("UPDATE squirrel.pv SET description = 'streamed'")
+    await eventually(lambda: _in_step(o, first.name))
+
+    slot = frozenset({"slot": subscription_name(first.name), "kind": "subscription"}.items())
+    on_first = metric_samples(await read_status(first.admin, role="primary"))
+    assert on_first[("canopy_replication_slot_active", slot)] == 1
+    assert on_first[("canopy_replication_slot_wal_status", slot | {("wal_status", "reserved")})] == 1
+    assert on_first[("canopy_replication_slot_retained_bytes", slot)] >= 0
+    assert ("canopy_replication_slot_lag_bytes", slot) in on_first
+    assert metric_samples(await read_status(second.admin, role="primary")) == {
+        ("canopy_replication_status_up", frozenset()): 1
+    }
+
+    # The head's API reads its gauges as the app role, which can't see the applied position.
+    arm1, arm2 = (frozenset({"arm": arm.name}.items()) for arm in (first, second))
+    await o.head.admin.execute(f'SET ROLE "{o.config.app_role}"')
+    head = metric_samples(await read_status(o.head.admin, role="mirror"))
+    await o.head.admin.execute("RESET ROLE")
+    assert head[("canopy_replication_subscription_exists", arm1)] == 1
+    assert head[("canopy_replication_subscription_worker_up", arm1)] == 1
+    assert head[("canopy_replication_subscription_receive_age_seconds", arm1)] < 60
+    assert head[("canopy_replication_subscription_apply_errors_total", arm1)] == 0
+    assert head[("canopy_replication_subscription_tables_not_ready", arm1)] == 0
+    assert ("canopy_replication_subscription_applied_lsn_bytes", arm1) not in head
+    assert head[("canopy_replication_subscription_exists", arm2)] == 0
+    assert not [name for name, labels in head if labels == arm2 and not name.endswith("_exists")]
+    assert head[("canopy_replication_subscriptions_unexpected", frozenset())] == 0
+
+    as_superuser = metric_samples(await read_status(o.head.admin, role="mirror"))
+    assert as_superuser[("canopy_replication_subscription_applied_lsn_bytes", arm1)] > 0
+
+    # A disabled subscription keeps its pg_stat_subscription row, without a worker.
+    await o.head.admin.execute(f'ALTER SUBSCRIPTION "{subscription_name(first.name)}" DISABLE')
+
+    async def worker_stopped():
+        samples = metric_samples(await read_status(o.head.admin, role="mirror"))
+        return samples[("canopy_replication_subscription_worker_up", arm1)] == 0
+
+    await eventually(worker_stopped)
+
+
+async def _facility_on(conn: asyncpg.Connection, facility_id: str) -> bool:
+    return bool(await conn.fetchval("SELECT count(*) FROM core.facility WHERE id = $1", facility_id))
+
+
+async def test_a_slug_another_owner_holds_stops_only_that_arms_apply(octopus: Octopus, monkeypatch):
+    """The apply-stopped alert's case: two arms create one facility slug after subscribing."""
+    o = octopus
+    first, second = o.arms.values()
+    monkeypatch.setattr("canopy.core.replication.metrics.get_arms_config", lambda: o.arms_config)
+    for arm in o.arms.values():
+        await publish(arm.admin, role="primary", config=o.config)
+    await grants(o.head.conn, role="mirror", head=o.head.name, config=o.config)
+    await _subscribe(o)
+    for arm in o.arms.values():
+        await eventually(lambda arm=arm: copied(o, arm.name))
+    arm1, arm2 = (frozenset({"arm": arm.name}.items()) for arm in (first, second))
+
+    async def create(arm, slug: str) -> str:
+        facility_id = str(uuid4())
+        await arm.admin.execute(
+            "INSERT INTO core.facility (id, slug, name, owner_instance) VALUES ($1, $2, 'Facility', $3)",
+            facility_id,
+            slug,
+            arm.name,
+        )
+        return facility_id
+
+    async def apply_errors(arm: frozenset) -> float:
+        samples = metric_samples(await read_status(o.head.admin, role="mirror"))
+        return samples[("canopy_replication_subscription_apply_errors_total", arm)]
+
+    held = await create(first, "fac_shared")
+    await eventually(lambda: _facility_on(o.head.conn, held))
+    stuck = await create(second, "fac_shared")  # unique everywhere: the head can't apply it
+    await eventually(lambda: _more_than(apply_errors(arm2), 1))
+
+    # The other arm keeps streaming, with no errors of its own.
+    later = await create(first, "fac_later")
+    await eventually(lambda: _facility_on(o.head.conn, later))
+    assert await apply_errors(arm1) == 0
+    assert not await _facility_on(o.head.conn, stuck)
+
+    # The fix: rename the other owner's facility where it's owned; the stuck change then applies.
+    await first.admin.execute("UPDATE core.facility SET slug = 'fac_renamed' WHERE id = $1", held)
+    await eventually(lambda: _facility_on(o.head.conn, stuck))
+    errors = await apply_errors(arm2)
+    after = await create(second, "fac_after")
+    await eventually(lambda: _facility_on(o.head.conn, after))
+    assert await apply_errors(arm2) == errors
+
+
+async def _more_than(value, limit: float) -> bool:
+    return await value > limit

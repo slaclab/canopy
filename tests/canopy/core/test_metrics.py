@@ -152,4 +152,5 @@ def test_metrics_endpoint_is_unauthenticated_and_parseable():
         "canopy_hare_clients",
         "canopy_hare_active_monitors",
         "canopy_hare_subscriptions",
+        "canopy_replication_status_up",
     } <= names
