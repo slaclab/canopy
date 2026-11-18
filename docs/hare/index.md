@@ -76,7 +76,8 @@ Environment variables with prefix `CANOPY_HARE__`:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `CANOPY_HARE__WS_BATCH_INTERVAL_MS` | `100` | Diff-stream batching window — buffered updates flush to clients this often |
+| `CANOPY_HARE__WS_BATCH_INTERVAL_MS` | `100` | Diff-stream batching window — buffered updates, and the `initial` frames of PVs that finished seeding, flush to clients this often |
+| `CANOPY_HARE__INITIAL_FRAME_MAX_PVS` | `1000` | Max PVs in one `initial` frame sent by a flush; more ready PVs are split across several frames in the same flush |
 | `CANOPY_HARE__HEARTBEAT_INTERVAL_S` | `5.0` | Cadence of WebSocket `heartbeat` frames |
 | `CANOPY_HARE__MAX_PVS_PER_MESSAGE` | `5000` | Max PV names accepted in a single subscribe frame (excess dropped) |
 | `CANOPY_HARE__MAX_SUBSCRIPTIONS_PER_CLIENT` | `20000` | Max distinct PVs one client may hold subscriptions to |

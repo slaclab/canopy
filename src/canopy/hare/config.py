@@ -21,6 +21,13 @@ class HareConfig(BaseSettings):
 
     # Diff-stream batching window: buffered updates flush to clients this often.
     ws_batch_interval_ms: int = 100
+    initial_frame_max_pvs: int = 1_000
+    """Max PVs in one ``initial`` frame sent by a flush.
+
+    PVs that finish seeding between two flushes are sent together; a client
+    with more ready PVs than this gets several frames in that flush, so one
+    large subscribe never produces a single multi-megabyte frame.
+    """
     # Heartbeat frames keep clients aware the broker is alive.
     heartbeat_interval_s: float = 5.0
 

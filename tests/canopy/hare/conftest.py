@@ -97,7 +97,11 @@ class FakeWebSocket:
 
 
 async def settle(broker: PVBroker) -> None:
-    """Ingest queued monitor updates, wait for the seeding they start and flush the diffs, as the running broker would."""
+    """Ingest queued monitor updates, wait for the seeding that follows and flush, as the running broker would.
+
+    The flush sends the ``initial`` frames of the PVs that seeding queued as
+    well as the buffered diffs.
+    """
     await broker._drain_nowait()
     await broker.drain_seeds()
     await broker._drain_nowait()
