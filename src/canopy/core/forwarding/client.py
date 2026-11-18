@@ -11,6 +11,7 @@ import asyncio
 import logging
 from dataclasses import field, dataclass
 from urllib.parse import quote, urlsplit
+from collections.abc import Callable, Awaitable
 
 import httpx
 import asyncpg
@@ -168,19 +169,49 @@ async def send_to_arm(
         ) from None
 
 
+class ArmRefused(Exception):
+    """An arm answered a request the head sent it with an error status.
+
+    Raised by callers that act on the arm's answer rather than relay it (a capture
+    the head delivers). ``status`` is the HTTP status, 4xx or 5xx; ``code`` and
+    ``detail`` are the arm's ``{code, detail}`` body, or ``None`` and the body's
+    text when it sent something else.
+    """
+
+    def __init__(self, arm: str, status: int, code: str | None, detail: str) -> None:
+        super().__init__(f"Arm '{arm}' answered {status} {code or ''}: {detail}".replace("  ", " "))
+        self.arm = arm
+        self.status = status
+        self.code = code
+        self.detail = detail
+
+    @classmethod
+    def from_answer(cls, arm: str, answer: httpx.Response) -> ArmRefused:
+        return cls(arm, answer.status_code, *arm_error(answer))
+
+
 def lsn_value(lsn: str) -> int:
     """A ``pg_lsn`` text value (``"16/B374D848"``) as a comparable integer."""
     high, _, low = lsn.partition("/")
     return (int(high, 16) << 32) | int(low, 16)
 
 
-async def wait_until_applied(commit_lsn: str, timeout_s: float, *, subscription: str) -> bool:
+async def wait_until_applied(
+    commit_lsn: str,
+    timeout_s: float,
+    *,
+    subscription: str,
+    until: Callable[[asyncpg.Connection], Awaitable[bool]] | None = None,
+) -> bool:
     """Wait up to ``timeout_s`` for ``subscription`` to apply ``commit_lsn`` here.
 
-    Polls ``applied_lsn`` (``pg_replication_origin_status.remote_lsn``). ``False`` on a
-    timeout, and also when the position can't be read (no such subscription, or no
-    grant on the view): the caller then marks the answer stale, which is true as far
-    as this instance can tell. Never raises; the write already succeeded on the arm.
+    Polls ``applied_lsn`` (``pg_replication_origin_status.remote_lsn``). ``until``, if
+    given, is asked on the same connection at each poll and ends the wait early when
+    true: for a write that may already be here although the position isn't reached.
+    ``False`` on a timeout, and also when the position can't be read (no such
+    subscription, or no grant on the view): the caller then marks the answer stale,
+    which is true as far as this instance can tell. Never raises; the write already
+    succeeded on the arm.
 
     ``timeout_s`` bounds the whole wait, getting a connection from the pool and each
     query included, so a busy pool or a stalled database can't hold the answer.
@@ -195,6 +226,8 @@ async def wait_until_applied(commit_lsn: str, timeout_s: float, *, subscription:
             async with get_engine().connect() as conn:
                 raw = (await conn.get_raw_connection()).driver_connection
                 while True:
+                    if until is not None and await until(raw):
+                        return True
                     applied = await applied_lsn(raw, subscription)
                     if applied is not None and lsn_value(applied) >= target:
                         return True

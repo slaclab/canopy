@@ -36,6 +36,7 @@ class ErrorCode(StrEnum):
     ARCHIVED_IMMUTABLE = auto()
     PRIMARY_UNAVAILABLE = auto()
     SERVICE_KEY_REFUSED = auto()
+    MACHINE_READ_ONLY = auto()
 
     # Mole
     ARCHIVER_NOT_CONFIGURED = auto()
@@ -332,6 +333,17 @@ class ServiceKeyRefused(CanopyError):
 
     status_code = 502
     error_code = ErrorCode.SERVICE_KEY_REFUSED
+
+
+class MachineReadOnly(CanopyError):
+    """A machine write (a PV write, a restore) refused by an instance without machine access.
+
+    The instance takes other writes, just not ones that change the machine
+    (``CANOPY_MACHINE_ACCESS=read``).
+    """
+
+    status_code = 403
+    error_code = ErrorCode.MACHINE_READ_ONLY
 
 
 def register_canopy_error_handler(app: FastAPI) -> None:

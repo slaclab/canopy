@@ -1,7 +1,8 @@
 """``GET /v1/instance`` — what this deployment is, for clients and deploy checks.
 
 Clients read ``instance`` to tell which rows they can write here (a row's
-``ownerInstance`` must match it) and ``historyUrl`` to link to the full history.
+``ownerInstance`` must match it), ``machineAccess`` to hide PV writes and restores
+where they would be refused, and ``historyUrl`` to link to the full history.
 The deploy pipeline compares the head's ``alembicHead`` with the new image's to
 stop a release that would migrate the primary ahead of the copy subscribed to it.
 On a history head, ``arms`` lists the arms it subscribes to, the state of each
@@ -49,6 +50,7 @@ class InstanceDTO(CanopyModel):
     history_url: str | None
     window_days: int | None
     alembic_head: str | None
+    machine_access: Literal["read", "write"]
     arms: list[ArmDTO]
 
 
@@ -134,5 +136,6 @@ async def get_instance(session: SessionDep) -> InstanceDTO:
         history_url=settings.history_url,
         window_days=settings.window_days,
         alembic_head=shipped_alembic_head(),
+        machine_access=settings.machine_access,
         arms=[ArmDTO(name=arm, subscription=states[arm], forwards=configured[arm].forwards) for arm in arms],
     )
