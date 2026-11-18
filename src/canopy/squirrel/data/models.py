@@ -28,7 +28,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, relationship, mapped_column
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
-from canopy.core.db import Base, UUIDMixin, TimestampMixin
+from canopy.core.db import Base, UUIDMixin, TimestampMixin, SoftDeleteMixin
 from canopy.core.ownership import OwnedMixin
 
 SQUIRREL_SCHEMA = "squirrel"
@@ -54,7 +54,7 @@ pv_tag = Table(
 )
 
 
-class Pv(UUIDMixin, TimestampMixin, OwnedMixin, Base):
+class Pv(UUIDMixin, TimestampMixin, OwnedMixin, SoftDeleteMixin, Base):
     """A registered PV: its address(es), owning device, and compare tolerances.
 
     Address resolution (the three ``*_address`` columns + ``device``) is kept
@@ -63,6 +63,10 @@ class Pv(UUIDMixin, TimestampMixin, OwnedMixin, Base):
     tolerances stay local. Only ``setpoint_address`` is unique, per owner: the same
     PV can be registered on two instances, and a mirror holds both rows. The
     at-least-one-address rule is enforced in the service layer, not the DB.
+
+    Deleting a PV sets ``deleted_at``: the row, its tags and its values in past
+    snapshots stay, and registering the same identifying address again brings the
+    row back.
     """
 
     __tablename__ = "pv"
@@ -80,8 +84,9 @@ class Pv(UUIDMixin, TimestampMixin, OwnedMixin, Base):
     rel_tolerance: Mapped[float] = mapped_column(Float, nullable=False, server_default=text("0.0"))
 
     tags: Mapped[list[Tag]] = relationship("Tag", secondary=pv_tag, back_populates="pvs", lazy="selectin")
+    # No ORM cascade: a PV's values belong to the snapshots that captured them.
     snapshot_values: Mapped[list[SnapshotValue]] = relationship(
-        "SnapshotValue", back_populates="pv", cascade="all, delete-orphan"
+        "SnapshotValue", back_populates="pv", passive_deletes=True
     )
 
 
@@ -144,10 +149,11 @@ pv_facility = Table(
 # --------------------------------------------------------------------------- #
 
 
-class Snapshot(UUIDMixin, TimestampMixin, OwnedMixin, Base):
+class Snapshot(UUIDMixin, TimestampMixin, OwnedMixin, SoftDeleteMixin, Base):
     """A captured machine state: metadata + one ``SnapshotValue`` per read address.
 
     Its facility and every PV its values reference share its ``owner_instance``.
+    Deleting a snapshot sets ``deleted_at`` and keeps its values; the row keeps its owner.
     """
 
     __tablename__ = "snapshot"
