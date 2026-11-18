@@ -17,6 +17,8 @@ case-insensitive, so ``APPS__SQUIRREL__`` lands in ``apps["squirrel"]``.
 from pydantic import Field, BaseModel, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsError, SettingsConfigDict
 
+from canopy.core import config as core_config
+
 
 class ElogPlusConfig(BaseModel):
     """Settings for the ``elog_plus`` provider (https://github.com/slaclab/elog-plus).
@@ -91,15 +93,4 @@ def describe_settings_error(exc: ValidationError | SettingsError) -> str:
     Names the offending variables but never their values: pydantic's own
     message echoes the input, which may sit next to a token in a deploy secret.
     """
-    if isinstance(exc, ValidationError):
-        problems = [
-            f"{_env_name(error['loc'])}: {error['msg']}"
-            for error in exc.errors(include_input=False, include_url=False, include_context=False)
-        ]
-        return "Invalid e-log settings: " + "; ".join(problems)
-    # SettingsError names the field and source only (e.g. a DEFAULT_LOGBOOK_IDS that isn't JSON).
-    return f"Invalid e-log settings: {exc}"
-
-
-def _env_name(loc: tuple) -> str:
-    return "CANOPY_ELOG__" + "__".join(str(part).upper() for part in loc)
+    return "Invalid e-log settings: " + core_config.describe_settings_error(exc, prefix="CANOPY_ELOG__")
