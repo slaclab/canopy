@@ -18,5 +18,8 @@ canopy.core.replication`` (see ``__main__``) applies them:
   ``pg_create_subscription`` (or a superuser), with each arm's
   ``CANOPY_ARMS__<arm>__PUBLISHER_DSN`` from a secret (``canopy.core.arms``).
 
-``status`` reports either side as JSON; on a head, per arm.
+``status`` reports either side as JSON; on a head, per arm. ``drift-check`` runs on
+a head, hourly after ``refresh``: it compares each arm's rows with the head's copy
+over that arm's read-only connection (``CANOPY_ARMS__<arm>__READER_DSN``), then
+checks every reference on the head (see ``drift``).
 """
