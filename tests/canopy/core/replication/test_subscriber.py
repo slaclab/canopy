@@ -52,7 +52,7 @@ async def test_grants_reads_every_row_and_writes_only_the_heads(db, config):
     result = await grants(db, role="mirror", head=HEAD, config=config)
 
     assert result["replicated"] == PRESENT and result["row_security"] == ROOTS
-    assert result["local"] == ["core.api_key", "core.history_heartbeat"]
+    assert result["local"] == ["core.api_key", "core.history_heartbeat", "squirrel.snapshot_outbox"]
     for table in PRESENT + result["local"]:
         assert await privileges(db, config.app_role, table) == RW, table
     for table in PRESENT:

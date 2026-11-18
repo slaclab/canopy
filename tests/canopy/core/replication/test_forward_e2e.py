@@ -139,10 +139,13 @@ async def test_the_heads_own_rows_stay_on_the_head(octopus: Octopus, head_app):
         assert await arm.admin.fetchval("SELECT count(*) FROM squirrel.tag_group WHERE id = $1", group_id) == 0
 
 
-async def _captured_import(octopus: Octopus, arm: str, bundle: SnapshotBundleDTO, monkeypatch) -> tuple[bool, str]:
+async def _captured_import(
+    octopus: Octopus, arm: str, bundle: SnapshotBundleDTO, monkeypatch, *, strict: bool = False
+) -> tuple[bool, str]:
     """Save ``bundle`` on ``arm`` the way its captured import does, as a forwarded request.
 
-    Returns whether it saved anything, and the position the arm would answer with.
+    Returns whether it saved anything, and the position the arm would answer with. A
+    refusal is raised as the service raises it, with nothing saved.
     """
     monkeypatch.setenv("CANOPY_INSTANCE", arm)
     get_settings.cache_clear()
@@ -158,7 +161,13 @@ async def _captured_import(octopus: Octopus, arm: str, bundle: SnapshotBundleDTO
     try:
         sessions = db.get_session()
         session = await anext(sessions)
-        result = await SnapshotService(session, None).import_bundle(bundle, captured=True, created_by="operator@head")
+        try:
+            result = await SnapshotService(session, None).import_bundle(
+                bundle, captured=True, created_by="operator@head", strict=strict
+            )
+        except Exception:
+            await sessions.aclose()  # rolls the arm's transaction back
+            raise
         with pytest.raises(StopAsyncIteration):
             await anext(sessions)
     finally:

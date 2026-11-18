@@ -21,12 +21,18 @@ from canopy.core.logging import configure_logging
 from canopy.epics.config import get_epics_config
 from canopy.epics.gateway import build_connector
 from canopy.squirrel.prune import prune_snapshots
-from canopy.squirrel.tasks import create_snapshot_task, restore_snapshot_task
+from canopy.squirrel.tasks import (
+    deliver_outbox_task,
+    create_snapshot_task,
+    restore_snapshot_task,
+)
 from canopy.converter.tasks import convert_batch
 from canopy.squirrel.config import get_squirrel_config
 from canopy.squirrel.pv_cache import PVCacheMonitor
+from canopy.core.forwarding.client import forwardable_arms
 from canopy.squirrel.restore_hooks import get_restore_hooks, publish_worker_status
 from canopy.core.replication.config import get_prune_config
+from canopy.squirrel.outbox.delivery import RUN_BUDGET_S
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -83,7 +89,7 @@ async def on_shutdown(ctx: dict) -> None:
 
 
 # Task functions registered with Arq. Each module appends its tasks here.
-FUNCTIONS = [ping, convert_batch, create_snapshot_task, restore_snapshot_task]
+FUNCTIONS = [ping, convert_batch, create_snapshot_task, restore_snapshot_task, deliver_outbox_task]
 # Tasks that write to the machine, registered only with CANOPY_MACHINE_ACCESS=write.
 MACHINE_FUNCTIONS = [restore_snapshot_task]
 
@@ -102,14 +108,29 @@ def worker_functions(settings: Settings) -> list:
 
 
 def worker_cron_jobs(role: str) -> list:
-    """Scheduled tasks for an instance ``role``: pruning, on a primary (an arm) only.
+    """Scheduled tasks for an instance ``role``: pruning on a primary (an arm), outbox delivery on a head.
 
-    ``unique`` makes one worker run each tick when several share the queue. The job
-    itself does nothing unless ``CANOPY_PRUNE__ENABLED``; a mirror (a head) never
-    registers it, since it holds the history its arms prune, and its own rows too.
+    ``unique`` makes one worker run each tick when several share the queue. The prune
+    job itself does nothing unless ``CANOPY_PRUNE__ENABLED``; a mirror (a head) never
+    registers it, since it holds the history its arms prune, and its own rows too. A
+    head that forwards to arms delivers their queued snapshots every
+    ``CANOPY_SQUIRREL__OUTBOX__INTERVAL_S`` seconds past each minute.
     """
     if role != "primary":
-        return []
+        if not forwardable_arms():
+            return []
+        interval = get_squirrel_config().outbox.interval_s
+        # One run stops starting sends after RUN_BUDGET_S, so it ends within the timeout.
+        return [
+            cron(
+                deliver_outbox_task,
+                second=set(range(0, 60, interval)),
+                unique=True,
+                run_at_startup=True,
+                timeout=RUN_BUDGET_S + 120,
+                keep_result=600,
+            )
+        ]
     # A run may delete hundreds of full-machine snapshots, well past job_timeout; its
     # outcome is kept a day for anyone checking on it.
     return [

@@ -1,0 +1,208 @@
+# Alert rules for a history head's snapshot outbox, on the gauges from
+# canopy.squirrel.outbox.metrics (docs/observability/metrics.md, "Snapshot outbox").
+# Each series carries `arm`, the arm the snapshots are queued for. Only a head that
+# delivers to arms reports these series; elsewhere they evaluate to "no data", which
+# is OK.
+#
+# Grafana loads these at startup; they are read-only in the UI, like the
+# provisioned dashboards. No contact point is provisioned: route the
+# `team: canopy` label from a notification policy where one is wanted.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: Snapshot outbox
+    folder: Canopy
+    interval: 1m
+    rules:
+      - uid: canopy-outbox-pending-age
+        title: Snapshots waiting for an arm
+        condition: C
+        for: 1m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: canopy}
+        annotations:
+          summary: "{{ $labels.arm }}'s oldest queued snapshot on {{ $labels.instance }} has waited over 15 minutes."
+          description: >-
+            The head can't deliver to the arm: the arm is unreachable, answers 5xx, or turns down the
+            head's service key. Captures for that arm keep queueing until its cap. `python -m
+            canopy.squirrel.outbox status` on the head shows the last error.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: canopy_squirrel_outbox_oldest_pending_age_seconds
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [900]}
+
+      - uid: canopy-outbox-failed
+        title: Arm refused a queued snapshot
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical, team: canopy}
+        annotations:
+          summary: "{{ $labels.arm }} refused a snapshot {{ $labels.instance }} queued for it."
+          description: >-
+            The snapshot is kept on the head as failed, with the arm's reason, and still holds its share
+            of the arm's cap. Fix the cause and `retry` it (with `--allow-skips` for import_would_skip),
+            or export and `discard` it.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: 'canopy_squirrel_outbox_snapshots{state="failed"}'
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+
+      - uid: canopy-outbox-not-back
+        title: Delivered snapshot not replicated back
+        condition: C
+        for: 1m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: canopy}
+        annotations:
+          summary: "A snapshot {{ $labels.arm }} saved for {{ $labels.instance }} hasn't replicated back in 30 minutes."
+          description: >-
+            The arm has it, but the head's subscription to that arm isn't applying. Check the arm's
+            replication alerts.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: canopy_squirrel_outbox_oldest_delivered_age_seconds
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [1800]}
+
+      - uid: canopy-outbox-near-full
+        title: Arm's outbox over 80% full
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: canopy}
+        annotations:
+          summary: "{{ $labels.arm }}'s outbox on {{ $labels.instance }} is over 80% of a cap."
+          description: >-
+            At either cap (snapshots or bytes) new captures for the arm are refused with outbox_full.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: >-
+                max by (instance, arm) (
+                  label_replace(
+                    sum by (instance, job, arm) (canopy_squirrel_outbox_snapshots)
+                    / on (instance, job) group_left canopy_squirrel_outbox_max_snapshots,
+                    "cap", "snapshots", "", "")
+                  or label_replace(
+                    canopy_squirrel_outbox_bytes / on (instance, job) group_left canopy_squirrel_outbox_max_bytes,
+                    "cap", "bytes", "", "")
+                )
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0.8]}
+
+      - uid: canopy-outbox-full
+        title: Arm's outbox full
+        condition: C
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: critical, team: canopy}
+        annotations:
+          summary: "{{ $labels.arm }}'s outbox on {{ $labels.instance }} is full; captures for it are refused."
+          description: >-
+            New captures for the arm get 503 outbox_full. Bring the arm back, or retry or discard failed
+            rows to make room.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: >-
+                max by (instance, arm) (
+                  label_replace(
+                    sum by (instance, job, arm) (canopy_squirrel_outbox_snapshots)
+                    / on (instance, job) group_left canopy_squirrel_outbox_max_snapshots,
+                    "cap", "snapshots", "", "")
+                  or label_replace(
+                    canopy_squirrel_outbox_bytes / on (instance, job) group_left canopy_squirrel_outbox_max_bytes,
+                    "cap", "bytes", "", "")
+                )
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: gt, params: [0.999]}
+
+      - uid: canopy-outbox-status-down
+        title: Outbox status unreadable
+        condition: C
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels: {severity: warning, team: canopy}
+        annotations:
+          summary: "{{ $labels.instance }} can't read its snapshot outbox, so its other outbox alerts are blind."
+          description: >-
+            The API's metrics refresh can't query its database. The API log has the reason.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: canopy-prometheus
+            model:
+              refId: A
+              expr: canopy_squirrel_outbox_status_up
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: {type: lt, params: [1]}

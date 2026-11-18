@@ -94,6 +94,8 @@ class ErrorCode(StrEnum):
     TAG_GROUP_NOT_FOUND = auto()
     TAG_GROUP_ALREADY_EXISTS = auto()
     META_PV_NOT_FOUND = auto()
+    SNAPSHOT_PENDING = auto()
+    OUTBOX_FULL = auto()
     FACILITY_NOT_FOUND = auto()
     FACILITY_SLUG_CONFLICT = auto()
     FACILITY_HAS_CHILDREN = auto()
