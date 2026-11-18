@@ -153,7 +153,10 @@ class Snapshot(UUIDMixin, TimestampMixin, OwnedMixin, SoftDeleteMixin, Base):
     """A captured machine state: metadata + one ``SnapshotValue`` per read address.
 
     Its facility and every PV its values reference share its ``owner_instance``.
-    Deleting a snapshot sets ``deleted_at`` and keeps its values; the row keeps its owner.
+    Deleting a snapshot sets ``deleted_at`` and keeps its values; the row keeps its
+    owner. ``retain`` exempts it from any pruning of old snapshots. ``imported_from`` is
+    the id of the snapshot it was imported from, usually on a history head; no foreign
+    key, since that snapshot may no longer exist here.
     """
 
     __tablename__ = "snapshot"
@@ -171,6 +174,8 @@ class Snapshot(UUIDMixin, TimestampMixin, OwnedMixin, SoftDeleteMixin, Base):
     # Opaque reference to ``core.facility.id`` — no cross-schema foreign key; resolved
     # via ``canopy.core.facilities.gateway``.
     facility_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False), index=True)
+    retain: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    imported_from: Mapped[str | None] = mapped_column(UUID(as_uuid=False))
 
     values: Mapped[list[SnapshotValue]] = relationship(
         "SnapshotValue", back_populates="snapshot", cascade="all, delete-orphan", lazy="selectin"

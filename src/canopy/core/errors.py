@@ -79,6 +79,9 @@ class ErrorCode(StrEnum):
 
     # Squirrel
     SNAPSHOT_NOT_FOUND = auto()
+    SNAPSHOT_ID_CONFLICT = auto()
+    NOTHING_TO_IMPORT = auto()
+    IMPORT_WOULD_SKIP = auto()
     PV_NOT_FOUND = auto()
     PV_ALREADY_EXISTS = auto()
     TAG_NOT_FOUND = auto()
