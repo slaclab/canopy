@@ -14,6 +14,7 @@ from datetime import datetime
 from sqlalchemy import (
     Text,
     Float,
+    Index,
     Table,
     Column,
     String,
@@ -21,12 +22,14 @@ from sqlalchemy import (
     Integer,
     DateTime,
     ForeignKey,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.orm import Mapped, relationship, mapped_column
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
 from canopy.core.db import Base, UUIDMixin, TimestampMixin
+from canopy.core.ownership import OwnedMixin
 
 SQUIRREL_SCHEMA = "squirrel"
 
@@ -51,20 +54,24 @@ pv_tag = Table(
 )
 
 
-class Pv(UUIDMixin, TimestampMixin, Base):
+class Pv(UUIDMixin, TimestampMixin, OwnedMixin, Base):
     """A registered PV: its address(es), owning device, and compare tolerances.
 
     Address resolution (the three ``*_address`` columns + ``device``) is kept
     independent of the comparison policy (``abs_tolerance``/``rel_tolerance``) so a
     later Raccoon directory delegation can resolve addresses externally while the
-    tolerances stay local. Only ``setpoint_address`` is unique; the
+    tolerances stay local. Only ``setpoint_address`` is unique, per owner: the same
+    PV can be registered on two instances, and a mirror holds both rows. The
     at-least-one-address rule is enforced in the service layer, not the DB.
     """
 
     __tablename__ = "pv"
-    __table_args__ = {"schema": SQUIRREL_SCHEMA}
+    __table_args__ = (
+        UniqueConstraint("owner_instance", "setpoint_address", name="uq_pv_owner_instance_setpoint_address"),
+        {"schema": SQUIRREL_SCHEMA},
+    )
 
-    setpoint_address: Mapped[str | None] = mapped_column(String(255), index=True, unique=True)
+    setpoint_address: Mapped[str | None] = mapped_column(String(255), index=True)
     readback_address: Mapped[str | None] = mapped_column(String(255), index=True)
     config_address: Mapped[str | None] = mapped_column(String(255), index=True)
     device: Mapped[str | None] = mapped_column(String(255), index=True)
@@ -78,13 +85,16 @@ class Pv(UUIDMixin, TimestampMixin, Base):
     )
 
 
-class TagGroup(UUIDMixin, TimestampMixin, Base):
-    """A named group of tags (e.g. ``Region``); group name is globally unique."""
+class TagGroup(UUIDMixin, TimestampMixin, OwnedMixin, Base):
+    """A named group of tags (e.g. ``Region``); the name is unique per owner."""
 
     __tablename__ = "tag_group"
-    __table_args__ = {"schema": SQUIRREL_SCHEMA}
+    __table_args__ = (
+        UniqueConstraint("owner_instance", "name", name="uq_tag_group_owner_instance_name"),
+        {"schema": SQUIRREL_SCHEMA},
+    )
 
-    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True, unique=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[str | None] = mapped_column(Text)
 
     tags: Mapped[list[Tag]] = relationship("Tag", back_populates="group", cascade="all, delete-orphan", lazy="selectin")
@@ -104,6 +114,11 @@ class Tag(UUIDMixin, TimestampMixin, Base):
 
     group: Mapped[TagGroup] = relationship("TagGroup", back_populates="tags", lazy="selectin")
     pvs: Mapped[list[Pv]] = relationship("Pv", secondary=pv_tag, back_populates="tags")
+
+    @staticmethod
+    def __owner_parent__() -> tuple[type[TagGroup], str]:
+        """A tag is owned by its group's owner (``canopy.core.ownership``)."""
+        return TagGroup, "group_id"
 
 
 # --------------------------------------------------------------------------- #
@@ -129,11 +144,17 @@ pv_facility = Table(
 # --------------------------------------------------------------------------- #
 
 
-class Snapshot(UUIDMixin, TimestampMixin, Base):
-    """A captured machine state: metadata + one ``SnapshotValue`` per read address."""
+class Snapshot(UUIDMixin, TimestampMixin, OwnedMixin, Base):
+    """A captured machine state: metadata + one ``SnapshotValue`` per read address.
+
+    Its facility and every PV its values reference share its ``owner_instance``.
+    """
 
     __tablename__ = "snapshot"
-    __table_args__ = {"schema": SQUIRREL_SCHEMA}
+    __table_args__ = (
+        Index("ix_squirrel_snapshot_owner_instance", "owner_instance"),
+        {"schema": SQUIRREL_SCHEMA},
+    )
 
     title: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[str | None] = mapped_column(Text)

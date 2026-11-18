@@ -65,7 +65,7 @@ class SnapshotBase(CanopyModel):
 
 class NewSnapshotDTO(SnapshotBase):
     """Create a snapshot. With ``facility``, captures the PVs assigned to that facility
-    or its descendants; without, every registered PV."""
+    or its descendants; without, every PV this instance owns."""
 
     facility: str | None = None
 
@@ -74,6 +74,9 @@ class SnapshotSummaryDTO(SnapshotBase):
     """Summary DTO for listing snapshots."""
 
     id: str
+    # The owner of the snapshot's facility and PVs, the one instance that writes it
+    # (``canopy.core.ownership``).
+    owner_instance: str
     created_date: datetime
     created_by: str | None = None
     pv_count: int = 0

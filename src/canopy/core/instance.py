@@ -1,9 +1,9 @@
 """``GET /v1/instance`` — what this deployment is, for clients and deploy checks.
 
-Clients read ``role`` to hide write controls on a read-only mirror and
-``historyUrl`` to link to the full history; the deploy pipeline compares
-``alembicHead`` between a mirror and its primary to stop a release that would
-migrate the primary ahead of the copy subscribed to it.
+Clients read ``instance`` to tell which rows they can write here (a row's
+``ownerInstance`` must match it) and ``historyUrl`` to link to the full history.
+The deploy pipeline compares the head's ``alembicHead`` with the new image's to
+stop a release that would migrate the primary ahead of the copy subscribed to it.
 """
 
 import os

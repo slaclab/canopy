@@ -85,6 +85,13 @@ async def ids_by_slug(slugs: list[str] | set[str]) -> dict[str, str]:
         return await FacilityService(session).ids_by_slug(slugs)
 
 
+async def owners_by_id(ids: list[str] | set[str]) -> dict[str, str]:
+    """``{id: owner_instance}`` for the subset of ``ids`` that exist, in one round trip.
+    For a module checking that the rows it links to facilities share their owner."""
+    async with session_scope() as session:
+        return await FacilityService(session).owners_by_id(ids)
+
+
 async def slugs_by_id(ids: list[str] | set[str]) -> dict[str, str]:
     """``{id: slug}`` for the subset of ``ids`` that exist, in one round trip. For a
     module that stores facility ids but reports facilities by slug."""

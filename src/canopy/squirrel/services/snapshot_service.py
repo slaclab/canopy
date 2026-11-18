@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
+from canopy.core.ownership import require_owned, local_instance
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.time_parse import to_utc
 from canopy.squirrel.errors import SnapshotNotFound
@@ -406,6 +407,7 @@ class SnapshotService:
             result.append(
                 SnapshotSummaryDTO(
                     id=snap.id,
+                    owner_instance=snap.owner_instance,
                     title=snap.title,
                     description=snap.description,
                     created_date=snap.created_at,
@@ -474,6 +476,7 @@ class SnapshotService:
         meta_pvs = [pv.pv_id for pv in await self.meta_pv_repo.get(active=True)]
         return SnapshotDTO(
             id=snapshot.id,
+            owner_instance=snapshot.owner_instance,
             title=snapshot.title,
             description=snapshot.description,
             created_date=snapshot.created_at,
@@ -496,6 +499,7 @@ class SnapshotService:
         existing = await self.snapshot_repo.get_by_id(snapshot_id)
         if not existing:
             return None
+        require_owned(existing.owner_instance, f"Snapshot {snapshot_id}")
         await self._require_facility_write(existing.facility_id, "this snapshot")
         snapshot = await self.snapshot_repo.update_metadata(snapshot_id, title=title, description=description)
         if not snapshot:
@@ -505,6 +509,7 @@ class SnapshotService:
         meta_pvs = [pv.pv_id for pv in await self.meta_pv_repo.get(active=True)]
         return SnapshotSummaryDTO(
             id=snapshot.id,
+            owner_instance=snapshot.owner_instance,
             title=snapshot.title,
             description=snapshot.description,
             created_date=snapshot.created_at,
@@ -549,7 +554,9 @@ class SnapshotService:
                 raise FacilityNotFound(f"Facility '{data.facility}' not found")
         capture_scope = await facilities_gateway.descendant_ids(facility_id) if facility_id is not None else None
 
-        pv_addresses = await self.pv_repo.get_all_addresses(capture_scope)
+        # Only this instance's PVs: a mirror holds its arms' PVs too, and a snapshot's
+        # values reference PVs of its own owner. A facility's tree is one owner already.
+        pv_addresses = await self.pv_repo.get_all_addresses(capture_scope, owner=local_instance())
         total_pv_count = len(pv_addresses)
 
         # Collect the unique addresses to read (config addresses are not snapshotted).
@@ -600,6 +607,14 @@ class SnapshotService:
 
         if progress_callback:
             await progress_callback(total_pv_count, total_pv_count, "Processing results...")
+
+        # The save: a snapshot is owned by its facility's owner, and this instance writes
+        # only its own rows. The create route checked this before enqueueing; this is
+        # the backstop on the write itself.
+        if facility_id is not None:
+            facility_owner = (await facilities_gateway.owners_by_id({facility_id})).get(facility_id)
+            if facility_owner is not None:
+                require_owned(facility_owner, f"A snapshot of facility {data.facility or facility_id}")
 
         # Create the snapshot row. The flush puts it in the open transaction so the
         # COPY below (same connection) sees it for the FK — no commit needed here.
@@ -671,6 +686,7 @@ class SnapshotService:
         meta_pvs = [pv.pv_id for pv in await self.meta_pv_repo.get(active=True)]
         return SnapshotSummaryDTO(
             id=snapshot.id,
+            owner_instance=snapshot.owner_instance,
             title=snapshot.title,
             description=snapshot.description,
             created_date=snapshot.created_at,
@@ -1037,5 +1053,6 @@ class SnapshotService:
         snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
         if not snapshot:
             return False
+        require_owned(snapshot.owner_instance, f"Snapshot {snapshot_id}")
         await self._require_facility_write(snapshot.facility_id, "this snapshot")
         return await self.snapshot_repo.delete_with_values(snapshot_id)

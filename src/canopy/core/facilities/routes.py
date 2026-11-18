@@ -23,6 +23,7 @@ from canopy.core.security import (
     require_read_or_admin_access,
     require_wildcard_facility_access,
 )
+from canopy.core.ownership import OwnerQuery
 from canopy.core.facilities.schemas import (
     FacilityDTO,
     FacilityCreate,
@@ -55,10 +56,13 @@ async def get_facility_access(key: APIKeyDep, service: FacilityServiceDep) -> Fa
 
 
 @router.post("", dependencies=[Security(require_wildcard_facility_access)])
-async def create_facility(data: FacilityCreate, service: FacilityServiceDep) -> FacilityDTO:
+async def create_facility(data: FacilityCreate, service: FacilityServiceDep, owner: OwnerQuery = None) -> FacilityDTO:
     """Define a facility. ``slug`` is immutable once created — key grants and
-    ``?facility=`` filters reference it, so renaming would silently invalidate them."""
-    return await service.create(data)
+    ``?facility=`` filters reference it, so renaming would silently invalidate them.
+
+    A facility with a parent is owned by the parent's owner. A root facility is owned
+    by ``owner``, or by this instance."""
+    return await service.create(data, owner)
 
 
 @router.put("/{facility_slug}", dependencies=[Security(require_wildcard_facility_access)])

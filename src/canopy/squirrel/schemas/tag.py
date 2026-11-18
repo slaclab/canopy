@@ -43,6 +43,9 @@ class TagGroupSummaryDTO(CanopyModel):
     """Summary DTO without the full tag list."""
 
     id: str
+    # The instance that created the group and alone writes it and its tags
+    # (``canopy.core.ownership``). On a mirror a group name can appear once per owner.
+    owner_instance: str
     name: str
     description: str | None = None
     tag_count: int = 0
@@ -52,6 +55,7 @@ class TagGroupDTO(TagGroupBase):
     """Full tag group with its tags."""
 
     id: str
+    owner_instance: str  # as on ``TagGroupSummaryDTO``
     tags: list[TagDTO] = []
     created_date: datetime
     last_modified_date: datetime
