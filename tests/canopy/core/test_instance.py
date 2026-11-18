@@ -71,6 +71,8 @@ def test_mirror_reports_its_role_and_history_fields(client, history_settings):
 def test_a_head_lists_its_arms_and_their_subscriptions(client, history_settings, monkeypatch):
     monkeypatch.setenv("CANOPY_ARMS__ARM2__PUBLISHER_DSN", "host=arm2.example.org")
     monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "host=arm1.example.org")
+    monkeypatch.setenv("CANOPY_ARMS__ARM1__FORWARD_URL", "https://arm1.example.org")
+    monkeypatch.setenv("CANOPY_ARMS__ARM1__SERVICE_KEY", "s3cret-key")
 
     async def states(session, arms):
         assert arms == ["arm1", "arm2"]
@@ -81,10 +83,11 @@ def test_a_head_lists_its_arms_and_their_subscriptions(client, history_settings,
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["arms"] == [
-        {"name": "arm1", "subscription": "streaming"},
-        {"name": "arm2", "subscription": "missing"},
+        {"name": "arm1", "subscription": "streaming", "forwards": True},
+        {"name": "arm2", "subscription": "missing", "forwards": False},
     ]
     assert "arm1.example.org" not in resp.text
+    assert "s3cret-key" not in resp.text
 
 
 def test_a_primary_lists_no_arms_even_if_some_are_set(client, monkeypatch):

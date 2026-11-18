@@ -32,6 +32,10 @@ class ErrorCode(StrEnum):
     KEY_STORE_UNAVAILABLE = auto()
     NOT_OWNER = auto()
     OWNER_MISMATCH = auto()
+    FORWARDED_WRITE_REFUSED = auto()
+    ARCHIVED_IMMUTABLE = auto()
+    PRIMARY_UNAVAILABLE = auto()
+    SERVICE_KEY_REFUSED = auto()
 
     # Mole
     ARCHIVER_NOT_CONFIGURED = auto()
@@ -277,6 +281,57 @@ class OwnerMismatch(CanopyError):
 
     status_code = 409
     error_code = ErrorCode.OWNER_MISMATCH
+
+
+class ForwardedWriteRefused(CanopyError):
+    """Refused a request carrying ``X-Canopy-On-Behalf-Of`` that this instance won't trust.
+
+    Only a service key may name another caller, and only on a primary that
+    accepts forwarded writes. Refused rather than ignored, so a misconfigured
+    head fails loudly instead of recording writes under its own key.
+    """
+
+    status_code = 403
+    error_code = ErrorCode.FORWARDED_WRITE_REFUSED
+
+
+class ArchivedImmutable(CanopyError):
+    """A change to a snapshot its arm no longer holds, refused on the history head that still does.
+
+    The arm pruned it, and the head's copy is history that only its owner may change.
+    """
+
+    status_code = 409
+    error_code = ErrorCode.ARCHIVED_IMMUTABLE
+
+
+class PrimaryUnavailable(CanopyError):
+    """A history head couldn't get an answer from the arm that owns a write.
+
+    502 when the arm couldn't be reached (nothing was sent); a subclass with
+    504 when it stopped answering after the request went out, so the write may
+    or may not have been applied.
+    """
+
+    status_code = 502
+    error_code = ErrorCode.PRIMARY_UNAVAILABLE
+
+
+class PrimaryTimeout(PrimaryUnavailable):
+    status_code = 504
+
+
+class ServiceKeyRefused(CanopyError):
+    """An arm refused the service key a history head sends a write with.
+
+    The head checks the caller's own key before forwarding, so this is the head's
+    configuration, not the caller's key: the key it holds for that arm is unknown
+    there, or lacks the modules or access the write needs. The detail names the arm
+    and relays its answer.
+    """
+
+    status_code = 502
+    error_code = ErrorCode.SERVICE_KEY_REFUSED
 
 
 def register_canopy_error_handler(app: FastAPI) -> None:

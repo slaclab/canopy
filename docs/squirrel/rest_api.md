@@ -796,3 +796,4 @@ FastAPI's validation body, which lists each problem under `detail`.
 | `tag_group_already_exists` | 409 | A group with this name exists |
 | `tag_already_exists` | 409 | The group already has a tag with this name |
 | `job_not_found` | 404 | From `/jobs/v1/{jobId}`: no such job, or its result has expired |
+| `service_key_refused` | 502 | On a history head: the arm refused the head's service key for it, not the caller's key. See [When an arm is unreachable](../deployment/history.md#when-an-arm-is-unreachable) |

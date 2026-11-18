@@ -1,16 +1,20 @@
+import json
 import logging
 from typing import Protocol, Annotated
 from dataclasses import field, dataclass
+from urllib.parse import unquote
 
-from fastapi import Request, Security, WebSocket, status
+from fastapi import Depends, Request, Security, WebSocket, status
 from fastapi.security import APIKeyHeader
 from fastapi.exceptions import WebSocketException
 
 from canopy.core.config import get_settings
 from canopy.core.errors import (
     ErrorCode,
+    BadRequest,
     InvalidAPIKey,
     KeyStoreUnavailable,
+    ForwardedWriteRefused,
     InsufficientReadAccess,
     InsufficientAdminAccess,
     InsufficientWriteAccess,
@@ -18,6 +22,12 @@ from canopy.core.errors import (
     InsufficientFacilityAccess,
 )
 from canopy.core.modules import JOBS, WILDCARD, split_modules, module_for_app
+from canopy.core.forwarding.context import (
+    ON_BEHALF_OF_HEADER,
+    ON_BEHALF_OF_FACILITIES_HEADER,
+    ForwardedWrite,
+    forwarded_write,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +44,17 @@ class APIKey:
     `modules` has no default: every real registry (``EnvKeyRegistry``,
     ``DbKeyRegistry``) already passes it explicitly, so a future one that
     forgets to must fail loudly rather than silently granting every module.
+
+    `is_service` marks a key held by another Canopy instance (a history head's
+    key on one of its arms): only such a key may name the caller it acts for in
+    ``X-Canopy-On-Behalf-Of``. Only database keys can be service keys.
     """
 
     read: bool
     write: bool
     modules: frozenset[str]
     admin: bool = False
+    is_service: bool = False
     name: str = "unknown"
     id: str | None = None
     token: str = field(default="", repr=False)
@@ -237,10 +252,101 @@ async def get_api_key(request: Request, token: Annotated[str | None, Security(ap
     module = module_for_app(request.app)
     if not key.allows_module(module):
         raise InsufficientModuleAccess(f"API key is not scoped to '{module}'")
+    if (on_behalf_of := request.headers.get(ON_BEHALF_OF_HEADER)) is not None:
+        _accept_on_behalf_of(on_behalf_of, request.headers.get(ON_BEHALF_OF_FACILITIES_HEADER), key)
     return key
 
 
 APIKeyDep = Annotated[APIKey, Security(get_api_key)]
+
+MAX_ON_BEHALF_OF_LEN = 255  # the width of the created_by columns it is recorded in
+
+
+def _accept_on_behalf_of(value: str, facilities: str | None, key: APIKey) -> None:
+    """Trust ``X-Canopy-On-Behalf-Of`` from ``key``, or refuse the request.
+
+    Only a primary with ``CANOPY_ACCEPT_FORWARDED_WRITES`` trusts it, and only from
+    a service key: anything else could write under a name of its choosing. The name
+    travels percent-encoded UTF-8, since header values are ASCII and a key's name
+    needn't be; the decoded value is recorded for this request (see ``request_actor``).
+
+    ``X-Canopy-On-Behalf-Of-Facilities`` must come with it: the caller's facility grant,
+    a JSON list of slugs. The request then reaches only the facilities both the service
+    key and the caller reach (see ``forwarded_facilities``). Without it a head would
+    widen every caller to the service key's grant, so it is required.
+    """
+    settings = get_settings()
+    if settings.role != "primary" or not settings.accept_forwarded_writes:
+        raise ForwardedWriteRefused(f"This instance doesn't accept {ON_BEHALF_OF_HEADER}")
+    if not key.is_service:
+        raise ForwardedWriteRefused(f"Only a service key may send {ON_BEHALF_OF_HEADER}")
+    try:
+        value = unquote(value, errors="strict").strip()
+    except UnicodeDecodeError:
+        raise BadRequest(f"{ON_BEHALF_OF_HEADER} must be percent-encoded UTF-8") from None
+    if not value or len(value) > MAX_ON_BEHALF_OF_LEN or not value.isprintable():
+        raise BadRequest(f"{ON_BEHALF_OF_HEADER} must be 1-{MAX_ON_BEHALF_OF_LEN} printable characters")
+    grant = _parse_facilities(facilities)
+    if (write := forwarded_write.get()) is None:
+        write = ForwardedWrite()
+        forwarded_write.set(write)
+    write.on_behalf_of = value
+    write.facilities = grant
+
+
+def _parse_facilities(value: str | None) -> frozenset[str]:
+    """The caller's facility grant from ``X-Canopy-On-Behalf-Of-Facilities``."""
+    if value is None:
+        raise BadRequest(f"{ON_BEHALF_OF_FACILITIES_HEADER} is required with {ON_BEHALF_OF_HEADER}")
+    try:
+        slugs = json.loads(value)
+    except ValueError:
+        slugs = None
+    if not isinstance(slugs, list) or not all(isinstance(slug, str) for slug in slugs):
+        raise BadRequest(f"{ON_BEHALF_OF_FACILITIES_HEADER} must be a JSON list of facility slugs")
+    return frozenset(slugs)
+
+
+def forwarded_for() -> str | None:
+    """The caller a trusted history head named for this request, or ``None``.
+
+    Set by ``get_api_key``, so only meaningful once the request's key has resolved.
+    """
+    write = forwarded_write.get()
+    return write.on_behalf_of if write is not None else None
+
+
+def forwarded_facilities() -> frozenset[str] | None:
+    """The facility grant of the caller a trusted history head named, or ``None``.
+
+    Set by ``get_api_key`` alongside ``forwarded_for``. Facility gates intersect it
+    with the service key's own grant.
+    """
+    write = forwarded_write.get()
+    return write.facilities if write is not None else None
+
+
+def request_actor(key: APIKeyDep) -> str:
+    """Who this request's writes are recorded under (``created_by``).
+
+    The caller a trusted history head named in ``X-Canopy-On-Behalf-Of``,
+    else the key's own name. Never a token.
+    """
+    return forwarded_for() or key.name
+
+
+ActorDep = Annotated[str, Depends(request_actor)]
+
+
+def report_commit_position() -> None:
+    """Answer this forwarded request with ``X-Canopy-Commit-LSN`` even if it writes nothing.
+
+    For a route whose head always waits for the answer to replicate back: a replay
+    that finds its write already committed still gives the head a position to wait
+    for (``core.db._commit_forwarded``). A no-op outside a forwarded request.
+    """
+    if (write := forwarded_write.get()) is not None:
+        write.report_position = True
 
 
 async def get_optional_api_key(token: Annotated[str | None, Security(api_key_header)]) -> APIKey | None:
