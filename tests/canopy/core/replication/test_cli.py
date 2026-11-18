@@ -47,10 +47,19 @@ def test_a_command_is_required():
     assert caught.value.code == 2
 
 
-@pytest.mark.parametrize(("command", "role"), [("publish", "mirror"), ("subscribe", "primary"), ("grants", "primary")])
+@pytest.mark.parametrize(
+    ("command", "role"),
+    [
+        ("publish", "mirror"),
+        ("subscribe", "primary"),
+        ("grants", "primary"),
+        ("switch --arm arm1", "primary"),
+        ("heartbeat --arm arm1", "primary"),
+    ],
+)
 def test_wrong_side_is_refused_without_connecting(env, no_connect, caplog, command, role):
     env(CANOPY_ROLE=role)
-    assert cli.main([command]) == 2
+    assert cli.main(command.split()) == 2
     assert "refused:" in caplog.text
 
 
@@ -59,6 +68,55 @@ def test_connection_failure_exits_1_without_the_password(env, caplog):
     assert cli.main(["status"]) == 1
     assert "cannot connect" in caplog.text
     assert "s3cret-local" not in caplog.text
+
+
+def test_split_switch_and_heartbeat_options():
+    parser = cli.build_parser()
+
+    assert parser.parse_args(["publish", "--split"]).split is True
+    assert parser.parse_args(["publish"]).split is False
+    assert parser.parse_args(["subscribe", "--split", "--arm", "arm1"]).split is True
+    switch = parser.parse_args(["switch", "--arm", "arm1"])
+    assert (switch.arm, switch.timeout) == ("arm1", 120.0)
+    checks = parser.parse_args(["heartbeat", "--arm", "arm2", "--backup-ok", "--drift-ok"])
+    assert (checks.arm, checks.backup_ok, checks.wal_archive_ok, checks.drift_ok) == ("arm2", True, False, True)
+
+
+@pytest.mark.parametrize("command", ["switch", "heartbeat"])
+def test_switch_and_heartbeat_name_one_arm(command, capsys):
+    # One arm's layout moves, and one arm's drift result is recorded: never every arm.
+    with pytest.raises(SystemExit) as caught:
+        cli.build_parser().parse_args([command])
+    assert caught.value.code == 2
+    assert "--arm" in capsys.readouterr().err
+
+
+async def test_split_without_an_arm_is_refused(db, env, caplog):
+    env(CANOPY_DATABASE_URL=_sqlalchemy_url(DB_DSN), CANOPY_ROLE="mirror", CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=x")
+    options = cli.build_parser().parse_args(["subscribe", "--split"])
+    assert await cli.run("subscribe", None, options) == 2
+    assert "the split layout is one arm's; name it with --arm" in caplog.text
+
+
+async def test_an_unreachable_arm_is_reported_without_its_heartbeat_password():
+    from pydantic import SecretStr
+
+    from canopy.core.arms import Arm
+    from canopy.core.replication.subscriber import ReplicationError, _connect_arm
+
+    arm = Arm(heartbeat_dsn=SecretStr("postgresql://beat:s3cret-beat@127.0.0.1:1/canopy"))
+    with pytest.raises(ReplicationError) as caught:
+        await _connect_arm("arm1", arm, "heartbeat")
+    assert "cannot connect to arm arm1" in str(caught.value)
+    assert "s3cret-beat" not in str(caught.value)
+
+
+async def test_a_missing_heartbeat_dsn_names_the_arms_setting():
+    from canopy.core.arms import Arm
+    from canopy.core.replication.subscriber import Refused, _connect_arm
+
+    with pytest.raises(Refused, match="CANOPY_ARMS__ARM1__HEARTBEAT_DSN"):
+        await _connect_arm("arm1", Arm(), "switch")
 
 
 def test_logging_is_configured_once():

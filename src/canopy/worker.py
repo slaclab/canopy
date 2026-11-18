@@ -12,6 +12,7 @@ the Arq context so every job reuses one connection set rather than rebuilding it
 
 import logging
 
+from arq import cron
 from arq.connections import RedisSettings
 
 from canopy.core.db import dispose_engine
@@ -19,11 +20,13 @@ from canopy.core.config import get_settings
 from canopy.core.logging import configure_logging
 from canopy.epics.config import get_epics_config
 from canopy.epics.gateway import build_connector
+from canopy.squirrel.prune import prune_snapshots
 from canopy.squirrel.tasks import create_snapshot_task, restore_snapshot_task
 from canopy.converter.tasks import convert_batch
 from canopy.squirrel.config import get_squirrel_config
 from canopy.squirrel.pv_cache import PVCacheMonitor
 from canopy.squirrel.restore_hooks import get_restore_hooks, publish_worker_status
+from canopy.core.replication.config import get_prune_config
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -83,8 +86,33 @@ async def on_shutdown(ctx: dict) -> None:
 FUNCTIONS = [ping, convert_batch, create_snapshot_task, restore_snapshot_task]
 
 
+def worker_cron_jobs(role: str) -> list:
+    """Scheduled tasks for an instance ``role``: pruning, on a primary (an arm) only.
+
+    ``unique`` makes one worker run each tick when several share the queue. The job
+    itself does nothing unless ``CANOPY_PRUNE__ENABLED``; a mirror (a head) never
+    registers it, since it holds the history its arms prune, and its own rows too.
+    """
+    if role != "primary":
+        return []
+    # A run may delete hundreds of full-machine snapshots, well past job_timeout; its
+    # outcome is kept a day for anyone checking on it.
+    return [
+        cron(
+            prune_snapshots,
+            hour={get_prune_config().hour},
+            minute={7},
+            unique=True,
+            run_at_startup=False,
+            timeout=3600,
+            keep_result=86400,
+        )
+    ]
+
+
 class WorkerSettings:
     functions = FUNCTIONS
+    cron_jobs = worker_cron_jobs(get_settings().role)
     on_startup = on_startup
     on_shutdown = on_shutdown
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)

@@ -6,6 +6,7 @@ setting, keyed by arm name::
 
     CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=<arm1-host> dbname=canopy user=replicator password=<secret>"
     CANOPY_ARMS__ARM1__READER_DSN="postgresql://canopy_reader:<secret>@<arm1-host>/canopy"
+    CANOPY_ARMS__ARM1__HEARTBEAT_DSN="postgresql://canopy_heartbeat:<secret>@<arm1-host>/canopy"
     CANOPY_ARMS__ARM2__PUBLISHER_DSN="..."
 
 or as JSON, ``CANOPY_ARMS='{"arm1": {"publisher_dsn": "..."}}'``. An arm's name
@@ -45,6 +46,16 @@ class Arm(BaseModel):
         description=(
             "postgresql:// URI the head's `drift-check` and `reseed` use to read this arm, as its "
             "read-only reader role. Supply it from a secret, like the publisher DSN."
+        ),
+    )
+
+    heartbeat_dsn: SecretStr | None = Field(
+        default=None,
+        description=(
+            "postgresql:// URI to this arm as its heartbeat role, which may write only "
+            "core.history_heartbeat. `heartbeat` records the head's checks for this arm through it, and "
+            "`switch` reads the arm's slot position. Needed only for an arm that prunes. Supply it from a "
+            "secret, like the publisher DSN."
         ),
     )
 
