@@ -160,7 +160,8 @@ class Check:
     dated_alias: str = "t"  # time series: the alias whose time column dates a row
 
 
-async def _columns(conn: asyncpg.Connection, table: str) -> list[str]:
+async def table_columns(conn: asyncpg.Connection, table: str) -> list[str]:
+    """``table``'s columns, in order."""
     rows = await conn.fetch(
         "SELECT attname FROM pg_attribute WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped "
         "ORDER BY attnum",
@@ -169,7 +170,8 @@ async def _columns(conn: asyncpg.Connection, table: str) -> list[str]:
     return [row["attname"] for row in rows]
 
 
-async def _primary_key(conn: asyncpg.Connection, table: str) -> list[str]:
+async def primary_key(conn: asyncpg.Connection, table: str) -> list[str]:
+    """``table``'s primary-key columns, in key order."""
     rows = await conn.fetch(
         """
         SELECT a.attname
@@ -231,10 +233,10 @@ async def plan(
             alias = "t" if hop == 0 else f"t_o{hop}"
             checks.append(Check(table, kind, owners, bucketing=TIME_SERIES_BUCKETS[root], dated_alias=alias))
         else:
-            on_primary = set(await _columns(primary, table))
+            on_primary = set(await table_columns(primary, table))
             # One column list, in one order, for both sides' row hashes.
-            columns = tuple(c for c in await _columns(mirror, table) if c in on_primary)
-            checks.append(Check(table, kind, owners, columns=columns, key=tuple(await _primary_key(mirror, table))))
+            columns = tuple(c for c in await table_columns(mirror, table) if c in on_primary)
+            checks.append(Check(table, kind, owners, columns=columns, key=tuple(await primary_key(mirror, table))))
     return checks, dict(sorted(skipped.items())), sub["subslotname"]
 
 
@@ -601,15 +603,27 @@ def overall(statuses: list[str]) -> str:
     return "not_checked" if "not_checked" in statuses else "in_step"
 
 
+def configured_arms() -> Mapping[str, Arm]:
+    """``CANOPY_ARMS``; ``Refused`` says what's wrong in it without its values."""
+    try:
+        return get_arms_config().arms
+    except ArmsConfigError as exc:  # names each wrong setting, never a value
+        raise Refused(str(exc)) from None
+
+
+async def connect_reader(name: str, arm: Arm, session: Mapping[str, str] = SESSION) -> asyncpg.Connection:
+    """The arm as its reader role, in a read-only session; ``Refused`` without a reader URI."""
+    dsn = arm.reader_dsn.get_secret_value() if arm.reader_dsn else ""
+    if not dsn:
+        raise Refused(f"set CANOPY_ARMS__{name.upper()}__READER_DSN to this arm's read-only URI (from a secret)")
+    return await asyncpg.connect(dsn, server_settings={**session, "default_transaction_read_only": "on"})
+
+
 async def _check_arm(mirror: asyncpg.Connection, name: str, arm: Arm, *, days, settle_s, secrets) -> dict:
     """One arm's report; a failure to reach or read it makes that arm not checked, not the run."""
-    if arm.reader_dsn is None or not arm.reader_dsn.get_secret_value():
-        return _not_checked(f"set CANOPY_ARMS__{name.upper()}__READER_DSN to this arm's read-only URI (from a secret)")
     primary = None
     try:
-        primary = await asyncpg.connect(
-            arm.reader_dsn.get_secret_value(), server_settings={**SESSION, "default_transaction_read_only": "on"}
-        )
+        primary = await connect_reader(name, arm)
         return await drift_check(primary, mirror, arm=name, days=days, settle_s=settle_s)
     except Refused as exc:
         return _not_checked(str(exc))
@@ -665,13 +679,9 @@ async def check_arms(
 async def run(args: argparse.Namespace) -> int:
     """``drift-check``: 0 every arm in step, 1 drift found, 2 not everything could be checked."""
     settings = get_settings()
-    try:
-        arms = get_arms_config().arms
-    except ArmsConfigError as exc:  # names each wrong setting, never a value
-        logger.error("refused: %s", exc)
-        return 2
     mirror = None
     try:
+        arms = configured_arms()
         require_role("drift-check", "mirror", settings.role)
         names = _selected_arms(arms, args.arm, settings.instance)
         mirror = await asyncpg.connect(asyncpg_dsn(settings.database_url), server_settings=SESSION)

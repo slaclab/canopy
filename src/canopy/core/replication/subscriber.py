@@ -244,6 +244,7 @@ async def subscribe(
     only: str | None = None,
     registry: ReplicationRegistry = REGISTRY,
     connect_arm: ArmConnector | None = None,
+    copy_data: bool = True,
 ) -> dict:
     """Create the head's subscription to each arm, copying every table the arm publishes.
 
@@ -258,6 +259,11 @@ async def subscribe(
     arm's values of a key unique across owners (facility and Magpie slugs) may
     already be taken here. An arm that can't be reached for the second check is
     reported and skipped.
+
+    With ``copy_data=False`` (used by ``reseed``) nothing is copied, so neither check
+    applies: the head may already hold the arm's rows, and the subscription starts
+    disabled. Its slot keeps the arm's changes from now on while ``reseed`` fills in
+    what came before.
 
     Run it as the role that owns the tables, granted ``pg_create_subscription``:
     Postgres 16 applies changes as each table's owner, which then needs no superuser.
@@ -281,6 +287,8 @@ async def subscribe(
     connect_arm : ArmConnector | None
         Opens a connection to an arm for the key check; by default with the arm's own
         ``publisher_dsn``, the way the subscription connects.
+    copy_data : bool
+        ``False`` for disabled subscriptions without the initial copy.
 
     Returns
     -------
@@ -331,6 +339,9 @@ async def subscribe(
     failures = []
     checked = []
     for arm in to_create:
+        if not copy_data:  # nothing is copied, so nothing can clash; reseed checks what it writes
+            checked.append(arm)
+            continue
         await _require_unowned(conn, registry, copied, arm, "subscribe")
         try:
             await _require_no_shared_key_clash(conn, connect, registry, copied, arm, "subscribe")
@@ -361,13 +372,14 @@ async def subscribe(
         )
 
     publications = ", ".join(quote_ident(p.name) for p in registry.publications)
+    options = "copy_data = true" if copy_data else "copy_data = false, enabled = false"
     for arm in checked:
         name = subscription_name(arm)
         dsn = arms[arm].publisher_dsn.get_secret_value()
         try:
             await conn.execute(
                 f"CREATE SUBSCRIPTION {quote_ident(name)} CONNECTION {quote_literal(dsn)} "
-                f"PUBLICATION {publications} WITH (copy_data = true, streaming = parallel)"
+                f"PUBLICATION {publications} WITH ({options}, streaming = parallel)"
             )
         except asyncpg.PostgresError as exc:
             message = redact(str(exc), [dsn])
@@ -376,7 +388,10 @@ async def subscribe(
             continue
         sub = await _subscription(conn, name)
         tables = await _subscribed_tables(conn, sub["oid"])
-        logger.info("Created subscription %s; initial copy of %d tables started", name, len(tables))
+        if copy_data:
+            logger.info("Created subscription %s; initial copy of %d tables started", name, len(tables))
+        else:
+            logger.info("Created subscription %s, disabled and without an initial copy", name)
         results.append({"arm": arm, "name": name, "created": True, "tables": tables})
     if failures:
         raise ReplicationError(f"subscribe failed for {'; '.join(failures)}")
