@@ -11,7 +11,8 @@
 # (default 8000) directly on the host.
 #
 # All config comes from a sibling .env file: IMAGE=ghcr.io/slaclab/canopy:<tag>
-# for the compose file itself, plus the app's CANOPY_* / EPICS_* settings.
+# for the compose file itself, plus the app's CANOPY_* / EPICS_* settings,
+# including the required CANOPY_INSTANCE (this instance's permanent name).
 # From that host directory, run `docker compose run --rm api alembic upgrade head`
 # before starting a new image, then `docker compose up -d`. Without -f, Compose
 # doesn't find this file under its repo name, and in this repo's docker/
