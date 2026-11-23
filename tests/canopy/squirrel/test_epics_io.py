@@ -3,8 +3,11 @@
 A fake connector stands in for ``canopy.epics`` — no IOCs, no DB.
 """
 
+import asyncio
 from typing import Any
 from datetime import UTC, datetime
+
+import pytest
 
 from canopy.contracts.pv import PVValue
 from canopy.contracts.sample import AlarmSeverity
@@ -102,6 +105,101 @@ async def test_get_many_progress_is_chunked():
 
     await EpicsIO(conn, chunk_size=2).get_many_with_progress([f"P{i}" for i in range(5)], cb)
     assert calls == [(2, 5), (4, 5), (5, 5)]  # chunks of 2 over 5 PVs
+
+
+class SlowConnector:
+    """Reads that take `delay[addr]` seconds (0 by default), tracking how many are in flight.
+
+    With `gate` set, reads wait on it first, so they can be held open: the reads in
+    `held`, or every read if `held` isn't given.
+    """
+
+    def __init__(
+        self,
+        delay: dict[str, float] | None = None,
+        gate: asyncio.Event | None = None,
+        held: set[str] | None = None,
+    ):
+        self.delay = delay or {}
+        self.gate = gate
+        self.held = held
+        self.open: set[str] = set()
+        self.max_inflight = 0
+        self.started = 0
+        self.cancelled = 0
+
+    @property
+    def inflight(self) -> int:
+        return len(self.open)
+
+    async def get(self, addr: str, *, timeout=None) -> PVValue:
+        self.open.add(addr)
+        self.started += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        try:
+            if self.gate is not None and (self.held is None or addr in self.held):
+                await self.gate.wait()
+            await asyncio.sleep(self.delay.get(addr, 0))
+            return _pv(addr, 1.0)
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        finally:
+            self.open.discard(addr)
+
+
+async def test_get_many_slow_pvs_do_not_stall_the_rest():
+    # One read held open in each of what used to be three chunks. Chunk by chunk, the
+    # first chunk waited on its held read and the next two never started; in one pool
+    # all three are open at once.
+    addrs = [f"P{i}" for i in range(6)]
+    held = {"P0", "P2", "P4"}
+    gate = asyncio.Event()
+    conn = SlowConnector(gate=gate, held=held)
+    task = asyncio.create_task(EpicsIO(conn, concurrency=4, chunk_size=2).get_many(addrs))
+    async with asyncio.timeout(5):  # only stops a failing run from hanging
+        while conn.open != held:
+            await asyncio.sleep(0)
+    gate.set()
+    assert set(await task) == set(addrs)
+
+
+async def test_get_many_progress_counts_completions_in_order():
+    # Later PVs finish first; progress still counts up by chunk_size and ends at total.
+    addrs = [f"P{i}" for i in range(5)]
+    conn = SlowConnector(delay={f"P{i}": 0.05 * (5 - i) for i in range(5)})
+    calls: list[tuple[int, int]] = []
+
+    async def cb(cur: int, total: int, _msg: str) -> None:
+        calls.append((cur, total))
+
+    await EpicsIO(conn, concurrency=5, chunk_size=2).get_many_with_progress(addrs, cb)
+    assert calls == [(2, 5), (4, 5), (5, 5)]
+
+
+async def test_get_many_keeps_concurrency_reads_in_flight():
+    conn = SlowConnector(delay={f"P{i}": 0.01 for i in range(50)})
+    await EpicsIO(conn, concurrency=8, chunk_size=3).get_many([f"P{i}" for i in range(50)])
+    assert conn.max_inflight == 8  # saturated, never over
+
+
+async def test_get_many_cancelled_cancels_reads_in_flight():
+    gate = asyncio.Event()  # never set: every read stays open
+    conn = SlowConnector(gate=gate)
+    task = asyncio.create_task(EpicsIO(conn, concurrency=4).get_many([f"P{i}" for i in range(20)]))
+    while conn.inflight < 4:
+        await asyncio.sleep(0)
+    # Only the 4 reads in flight have tasks; the other 16 don't exist yet.
+    reads = [t for t in asyncio.all_tasks() if t not in (asyncio.current_task(), task)]
+    assert len(reads) == 4
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert conn.inflight == 0
+    assert conn.cancelled == conn.started == 4
+    # Reads not yet started never reach the connector, and no task is left over.
+    leftover = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+    assert leftover == []
 
 
 # --- batch writes ----------------------------------------------------------- #
