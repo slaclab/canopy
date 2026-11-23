@@ -192,11 +192,12 @@ A `?facility=` naming a facility that doesn't exist is a `404 facility_not_found
 with the key's own grant, so an unrestricted key gets the same 404 a restricted
 one does.
 
-The grant itself is defined and validated here; nothing yet *consults* it. A
-data-serving module (Squirrel) reading and enforcing this scope on its own
-reads and writes is separate, not-yet-merged work — until it lands, a
-facility-scoped key authenticates and passes module/read/write checks
-normally, but every module ignores its facility grant.
+Squirrel enforces the grant on its PV and snapshot reads and writes, as the
+rest of this section describes. Key management applies it too: an `admin` key
+can mint or deactivate only keys whose grant falls within its own, and only an
+`admin` key granted every facility may change the facility hierarchy. No other
+module consults it, so a facility-scoped key reaches the other modules it's
+scoped to as any key does.
 
 Unlike module scope, an **empty** facility list is valid and meaningful — it's
 the default for a newly minted key, and means "provisioned but not yet
