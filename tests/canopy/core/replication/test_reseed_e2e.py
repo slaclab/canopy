@@ -708,6 +708,39 @@ async def test_one_run_per_arm_at_a_time(octopus: Octopus):
 
 
 @one_arm
+async def test_a_second_reseed_refuses_at_once_while_the_first_copies(octopus: Octopus):
+    """Two reseeds of the same arm at the same time: the second refuses, naming the arm; the first finishes."""
+    o = octopus
+    await _subscribed(o)
+    since = await _newest_on_head(o)
+    await _lose_subscription(o)
+    copying, finish = asyncio.Event(), asyncio.Event()
+
+    async def hold():
+        copying.set()
+        await finish.wait()
+
+    first, second = await _connections(o), await _connections(o)
+    run = None
+    try:
+        run = asyncio.create_task(_reseed(o, *first, since=since, hooks={"before_commit": hold}))
+        await asyncio.wait_for(copying.wait(), 30)
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(Refused, match=f"another reseed of {o.arm.name} is running"):
+            await asyncio.wait_for(_reseed(o, *second, since=since), 10)  # never blocked behind the first
+        assert asyncio.get_running_loop().time() - started < 5
+        finish.set()
+        assert (await asyncio.wait_for(run, 60))["created"]
+        await eventually(lambda: _in_step(o, o.arm.name))
+    finally:
+        finish.set()
+        if run is not None and not run.done():
+            run.cancel()
+        for conn in (*first, *second):
+            await conn.close()
+
+
+@one_arm
 async def test_deletes_links_whose_pv_was_already_gone_here(octopus: Octopus):
     """The head lost a PV but kept its links; the arm deletes the PV in the gap. The links go too."""
     o = octopus

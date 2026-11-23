@@ -53,9 +53,11 @@ PV) can't be found through that path. When another parent it references still na
 the arm as owner (``drift.owner_of``) and the arm lacks the row, it is deleted too, as
 replication would have deleted it. Rows the head still holds afterwards whose
 reference finds no parent, owned by the arm or by nobody known, are listed in the
-result (``dangling``) and logged; ``drift-check`` reports them too. One cause the
-copy can't remove: the arm deleted a facility its snapshots still referenced on the
-head (snapshots the arm pruned stay on the head), which replication leaves the same.
+result (``dangling``) and logged; ``drift-check`` reports them too. One case the
+copy can't remove: an arm that deleted a snapshot and then its facility leaves the
+head's copy of the snapshot (time-series rows are never deleted on the head) without
+its facility, as replication would. The list also shows rows a rebuilt or out-of-date
+arm left behind.
 
 ``--since`` must not be later than the newest snapshot the head holds from that arm. Missing
 parents are found by id whatever their time, but children of a parent both sides hold

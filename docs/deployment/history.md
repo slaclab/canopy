@@ -238,9 +238,10 @@ the old slot left off, not from the copy. Only one `reseed` of an arm runs at a 
 second is refused while the first runs.
 
 `reseed`'s report lists under `dangling` any row of that arm (or of nobody known) that
-still references a missing parent once it is done. The usual cause: the arm deleted a
-facility whose snapshots it had pruned or deleted, while the head keeps those
-snapshots. Replication leaves the same reference.
+still references a missing parent once it is done: for example, a snapshot the arm
+deleted before deleting its facility, which the head keeps (it never deletes
+time-series rows), as replication would, or rows a rebuilt or out-of-date arm left
+behind. `drift-check` reports them too; fix them by hand.
 
 ### Head PITR
 
