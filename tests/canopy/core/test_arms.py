@@ -83,6 +83,18 @@ def test_a_publisher_dsn_is_either_uri_scheme(dsn):
     assert Arm(publisher_dsn=dsn).publisher_dsn.get_secret_value() == dsn
 
 
+def test_a_key_value_heartbeat_dsn_is_refused_without_its_password(monkeypatch):
+    # The heartbeat and switch commands connect with asyncpg, which takes only the URI form.
+    monkeypatch.setenv("CANOPY_ARMS__ARM1__HEARTBEAT_DSN", "host=x user=canopy_heartbeat password=s3cret-beat")
+
+    with pytest.raises(ArmsConfigError) as caught:
+        get_arms_config()
+
+    assert "CANOPY_ARMS__ARM1__HEARTBEAT_DSN: Value error, must be a postgresql:// URI" in str(caught.value)
+    shown = [str(caught.value), repr(caught.value), "".join(traceback.format_exception(caught.value))]
+    assert [text for text in shown if "s3cret-beat" in text] == []
+
+
 def test_the_longest_name_fits_postgres():
     name = "x" * 48
     ArmsConfig(arms={name: Arm()})
