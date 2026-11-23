@@ -98,6 +98,11 @@ class Settings(BaseSettings):
         """Read a blank value as unset rather than as ``""`` or an unparseable int."""
         return blank_keeps_default(cls, value, info)
 
+    @property
+    def machine_writes(self) -> bool:
+        """Whether this instance may change the machine (a Hare PV write, a restore): a primary only."""
+        return self.role == "primary"
+
 
 def blank_keeps_default(model: type[BaseModel], value: object, info: ValidationInfo) -> object:
     """Read a blank string, as Helm and compose render an unset variable, as the field's default.

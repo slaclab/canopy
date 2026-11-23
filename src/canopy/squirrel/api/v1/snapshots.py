@@ -12,7 +12,12 @@ from fastapi import Query, Security, APIRouter
 
 from canopy.jobs import gateway as jobs_gateway
 from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilityAccess
-from canopy.core.security import WriteKeyDep, require_read_access, require_write_access
+from canopy.core.security import (
+    WriteKeyDep,
+    require_read_access,
+    require_write_access,
+    require_machine_access,
+)
 from canopy.contracts.jobs import JobCreatedDTO
 from canopy.core.ownership import OwnerQuery, require_create_owner
 from canopy.core.facilities import gateway as facilities_gateway
@@ -214,10 +219,14 @@ async def restore_snapshot(
     service: SnapshotServiceDep,
     request: RestoreRequestDTO | None = None,
 ) -> JobCreatedDTO:
-    """Enqueue a restore of a snapshot's setpoints to EPICS (``pv_ids=None`` restores all)."""
+    """Enqueue a restore of a snapshot's setpoints to EPICS (``pv_ids=None`` restores all).
+
+    Only on a primary; a mirror answers ``machine_read_only``.
+    """
     snapshot_id = require_uuid(snapshot_id, SnapshotNotFound, f"Snapshot {snapshot_id} not found")
     if not await service.snapshot_exists(snapshot_id):
         raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
+    require_machine_access()
     # Narrow the write set to the key's facilities here, pre-enqueue — the worker has no
     # caller identity to check against.
     pv_ids, skipped = await service.plan_restore(snapshot_id, request.pv_ids if request else None)
