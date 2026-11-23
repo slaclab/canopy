@@ -147,7 +147,7 @@ make you see one twice or skip one.
           "metaPvs": [
             {
               "pvId": "9b2e…",
-              "pvName": "SIM:BEND:01:BDES",
+              "pvName": "BEND:SIM:01:BDES",
               "value": 10.0,
               "status": 0,
               "severity": 0,
@@ -266,10 +266,10 @@ Returns the snapshot summary plus its saved values, sorted by PV address.
       "pvValues": [
         {
           "pvId": "41a7…",
-          "pvName": "SIM:QUAD:01:BDES",
-          "device": "SIM:QUAD:01",
-          "setpointName": "SIM:QUAD:01:BDES",
-          "readbackName": "SIM:QUAD:01:BACT",
+          "pvName": "QUAD:SIM:01:BDES",
+          "device": "QUAD:SIM:01",
+          "setpointName": "QUAD:SIM:01:BDES",
+          "readbackName": "QUAD:SIM:01:BACT",
           "setpointValue": {"value": 12.5, "status": 0, "severity": 0, "timestamp": "2026-10-29T17:04:12Z", "units": null, "precision": null, "upperCtrlLimit": null, "lowerCtrlLimit": null},
           "readbackValue": {"value": 12.49, "status": 0, "severity": 0, "timestamp": "2026-10-29T17:04:12Z", "units": null, "precision": null, "upperCtrlLimit": null, "lowerCtrlLimit": null},
           "status": 0,
@@ -363,9 +363,9 @@ and its addresses as this instance holds them. Requires `read`.
       "values": [
         {
           "pvId": "41a7…",
-          "pvName": "SIM:QUAD:01:BDES",
-          "setpointAddress": "SIM:QUAD:01:BDES",
-          "readbackAddress": "SIM:QUAD:01:BACT",
+          "pvName": "QUAD:SIM:01:BDES",
+          "setpointAddress": "QUAD:SIM:01:BDES",
+          "readbackAddress": "QUAD:SIM:01:BACT",
           "configAddress": null,
           "setpointValue": {"value": 12.5},
           "readbackValue": {"value": 12.49},
@@ -415,7 +415,7 @@ instance's.
     ```json
     {
       "snapshot": {"id": "f31a…", "title": "Restored from history: Before ROD", "importedFrom": "8d0c…"},
-      "skipped": [{"pvId": "77d0…", "pvName": "SIM:QUAD:02:BDES"}],
+      "skipped": [{"pvId": "77d0…", "pvName": "QUAD:SIM:02:BDES"}],
       "created": true
     }
     ```
@@ -481,7 +481,7 @@ differ. See [Comparing snapshots](index.md#comparing-snapshots) for the rules.
       "differences": [
         {
           "pvId": "41a7…",
-          "pvName": "SIM:QUAD:01:BDES",
+          "pvName": "QUAD:SIM:01:BDES",
           "value1": 12.5,
           "value2": 12.9,
           "withinTolerance": false
@@ -509,10 +509,10 @@ Every endpoint that returns a PV uses the same shape.
     ```json
     {
       "id": "41a7…",
-      "setpointAddress": "SIM:QUAD:01:BDES",
-      "readbackAddress": "SIM:QUAD:01:BACT",
+      "setpointAddress": "QUAD:SIM:01:BDES",
+      "readbackAddress": "QUAD:SIM:01:BACT",
       "configAddress": null,
-      "device": "SIM:QUAD:01",
+      "device": "QUAD:SIM:01",
       "description": "Sector 1 quad field",
       "absTolerance": 0.01,
       "relTolerance": 0.0,
@@ -527,7 +527,7 @@ Every endpoint that returns a PV uses the same shape.
 A text search matches a case-insensitive substring of any address, the
 device, or the description. The text is used as a SQL `LIKE` pattern, so
 `_` matches any one character and `%` any run of characters: `QUAD_` also
-finds `SIM:QUAD:01:BDES`. `*` and `?` are matched literally.
+finds `QUAD:SIM:01:BDES`. `*` and `?` are matched literally.
 
 ### Search PVs (paged)
 
@@ -593,9 +593,9 @@ Requires `write`. Returns the created PV.
 ??? example "Request body"
     ```json
     {
-      "setpointAddress": "SIM:QUAD:01:BDES",
-      "readbackAddress": "SIM:QUAD:01:BACT",
-      "device": "SIM:QUAD:01",
+      "setpointAddress": "QUAD:SIM:01:BDES",
+      "readbackAddress": "QUAD:SIM:01:BACT",
+      "device": "QUAD:SIM:01",
       "description": "Sector 1 quad field",
       "absTolerance": 0.01,
       "relTolerance": 0.0,
@@ -690,7 +690,7 @@ Requires `write`.
 ??? example "Request body"
     ```json
     {
-      "pvName": "SIM:BEND:01:BDES",
+      "pvName": "BEND:SIM:01:BDES",
       "displayName": "DMP Energy"
     }
     ```
