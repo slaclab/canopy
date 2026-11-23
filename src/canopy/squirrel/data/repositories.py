@@ -17,6 +17,7 @@ from sqlalchemy import (
     ARRAY,
     Row,
     Select,
+    String,
     ColumnElement,
     or_,
     and_,
@@ -53,6 +54,11 @@ BULK_INSERT_CHUNK_SIZE = 5000
 # Postgres caps a statement at 32767 bind parameters; stay well under it when
 # expanding an ``IN (...)`` / address list.
 PARAM_BATCH_SIZE = 30000
+
+
+def _text_array(values: list[str]):
+    """``values`` as one ``text[]`` bind parameter, like ``_uuid_array`` for addresses."""
+    return literal(values, ARRAY(String))
 
 
 def _uuid_array(ids: list[str]):
@@ -406,10 +412,14 @@ class PvRepository(BaseRepository[Pv]):
         with neither.
         """
         if kind == "setpoint":
-            return Pv.setpoint_address.in_(addresses)
+            return Pv.setpoint_address == any_(_text_array(addresses))
         if kind == "readback":
-            return and_(Pv.setpoint_address.is_(None), Pv.readback_address.in_(addresses))
-        return and_(Pv.setpoint_address.is_(None), Pv.readback_address.is_(None), Pv.config_address.in_(addresses))
+            return and_(Pv.setpoint_address.is_(None), Pv.readback_address == any_(_text_array(addresses)))
+        return and_(
+            Pv.setpoint_address.is_(None),
+            Pv.readback_address.is_(None),
+            Pv.config_address == any_(_text_array(addresses)),
+        )
 
     @staticmethod
     def _locked(query: Select) -> Select:
@@ -531,16 +541,12 @@ class PvRepository(BaseRepository[Pv]):
         if not addresses:
             return set()
         column = getattr(Pv, f"{kind}_address")
-        existing: set[str] = set()
-        for i in range(0, len(addresses), PARAM_BATCH_SIZE):
-            batch = addresses[i : i + PARAM_BATCH_SIZE]
-            result = await self.session.execute(
-                select(column).where(
-                    self._identity_filter(kind, batch), Pv.owner_instance == owner, Pv.deleted_at.is_(None)
-                )
+        result = await self.session.execute(
+            select(column).where(
+                self._identity_filter(kind, addresses), Pv.owner_instance == owner, Pv.deleted_at.is_(None)
             )
-            existing.update({row[0] for row in result.all() if row[0]})
-        return existing
+        )
+        return {row[0] for row in result.all() if row[0]}
 
     async def get_existing_setpoints(self, setpoint_addresses: list[str], *, owner: str) -> set[str]:
         """Return the subset of ``setpoint_addresses`` held by one of ``owner``'s live PV.
@@ -597,8 +603,9 @@ class PvRepository(BaseRepository[Pv]):
     async def lock_by_identity(self, kind: str, addresses: list[str], *, owner: str) -> dict[str, Pv]:
         """Lock ``owner``'s PVs, live or deleted, whose identifying address of ``kind`` is one of ``addresses``.
 
-        The rows stay locked ``FOR UPDATE`` until the transaction ends, taken in id order
-        so two imports naming the same PVs lock them in the same order and can't deadlock.
+        The rows stay locked ``FOR UPDATE`` until the transaction ends, taken by one query
+        in id order (the addresses go as one ``text[]`` parameter), so two imports naming
+        overlapping PVs lock them in the same order and can't deadlock.
         Locking the live rows too is what lets a caller see that one it found deleted was
         brought back meanwhile, rather than miss it and register the address twice.
 
@@ -616,18 +623,17 @@ class PvRepository(BaseRepository[Pv]):
         dict[str, Pv]
             Each PV, with its tags loaded, keyed by the address that identifies it.
         """
-        found: dict[str, Pv] = {}
-        for i in range(0, len(addresses), PARAM_BATCH_SIZE):
-            batch = addresses[i : i + PARAM_BATCH_SIZE]
-            query = (
-                select(Pv)
-                .options(selectinload(Pv.tags).selectinload(Tag.group))
-                .where(self._identity_filter(kind, batch), Pv.owner_instance == owner)
-                .order_by(Pv.id)
-            )
-            for pv in (await self.session.execute(self._locked(query))).scalars():
-                found[getattr(pv, f"{kind}_address")] = pv
-        return found
+        if not addresses:
+            return {}
+        query = (
+            select(Pv)
+            .options(selectinload(Pv.tags).selectinload(Tag.group))
+            .where(self._identity_filter(kind, addresses), Pv.owner_instance == owner)
+            .order_by(Pv.id)
+        )
+        return {
+            getattr(pv, f"{kind}_address"): pv for pv in (await self.session.execute(self._locked(query))).scalars()
+        }
 
     async def soft_delete(self, pv_id: str) -> bool:
         """Mark a live PV deleted, keeping its tags and values; ``False`` when there is none."""
