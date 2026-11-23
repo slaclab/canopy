@@ -20,4 +20,3 @@ def load_write_outcome_vectors() -> dict[str, Any]:
     """Return the parsed write-outcome table (read fresh on every call)."""
     text = (resources.files(__name__) / WRITE_OUTCOME_VECTORS_FILE).read_text(encoding="utf-8")
     return json.loads(text)
-
