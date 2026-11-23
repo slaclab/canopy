@@ -37,7 +37,6 @@ from canopy.core.replication.sql import (
     table_owners,
     quote_literal,
     tables_present,
-    conninfo_as_uri,
     schemas_present,
     require_confined,
     owner_memberships,
@@ -160,9 +159,7 @@ def _arm_connector(arms: Mapping[str, Arm]) -> ArmConnector:
         dsn = arms[arm].publisher_dsn
         if dsn is None or not dsn.get_secret_value():
             raise Refused(f"set CANOPY_ARMS__<arm>__PUBLISHER_DSN (from a secret) for {arm}")
-        return await asyncpg.connect(
-            conninfo_as_uri(dsn.get_secret_value()), server_settings={"application_name": "canopy-replication"}
-        )
+        return await asyncpg.connect(dsn.get_secret_value(), server_settings={"application_name": "canopy-replication"})
 
     return connect
 
@@ -185,54 +182,123 @@ async def _require_unowned(
         )
 
 
-async def _require_no_shared_key_clash(
-    conn: asyncpg.Connection,
-    connect: ArmConnector,
-    registry: ReplicationRegistry,
-    tables: list[str],
-    arm: str,
-    action: str,
-) -> None:
-    """Refuse ``action`` when ``arm`` holds a value of a key unique across owners that the head already has.
+SharedKeys = dict[tuple[str, str], set[str]]
+"""An arm's values of each key unique across owners, by ``(table, column)``."""
 
-    Facility and Magpie slugs are unique everywhere, so an arm's row whose slug the
-    head already holds (for its own row or another arm's) would stop the copy, and
-    then replication from that arm. Only keys of ``tables`` are checked: those are
-    the tables this run copies. A clash that streams in later shows as an apply error.
+
+async def _shared_keys_of(
+    connect: ArmConnector, registry: ReplicationRegistry, tables: list[str], arm: str
+) -> SharedKeys:
+    """What ``arm``'s copy of ``tables`` would bring of each key unique across owners.
+
+    Every row the arm publishes is copied, whoever it names as owner, so every value
+    counts. Connects to the arm only when ``tables`` hold such a key.
 
     Raises
     ------
-    Refused
-        On any clash, naming each value and the owner of the row already here.
     OSError, asyncpg.PostgresError
         The arm can't be read.
     """
     keyed = [(table, column) for table in tables for column in registry.shared_keys.get(table, ())]
     if not keyed:
-        return
-    clashes = []
+        return {}
     arm_conn = await connect(arm)
     try:
-        for table, column in keyed:
-            # Every row the arm publishes is copied, whoever it names as owner.
-            theirs = [row[0] for row in await arm_conn.fetch(f"SELECT {quote_ident(column)} FROM {qualified(table)}")]
-            if not theirs:
+        return {
+            (table, column): {
+                row[0] for row in await arm_conn.fetch(f"SELECT {quote_ident(column)} FROM {qualified(table)}")
+            }
+            for table, column in keyed
+        }
+    finally:
+        await arm_conn.close()
+
+
+async def _require_no_shared_key_clash(
+    conn: asyncpg.Connection, registry: ReplicationRegistry, keys: Mapping[str, SharedKeys], action: str
+) -> None:
+    """Refuse ``action`` when the arms about to copy would bring a key unique across owners twice.
+
+    Facility and Magpie slugs are unique everywhere, so a copied row whose slug is
+    already here (the head's own row or another arm's), or that another arm in this
+    run copies too, would stop a copy, and then replication from that arm. Another
+    arm's copy of the same table that hasn't finished can't be checked against (its
+    rows aren't all here yet), so ``action`` waits for it. A clash that streams in
+    later shows as an apply error.
+
+    Parameters
+    ----------
+    keys : Mapping[str, SharedKeys]
+        Per arm about to copy, its values of each shared key in the tables it copies.
+
+    Raises
+    ------
+    Refused
+        On any clash, naming each value and where it already is, or while another
+        arm's copy of a keyed table is still running.
+    """
+    keyed = sorted({table for arm_keys in keys.values() for table, _ in arm_keys})
+    if not keyed:
+        return
+    running = await conn.fetch(
+        """
+        SELECT s.subname, n.nspname || '.' || c.relname AS name
+        FROM pg_subscription_rel r
+        JOIN pg_subscription s ON s.oid = r.srsubid
+        JOIN pg_class c ON c.oid = r.srrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE starts_with(s.subname, $1) AND r.srsubstate <> 'r'
+          AND s.subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+          AND n.nspname || '.' || c.relname = ANY($2::text[])
+        ORDER BY 1, 2
+        """,
+        _SUBSCRIPTION_PREFIX,
+        keyed,
+    )
+    waits = sorted(
+        {
+            f"{row['subname']} is still copying {row['name']}"
+            for row in running
+            for arm, arm_keys in keys.items()
+            if row["subname"] != subscription_name(arm) and any(table == row["name"] for table, _ in arm_keys)
+        }
+    )
+    clashes = []
+    for arm, arm_keys in keys.items():
+        for (table, column), values in arm_keys.items():
+            if not values:
                 continue
             join_sql, owner_sql = owner_join(registry, table, alias="t")
             rows = await conn.fetch(
                 f"SELECT t.{quote_ident(column)} AS value, {owner_sql} AS owner FROM {qualified(table)} t {join_sql} "
                 f"WHERE {owner_sql} <> $1 AND t.{quote_ident(column)} = ANY($2::text[]) ORDER BY 1",
                 arm,
-                theirs,
+                sorted(values),
             )
-            clashes += [f"{table}.{column} {row['value']!r} (here, owned by {row['owner']})" for row in rows]
-    finally:
-        await arm_conn.close()
+            clashes += [f"arm {arm}: {table}.{column} {row['value']!r} (here, owned by {row['owner']})" for row in rows]
+    copiers: dict[tuple[str, str, str], list[str]] = {}
+    for arm in sorted(keys):
+        for (table, column), values in keys[arm].items():
+            for value in values:
+                copiers.setdefault((table, column, value), []).append(arm)
+    clashes += [
+        f"arms {' and '.join(arms)}: {table}.{column} {value!r} (both copy it)"
+        for (table, column, value), arms in sorted(copiers.items())
+        if len(arms) > 1
+    ]
+    problems = []
     if clashes:
-        raise Refused(
-            f"{action} for arm {arm} would copy keys that must be unique and are already taken: {'; '.join(clashes)}. "
+        problems.append(
+            f"{action} would copy keys that must be unique and are already taken: {'; '.join(clashes)}. "
             "Rename one of each pair first; the copy would stop on the clash"
         )
+    if waits:
+        problems.append(
+            f"{action} can't check its unique keys while {'; '.join(waits)}. Wait for that copy to finish "
+            "(`status` shows each table's state), then run it again"
+        )
+    if problems:
+        raise Refused(". ".join(problems))
 
 
 async def subscribe(
@@ -257,8 +323,9 @@ async def subscribe(
     Before copying, each arm is checked two ways. The head must hold none of the
     arm's own rows yet (its own rows and other arms' are expected). And none of the
     arm's values of a key unique across owners (facility and Magpie slugs) may
-    already be taken here. An arm that can't be reached for the second check is
-    reported and skipped.
+    already be taken here, or be copied by another arm in the same run; while
+    another arm's copy of such a table is still running, this waits for it. An arm
+    that can't be reached for the second check is reported and skipped.
 
     With ``copy_data=False`` (used by ``reseed``) nothing is copied, so neither check
     applies: the head may already hold the arm's rows, and the subscription starts
@@ -337,20 +404,19 @@ async def subscribe(
     connect = connect_arm or _arm_connector(arms)
     secrets = [arms[arm].publisher_dsn.get_secret_value() for arm in to_create]
     failures = []
-    checked = []
+    keys: dict[str, SharedKeys] = {}
     for arm in to_create:
         if not copy_data:  # nothing is copied, so nothing can clash; reseed checks what it writes
-            checked.append(arm)
             continue
         await _require_unowned(conn, registry, copied, arm, "subscribe")
         try:
-            await _require_no_shared_key_clash(conn, connect, registry, copied, arm, "subscribe")
+            keys[arm] = await _shared_keys_of(connect, registry, copied, arm)
         except (OSError, asyncpg.PostgresError) as exc:
             message = redact(str(exc), secrets)
             logger.error("Arm %s: can't read it to check its unique keys: %s", arm, message)
             failures.append(f"{arm}: can't read it to check its unique keys: {message}")
-            continue
-        checked.append(arm)
+    await _require_no_shared_key_clash(conn, registry, keys, "subscribe")
+    checked = list(keys) if copy_data else to_create
 
     superuser = await is_superuser(conn)
     if not superuser and not await conn.fetchval(
@@ -413,7 +479,8 @@ async def refresh(
     others still go ahead. An arm without a subscription yet gets a notice, not an
     error: the first deploy's migration Job runs before the one-time ``subscribe``.
     Tables about to get their initial copy get ``subscribe``'s two checks first:
-    none of the arm's rows here yet, and no clash on a key unique across owners.
+    none of the arm's rows here yet, and no clash on a key unique across owners,
+    here or with another arm refreshed in the same run.
 
     Returns
     -------
@@ -442,6 +509,7 @@ async def refresh(
     failures = []
     pending = []
     results = []
+    keys: dict[str, SharedKeys] = {}
     for arm in selected:
         name = subscription_name(arm)
         if name not in existing:
@@ -454,13 +522,14 @@ async def refresh(
         new = sorted((set(registry.replicated) & present) - set(before))
         await _require_unowned(conn, registry, new, arm, "refresh")
         try:
-            await _require_no_shared_key_clash(conn, connect, registry, new, arm, "refresh")
+            keys[arm] = await _shared_keys_of(connect, registry, new, arm)
         except (OSError, asyncpg.PostgresError) as exc:
             message = redact(str(exc), secrets)
             logger.error("Arm %s: can't read it to check its unique keys: %s", arm, message)
             failures.append(f"{arm}: can't read it to check its unique keys: {message}")
             continue
         pending.append((arm, name, sub, before))
+    await _require_no_shared_key_clash(conn, registry, keys, "refresh")
 
     for arm, name, sub, before in pending:
         try:
@@ -483,26 +552,30 @@ async def refresh(
     return {"subscriptions": _in_order(results, selected)}
 
 
-_POLICIES = ("canopy_read", "canopy_insert", "canopy_update", "canopy_delete")
+_POLICIES = ("canopy_access", "canopy_insert", "canopy_update", "canopy_delete")
 
 
 async def _limit_writes_to_the_head(conn: asyncpg.Connection, table: str, column: str, app: str, head: str) -> None:
-    """Row-level security on one root table: the app role reads every row, writes only the head's.
+    """Row-level security on one root table: the app role reads every row, and no role writes another owner's.
 
     Enabled, not forced: the table's owner, which applies every arm's changes,
-    isn't bound by it. Policies are dropped and created again, so a renamed app role
-    or head is picked up. An UPDATE or DELETE of an arm's row matches no row, and an
-    INSERT of one is an error.
+    isn't bound by it. ``canopy_access`` lets the app role at every row. The write
+    policies are restrictive and apply to every role, so they hold alongside any
+    permissive policy, ours or one added by hand: an UPDATE or DELETE of a row the
+    head doesn't own matches no row, and an INSERT of one is an error. Policies are
+    dropped and created again, so a renamed app role or head is picked up.
     """
     name, ident, own = qualified(table), quote_ident(app), f"{quote_ident(column)} = {quote_literal(head)}"
     await conn.execute(f"ALTER TABLE {name} ENABLE ROW LEVEL SECURITY")
     await conn.execute(f"ALTER TABLE {name} NO FORCE ROW LEVEL SECURITY")
     for policy in _POLICIES:
         await conn.execute(f"DROP POLICY IF EXISTS {quote_ident(policy)} ON {name}")
-    await conn.execute(f"CREATE POLICY canopy_read ON {name} FOR SELECT TO {ident} USING (true)")
-    await conn.execute(f"CREATE POLICY canopy_insert ON {name} FOR INSERT TO {ident} WITH CHECK ({own})")
-    await conn.execute(f"CREATE POLICY canopy_update ON {name} FOR UPDATE TO {ident} USING ({own}) WITH CHECK ({own})")
-    await conn.execute(f"CREATE POLICY canopy_delete ON {name} FOR DELETE TO {ident} USING ({own})")
+    await conn.execute(f"CREATE POLICY canopy_access ON {name} FOR ALL TO {ident} USING (true) WITH CHECK (true)")
+    await conn.execute(f"CREATE POLICY canopy_insert ON {name} AS RESTRICTIVE FOR INSERT TO PUBLIC WITH CHECK ({own})")
+    await conn.execute(
+        f"CREATE POLICY canopy_update ON {name} AS RESTRICTIVE FOR UPDATE TO PUBLIC USING ({own}) WITH CHECK ({own})"
+    )
+    await conn.execute(f"CREATE POLICY canopy_delete ON {name} AS RESTRICTIVE FOR DELETE TO PUBLIC USING ({own})")
 
 
 async def grants(
@@ -522,8 +595,8 @@ async def grants(
     - on replicated tables, every privilege revoked, then SELECT, INSERT, UPDATE and
       DELETE;
     - on each root table (one that names its row's owner), row-level security: the
-      app role reads every row and may insert, update or delete only rows whose
-      owner is ``head``;
+      app role reads every row, and it (or any role but the tables' owner) may
+      insert, update or delete only rows whose owner is ``head``;
     - SELECT, INSERT, UPDATE and DELETE on local tables (DB-key auth writes
       ``core.api_key.last_used_at``, and key management writes keys);
     - default privileges, for each owner of the registered tables, so a table a later
@@ -538,8 +611,8 @@ async def grants(
     head``, as the tables' owner, so a new table gets its grants too.
 
     Afterwards the app role must hold nothing more, counting what it inherits from
-    other roles or PUBLIC. ``grants`` refuses rather than change those shared grants,
-    and the refusal rolls back its own.
+    other roles or PUBLIC and what it can reach with ``SET ROLE``. ``grants`` refuses
+    rather than change those shared grants, and the refusal rolls back its own.
 
     Raises
     ------
@@ -601,6 +674,7 @@ async def grants(
             allowed={table: (read_write if table in registry.tables else {"SELECT"}) for table in present},
             command="grants",
             policy="read-write on registered tables (rows of other owners blocked by row-level security)",
+            row_security=True,
         )
     logger.info(
         "Granted %s: read-write on %d replicated tables (writes to %s's rows only on %s) and on %s",

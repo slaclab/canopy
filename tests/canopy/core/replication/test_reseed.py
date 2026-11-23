@@ -86,7 +86,7 @@ async def test_refused_for_an_arm_not_configured(env, caplog):
 
 
 async def test_refused_without_the_arms_reader_connection(env, caplog):
-    env(CANOPY_ROLE="mirror", CANOPY_INSTANCE="head", CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=arm1-db")
+    env(CANOPY_ROLE="mirror", CANOPY_INSTANCE="head", CANOPY_ARMS__ARM1__PUBLISHER_DSN="postgresql://arm1-db/canopy")
     assert await reseed.run(ARGS) == 2
     assert "CANOPY_ARMS__ARM1__READER_DSN" in caplog.text
 
@@ -95,7 +95,7 @@ async def test_invalid_arms_are_refused_without_their_values(env, caplog, capsys
     env(
         CANOPY_ROLE="mirror",
         CANOPY_INSTANCE="head",
-        CANOPY_ARMS='{"Bad-Name": {"publisher_dsn": "host=x password=s3cret-publisher",'
+        CANOPY_ARMS='{"Bad-Name": {"publisher_dsn": "postgresql://replicator:s3cret-publisher@x/canopy",'
         ' "reader_dsn": "postgresql://r:s3cret-reader@x/db"}}',
     )
     assert await reseed.run(ARGS) == 2
@@ -110,7 +110,7 @@ async def test_a_failed_connection_is_exit_1_and_never_shows_a_password(env, cap
         CANOPY_ROLE="mirror",
         CANOPY_INSTANCE="head",
         CANOPY_ARMS__ARM1__READER_DSN=f"postgresql://reader:{secret}@127.0.0.1:1/canopy",
-        CANOPY_ARMS__ARM1__PUBLISHER_DSN=f"host=127.0.0.1 port=1 password={other}",
+        CANOPY_ARMS__ARM1__PUBLISHER_DSN=f"postgresql://replicator:{other}@127.0.0.1:1/canopy",
     )
     assert await reseed.run(ARGS) == 1
     out = caplog.text + capsys.readouterr().out
