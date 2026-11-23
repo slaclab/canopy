@@ -30,7 +30,8 @@ from canopy.squirrel.schemas.snapshot import (
 from canopy.squirrel.data.repositories import OutboxRepository
 
 CAPTURED = datetime(2026, 11, 6, 14, 2, tzinfo=UTC)
-CALLER = {"on_behalf_of": "operator@head", "facilities": ["lab-b"]}
+LAB_B = "00000000-0000-4000-8000-0000000000b0"  # lab-b's id: the caller is granted lab-b
+CALLER = {"on_behalf_of": "operator@head", "facility_ids": [LAB_B]}
 
 
 class Seeded:
@@ -47,7 +48,7 @@ class Seeded:
 
 @pytest_asyncio.fixture
 async def seeded(db_session: AsyncSession) -> Seeded:
-    facility = Facility(slug="lab-b", name="Lab B")
+    facility = Facility(id=LAB_B, slug="lab-b", name="Lab B")
     sp = Pv(setpoint_address="LAB:B:SP", readback_address="LAB:B:RB", device="MAG-1")
     rb = Pv(readback_address="LAB:B:ONLY:RB")
     group = TagGroup(name="Area")
