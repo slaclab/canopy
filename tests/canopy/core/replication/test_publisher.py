@@ -12,9 +12,7 @@ from canopy.core.replication.publisher import (
     publication_state,
 )
 
-from .conftest import privileges, direct_grants
-
-PRESENT = sorted(REGISTRY.replicated)
+from .conftest import PRESENT, privileges, direct_grants, present_tables
 
 
 async def _published(conn) -> list[str]:
@@ -75,12 +73,14 @@ async def test_publish_converges_a_stale_publication(db, config):
 async def test_a_retired_table_already_dropped_is_not_reported_missing(db, config, caplog, monkeypatch):
     # Retired tables stay registered for databases that still hold them; one that has
     # dropped the table shouldn't log it as "not here yet" on every deploy.
-    monkeypatch.setattr("canopy.core.replication.publisher.RETIRED", frozenset({"squirrel.pv_facility"}))
+    retired = frozenset({"squirrel.pv_facility"})
+    monkeypatch.setattr("canopy.core.replication.publisher.RETIRED", retired)
     await db.execute("DROP TABLE squirrel.pv_facility")
     caplog.set_level(logging.INFO, logger="canopy.core.replication")
     result = await publish(db, role="primary", config=config)
     assert result["missing"] == []
     assert "Not in this database yet" not in caplog.text
+    assert await _published(db) == present_tables(retired)  # what PRESENT becomes once it's retired
 
 
 async def test_publish_picks_up_a_registered_table_once_it_exists(db, config, caplog):
@@ -140,6 +140,21 @@ async def test_publish_before_any_table_exists_reports_each_role(db, config):
 
     assert result["roles"] == {config.replicator_role: "absent", config.reader_role: "nothing_published"}
     assert result["missing"] == PRESENT
+
+
+async def test_publish_drops_a_whole_schema_even_with_no_table_to_publish(db, config):
+    # Set by hand before the first migration: a later table in that schema would be published unasked.
+    for schema in REGISTRY.schemas:
+        await db.execute(f'DROP SCHEMA "{schema}" CASCADE')
+    await db.execute("CREATE SCHEMA core")
+    await db.execute("CREATE PUBLICATION canopy_history FOR TABLES IN SCHEMA core")
+
+    result = await publish(db, role="primary", config=config)
+
+    assert result["publications"]["canopy_history"]["schemas_removed"] == ["core"]
+    assert (await publication_state(db, "canopy_history")).schemas == frozenset()
+    await db.execute("CREATE TABLE core.api_key_like (id int PRIMARY KEY)")
+    assert await _published(db) == []
 
 
 async def test_publish_refuses_an_unclassified_table_and_changes_nothing(db, config):
