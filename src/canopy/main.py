@@ -59,6 +59,34 @@ API_MODULES = (
 )
 
 
+# The optional extra that provides each package a module may need beyond the core install.
+_EXTRA_FOR_PACKAGE = {
+    "sqlalchemy": "data",
+    "asyncpg": "data",
+    "alembic": "data",
+    "arq": "data",
+    "redis": "data",
+    "pydmconverter": "convert",
+}
+
+
+def _import_sub_app(name: str, package: str):
+    """Import ``canopy.<package>.app``, naming the missing extra when the install lacks one."""
+    try:
+        return import_module(f"canopy.{package}.app")
+    except ModuleNotFoundError as exc:
+        missing = (exc.name or "").partition(".")[0]
+        extra = _EXTRA_FOR_PACKAGE.get(missing)
+        if extra is None:
+            raise
+        raise ModuleNotFoundError(
+            f"The {name} module needs the '{extra}' extra, which is not installed (no module named "
+            f"'{missing}'). Install canopy[{extra}], or leave {name} out of CANOPY_MODULES; "
+            "unset, CANOPY_MODULES selects every module.",
+            name=exc.name,
+        ) from exc
+
+
 class _SelectedModules:
     """Publish the app's module selection on every ASGI scope.
 
@@ -210,7 +238,7 @@ def build_app(modules: Iterable[str] | str, *, closed_meta: bool | None = None) 
     # Import here, not at module top: an unselected sub-app must never load. A
     # module's label is its mount and key scope; its package spells "-" as "_".
     packages = {name: name.replace("-", "_") for name in selected}
-    sub_apps = {name: import_module(f"canopy.{package}.app") for name, package in packages.items()}
+    sub_apps = {name: _import_sub_app(name, package) for name, package in packages.items()}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

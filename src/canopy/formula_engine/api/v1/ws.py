@@ -11,10 +11,11 @@ import logging
 
 from fastapi import Security, APIRouter, WebSocket, WebSocketDisconnect
 
+from canopy.core.config import get_settings
 from canopy.core.errors import ErrorCode, CanopyError
 from canopy.core.security import ws_require_read_access
 from canopy.contracts.formula import FormulaSpec
-from canopy.formula_engine.dependencies import SubscriptionManagerDep
+from canopy.formula_engine.dependencies import FormulaServiceDep, SubscriptionManagerDep
 
 logger = logging.getLogger(__name__)
 
@@ -51,20 +52,39 @@ async def _send_error(send_fn, code: str, message: str, *, sub_id: str | None = 
     await send_fn(frame)
 
 
+async def _send_unhandled_error(send_fn, exc: Exception, *, sub_id: str | None = None) -> None:
+    """Send an unexpected error, with its detail only in debug mode like the REST fallback handler."""
+    message = str(exc) if get_settings().debug else "Internal server error"
+    await _send_error(send_fn, ErrorCode.UNHANDLED_EXCEPTION.value, message, sub_id=sub_id)
+
+
 @router.websocket("/formulas", dependencies=[Security(ws_require_read_access)])
-async def ws_formulas(websocket: WebSocket, manager: SubscriptionManagerDep) -> None:
+async def ws_formulas(
+    websocket: WebSocket, manager: SubscriptionManagerDep, formula_service: FormulaServiceDep
+) -> None:
     """Live formula evaluation stream.
 
     Client -> server:
     - ``{"type": "subscribe", "spec": {...}, "t0Ns": ..., "t1Ns": ...}``
+    - ``{"type": "update", "id": "<server-assigned>", "spec": {...}, ...}``
     - ``{"type": "unsubscribe", "id": "<server-assigned>"}``
     - ``{"type": "ping"}``
 
     Server -> client:
     - ``{"type": "subscribed", "id": "<assigned>"}``
     - ``{"type": "result", "id": "...", "data": {...}}``
-    - ``{"type": "error", "code": "...", "message": "..."}``
+    - ``{"type": "updated", "id": "..."}``
+    - ``{"type": "completed", "id": "..."}``
+    - ``{"type": "error", "id": "...", "code": "...", "message": "..."}``
+    - ``{"type": "error", "code": "...", "message": "..."}`` (no ``id``)
     - ``{"type": "pong", "timestamp": T}``
+
+    Each subscribe gets one reply, in the order the subscribes arrive:
+    ``subscribed``, or an error without an ``id``. A malformed subscribe or a
+    spec that can't be evaluated (a bad binding or expression) gets the
+    id-less error, before anything subscribes and before any id is assigned.
+    A failure after that (the subscription limit, a PV subscribe that fails)
+    gets ``subscribed``, then an error with the id.
     """
     await websocket.accept()
     client_id = uuid.uuid4().hex
@@ -111,6 +131,16 @@ async def ws_formulas(websocket: WebSocket, manager: SubscriptionManagerDep) -> 
                     await _send_error(send_fn, ErrorCode.INVALID_SPEC.value, f"invalid spec: {exc}")
                     continue
 
+                try:
+                    formula_service.check_spec(spec)
+                except CanopyError as exc:
+                    await _send_error(send_fn, exc.error_code.value, exc.detail)
+                    continue
+                except Exception as exc:
+                    logger.warning("Formula Engine spec check failed: %s", exc, exc_info=True)
+                    await _send_unhandled_error(send_fn, exc)
+                    continue
+
                 sub_id = uuid.uuid4().hex
                 await send_fn({"type": "subscribed", "id": sub_id})
                 try:
@@ -120,22 +150,24 @@ async def ws_formulas(websocket: WebSocket, manager: SubscriptionManagerDep) -> 
                 except CanopyError as exc:
                     await _send_error(send_fn, exc.error_code.value, exc.detail, sub_id=sub_id)
                 except Exception as exc:
-                    logger.warning("Formula Engine subscribe failed for %s: %s", sub_id, exc)
-                    await _send_error(send_fn, ErrorCode.UNHANDLED_EXCEPTION.value, str(exc), sub_id=sub_id)
+                    logger.warning("Formula Engine subscribe failed for %s: %s", sub_id, exc, exc_info=True)
+                    await _send_unhandled_error(send_fn, exc, sub_id=sub_id)
 
             elif mtype == "update":
                 sub_id = message.get("id", "")
+                if not sub_id:
+                    await _send_error(send_fn, ErrorCode.INVALID_MESSAGE.value, "update requires 'id'")
+                    continue
+
+                # Errors from here on carry the id: an id-less error is read
+                # as the reply to a pending subscribe.
                 try:
                     t0_update = _coerce_opt_int(message.get("t0Ns"), "t0Ns")
                     interval_update = _coerce_opt_int(message.get("intervalMs"), "intervalMs")
                 except _WSValidationError as exc:
-                    await _send_error(send_fn, ErrorCode.INVALID_MESSAGE.value, str(exc))
+                    await _send_error(send_fn, ErrorCode.INVALID_MESSAGE.value, str(exc), sub_id=sub_id)
                     continue
                 spec_update = message.get("spec")
-
-                if not sub_id:
-                    await _send_error(send_fn, ErrorCode.INVALID_MESSAGE.value, "update requires 'id'")
-                    continue
 
                 parsed_spec = None
                 if spec_update is not None:
@@ -156,8 +188,8 @@ async def ws_formulas(websocket: WebSocket, manager: SubscriptionManagerDep) -> 
                     await _send_error(send_fn, exc.error_code.value, exc.detail, sub_id=sub_id)
                     continue
                 except Exception as exc:
-                    logger.warning("Formula Engine update failed for %s: %s", sub_id, exc)
-                    await _send_error(send_fn, ErrorCode.UNHANDLED_EXCEPTION.value, str(exc), sub_id=sub_id)
+                    logger.warning("Formula Engine update failed for %s: %s", sub_id, exc, exc_info=True)
+                    await _send_unhandled_error(send_fn, exc, sub_id=sub_id)
                     continue
 
                 if ok:

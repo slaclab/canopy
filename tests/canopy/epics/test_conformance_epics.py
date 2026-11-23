@@ -13,8 +13,10 @@ The helper is this file, run as a script with ``--helper``.
 import os
 import sys
 import json
+import random
 import socket
 import asyncio
+import tempfile
 import subprocess
 from pathlib import Path
 
@@ -26,8 +28,13 @@ from canopy.epics.gateway import build_connector
 from canopy.epics.testing import conformance
 from canopy.epics.pv_protocol import parse_pv_name
 
-# Ports this host's own control systems listen on; a run must never use them.
-_FORBIDDEN_CA_PORTS = {5064, 5065, 10090}
+# The standard Channel Access (5064, 5065) and PV Access (5075, 5076) ports, and 10090.
+# A run must never use them.
+_FORBIDDEN_CA_PORTS = {5064, 5065, 5075, 5076, 10090}
+# Test ports come from below the OS's ephemeral range (from 32768 on Linux, 49152 on
+# macOS and Windows), so no socket the OS numbers itself can take one while a restart
+# has it unbound.
+_PORT_RANGE = (20000, 32767)
 
 _PORT_ENV = "CANOPY_CONFORMANCE_CA_PORT"
 _PREFIX_ENV = "CANOPY_CONFORMANCE_PREFIX"
@@ -38,7 +45,9 @@ _IOC_START_TIMEOUT_S = 30.0
 _NAME_PREFIX = {"bare": "", "ca": "ca://", "pva": "pva://"}
 
 _IOC_SOURCE = """
+import os
 import sys
+import threading
 from caproto import ChannelType
 from caproto.server import PVGroup, pvproperty, run
 
@@ -49,6 +58,13 @@ class ConformanceIOC(PVGroup):
     waveform = pvproperty(value=[0.0, 0.0, 0.0], name="WAVEFORM")
 
 
+def exit_with_the_helper():
+    # stdin is a pipe from the helper, which reads end-of-file however the helper ends.
+    sys.stdin.read()
+    os._exit(0)
+
+
+threading.Thread(target=exit_with_the_helper, daemon=True).start()
 run(ConformanceIOC(prefix=sys.argv[1]).pvdb, interfaces=["127.0.0.1"])
 """
 
@@ -66,6 +82,7 @@ class EpicsDriver:
         self._prefix = prefix
         self._ca_port = ca_port
         self._ioc: subprocess.Popen | None = None
+        self._ioc_log = None
         self._pva_server = None
         self._pva_pvs: dict = {}
 
@@ -100,13 +117,19 @@ class EpicsDriver:
                 f"{base}WAVEFORM": SharedPV(nt=NTScalar("ad"), initial=[0.0, 0.0, 0.0]),
             }
         self._pva_server = Server(providers=[self._pva_pvs])
+        self._ioc_log = tempfile.TemporaryFile()
         self._ioc = subprocess.Popen(
             [sys.executable, "-c", _IOC_SOURCE, f"{self._prefix}CA:"],
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,  # closed when the helper ends, which ends the IOC too
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=self._ioc_log,
         )
         await self._wait_for_ioc()
+
+    def _ioc_output(self) -> str:
+        """The soft IOC's stderr so far, for a failure message."""
+        self._ioc_log.seek(0)
+        return self._ioc_log.read().decode(errors="replace")[-4000:]
 
     async def _wait_for_ioc(self) -> None:
         from caproto.sync.client import read
@@ -115,12 +138,14 @@ class EpicsDriver:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _IOC_START_TIMEOUT_S
         while True:
-            assert self._ioc is not None and self._ioc.poll() is None, "the soft IOC exited"
+            assert self._ioc is not None and self._ioc.poll() is None, f"the soft IOC exited:\n{self._ioc_output()}"
             try:
                 await asyncio.to_thread(read, name, timeout=0.5, repeater=False)
                 return
             except Exception:
-                assert loop.time() < deadline, f"the soft IOC did not serve {name} in {_IOC_START_TIMEOUT_S} s"
+                assert loop.time() < deadline, (
+                    f"the soft IOC did not serve {name} in {_IOC_START_TIMEOUT_S} s:\n{self._ioc_output()}"
+                )
 
     async def stop(self) -> None:
         if self._pva_server is not None:
@@ -129,7 +154,11 @@ class EpicsDriver:
         if self._ioc is not None:
             self._ioc.kill()
             await asyncio.to_thread(self._ioc.wait)
+            self._ioc.stdin.close()
             self._ioc = None
+        if self._ioc_log is not None:
+            self._ioc_log.close()
+            self._ioc_log = None
 
     # --- the conformance driver ---
 
@@ -181,19 +210,22 @@ def _helper_main(result_path: str) -> None:
 
 
 def _free_port() -> int:
-    """A loopback port free for both TCP and UDP, outside the real CA ports."""
+    """A loopback port in `_PORT_RANGE` free for both TCP and UDP, outside the real EPICS ports."""
+    pick = random.SystemRandom()
     for _ in range(200):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
-            tcp.bind(("127.0.0.1", 0))
-            port = tcp.getsockname()[1]
-            if port in _FORBIDDEN_CA_PORTS:
+        port = pick.randint(*_PORT_RANGE)
+        if port in _FORBIDDEN_CA_PORTS:
+            continue
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp,
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp,
+        ):
+            try:
+                tcp.bind(("127.0.0.1", port))
+                udp.bind(("127.0.0.1", port))
+            except OSError:
                 continue
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
-                try:
-                    udp.bind(("127.0.0.1", port))
-                except OSError:
-                    continue
-            return port
+        return port
     raise RuntimeError("no free loopback port found")
 
 
