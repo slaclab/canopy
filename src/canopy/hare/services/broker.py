@@ -789,7 +789,8 @@ class PVBroker:
         self._latest[value.pv] = value
         if previous is None:
             self._cancel_task(self._connect_timers, value.pv)
-        if value.connected and self._meta_is_missing(value.pv) and (previous is None or not previous.connected):
+        # The connect edge first: `_meta_is_missing` dumps the metadata, too dear for every update.
+        if value.connected and (previous is None or not previous.connected) and self._meta_is_missing(value.pv):
             self._ensure_describe_task(value.pv, again_if_running=True)
         async with self._buffer_lock:
             self._buffer[value.pv] = value
