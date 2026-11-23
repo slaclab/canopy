@@ -4,10 +4,12 @@ import json
 import logging
 
 import pytest
+from pydantic_settings import SettingsError
 from sqlalchemy.engine import make_url
 
 from canopy.core.config import get_settings
 from canopy.core.replication import __main__ as cli
+from canopy.core.replication.registry import RegistryError
 
 from .conftest import DB_DSN
 
@@ -139,6 +141,26 @@ def test_a_missing_instance_is_refused(env, no_connect, caplog, monkeypatch):
     env()
     assert cli.main(["status"]) == 2
     assert "refused: CANOPY_INSTANCE: Field required" in caplog.text
+
+
+def test_a_settings_value_that_doesnt_parse_is_refused(no_connect, caplog, monkeypatch):
+    def unparsable():
+        raise SettingsError('error parsing value for field "instance" from source "EnvSettingsSource"')
+
+    monkeypatch.setattr(cli, "get_settings", unparsable)
+    assert cli.main(["status"]) == 2
+    assert 'refused: error parsing value for field "instance"' in caplog.text
+
+
+async def test_an_incomplete_registry_is_refused(db, env, caplog, monkeypatch):
+    async def incomplete(*args, **kwargs):
+        raise RegistryError("squirrel.new_table has no owner path in the replication registry")
+
+    monkeypatch.setattr(cli, "grants", incomplete)
+    env(CANOPY_DATABASE_URL=_sqlalchemy_url(DB_DSN), CANOPY_ROLE="mirror")
+
+    assert await _run("grants") == 2
+    assert "refused: squirrel.new_table has no owner path" in caplog.text
 
 
 def test_only_head_commands_take_an_arm():

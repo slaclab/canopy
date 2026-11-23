@@ -112,7 +112,7 @@ def owner_join(registry: ReplicationRegistry, table: str, *, alias: str) -> tupl
 
     Raises
     ------
-    ValueError
+    RegistryError
         When ``table`` has no owner path in ``registry``.
     """
     joins = []

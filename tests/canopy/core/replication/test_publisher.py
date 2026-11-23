@@ -105,6 +105,18 @@ async def test_publish_grants_existing_roles_select_on_published_tables_only(db,
         assert await privileges(db, role, "core.api_key") == set()
 
 
+async def test_publish_before_any_table_exists_reports_each_role(db, config):
+    # A role provisioned before the first migration: nothing to grant it yet.
+    for schema in REGISTRY.schemas:
+        await db.execute(f'DROP SCHEMA "{schema}" CASCADE')
+    await db.execute(f'CREATE ROLE "{config.reader_role}"')
+
+    result = await publish(db, role="primary", config=config)
+
+    assert result["roles"] == {config.replicator_role: "absent", config.reader_role: "nothing_published"}
+    assert result["missing"] == PRESENT
+
+
 async def test_publish_refuses_an_unclassified_table_and_changes_nothing(db, config):
     await db.execute("CREATE TABLE squirrel.mystery (id int PRIMARY KEY)")
 

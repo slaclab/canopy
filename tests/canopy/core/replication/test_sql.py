@@ -17,6 +17,7 @@ from canopy.core.replication.registry import (
     REGISTRY,
     OwnerPath,
     TableClass,
+    RegistryError,
     ReplicationRegistry,
 )
 
@@ -108,7 +109,7 @@ def test_owner_join_for_a_root_child_and_grandchild():
 
 
 def test_owner_join_refuses_a_table_without_a_path():
-    with pytest.raises(ValueError, match="s.other has no owner path"):
+    with pytest.raises(RegistryError, match="s.other has no owner path"):
         owner_join(CHAIN, "s.other", alias="t")
 
 

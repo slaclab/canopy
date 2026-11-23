@@ -228,7 +228,8 @@ async def publish(
     Returns
     -------
     dict
-        Per publication, what changed; per role, ``"granted"`` or ``"absent"``; and the
+        Per publication, what changed; per role, ``"granted"``, ``"absent"`` (no such
+        role yet) or ``"nothing_published"`` (no registered table here yet); and the
         registered tables that don't exist here.
 
     Raises
@@ -276,6 +277,9 @@ async def publish(
                     policy="SELECT on the published tables",
                 )
                 result["roles"][grantee] = "granted"
+            else:
+                logger.info("Nothing is published here yet; no grants made for %s", grantee)
+                result["roles"][grantee] = "nothing_published"
     return result
 
 

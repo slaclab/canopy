@@ -23,6 +23,7 @@ from pydantic import Field, BaseModel, SecretStr, ValidationError, field_validat
 from pydantic_settings import BaseSettings, SettingsError, SettingsConfigDict
 
 from canopy.core.config import INSTANCE_NAME_PATTERN, describe_settings_error
+from canopy.core.errors import ErrorCode, CanopyError
 
 _SUBSCRIPTION_PREFIX = "canopy_history_"
 
@@ -63,8 +64,15 @@ class ArmsConfig(BaseSettings):
         return arms
 
 
-class ArmsConfigError(ValueError):
-    """``CANOPY_ARMS`` is invalid. The message names each wrong setting and why, never a value."""
+class ArmsConfigError(CanopyError, ValueError):
+    """``CANOPY_ARMS`` is invalid. The message names each wrong setting and why, never a value.
+
+    A ``CanopyError``, so an API route that reads the arms answers 500
+    ``invalid_settings`` with that message rather than an unhandled exception.
+    """
+
+    status_code = 500
+    error_code = ErrorCode.INVALID_SETTINGS
 
 
 def get_arms_config() -> ArmsConfig:
