@@ -34,4 +34,6 @@ uv sync --frozen --group dev --all-extras --python "$PYTHON_REQUEST"
 uv export --frozen --no-hashes --no-emit-project --group dev --all-extras | grep -v '^#' | sort
 
 # 2. the tests.
+# A nested `uv run` (a test runs alembic) would otherwise re-sync this venv to the newest releases.
+export UV_NO_SYNC=1
 uv run --no-sync pytest -rs "$@"

@@ -85,13 +85,6 @@ jobs:
       with:
         python-version: "3.12"
 
-    # The browser tests drive the Chromium build of the floor Playwright, the
-    # version the mcp extra's playwright>= line names.
-    - name: Install Chromium for the floor Playwright
-      run: >-
-        uvx --from "playwright==$(sed -n 's/^ *"playwright>=\([0-9.]*\)".*/\1/p' pyproject.toml)"
-        playwright install --with-deps chromium
-
     # The perf bounds are for operator-class hardware, not a shared runner.
     - name: Test under the dependency floors
       run: ci/run-under-floors.sh tests/ -m "not perf"
