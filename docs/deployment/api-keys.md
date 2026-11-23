@@ -317,12 +317,13 @@ So a row naming no facility the key holds gets the same `403` whether or not its
 address exists. With `onConflict=skip`, a registered PV is left alone whatever its
 facilities, and the response only repeats the skipped rows' own addresses. That
 tells the key no more than the `409` from `POST /v1/pvs/multi` already does. With
-`onConflict=update`, every registered PV the import matches must pass the same
-checks as `PUT /v1/pvs/{id}`: the key holds all of the PV's facilities, it isn't
-unassigning the PV's last one, and every facility it adds or removes is in its
-grant. Otherwise the whole import is refused. That refusal lists the rows, but it
-doesn't name the facilities of a PV the key can't write, since the key only
-supplied an address.
+`onConflict=update`, the key must hold all of the facilities of every registered
+PV the import matches, as `PUT /v1/pvs/{id}` requires. Otherwise the whole import
+is refused. That refusal lists the rows, but it doesn't name the facilities of a
+PV the key can't write, since the key only supplied an address. An import never
+changes a registered PV's facilities: a matched row's `facilities` only has to
+pass the create rule above, and `PUT /v1/pvs/{id}` is how a PV moves between
+facilities.
 
 **Checking access ahead of a write.** `GET /v1/facilities/access` returns the
 calling key's own reach, so a client can check before writing instead of finding

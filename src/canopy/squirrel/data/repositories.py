@@ -667,19 +667,6 @@ class PvRepository(BaseRepository[Pv]):
         if rows:
             await self.session.execute(insert(pv_facility), rows)
 
-    async def set_facilities_many(self, assignments: list[tuple[str, set[str]]]) -> None:
-        """Replace the facility assignments of many PVs, as ``set_facilities`` does for one.
-
-        One delete for every listed PV, then one bulk insert; an empty set clears a PV's
-        assignments.
-        """
-        if not assignments:
-            return
-        await self.session.execute(
-            delete(pv_facility).where(pv_facility.c.pv_id == any_(_uuid_array([pv_id for pv_id, _ in assignments])))
-        )
-        await self.add_facilities_many(assignments)
-
     async def get_by_ids(self, ids: list[str], *, populate_existing: bool = False) -> list[Pv]:
         """Get many PVs by id in one query.
 

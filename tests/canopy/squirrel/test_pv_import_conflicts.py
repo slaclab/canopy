@@ -10,14 +10,11 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from canopy.core import security
-from canopy.core.errors import InsufficientFacilityAccess
 from canopy.core.modules import WILDCARD
 from canopy.squirrel.app import app as squirrel_app
 from canopy.core.security import APIKey
-from canopy.squirrel.schemas.pv import NewPVElementDTO
 from canopy.squirrel.data.models import Pv
 from canopy.core.facilities.models import Facility
-from canopy.squirrel.services.pv_service import PvService, _ImportRow
 
 ALL = {"X-API-Key": "all-key"}
 ALPHA = {"X-API-Key": "alpha-key"}
@@ -232,19 +229,17 @@ async def test_update_applies_only_the_fields_a_row_provides(client: AsyncClient
     assert after["SIM:DEV:00001:SET"] == first
 
 
-async def test_update_replaces_tags_tolerances_and_facilities_when_given(client: AsyncClient, facilities):
+async def test_update_replaces_tags_and_tolerances_when_given(client: AsyncClient):
     tag_a, tag_b = await _tags(client, "a", "b")
     await _create(client, setpointAddress="SIM:DEV:00001:SET", absTolerance=0.1, tags=[tag_a, tag_b])
 
-    rows = [{"setpointAddress": "SIM:DEV:00001:SET", "absTolerance": 0.0, "tags": [], "facilities": ["beta", "alpha"]}]
+    rows = [{"setpointAddress": "SIM:DEV:00001:SET", "absTolerance": 0.0, "tags": []}]
     r = await _import(client, rows, "update")
 
     assert r.status_code == 200, r.text
     [pv] = r.json()["updated"]
     assert pv["absTolerance"] == 0.0
     assert pv["tags"] == []
-    assert pv["facilities"] == ["alpha", "beta"]
-    assert (await _all_pvs(client))["SIM:DEV:00001:SET"]["facilities"] == ["alpha", "beta"]
 
 
 async def test_update_reports_a_differing_address_and_keeps_the_stored_one(client: AsyncClient):
@@ -327,23 +322,6 @@ async def test_update_picks_the_lowest_id_when_registered_pvs_share_an_identity(
     assert [pv["id"] for pv in r.json()["updated"]] == [min(ids)]
 
 
-def test_a_restricted_key_cannot_unassign_a_registered_pv_through_an_import():
-    """Unreachable through the route today, since every row must first name a facility the
-    key holds, but the update gate keeps ``update``'s rule rather than relying on that."""
-    service = PvService(session=None, facility_scope={"alpha-id"})
-    row = _ImportRow(
-        1,
-        ("SIM:DEV:00001:SET", None, None),
-        "setpoint",
-        "SIM:DEV:00001:SET",
-        NewPVElementDTO(setpoint_address="SIM:DEV:00001:SET", facilities=[]),
-    )
-    pv = Pv(id="00000000-0000-4000-8000-000000000001", setpoint_address="SIM:DEV:00001:SET")
-
-    with pytest.raises(InsufficientFacilityAccess, match="cannot unassign the PV's last facility"):
-        service._gate_import_updates([(row, pv)], {pv.id: {"alpha-id"}}, {})
-
-
 # --- facility-restricted keys ------------------------------------------------ #
 
 
@@ -410,18 +388,36 @@ async def test_update_with_a_restricted_key_needs_every_facility_of_the_pv(clien
     assert r.status_code == 200, r.text
     [pv] = r.json()["updated"]
     assert pv["description"] == "shared"
-    assert pv["facilities"] == ["alpha"]
+    assert pv["facilities"] == ["alpha", "beta"]
 
 
-async def test_update_with_a_restricted_key_cannot_add_a_facility_outside_its_grant(client: AsyncClient, facilities):
-    await _create(client, setpointAddress="SIM:DEV:00001:SET", facilities=["alpha"])
+@pytest.mark.parametrize(
+    ("headers", "stored", "named"),
+    [
+        # A key holding both of the PV's facilities naming one of them, as it must.
+        (ALPHA_BETA, ["alpha", "beta"], ["alpha"]),
+        # A restricted key naming one facility outside its grant alongside one it holds.
+        (ALPHA, ["alpha"], ["alpha", "beta"]),
+        # An unrestricted key naming a different facility, as a CSV import's default does.
+        (ALL, ["alpha"], ["beta"]),
+        # An unrestricted key naming none at all.
+        (ALL, ["alpha", "beta"], []),
+    ],
+)
+async def test_update_never_changes_a_registered_pvs_facilities(
+    client: AsyncClient, facilities, headers: dict, stored: list[str], named: list[str]
+):
+    """A matched row's ``facilities`` only passes the create gate; changing a registered
+    PV's facilities is ``PUT /v1/pvs/{id}``'s job."""
+    await _create(client, setpointAddress="SIM:DEV:00001:SET", facilities=stored)
 
-    rows = [{"setpointAddress": "SIM:DEV:00001:SET", "facilities": ["alpha", "beta"]}]
-    r = await _import(client, rows, "update", ALPHA)
+    rows = [{"setpointAddress": "SIM:DEV:00001:SET", "description": "changed", "facilities": named}]
+    r = await _import(client, rows, "update", headers)
 
-    assert r.status_code == 403
-    assert r.json()["detail"].endswith("row 1 (SIM:DEV:00001:SET): cannot add or remove facility(s) beta")
-    assert (await _all_pvs(client))["SIM:DEV:00001:SET"]["facilities"] == ["alpha"]
+    assert r.status_code == 200, r.text
+    [pv] = r.json()["updated"]
+    assert (pv["description"], pv["facilities"]) == ("changed", stored)
+    assert (await _all_pvs(client))["SIM:DEV:00001:SET"]["facilities"] == stored
 
 
 async def test_update_with_a_restricted_key_may_leave_facilities_unchanged(client: AsyncClient, facilities):
@@ -554,8 +550,9 @@ async def test_a_malformed_tag_id_is_an_unknown_tag(client: AsyncClient):
 
 
 async def test_update_moves_updated_at_only_for_rows_that_change_a_pv_column(client: AsyncClient, facilities):
-    """A tags- or facilities-only change issues no UPDATE on ``pv``, so its
-    ``updated_at`` stays, as with ``PUT /v1/pvs/{id}``."""
+    """A tags-only change issues no UPDATE on ``pv``, so its ``updated_at`` stays, as with
+    ``PUT /v1/pvs/{id}``. Nor does a row naming only facilities, which an import never
+    changes on a registered PV."""
     [tag] = await _tags(client, "kept")
     before = [await _create(client, setpointAddress=f"SIM:DEV:{n:05d}:SET", facilities=["alpha"]) for n in range(1, 5)]
 
@@ -572,7 +569,7 @@ async def test_update_moves_updated_at_only_for_rows_that_change_a_pv_column(cli
     assert updated[0]["lastModifiedDate"] > before[0]["lastModifiedDate"]
     assert [pv["lastModifiedDate"] for pv in updated[1:]] == [pv["lastModifiedDate"] for pv in before[1:]]
     assert [t["id"] for t in updated[1]["tags"]] == [tag]
-    assert updated[2]["facilities"] == ["beta"]
+    assert updated[2]["facilities"] == ["alpha"]
     after = await _all_pvs(client)
     assert [after[pv["setpointAddress"]]["lastModifiedDate"] for pv in updated] == [
         pv["lastModifiedDate"] for pv in updated

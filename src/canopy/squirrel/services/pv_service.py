@@ -230,9 +230,9 @@ class PvService:
     def _facility_change_refusal(self, current: set[str], new_ids: set[str]) -> _FacilityChangeRefusal | None:
         """Why the calling key may not reassign a PV it can write, if it may not.
 
-        Shared by ``update`` and the ``update`` mode of ``import_many``, which word the
-        refusal themselves. Applies on top of ``_can_write`` for the PV's current
-        facilities. Two rules, both for restricted keys only:
+        ``update``'s facility-change rules, the only path that changes a registered PV's
+        facilities (``import_many`` leaves them alone). Applies on top of ``_can_write``
+        for the PV's current facilities. Two rules, both for restricted keys only:
 
         - A restricted key may not strip a PV down to unassigned: that would hide it from
           every facility-filtered read and hand write access to every other write-scoped
@@ -473,13 +473,18 @@ class PvService:
 
         With ``on_conflict="update"``, a matched PV is changed the way ``update`` changes
         one: only fields the row explicitly provides with a non-null value are applied,
-        ``tags`` replaces the tag list, ``facilities`` replaces the assignments, and
-        addresses are never changed (a differing non-identifying address is reported in
-        ``address_mismatches`` and kept as stored). The key must be allowed to write every
-        matched PV under ``update``'s facility rules, or the whole import is refused. The
-        refusal names the rows, but not the facilities of a PV the key cannot write.
-        Unlike a created row, an update row naming an unknown tag ID is refused rather
-        than having that tag dropped, since dropping it would remove a stored tag.
+        ``tags`` replaces the tag list, and addresses are never changed (a differing
+        non-identifying address is reported in ``address_mismatches`` and kept as stored).
+        Facilities are never changed either: a matched row's ``facilities`` only has to
+        pass the create gate, and the PV keeps its assignments, which change through
+        ``update`` alone. A client may fill a default facility into every row (a CSV
+        import does, for rows that name none), and the gate needs a facility on every row
+        from a restricted key, so applying them would move or strip PVs no row meant to
+        reassign. The key must be allowed to write every matched PV (``_can_write``), or
+        the whole import is refused. The refusal names the rows, but not the facilities
+        of a PV the key cannot write. Unlike a created row, an update row naming an
+        unknown tag ID is refused rather than having that tag dropped, since dropping it
+        would remove a stored tag.
 
         Nothing is written until every check has passed, and all of it happens in the
         caller's transaction.
@@ -503,7 +508,7 @@ class PvService:
             row names an unknown tag ID.
         InsufficientFacilityAccess
             If a row names no facility the key holds, or (``update``) the key may not
-            write a matched PV or make the requested facility change.
+            write a matched PV.
         PvAlreadyExists
             If a concurrent write registers one of the new rows' addresses first.
         """
@@ -541,7 +546,7 @@ class PvService:
         ]
 
         stored_ids = await self.pv_repo.facility_ids_for_many([pv.id for _, pv in to_update])
-        new_ids_by_pv = self._gate_import_updates(to_update, stored_ids, ids_by_slug)
+        self._gate_import_updates(to_update, stored_ids)
 
         tags_by_id = await self._load_import_tags(rows)
         unknown_tags = [
@@ -570,10 +575,8 @@ class PvService:
                     mismatches.append(PVAddressMismatchDTO(row=row.row, kind=kind, requested=requested, stored=stored))
 
         created = await self._create_import_rows(to_create, ids_by_slug, tags_by_id)
-        await self.pv_repo.set_facilities_many(list(new_ids_by_pv.items()))
         updated_pvs = await self.pv_repo.update_many([pv for _, pv in to_update])
-        facility_ids_by_pv = {pv.id: new_ids_by_pv.get(pv.id, stored_ids.get(pv.id, set())) for pv in updated_pvs}
-        updated = await self._to_dtos(updated_pvs, facility_ids_by_pv)
+        updated = await self._to_dtos(updated_pvs, {pv.id: stored_ids.get(pv.id, set()) for pv in updated_pvs})
         return PVImportResultDTO(created=created, updated=updated, skipped=[], address_mismatches=mismatches)
 
     async def _prepare_import(
@@ -660,23 +663,16 @@ class PvService:
             )
         return rows, identities, ids_by_slug
 
-    def _gate_import_updates(
-        self,
-        to_update: list[tuple[_ImportRow, Pv]],
-        stored_ids: dict[str, set[str]],
-        ids_by_slug: dict[str, str],
-    ) -> dict[str, set[str]]:
-        """Apply ``update``'s facility rules to every registered PV an import would change.
+    def _gate_import_updates(self, to_update: list[tuple[_ImportRow, Pv]], stored_ids: dict[str, set[str]]) -> None:
+        """Require the key to be allowed to write every registered PV an import would change.
 
-        A matched PV must be writable by the key (``_can_write``), and a row providing
-        ``facilities`` must pass ``_facility_change_refusal``, the rule ``update`` applies
-        too. Every row is checked before refusing, so one 403 lists them all.
+        The same rule ``update`` applies (``_can_write``). An import never changes a PV's
+        facilities, so ``update``'s facility-change rules don't come into it. Every row is
+        checked before refusing, so one 403 lists them all.
 
         The refusal does not name the facilities of a PV the key cannot write: the key
         gave only an address, and naming them would tell it where an out-of-scope PV is
-        assigned. A facility change it may not make is named, since the key can write
-        the PV, so every facility it is removing is one it holds, and the rest came
-        from its own request.
+        assigned.
 
         Parameters
         ----------
@@ -684,38 +680,17 @@ class PvService:
             Each update row with the registered PV it matched.
         stored_ids : dict[str, set[str]]
             The matched PVs' current facility ids, as ``facility_ids_for_many`` returns.
-        ids_by_slug : dict[str, str]
-            Every facility slug the import names, mapped to its id.
-
-        Returns
-        -------
-        dict[str, set[str]]
-            New facility ids by PV id, for the rows that provide ``facilities``.
 
         Raises
         ------
         InsufficientFacilityAccess
-            If any matched PV may not be changed as requested.
+            If the key may not write any of the matched PVs.
         """
-        slug_by_id = {fid: slug for slug, fid in ids_by_slug.items()}
-        new_ids_by_pv: dict[str, set[str]] = {}
-        refused: list[tuple[_ImportRow, str]] = []
-        for row, pv in to_update:
-            current = stored_ids.get(pv.id, set())
-            if not self._can_write(current):
-                refused.append((row, "the registered PV is outside the key's facilities"))
-                continue
-            if "facilities" not in row.data.model_fields_set:
-                continue
-            new_ids = {ids_by_slug[slug] for slug in row.data.facilities}
-            refusal = self._facility_change_refusal(current, new_ids)
-            if refusal is None:
-                new_ids_by_pv[pv.id] = new_ids
-            elif refusal.reason == "unassign":
-                refused.append((row, "cannot unassign the PV's last facility"))
-            else:
-                slugs = ", ".join(sorted(slug_by_id[fid] for fid in refusal.facility_ids))
-                refused.append((row, f"cannot add or remove facility(s) {slugs}"))
+        refused = [
+            (row, "the registered PV is outside the key's facilities")
+            for row, pv in to_update
+            if not self._can_write(stored_ids.get(pv.id, set()))
+        ]
         if refused:
             listed = _list_refused(refused)
             logger.warning(
@@ -728,7 +703,6 @@ class PvService:
                 f"API key may not update {len(refused)} of the {len(to_update)} registered PVs this import matches: "
                 f"{listed}"
             )
-        return new_ids_by_pv
 
     async def _load_import_tags(self, rows: list[_ImportRow]) -> dict[str, Tag]:
         """Every tag the rows name, by canonical id, in one query. Unknown ids are absent.

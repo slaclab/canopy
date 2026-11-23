@@ -466,12 +466,14 @@ whose identifying address is already registered doesn't refuse the import.
   [Update a PV](#update-a-pv) changes one, and the other rows are created.
   Only the fields the row includes are applied, so a column missing from the
   row keeps its stored value even where creating a PV would use a default
-  (tolerances, `tags`, `facilities`); a `null` `device` or `description` also
-  leaves it alone. `tags` replaces the tag list, and an unknown tag id on such
-  a row is a `400`. `facilities` replaces the assignments. Addresses are never
-  changed: a non-identifying address that differs from the stored one is kept
-  as stored and reported in `addressMismatches`. An address the row leaves
-  out isn't a mismatch.
+  (tolerances, `tags`); a `null` `device` or `description` also leaves it
+  alone. `tags` replaces the tag list, and an unknown tag id on such a row is
+  a `400`. Addresses are never changed: a non-identifying address that differs
+  from the stored one is kept as stored and reported in `addressMismatches`.
+  An address the row leaves out isn't a mismatch. Facilities aren't changed
+  either: the row's `facilities` only has to pass the same check as a created
+  row's (see [API keys](../deployment/api-keys.md)), and the PV keeps its
+  assignments. Change them with [Update a PV](#update-a-pv).
 
 Rows that match no registered PV are created exactly as
 [Create PVs in bulk](#create-pvs-in-bulk) creates them, unknown tag ids
