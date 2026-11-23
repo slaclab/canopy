@@ -813,7 +813,7 @@ class PVBroker:
         ready : dict[str, tuple[asyncio.Lock, dict | None, dict | None]]
             The flush's snapshot of ready PVs, as `_send_ready` takes it.
         """
-        cap = max(1, self._config.initial_frame_max_pvs)
+        cap = self._config.initial_frame_max_pvs
         for offset in range(0, len(initial_pvs), cap):
             await self._send_ready(client_id, initial_pvs[offset : offset + cap], ready)
         if diff:

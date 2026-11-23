@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 
 import pytest
+from pydantic import ValidationError
 
 from tests.conftest import wait_for
 from canopy.epics.base import PVWriteFailed
@@ -1123,6 +1124,13 @@ async def test_released_monitor_update_delivered_after_resubscribe_is_not_cached
     await broker._drain_nowait()
     assert broker._latest["PV:A"].value == 3.0
     assert broker._buffer["PV:A"].value == 3.0
+
+
+@pytest.mark.parametrize("cap", [0, -1])
+def test_initial_frame_cap_below_one_is_refused(cap):
+    """0 is an easy mistake for "no limit"; it is refused rather than read as a cap of 1, which sends one frame per PV."""
+    with pytest.raises(ValidationError):
+        HareConfig(initial_frame_max_pvs=cap)
 
 
 class TestBatchedInitialFrames:
