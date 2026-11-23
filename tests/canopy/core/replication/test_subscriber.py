@@ -16,7 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from canopy.core.arms import Arm
 from canopy.core.instance import arm_states
-from canopy.core.replication.sql import Refused, ReplicationError, tables_with_rows_of
+from canopy.core.replication.sql import (
+    Refused,
+    ReplicationError,
+    qualified,
+    tables_with_rows_of,
+)
 from canopy.core.replication.registry import REGISTRY
 from canopy.core.replication.subscriber import (
     grants,
@@ -25,15 +30,21 @@ from canopy.core.replication.subscriber import (
     subscriber_status,
 )
 
-from .conftest import DB_DSN, privileges, build_schema, direct_grants
+from .conftest import (
+    DB_DSN,
+    PRESENT,
+    privileges,
+    build_schema,
+    direct_grants,
+    present_tables,
+)
 
-PRESENT = sorted(REGISTRY.replicated)
 DSN = "postgresql://replicator:s3cret-pw@arm1.example.org/canopy"
 ARMS = {"arm1": Arm(publisher_dsn=SecretStr(DSN))}
 
 
 HEAD = "head"
-ROOTS = sorted(t for t in REGISTRY.replicated if not REGISTRY.owner_chain(t))
+ROOTS = sorted(t for t in PRESENT if not REGISTRY.owner_chain(t))
 RW = {"SELECT", "INSERT", "UPDATE", "DELETE"}
 
 
@@ -81,6 +92,19 @@ async def test_grants_reads_every_row_and_writes_only_the_heads(db, config):
             await db.execute("UPDATE squirrel.tag_group SET owner_instance = 'arm1' WHERE owner_instance = $1", HEAD)
     finally:
         await db.execute("RESET ROLE")
+
+
+async def test_grants_leaves_out_a_retired_table_once_it_is_dropped(db, config):
+    # What PRESENT and ROOTS become once a table is retired: its model is gone, so a
+    # database built from the models doesn't hold it, and grants covers the rest.
+    retired = frozenset({"magpie.config"})
+    await db.execute(f'CREATE ROLE "{config.app_role}"')
+    await db.execute("DROP TABLE magpie.config")
+
+    result = await grants(db, role="mirror", head=HEAD, config=config)
+
+    assert result["replicated"] == present_tables(retired)
+    assert result["row_security"] == sorted(set(ROOTS) - retired)
 
 
 async def test_a_permissive_policy_added_by_hand_doesnt_widen_writes(db, config):
@@ -293,6 +317,10 @@ async def _arm_databases(db, names: list[str]):
             conns[arm] = (name, None)
             await build_schema(dsn)
             conns[arm] = (name, await asyncpg.connect(dsn))
+            # As publish leaves it: the key checks read only what the arm publishes.
+            await conns[arm][1].execute(
+                f"CREATE PUBLICATION canopy_history FOR TABLE {', '.join(qualified(t) for t in PRESENT)}"
+            )
             arms[arm] = Arm(publisher_dsn=SecretStr(dsn))
         yield {arm: conn for arm, (_, conn) in conns.items()}, arms
     finally:
@@ -356,6 +384,23 @@ async def test_refresh_refuses_a_slug_two_arms_would_both_copy(
 
     with pytest.raises(Refused, match=r"arms arm1 and arm2: core.facility.slug 'lab' \(both copy it\)"):
         await refresh(db, role="mirror", arms=arms)
+
+
+async def test_a_keyed_table_the_arm_doesnt_publish_yet_isnt_read(db, arm_db):
+    # An older arm while the head deploys first: no magpie.config there at all.
+    arm, arms = arm_db
+    await arm.execute("ALTER PUBLICATION canopy_history DROP TABLE magpie.config")
+    await arm.execute("DROP TABLE magpie.config")
+    await arm.execute(
+        "INSERT INTO core.facility (id, slug, name, owner_instance) VALUES (gen_random_uuid(), 'lab', 'L', 'arm1')"
+    )
+    await db.execute(
+        "INSERT INTO core.facility (id, slug, name, owner_instance) VALUES (gen_random_uuid(), 'lab', 'L', 'head')"
+    )
+
+    # The facility check still runs; the missing table neither fails nor skips it.
+    with pytest.raises(Refused, match=r"core.facility.slug 'lab' \(here, owned by head\)"):
+        await subscribe(db, role="mirror", head="head", arms=arms)
 
 
 async def test_refresh_checks_the_slugs_of_tables_about_to_be_copied(db, arm_db, stray_subscription_for_arm1):
