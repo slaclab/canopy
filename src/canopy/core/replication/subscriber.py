@@ -407,7 +407,6 @@ async def subscribe(
     keys: dict[str, SharedKeys] = {}
     for arm in to_create:
         if not copy_data:  # nothing is copied, so nothing can clash; reseed checks what it writes
-            checked.append(arm)
             continue
         await _require_unowned(conn, registry, copied, arm, "subscribe")
         try:
@@ -417,7 +416,7 @@ async def subscribe(
             logger.error("Arm %s: can't read it to check its unique keys: %s", arm, message)
             failures.append(f"{arm}: can't read it to check its unique keys: {message}")
     await _require_no_shared_key_clash(conn, registry, keys, "subscribe")
-    checked = list(keys)
+    checked = list(keys) if copy_data else to_create
 
     superuser = await is_superuser(conn)
     if not superuser and not await conn.fetchval(
