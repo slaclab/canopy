@@ -539,10 +539,37 @@ class PvRepository(BaseRepository[Pv]):
         return list(result.tuples().all())
 
     async def bulk_create(self, pvs: list[Pv]) -> list[Pv]:
+        """Insert PVs and reload them from the database.
+
+        The reload is one ``get_by_ids`` call rather than one ``refresh`` per row, so a
+        large import costs a handful of queries instead of one per PV. The flushed PVs are
+        already in the identity map, so the reload overwrites those same objects like
+        ``refresh`` would, leaving every column and each PV's tags loaded for use outside
+        an async lazy load.
+
+        Parameters
+        ----------
+        pvs : list[Pv]
+            New, not yet persisted PVs.
+
+        Returns
+        -------
+        list[Pv]
+            ``pvs`` itself, reloaded, so in the order given.
+
+        Raises
+        ------
+        RuntimeError
+            If the reload doesn't return every flushed PV, which would leave the missing
+            ones half-loaded.
+        """
+        if not pvs:
+            return []
         self.session.add_all(pvs)
         await self.session.flush()
-        for pv in pvs:
-            await self.session.refresh(pv)
+        reloaded = await self.get_by_ids([pv.id for pv in pvs], populate_existing=True)
+        if len(reloaded) != len(pvs):
+            raise RuntimeError(f"Reloaded {len(reloaded)} of {len(pvs)} created PVs")
         return pvs
 
     async def facility_ids_for(self, pv_id: str) -> set[str]:
@@ -584,18 +611,22 @@ class PvRepository(BaseRepository[Pv]):
         if rows:
             await self.session.execute(insert(pv_facility), rows)
 
-    async def get_by_ids(self, ids: list[str]) -> list[Pv]:
-        """Get many PVs by id, batched under the Postgres parameter limit."""
+    async def get_by_ids(self, ids: list[str], *, populate_existing: bool = False) -> list[Pv]:
+        """Get many PVs by id in one query.
+
+        The ids go as a single ``uuid[]`` parameter (``= ANY(...)``), so the SQL is the same
+        for any number of ids, which lets asyncpg reuse its prepared statement, and it never
+        nears the Postgres parameter limit. Rows come back in database order, not in the
+        order of ``ids``. With ``populate_existing``, PVs already in the session are
+        overwritten with the database's values, as ``session.refresh`` would.
+        """
         if not ids:
             return []
-        all_pvs: list[Pv] = []
-        for i in range(0, len(ids), PARAM_BATCH_SIZE):
-            batch_ids = ids[i : i + PARAM_BATCH_SIZE]
-            result = await self.session.execute(
-                select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.id.in_(batch_ids))
-            )
-            all_pvs.extend(result.scalars().all())
-        return all_pvs
+        query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.id == any_(_uuid_array(ids)))
+        if populate_existing:
+            query = query.execution_options(populate_existing=True)
+        result = await self.session.execute(query)
+        return list(result.scalars().all())
 
     async def search_filtered(
         self,
