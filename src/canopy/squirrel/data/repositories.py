@@ -330,6 +330,10 @@ class PvRepository(BaseRepository[Pv]):
     def _any_address(address: str):
         return or_(Pv.setpoint_address == address, Pv.readback_address == address, Pv.config_address == address)
 
+    async def owner_of(self, pv_id: str) -> str | None:
+        """The PV's ``owner_instance``, or ``None`` when there's no such PV."""
+        return (await self.session.execute(select(Pv.owner_instance).where(Pv.id == pv_id))).scalar_one_or_none()
+
     async def owners_by_address(self, address: str) -> set[str]:
         """The owners of the PVs holding ``address`` as any of their addresses."""
         result = await self.session.execute(select(Pv.owner_instance).where(self._any_address(address)).distinct())

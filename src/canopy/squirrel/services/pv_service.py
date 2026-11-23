@@ -592,9 +592,8 @@ class PvService:
 
     async def _require_owned_pv(self, pv_id: str) -> None:
         """Refuse a meta-PV change on a PV another instance owns."""
-        pv = await self.pv_repo.get_by_id(pv_id)
-        if pv is not None:
-            require_owned(pv.owner_instance, f"PV {pv_id}")
+        if (owner := await self.pv_repo.owner_of(pv_id)) is not None:
+            require_owned(owner, f"PV {pv_id}")
 
     async def enable_meta_pv(self, id: str) -> MetaPVDTO:
         await self._require_owned_pv(id)
