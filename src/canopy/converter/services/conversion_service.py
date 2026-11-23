@@ -8,7 +8,10 @@ unknown widgets, hoisted formulas) for the API layer.
 
 from __future__ import annotations
 
+import os
+import re
 import logging
+import tempfile
 from typing import Any, Literal, get_args
 from pathlib import Path
 from dataclasses import dataclass
@@ -144,7 +147,7 @@ class ConversionService:
                 )
             else:
                 logger.exception("convert_bytes failed for a %s screen", kind)
-            raise ConversionFailed(f"Failed to convert {kind} screen: {exc}") from exc
+            raise ConversionFailed(f"Failed to convert {kind} screen: {_without_staging_dir(str(exc))}") from exc
 
         wire = to_wire_dict(screen)
         errors = validate_screen_json(wire)
@@ -191,3 +194,14 @@ def _walk(node: WidgetNode) -> Iterator[WidgetNode]:
     yield node
     for child in node.children:
         yield from _walk(child)
+
+
+def _without_staging_dir(message: str) -> str:
+    """Drop the private directory ``convert_bytes`` stages an upload in from an error message.
+
+    Parser errors quote the staged file's full path (``<tmp>/pydmconv-XXXX/name.ui``);
+    the client is shown just the upload's name, not a server path.
+    """
+    tmp = tempfile.gettempdir()
+    roots = "|".join(re.escape(root) for root in sorted({tmp, os.path.realpath(tmp)}, key=len, reverse=True))
+    return re.sub(rf"(?:{roots})[/\\]pydmconv-[^/\\]+[/\\]", "", message)

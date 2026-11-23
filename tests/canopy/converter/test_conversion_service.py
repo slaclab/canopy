@@ -1,6 +1,7 @@
 """Unit tests for the pure ConversionService (no HTTP layer)."""
 
 import logging
+import tempfile
 from pathlib import Path
 from xml.etree.ElementTree import ParseError
 
@@ -146,3 +147,13 @@ def test_malformed_input_maps_to_conversion_failed_and_warns(monkeypatch, caplog
     records = [r for r in caplog.records if r.name == cs.logger.name]
     assert [r.levelno for r in records] == [logging.WARNING]
     assert not records[0].exc_info
+
+
+def test_failure_detail_names_the_upload_not_the_staging_dir():
+    """Parser errors quote the staged temp path; the client is shown only the upload's name."""
+    with pytest.raises(ConversionFailed) as info:
+        ConversionService().convert(b'<ui version="4.0"></ui>', kind="ui", filename="bad.ui")
+    detail = info.value.detail
+    assert "bad.ui: no root <widget> element" in detail
+    assert "pydmconv-" not in detail
+    assert tempfile.gettempdir() not in detail
