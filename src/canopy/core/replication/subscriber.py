@@ -37,7 +37,6 @@ from canopy.core.replication.sql import (
     table_owners,
     quote_literal,
     tables_present,
-    conninfo_as_uri,
     schemas_present,
     require_confined,
     owner_memberships,
@@ -160,9 +159,7 @@ def _arm_connector(arms: Mapping[str, Arm]) -> ArmConnector:
         dsn = arms[arm].publisher_dsn
         if dsn is None or not dsn.get_secret_value():
             raise Refused(f"set CANOPY_ARMS__<arm>__PUBLISHER_DSN (from a secret) for {arm}")
-        return await asyncpg.connect(
-            conninfo_as_uri(dsn.get_secret_value()), server_settings={"application_name": "canopy-replication"}
-        )
+        return await asyncpg.connect(dsn.get_secret_value(), server_settings={"application_name": "canopy-replication"})
 
     return connect
 

@@ -28,7 +28,7 @@ from canopy.core.replication.subscriber import (
 from .conftest import DB_DSN, privileges, build_schema, direct_grants
 
 PRESENT = sorted(REGISTRY.replicated)
-DSN = "host=arm1.example.org dbname=canopy user=replicator password=s3cret-pw"
+DSN = "postgresql://replicator:s3cret-pw@arm1.example.org/canopy"
 ARMS = {"arm1": Arm(publisher_dsn=SecretStr(DSN))}
 
 
@@ -293,10 +293,7 @@ async def _arm_databases(db, names: list[str]):
             conns[arm] = (name, None)
             await build_schema(dsn)
             conns[arm] = (name, await asyncpg.connect(dsn))
-            url = make_url(dsn)
-            # As an arm's setting would hold it: key=value, which the CLI turns into a URI to read the arm.
-            conninfo = f"host={url.host} port={url.port} dbname={name} user={url.username} password='{url.password}'"
-            arms[arm] = Arm(publisher_dsn=SecretStr(conninfo))
+            arms[arm] = Arm(publisher_dsn=SecretStr(dsn))
         yield {arm: conn for arm, (_, conn) in conns.items()}, arms
     finally:
         for name, conn in conns.values():

@@ -4,7 +4,7 @@ An arm is a primary that publishes its database; a head (``CANOPY_ROLE=mirror``)
 keeps one subscription per arm and holds every arm's rows. The arms are one
 setting, keyed by arm name::
 
-    CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=<arm1-host> dbname=canopy user=replicator password=<secret>"
+    CANOPY_ARMS__ARM1__PUBLISHER_DSN="postgresql://replicator:<secret>@<arm1-host>/canopy"
     CANOPY_ARMS__ARM2__PUBLISHER_DSN="..."
 
 or as JSON, ``CANOPY_ARMS='{"arm1": {"publisher_dsn": "..."}}'``. An arm's name
@@ -26,6 +26,7 @@ from canopy.core.config import INSTANCE_NAME_PATTERN, describe_settings_error
 from canopy.core.errors import ErrorCode, CanopyError
 
 _SUBSCRIPTION_PREFIX = "canopy_history_"
+_URI_SCHEMES = ("postgresql://", "postgres://")
 
 
 class Arm(BaseModel):
@@ -34,11 +35,20 @@ class Arm(BaseModel):
     publisher_dsn: SecretStr | None = Field(
         default=None,
         description=(
-            "libpq connection string (key=value or URI) the head's subscription uses to reach this arm, "
-            "as its replication role. Only `subscribe` reads it. Supply it from a secret; it never goes "
-            "on the command line or into the CLI's output."
+            "postgresql:// URI the head's subscription uses to reach this arm, as its replication role; "
+            "`subscribe` and `refresh` also open it to check the arm before a copy. A URI because both "
+            "the subscription and the CLI's own connection read it. Supply it from a secret; it never "
+            "goes on the command line or into the CLI's output."
         ),
     )
+
+    @field_validator("publisher_dsn")
+    @classmethod
+    def _is_a_uri(cls, dsn: SecretStr | None) -> SecretStr | None:
+        # The message never quotes the value, which holds a password.
+        if dsn is not None and dsn.get_secret_value() and not dsn.get_secret_value().startswith(_URI_SCHEMES):
+            raise ValueError("must be a postgresql:// URI")
+        return dsn
 
 
 class ArmsConfig(BaseSettings):

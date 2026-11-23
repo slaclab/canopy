@@ -106,8 +106,8 @@ async def test_head_status_through_the_cli(db, env, capsys):
         CANOPY_DATABASE_URL=_sqlalchemy_url(DB_DSN),
         CANOPY_ROLE="mirror",
         CANOPY_INSTANCE="head",
-        CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=arm1.example.org password=s3cret-arm",
-        CANOPY_ARMS__ARM2__PUBLISHER_DSN="host=arm2.example.org password=s3cret-arm",
+        CANOPY_ARMS__ARM1__PUBLISHER_DSN="postgresql://replicator:s3cret-arm@arm1.example.org/canopy",
+        CANOPY_ARMS__ARM2__PUBLISHER_DSN="postgresql://replicator:s3cret-arm@arm2.example.org/canopy",
     )
     assert await _run("status") == 0
     every = json.loads(capsys.readouterr().out)
@@ -120,7 +120,11 @@ async def test_head_status_through_the_cli(db, env, capsys):
 
 
 async def test_an_unknown_arm_is_refused(db, env, caplog):
-    env(CANOPY_DATABASE_URL=_sqlalchemy_url(DB_DSN), CANOPY_ROLE="mirror", CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=x")
+    env(
+        CANOPY_DATABASE_URL=_sqlalchemy_url(DB_DSN),
+        CANOPY_ROLE="mirror",
+        CANOPY_ARMS__ARM1__PUBLISHER_DSN="postgresql://x/canopy",
+    )
     assert await _run("refresh", arm="arm9") == 2
     assert "no arm named 'arm9'" in caplog.text
 
@@ -131,7 +135,7 @@ def test_arm_applies_only_on_a_head(env, no_connect, caplog):
 
 
 def test_an_invalid_arm_name_is_refused_without_echoing_its_settings(env, no_connect, caplog, monkeypatch):
-    monkeypatch.setenv("CANOPY_ARMS", '{"Bad-Name": {"publisher_dsn": "host=x password=s3cret-arm"}}')
+    monkeypatch.setenv("CANOPY_ARMS", '{"Bad-Name": {"publisher_dsn": "postgresql://r:s3cret-arm@x/canopy"}}')
     assert cli.main(["status"]) == 2
     assert "CANOPY_ARMS: Value error, arm names must match" in caplog.text and "s3cret-arm" not in caplog.text
 

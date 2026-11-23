@@ -186,7 +186,8 @@ async def test_a_failed_subscribe_never_shows_the_password(octopus: Octopus, cap
     o, arm = octopus, octopus.arm
     await publish(arm.admin, role="primary", config=o.config)
     wrong = "wrong-" + uuid4().hex
-    arms = {arm.name: Arm(publisher_dsn=SecretStr(arm.publisher_dsn.rsplit("password=", 1)[0] + f"password={wrong}"))}
+    dsn = make_url(arm.publisher_dsn).set(password=wrong).render_as_string(hide_password=False)
+    arms = {arm.name: Arm(publisher_dsn=SecretStr(dsn))}
 
     with pytest.raises(ReplicationError, match=f"failed for {arm.name}") as caught:
         await subscribe(o.head.conn, role="mirror", head=o.head.name, arms=arms, connect_arm=o.connect_arm)

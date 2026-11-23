@@ -12,7 +12,7 @@ import re
 from typing import TYPE_CHECKING
 from decimal import Decimal
 from datetime import datetime
-from urllib.parse import quote, unquote, urlencode
+from urllib.parse import unquote
 from collections.abc import Mapping, Iterable
 
 import asyncpg
@@ -72,33 +72,6 @@ def quote_literal(value: str) -> str:
 def asyncpg_dsn(database_url: str) -> str:
     """Turn the app's SQLAlchemy URL (``postgresql+asyncpg://...``) into a DSN asyncpg accepts."""
     return make_url(database_url).set(drivername="postgresql").render_as_string(hide_password=False)
-
-
-_CONNINFO_PAIR = re.compile(r"(\w+)\s*=\s*('(?:[^'\\]|\\.)*'|\S+)")
-
-
-def conninfo_as_uri(conninfo: str) -> str:
-    """A libpq connection string as a URI, the one form asyncpg reads.
-
-    An arm's connection string may be key=value (``host=... dbname=...``) or a URI;
-    Postgres takes either for a subscription, and this lets the CLI open the same
-    connection itself. Keys other than host, port, dbname, user and password become
-    query parameters (``sslmode``, ``sslrootcert`` and the like).
-    """
-    if "://" in conninfo:
-        return conninfo
-    pairs = {}
-    for key, value in _CONNINFO_PAIR.findall(conninfo):
-        if len(value) >= 2 and value[0] == value[-1] == "'":
-            value = re.sub(r"\\(.)", r"\1", value[1:-1])
-        pairs[key] = value
-    user, password = pairs.pop("user", ""), pairs.pop("password", None)
-    credentials = quote(user, safe="") + (f":{quote(password, safe='')}" if password is not None else "")
-    host = pairs.pop("host", "")
-    port = f":{pairs.pop('port')}" if "port" in pairs else ""
-    database = quote(pairs.pop("dbname", ""), safe="")
-    query = f"?{urlencode(pairs)}" if pairs else ""
-    return f"postgresql://{credentials}{'@' if credentials else ''}{host}{port}/{database}{query}"
 
 
 def owner_join(registry: ReplicationRegistry, table: str, *, alias: str) -> tuple[str, str]:
