@@ -387,8 +387,9 @@ class PvRepository(BaseRepository[Pv]):
         return or_(Pv.setpoint_address == address, Pv.readback_address == address, Pv.config_address == address)
 
     async def owner_of(self, pv_id: str) -> str | None:
-        """The PV's ``owner_instance``, or ``None`` when there's no such PV."""
-        return (await self.session.execute(select(Pv.owner_instance).where(Pv.id == pv_id))).scalar_one_or_none()
+        """The PV's ``owner_instance``, or ``None`` when there's no such live PV."""
+        query = select(Pv.owner_instance).where(Pv.id == pv_id, Pv.deleted_at.is_(None))
+        return (await self.session.execute(query)).scalar_one_or_none()
 
     async def owners_by_address(self, address: str) -> set[str]:
         """The owners of the live PVs holding ``address`` as any of their addresses."""
