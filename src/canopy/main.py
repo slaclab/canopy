@@ -76,11 +76,23 @@ class _SelectedModules:
         await self.app(scope, receive, send)
 
 
+def _route_path(scope: Scope) -> str:
+    """The path the router matches: ``scope["path"]`` without the ``root_path`` prefix.
+
+    Behind a path-prefixed ingress (``uvicorn --root-path /canopy``) the server
+    puts the prefix in front of ``path``; the router strips it, and so must the gate.
+    """
+    path, root_path = scope["path"], scope.get("root_path", "")
+    if root_path and path.startswith(root_path) and path[len(root_path) : len(root_path) + 1] in ("", "/"):
+        return path[len(root_path) :] or "/"
+    return path
+
+
 def _is_open(scope: Scope) -> bool:
     """``GET /health`` and a CORS preflight pass the closed-meta gate."""
     if scope["type"] != "http":
         return False
-    if scope["method"] == "GET" and scope["path"] == "/health":
+    if scope["method"] == "GET" and _route_path(scope) == "/health":
         return True
     headers = dict(scope["headers"])
     return scope["method"] == "OPTIONS" and b"origin" in headers and b"access-control-request-method" in headers

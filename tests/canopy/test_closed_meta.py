@@ -159,6 +159,16 @@ def test_only_get_on_the_exact_health_path_is_open(closed_app, method, path):
     assert resp.status_code == 401
 
 
+def test_get_health_answers_without_a_key_behind_a_root_path(closed_app):
+    """uvicorn --root-path puts the prefix in front of the path; the gate matches what the router matches."""
+    client = TestClient(closed_app, root_path="/canopy")
+    resp = client.get("/canopy/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "healthy"}
+    assert client.get("/canopy/docs").status_code == 401
+    assert client.get("/canopy/docs", headers=READ_HEADERS).status_code == 200
+
+
 def test_a_path_that_matches_no_route_is_refused_rather_than_reported_missing(closed_app):
     assert TestClient(closed_app).get("/no/such/route").status_code == 401
 
