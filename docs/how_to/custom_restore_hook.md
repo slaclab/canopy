@@ -39,8 +39,8 @@ def derive_extra_writes(self, address: str, value: Any) -> list[tuple[str, Any]]
   an empty list if the hook doesn't apply to it. Most setpoints get an empty
   list.
 
-`WriteToConHook`, for instance, returns `[("QUAD:LI21:201:BCON", 3.0)]` for
-`("QUAD:LI21:201:BDES", 3.0)`, and `[]` for any PV that isn't a magnet
+`WriteToConHook`, for instance, returns `[("QUAD:SIM:01:BCON", 3.0)]` for
+`("QUAD:SIM:01:BDES", 3.0)`, and `[]` for any PV that isn't a magnet
 setpoint.
 
 Squirrel calls the method once per setpoint, for every setpoint in the
@@ -126,16 +126,16 @@ trim_hook = MagnetTrimHook()
 
 
 def test_bdes_derives_ctrl_trim():
-    assert trim_hook.derive_extra_writes("QUAD:LI21:201:BDES", 1.5) == [("QUAD:LI21:201:CTRL", "TRIM")]
+    assert trim_hook.derive_extra_writes("QUAD:SIM:01:BDES", 1.5) == [("QUAD:SIM:01:CTRL", "TRIM")]
 
 
 def test_non_magnet_pv_yields_no_extra_writes():
-    assert trim_hook.derive_extra_writes("KLYS:LI22:31:KVAC", 3.0) == []
+    assert trim_hook.derive_extra_writes("KLYS:SIM:01:KVAC", 3.0) == []
 
 
 def test_magnet_without_trailing_bdes_raises():
     with pytest.raises(RestoreHookError):
-        trim_hook.derive_extra_writes("QUAD:LI21:201:BCON", 3.0)
+        trim_hook.derive_extra_writes("QUAD:SIM:01:BCON", 3.0)
 ```
 
 Cover the setpoints the hook acts on, the ones it ignores, the ones it
