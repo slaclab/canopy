@@ -102,6 +102,13 @@ def test_a_trailing_newline_in_the_file_is_not_part_of_a_key(tmp_path):
     assert _get(registry, "file-read").read is True
 
 
+def test_a_byte_order_mark_is_not_part_of_the_first_key(tmp_path):
+    path = tmp_path / "data.keys"
+    path.write_bytes("\ufefffile-read:read@*\n".encode())
+    registry = load_keys_file(path)
+    assert registry._keys.keys() == {"file-read"}
+
+
 def test_entries_on_separate_lines_are_separate_keys(tmp_path):
     """A line break must never fold the next entry into the modules of the previous one."""
     registry = load_keys_file(_keys_file(tmp_path, "file-read:read@hare\nfile-write:read+write@hare\r\n"))

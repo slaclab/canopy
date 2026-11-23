@@ -271,7 +271,8 @@ def load_keys_file(path: str | Path) -> FileKeyRegistry:
     ``canopy.core.keys``, so a lean install can read a keys file.
     """
     try:
-        raw = Path(path).read_text(encoding="utf-8")
+        # utf-8-sig: an editor that saves a BOM must not glue it to the first token.
+        raw = Path(path).read_text(encoding="utf-8-sig")
     except (OSError, ValueError) as exc:
         reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
         raise KeysFileError(f"CANOPY_API_KEYS_FILE {path}: cannot be read ({reason})") from None
