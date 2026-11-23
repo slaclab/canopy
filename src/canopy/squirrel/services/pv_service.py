@@ -498,9 +498,10 @@ class PvService:
         pv = await self.pv_repo.get_by_id(pv_id)
         if not pv:
             return None
-        require_owned(pv.owner_instance, f"PV {pv_id}")
+        # The facility gate first: a caller who can't reach the row isn't told its owner.
         facility_ids = await self.pv_repo.facility_ids_for(pv_id)
         await self._require_facility_write(facility_ids, "this PV")
+        require_owned(pv.owner_instance, f"PV {pv_id}")
         if data.facilities is not None:
             new_ids = set((await self._resolve_slugs(data.facilities)).values())
             # A restricted key may not strip a PV down to unassigned: that would hide it
@@ -541,8 +542,8 @@ class PvService:
         pv = await self.pv_repo.get_by_id(pv_id)
         if not pv:
             return False
-        require_owned(pv.owner_instance, f"PV {pv_id}")
         await self._require_facility_write(await self.pv_repo.facility_ids_for(pv_id), "this PV")
+        require_owned(pv.owner_instance, f"PV {pv_id}")
         try:
             await self.pv_repo.delete(pv)
         except IntegrityError as e:

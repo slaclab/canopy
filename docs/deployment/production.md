@@ -107,6 +107,14 @@ The image carries the Alembic tree, so step 3 runs the new release's
 migrations. To roll back, deploy the older tag and skip step 3. Alembic in an
 older image fails if the database is already on a revision it doesn't know.
 
+**Upgrading past the row-owners revision** (`89e21441c63c`) adds a required
+`owner_instance` column that an older image doesn't fill in, so its inserts fail
+once the column exists. Stop the old API and workers (`docker compose stop api
+worker`) before step 3. To roll back past it, first run
+`docker compose run --rm api alembic downgrade 18ac64c44669` with the new image,
+then deploy the older tag. A history head can't roll back past it, since it holds
+other instances' rows.
+
 ## Verify
 
 ```bash
