@@ -431,23 +431,36 @@ config. Two PVs with the same identifying address are duplicates.
 ### Create PVs in bulk
 
 ```
-POST /squirrel/v1/pvs/multi?onConflict=error|skip|update
+POST /squirrel/v1/pvs/multi
 ```
 
 Takes a list of PVs shaped like [Create a PV](#create-a-pv) and returns the
 created PVs in the same order. Requires `write`. The import is all-or-nothing:
-if any row is rejected, no PV is created or changed.
+if any row is rejected, no PV is created.
 
 Unlike [Create a PV](#create-a-pv), a tag id that doesn't exist isn't an
-error on a row that creates a PV: it is ignored, and the PV is created without
-that tag. Tag ids match in any case, and a tag id listed twice on a row adds
-the tag once.
+error here: it is ignored, and the PV is created without that tag. Tag ids
+match in any case, and a tag id listed twice on a row adds the tag once.
 
-`onConflict` decides what happens to a row whose identifying address is
-already registered:
+To import rows whose PV may already be registered, use
+[Import PVs](#import-pvs) instead.
 
-- `error` (the default): the whole import is refused with a `409`. The
-  response is the plain list of created PVs.
+| Status | Code | Condition |
+|--------|------|-----------|
+| 400 | `bad_request` | Two rows share an identifying address |
+| 409 | `pv_already_exists` | A row's identifying address is already registered |
+| 422 | — | A row has no address |
+
+### Import PVs
+
+```
+POST /squirrel/v1/pvs/import?onConflict=skip|update
+```
+
+Takes the same list as [Create PVs in bulk](#create-pvs-in-bulk), but a row
+whose identifying address is already registered doesn't refuse the import.
+`onConflict` is required and decides what happens to such a row:
+
 - `skip`: the registered PV is left as it is, and the other rows are created.
 - `update`: the registered PV is changed the way
   [Update a PV](#update-a-pv) changes one, and the other rows are created.
@@ -460,9 +473,13 @@ already registered:
   as stored and reported in `addressMismatches`. An address the row leaves
   out isn't a mismatch.
 
-With `skip` or `update` the response is an object instead of a list. Each
-list is in request order, and `row` is the row's 1-based position in the
-request:
+Rows that match no registered PV are created exactly as
+[Create PVs in bulk](#create-pvs-in-bulk) creates them, unknown tag ids
+included. Requires `write`. The import is all-or-nothing: if any row is
+rejected, no PV is created or changed.
+
+The response lists what happened to each row. Each list is in request order,
+and `row` is the row's 1-based position in the request:
 
 ??? example "Response (`onConflict=update`)"
     ```json
@@ -481,14 +498,11 @@ request:
 `config`). `updated` and `addressMismatches` are always empty for `skip`, and
 `skipped` is always empty for `update`.
 
-Two rows sharing an identifying address are a `400` in every mode.
-
 | Status | Code | Condition |
 |--------|------|-----------|
 | 400 | `bad_request` | Two rows share an identifying address, or an `update` row names an unknown tag id |
 | 403 | `insufficient_facility_access` | See [API keys](../deployment/api-keys.md) |
-| 409 | `pv_already_exists` | With `onConflict=error`, a row's identifying address is already registered |
-| 422 | — | A row has no address, or `onConflict` isn't one of the three values |
+| 422 | — | A row has no address, or `onConflict` is missing or isn't `skip` or `update` |
 
 ### Update a PV
 

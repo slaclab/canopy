@@ -69,10 +69,10 @@ class PVSearchResponse(CanopyModel):
     offset: int
 
 
-# How ``POST /v1/pvs/multi`` treats a row whose identifying address is already registered:
-# refuse the whole import (``error``), leave the stored PV alone (``skip``), or apply the
-# row's provided fields to it (``update``).
-OnConflict = Literal["error", "skip", "update"]
+# How ``POST /v1/pvs/import`` treats a row whose identifying address is already registered:
+# leave the stored PV alone (``skip``), or apply the row's provided fields to it
+# (``update``). ``POST /v1/pvs/multi`` refuses the whole import instead.
+OnConflict = Literal["skip", "update"]
 
 AddressKind = Literal["setpoint", "readback", "config"]
 
@@ -98,7 +98,7 @@ class PVAddressMismatchDTO(CanopyModel):
 
 
 class PVImportResultDTO(CanopyModel):
-    """Response of ``POST /v1/pvs/multi`` with ``onConflict=skip`` or ``onConflict=update``.
+    """Response of ``POST /v1/pvs/import``, with ``onConflict=skip`` or ``onConflict=update``.
 
     Each list is in request order. ``updated`` and ``address_mismatches`` are always
     empty for ``skip``.

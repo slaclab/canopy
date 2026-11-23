@@ -308,15 +308,15 @@ write would silently do nothing, which is worse than an error. The rules:
   job result's `skippedPvIds`; if every PV is skipped, the restore is a `403`.
 
 A `403 insufficient_facility_access` names the facilities the key lacks. A refused
-`POST /v1/pvs/multi` names every one the import needs, and lists the refused rows,
-since one bad row refuses the whole batch.
+`POST /v1/pvs/multi` or `POST /v1/pvs/import` names every one the import needs,
+and lists the refused rows, since one bad row refuses the whole batch.
 
-`POST /v1/pvs/multi` applies the create rule above to every row before it looks
-up which addresses are already registered, with any `onConflict` value. So a row
-naming no facility the key holds gets the same `403` whether or not its address
-exists. With `onConflict=skip`, a registered PV is left alone whatever its
+`POST /v1/pvs/import` applies the create rule above to every row before it
+looks up which addresses are already registered, as `POST /v1/pvs/multi` does.
+So a row naming no facility the key holds gets the same `403` whether or not its
+address exists. With `onConflict=skip`, a registered PV is left alone whatever its
 facilities, and the response only repeats the skipped rows' own addresses. That
-tells the key no more than the default mode's `409` already does. With
+tells the key no more than the `409` from `POST /v1/pvs/multi` already does. With
 `onConflict=update`, every registered PV the import matches must pass the same
 checks as `PUT /v1/pvs/{id}`: the key holds all of the PV's facilities, it isn't
 unassigning the PV's last one, and every facility it adds or removes is in its

@@ -1,4 +1,4 @@
-"""``POST /v1/pvs/multi?onConflict=…``: skipping or updating rows whose PV is already registered.
+"""``POST /v1/pvs/import?onConflict=…``: skipping or updating rows whose PV is already registered.
 
 Facility-restricted keys are injected by rebinding the key registry, as
 ``test_facility_enforcement.py`` does, with simulated facility slugs.
@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from canopy.core import security
 from canopy.core.errors import InsufficientFacilityAccess
 from canopy.core.modules import WILDCARD
+from canopy.squirrel.app import app as squirrel_app
 from canopy.core.security import APIKey
 from canopy.squirrel.schemas.pv import NewPVElementDTO
 from canopy.squirrel.data.models import Pv
@@ -82,32 +83,50 @@ async def _all_pvs(client: AsyncClient) -> dict[str, dict]:
 
 
 def _import(client: AsyncClient, rows: list[dict], mode: str | None, headers: dict = ALL):
-    params = {"onConflict": mode} if mode else None
-    return client.post("/v1/pvs/multi", headers=headers, params=params, json=rows)
+    """``POST /v1/pvs/import`` with ``onConflict=mode``, or ``POST /v1/pvs/multi`` for ``None``."""
+    if mode is None:
+        return client.post("/v1/pvs/multi", headers=headers, json=rows)
+    return client.post("/v1/pvs/import", headers=headers, params={"onConflict": mode}, json=rows)
 
 
 # --- request contract -------------------------------------------------------- #
 
 
-async def test_an_unknown_on_conflict_value_is_422(client: AsyncClient):
-    r = await _import(client, [{"setpointAddress": "SIM:DEV:00001:SET"}], "replace")
+@pytest.mark.parametrize("params", [{}, {"onConflict": "error"}, {"onConflict": "replace"}])
+async def test_import_needs_on_conflict_skip_or_update(client: AsyncClient, params: dict):
+    r = await client.post("/v1/pvs/import", headers=ALL, params=params, json=[{"setpointAddress": "SIM:DEV:00001:SET"}])
     assert r.status_code == 422
+    assert await _all_pvs(client) == {}
 
 
-async def test_explicit_error_mode_matches_the_default(client: AsyncClient):
+async def test_multi_still_refuses_a_registered_row_and_returns_a_list(client: AsyncClient):
     await _create(client, setpointAddress="SIM:DEV:00001:SET")
 
-    r = await _import(client, [{"setpointAddress": "SIM:DEV:00002:SET"}], "error")
+    r = await _import(client, [{"setpointAddress": "SIM:DEV:00002:SET"}], None)
     assert r.status_code == 200, r.text
     assert isinstance(r.json(), list) and r.json()[0]["setpointAddress"] == "SIM:DEV:00002:SET"
 
-    for mode in (None, "error"):
-        r = await _import(client, [{"setpointAddress": "SIM:DEV:00001:SET"}], mode)
-        assert r.status_code == 409
-        assert r.json() == {
-            "code": "pv_already_exists",
-            "detail": "Setpoint addresses already exist: ['SIM:DEV:00001:SET']",
-        }
+    r = await _import(client, [{"setpointAddress": "SIM:DEV:00001:SET"}], None)
+    assert r.status_code == 409
+    assert r.json() == {
+        "code": "pv_already_exists",
+        "detail": "Setpoint addresses already exist: ['SIM:DEV:00001:SET']",
+    }
+
+
+def test_each_bulk_route_has_one_response_schema():
+    """Typed clients get a plain list from ``/multi`` and the result object from ``/import``,
+    with no ``anyOf`` to narrow."""
+    paths = squirrel_app.openapi()["paths"]
+
+    def ok_schema(path: str) -> dict:
+        return paths[path]["post"]["responses"]["200"]["content"]["application/json"]["schema"]
+
+    multi = ok_schema("/v1/pvs/multi")
+    assert multi["type"] == "array"
+    assert multi["items"] == {"$ref": "#/components/schemas/PVElementDTO"}
+    assert ok_schema("/v1/pvs/import") == {"$ref": "#/components/schemas/PVImportResultDTO"}
+    assert "onConflict" not in {p["name"] for p in paths["/v1/pvs/multi"]["post"].get("parameters", [])}
 
 
 @pytest.mark.parametrize("mode", ["skip", "update"])

@@ -15,6 +15,7 @@ from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilit
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.squirrel.errors import PvNotFound, MetaPvNotFound, PvAlreadyExists
 from canopy.squirrel.schemas.pv import (
+    OnConflict,
     AddressKind,
     PVElementDTO,
     NewPVElementDTO,
@@ -40,8 +41,8 @@ IDENTITY_KINDS: tuple[AddressKind, ...] = ("setpoint", "readback", "config")
 
 # How each identity kind (see `_identity`) is looked up among registered PVs, many
 # addresses at a time: the identifying addresses already registered, and the PVs holding
-# them. Single create and every onConflict mode use these, so they agree on what counts
-# as registered.
+# them. Single create and both bulk routes use these, so they agree on what counts as
+# registered.
 _REGISTERED_ADDRESSES: dict[AddressKind, Callable[[PvRepository, list[str]], Awaitable[set[str]]]] = {
     "setpoint": PvRepository.get_existing_setpoints,
     "readback": PvRepository.get_existing_readbacks_without_setpoint,
@@ -456,12 +457,11 @@ class PvService:
         tags_by_id = await self._load_import_tags(rows)
         return await self._create_import_rows(rows, ids_by_slug, tags_by_id)
 
-    async def import_many(
-        self, data_list: list[NewPVElementDTO], on_conflict: Literal["skip", "update"]
-    ) -> PVImportResultDTO:
+    async def import_many(self, data_list: list[NewPVElementDTO], on_conflict: OnConflict) -> PVImportResultDTO:
         """Import many PVs, skipping or updating rows whose PV is already registered.
 
-        ``create_many`` is the ``on_conflict="error"`` behaviour; this handles the other two.
+        ``POST /v1/pvs/import``. ``create_many`` (``POST /v1/pvs/multi``) refuses an import
+        with any registered row; this skips or updates those rows instead.
         A row matches a registered PV by the same identity rule as ``create_many`` (see
         ``_identity``). Rows that match nothing are created exactly as ``create_many``
         creates them. Duplicate identities within the import are still a ``BadRequest``.
@@ -489,7 +489,7 @@ class PvService:
         data_list : list[NewPVElementDTO]
             Wire payloads for the PVs to import.
         on_conflict : {"skip", "update"}
-            What to do with a row whose PV is registered. ``"error"`` is ``create_many``.
+            What to do with a row whose PV is registered.
 
         Returns
         -------
@@ -507,7 +507,8 @@ class PvService:
         PvAlreadyExists
             If a concurrent write registers one of the new rows' addresses first.
         """
-        # The type rules "error" out, but nothing checks types at runtime or in CI.
+        # The route validates this; the guard is for direct callers, since nothing
+        # type-checks in CI.
         if on_conflict not in ("skip", "update"):
             raise ValueError(f"import_many handles onConflict skip or update, not {on_conflict!r}")
         rows, identities, ids_by_slug = await self._prepare_import(data_list)
@@ -578,7 +579,7 @@ class PvService:
     async def _prepare_import(
         self, data_list: list[NewPVElementDTO]
     ) -> tuple[list[_ImportRow], dict[str, set[str]], dict[str, str]]:
-        """Normalize an import's rows and run the checks every ``onConflict`` mode shares.
+        """Normalize an import's rows and run the checks both bulk routes share.
 
         Refuses duplicate identities within the import, resolves the facility slugs, and
         applies the create-time facility gate to every row, all before any lookup of
