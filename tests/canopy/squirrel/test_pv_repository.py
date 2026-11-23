@@ -1,13 +1,12 @@
-"""Repository tests for ``PvRepository.bulk_create`` against the test Postgres."""
+"""Repository tests for ``PvRepository.bulk_create`` and ``get_by_ids`` against the test Postgres."""
 
 import random
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import inspect
+from sqlalchemy import event, inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from canopy.squirrel.data import repositories
 from canopy.squirrel.data.models import Pv, Tag, TagGroup
 from tests.canopy.squirrel.conftest import WRITE_HEADERS
 from canopy.squirrel.data.repositories import PvRepository
@@ -83,21 +82,6 @@ async def test_bulk_create_returns_input_order_with_attributes_loaded(db_session
         assert {t.name for t in pv.tags} <= {"sim-tag-0", "sim-tag-1", "sim-tag-2"}
 
 
-async def test_bulk_create_reloads_across_several_batches(db_session: AsyncSession, monkeypatch):
-    """A create larger than one reload batch still returns every row, in input order."""
-    monkeypatch.setattr(repositories, "PARAM_BATCH_SIZE", 4)
-    tags = await _seed_tags(db_session, 3)
-    pvs = _new_pvs(11, tags)
-    expected = [pv.setpoint_address for pv in pvs]
-
-    created = await PvRepository(db_session).bulk_create(pvs)
-
-    assert [pv.setpoint_address for pv in created] == expected
-    assert len({pv.id for pv in created}) == 11
-    for pv in created:
-        _assert_loaded(pv)
-
-
 async def test_bulk_create_fails_clearly_if_the_reload_misses_a_row(db_session: AsyncSession, monkeypatch):
     """A row missing from the reload is a clear error, not a ``KeyError`` or a half-loaded PV."""
     tags = await _seed_tags(db_session, 3)
@@ -110,6 +94,34 @@ async def test_bulk_create_fails_clearly_if_the_reload_misses_a_row(db_session: 
     monkeypatch.setattr(repo, "get_by_ids", short_get_by_ids)
     with pytest.raises(RuntimeError, match="Reloaded 2 of 3 created PVs"):
         await repo.bulk_create(_new_pvs(3, tags))
+
+
+async def test_get_by_ids_sends_any_number_of_ids_as_one_parameter(db_session: AsyncSession):
+    """The ids go as one ``uuid[]`` parameter, so the SQL text is the same for every size."""
+    tags = await _seed_tags(db_session, 3)
+    repo = PvRepository(db_session)
+    ids = [pv.id for pv in await repo.bulk_create(_new_pvs(11, tags))]
+
+    statements: list[tuple[str, object]] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append((statement, parameters))
+
+    sync_engine = db_session.bind.sync_engine
+    event.listen(sync_engine, "before_cursor_execute", record)
+    try:
+        few = await repo.get_by_ids(ids[:2])
+        few_statement = statements[0]
+        statements.clear()
+        many = await repo.get_by_ids(ids)
+        many_statement = statements[0]
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", record)
+
+    assert {pv.id for pv in few} == set(ids[:2])
+    assert {pv.id for pv in many} == set(ids)
+    assert few_statement[0] == many_statement[0]
+    assert len(few_statement[1]) == len(many_statement[1]) == 1
 
 
 async def test_bulk_create_of_nothing_is_a_no_op(db_session: AsyncSession):
