@@ -200,7 +200,9 @@ async def test_refresh_reads_the_primary_side(db, settings_env, caplog):
 
 async def test_refresh_reads_the_head_side(db, settings_env):
     settings_env(
-        CANOPY_DATABASE_URL=_app_url(DB_DSN), CANOPY_ROLE="mirror", CANOPY_ARMS__ARM1__PUBLISHER_DSN="host=arm1"
+        CANOPY_DATABASE_URL=_app_url(DB_DSN),
+        CANOPY_ROLE="mirror",
+        CANOPY_ARMS__ARM1__PUBLISHER_DSN="postgresql://arm1/canopy",
     )
     collector = ReplicationCollector()
     await collector.refresh()

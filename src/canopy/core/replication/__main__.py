@@ -33,6 +33,7 @@ import argparse
 
 import asyncpg
 import pydantic
+from pydantic_settings import SettingsError
 
 from canopy.core.arms import ArmsConfigError, get_arms_config
 from canopy.core.config import get_settings, describe_settings_error
@@ -46,6 +47,7 @@ from canopy.core.replication.sql import (
     require_role,
 )
 from canopy.core.replication.config import get_replication_config
+from canopy.core.replication.registry import RegistryError
 from canopy.core.replication.publisher import publish, publisher_status
 from canopy.core.replication.subscriber import (
     grants,
@@ -153,7 +155,7 @@ async def run(command: str, arm: str | None = None) -> int:
             print(json.dumps(await subscriber_status(conn, arms=arms, only=arm), indent=2))
         else:
             print(json.dumps(await publisher_status(conn, config=config), indent=2))
-    except Refused as exc:
+    except (Refused, RegistryError) as exc:
         logger.error("refused: %s", exc)
         return 2
     except ReplicationError as exc:
@@ -171,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         settings = get_settings()
-    except pydantic.ValidationError as exc:
+    except (pydantic.ValidationError, SettingsError) as exc:
         _configure_logging("text")
         logger.error("refused: %s", describe_settings_error(exc))
         return 2

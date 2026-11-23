@@ -216,7 +216,9 @@ class FacilityService:
         An unknown granted slug contributes nothing rather than raising. Grants are
         validated at mint time, and a facility this instance's keys grant can't be
         deleted here. But keys are local to each instance, so a head's key can still
-        name a facility its owner deleted, and rows can predate either guard.
+        name a facility its owner deleted, and rows can predate either guard. A grant
+        is a slug, not an id, so that key then reaches any facility later created with
+        the slug, by the same arm or another (slaclab/canopy#138).
         """
         if WILDCARD in slugs:
             return None
