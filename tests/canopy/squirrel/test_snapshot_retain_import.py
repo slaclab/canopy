@@ -241,8 +241,22 @@ async def test_import_reads_a_timestamp_without_offset_as_utc(client: AsyncClien
         {"values": [{"pvId": REPEATED, "pvName": "A"}, {"pvId": REPEATED, "pvName": "B"}]},
         {"values": [{"pvId": str(uuid.uuid4()), "pvName": "A", "setpointValue": {"value": 1, "precision": "invalid"}}]},
         {"values": [{"pvId": str(uuid.uuid4()), "pvName": "A", "readbackValue": {"severity": "high"}}]},
+        {"values": [{"pvId": str(uuid.uuid4()), "pvName": "A", "status": 2**31}]},
+        {"values": [{"pvId": str(uuid.uuid4()), "pvName": "A", "severity": -(2**31) - 1}]},
     ],
-    ids=["format", "version", "id", "title", "pv-id", "pv-name", "repeated-pv-id", "bad-precision", "bad-severity"],
+    ids=[
+        "format",
+        "version",
+        "id",
+        "title",
+        "pv-id",
+        "pv-name",
+        "repeated-pv-id",
+        "bad-precision",
+        "bad-severity",
+        "status-past-int32",
+        "severity-past-int32",
+    ],
 )
 async def test_import_rejects_a_malformed_bundle(client: AsyncClient, db_session: AsyncSession, change: dict):
     sid, _, _ = await _seed(db_session)
@@ -264,3 +278,4 @@ async def test_a_bundle_repeating_a_known_pv_creates_nothing(client: AsyncClient
     assert r.status_code == 422
     assert bundle["values"][1]["pvId"] in r.text
     assert (await client.get("/v1/snapshots", headers=READ_HEADERS)).json()["totalCount"] == 1
+
