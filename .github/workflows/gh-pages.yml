@@ -17,4 +17,4 @@ jobs:
       contents: read
       pages: write
       id-token: write
-    uses: slaclab/swapps-ci-helpers/.github/workflows/docs.yml@e7820b065bd175ae9ebc83a71e76f026aa918f2a
+    uses: slaclab/swapps-ci-helpers/.github/workflows/docs.yml@9bd3f16145f87d30ed28c044c8e51121529840e0
