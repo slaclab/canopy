@@ -11,21 +11,16 @@ Squirrel's tests are part of Canopy's suite:
 # Every test
 uv run pytest tests/
 
+# Only Squirrel's tests
+uv run pytest tests/canopy/squirrel/
+
 # One file, or one test
-uv run pytest tests/canopy/squirrel/test_services_snapshot.py
+uv run pytest tests/canopy/squirrel/test_restore_hooks.py
 uv run pytest tests/canopy/squirrel/test_services_snapshot.py::test_restore_runs_every_hook_in_order
 
-# Squirrel's tests whose names match a pattern
-uv run pytest tests/ -k "squirrel and restore"
+# Tests whose names match a pattern
+uv run pytest tests/canopy/squirrel/ -k restore
 ```
-
-!!! warning "Run the API tests from `tests/`"
-    The endpoint tests (`test_api_*.py`) currently fail with
-    `'State' object has no attribute 'canopy_module'` when run on their own,
-    for example with `uv run pytest tests/canopy/squirrel/`. They depend on
-    setup that happens only when the whole suite is collected. Select them
-    from `tests/` with `-k` instead. Other test files can be run on their
-    own.
 
 ### The test database
 

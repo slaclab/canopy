@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from canopy.raccoon import gateway
 from canopy.core.errors import register_canopy_error_handler
+from canopy.core.modules import tag_module
 from canopy.raccoon.config import CacheConfig, get_raccoon_config
 from canopy.raccoon.runtime import mark_started
 from canopy.raccoon.cache.flight import SingleFlight
@@ -60,4 +61,5 @@ app = FastAPI(
 )
 
 register_canopy_error_handler(app)
+tag_module(app, "raccoon")
 app.include_router(v1_router)

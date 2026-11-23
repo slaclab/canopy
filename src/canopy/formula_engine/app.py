@@ -7,6 +7,7 @@ from canopy.mole import gateway as mole_gateway
 from canopy.vole import gateway as vole_gateway
 from canopy.core.clock import SystemClock
 from canopy.core.errors import register_canopy_error_handler
+from canopy.core.modules import tag_module
 from canopy.vole.adapter import VoleDataSource
 from canopy.formula_engine import gateway
 from canopy.formula_engine.config import warn_legacy_env, get_formula_engine_config
@@ -70,4 +71,5 @@ app = FastAPI(
 )
 
 register_canopy_error_handler(app)
+tag_module(app, "formula-engine")
 app.include_router(v1_router)

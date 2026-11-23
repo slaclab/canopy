@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from canopy.converter import gateway
 from canopy.core.errors import register_canopy_error_handler
+from canopy.core.modules import tag_module
 from canopy.converter.config import get_converter_config
 from canopy.converter.runtime import mark_started
 from canopy.converter.api.v1.router import router as v1_router
@@ -61,4 +62,5 @@ app = FastAPI(
 )
 
 register_canopy_error_handler(app)
+tag_module(app, "converter")
 app.include_router(v1_router)

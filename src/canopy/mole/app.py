@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from canopy.mole import gateway
 from canopy.core.errors import register_canopy_error_handler
 from canopy.mole.config import get_mole_config
+from canopy.core.modules import tag_module
 from canopy.mole.runtime import mark_started
 from canopy.mole.api.v1.router import router as v1_router
 from canopy.mole.adapters.registry import build_registry
@@ -45,4 +46,5 @@ app = FastAPI(
 )
 
 register_canopy_error_handler(app)
+tag_module(app, "mole")
 app.include_router(v1_router)
