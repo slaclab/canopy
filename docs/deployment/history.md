@@ -307,6 +307,8 @@ needed, so this subscription can't continue.
    ```
 2. On the arm, drop the invalidated slot:
    `SELECT pg_drop_replication_slot('canopy_history_<arm>');`
+   If it says the slot is active, the arm's walsender for the head hasn't exited yet:
+   wait a few seconds and run it again.
 3. On the head, find the newest snapshot it holds from that arm:
    `SELECT max(created_at) FROM squirrel.snapshot WHERE owner_instance = '<arm>';`
 4. Run `reseed --arm <arm> --since <that time>` on the head, with that arm's

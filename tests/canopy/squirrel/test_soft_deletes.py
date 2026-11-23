@@ -123,6 +123,21 @@ async def test_a_meta_pv_marker_names_only_live_owners(
     assert (r.status_code, r.json()["code"]) == (status, code), r.text
 
 
+@pytest.mark.parametrize(("deleted", "status", "code"), [(False, 403, "not_owner"), (True, 404, "meta_pv_not_found")])
+async def test_a_meta_pv_change_treats_a_deleted_pv_as_missing(
+    client: AsyncClient, as_instance, deleted: bool, status: int, code: str
+):
+    # Another instance's live PV is refused by its owner; a deleted one is just not there.
+    with as_instance("arm2"):
+        theirs = (await client.post("/v1/pvs", headers=WRITE_HEADERS, json={"setpointAddress": "THEIRS:GONE"})).json()
+        if deleted:
+            assert (await client.delete(f"/v1/pvs/{theirs['id']}", headers=WRITE_HEADERS)).status_code == 200
+
+    r = await client.delete(f"/v1/pvs/meta/{theirs['id']}", headers=WRITE_HEADERS)
+
+    assert (r.status_code, r.json()["code"]) == (status, code), r.text
+
+
 @pytest.mark.parametrize(
     "addresses",
     [
