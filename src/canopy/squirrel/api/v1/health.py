@@ -1,6 +1,8 @@
 """Squirrel health endpoints: liveness and restore-hook configuration diagnostics."""
 
+import time
 import asyncio
+from datetime import UTC, datetime
 from dataclasses import dataclass
 
 from fastapi import Security
@@ -9,9 +11,17 @@ from redis.exceptions import RedisError
 from canopy.jobs import gateway as jobs_gateway
 from canopy.core.health import make_health_router
 from canopy.core.security import require_read_access
+from canopy.squirrel.config import get_squirrel_config
 from canopy.squirrel.runtime import uptime_s
+from canopy.squirrel.pv_cache import (
+    VALUES_KEY,
+    UnreadableStatus,
+    read_status,
+    untrusted_reason,
+)
 from canopy.squirrel.restore_hooks import read_worker_status, describe_restore_hooks
 from canopy.squirrel.schemas.health import (
+    PVCacheStatusDTO,
     RestoreHooksViewDTO,
     RestoreHooksStatusDTO,
     WorkerRestoreHooksViewDTO,
@@ -81,4 +91,97 @@ async def restore_hooks_status() -> RestoreHooksStatusDTO:
         worker=worker.view,
         worker_error=worker.error,
         matches_api=None if worker.view is None else worker.view.loaded == api["loaded"],
+    )
+
+
+PV_CACHE_STATUS_TIMEOUT_S = 2.0
+
+
+def _from_unix(value: float | None) -> datetime | None:
+    """``value`` as a UTC datetime; ``None`` for no value, 0 (a stepped-down leader) or one out of range."""
+    if not value:
+        return None
+    try:
+        return datetime.fromtimestamp(value, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _sentence(reason: str) -> str:
+    """A reason shared with snapshot create's log line, as an error message."""
+    return reason[:1].upper() + reason[1:]
+
+
+@router.get("/pv-cache", dependencies=[Security(require_read_access)])
+async def pv_cache_status() -> PVCacheStatusDTO:
+    """Report the worker-side PV cache that cached snapshots (``useCache=true``) read.
+
+    The cache is written by whichever ``canopy-worker`` holds the leader lease, which
+    publishes a report to Redis on every flush. A worker that never got
+    ``CANOPY_SQUIRREL__PV_CACHE__ENABLED``, or one that stopped, leaves cached
+    snapshots silently reading live; this endpoint shows which it is.
+
+    Returns
+    -------
+    PVCacheStatusDTO
+        The leader's last report, its heartbeat age, and the overall status.
+    """
+    cfg = get_squirrel_config().pv_cache
+    try:
+        async with asyncio.timeout(PV_CACHE_STATUS_TIMEOUT_S):
+            pool = await jobs_gateway.get_pool()
+            cached = await pool.hlen(VALUES_KEY)
+            try:
+                report, unreadable = await read_status(pool), None
+            except UnreadableStatus as exc:
+                report, unreadable = None, exc
+    except (TimeoutError, OSError, RedisError) as exc:
+        return PVCacheStatusDTO(
+            status="down",
+            enabled=cfg.enabled,
+            error=f"Could not read the PV cache report from Redis: {str(exc) or type(exc).__name__}",
+        )
+
+    now = time.time()
+    if unreadable is not None:
+        error = _sentence(str(unreadable))
+    elif report is None:
+        error = "No worker has reported a PV cache; is CANOPY_SQUIRREL__PV_CACHE__ENABLED set on canopy-worker?"
+    else:
+        # The same check snapshot create applies, so "ok" here means snapshots use the cache.
+        reason = untrusted_reason(report, now, cfg.heartbeat_max_age_s)
+        error = None if reason is None else _sentence(reason)
+
+    # Off, not broken, only when this process has the cache off too and no worker is
+    # leading it: no report, or one a leader left on stepping down. The flag is often
+    # set on the worker alone, and a leader that crashed never writes the step-down,
+    # so its stale report stays "down" here until it expires.
+    switched_off = not cfg.enabled and unreadable is None and (report is None or not report.heartbeat_at)
+    if error is not None and switched_off:
+        status, error = "disabled", None
+    elif error is not None:
+        status = "down"
+    elif not report.warm or (
+        report.monitored is not None and report.connected is not None and report.connected < report.monitored
+    ):
+        status = "degraded"
+    else:
+        status = "ok"
+    if report is None:
+        return PVCacheStatusDTO(status=status, enabled=cfg.enabled, cached=cached, error=error)
+    return PVCacheStatusDTO(
+        status=status,
+        enabled=cfg.enabled,
+        host=report.host,
+        instance=report.instance,
+        leader_since=_from_unix(report.leader_since),
+        heartbeat_at=_from_unix(report.heartbeat_at),
+        heartbeat_age_s=round(now - report.heartbeat_at, 3) if report.heartbeat_at else None,
+        configured=report.configured,
+        monitored=report.monitored,
+        connected=report.connected,
+        seen=report.seen,
+        warm=report.warm,
+        cached=cached,
+        error=error,
     )
