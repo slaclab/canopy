@@ -113,7 +113,7 @@ The names are the defaults of `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_R
 `__APP_ROLE` and `__HEARTBEAT_ROLE`. Each arm's `pg_hba.conf` admits `replicator`,
 `canopy_reader` and, where it prunes, `canopy_heartbeat` over `hostssl` with SCRAM
 from the head's network only. The head reaches each arm with two secrets:
-`CANOPY_ARMS__<arm>__PUBLISHER_DSN` (libpq, as the replication role) and
+`CANOPY_ARMS__<arm>__PUBLISHER_DSN` (a `postgresql://` URI, as the replication role) and
 `CANOPY_ARMS__<arm>__READER_DSN` (a `postgresql://` URI, as the reader role), plus
 `CANOPY_ARMS__<arm>__HEARTBEAT_DSN` (a URI, as the heartbeat role) for an arm that
 prunes. `subscribe` and `refresh` also open the publisher connection themselves, from
