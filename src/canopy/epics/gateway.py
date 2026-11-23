@@ -29,7 +29,14 @@ def build_connector(config: EpicsConfig) -> PVConnector:
 
         return EpicsConnector.from_config(config)
     if ":" in backend:
-        return _resolve_backend_class(backend).from_config(config)
+        connector = _resolve_backend_class(backend).from_config(config)
+        # Fail at startup, not at the first read, when the class leaves out part of the Protocol.
+        if not isinstance(connector, PVConnector):
+            raise EpicsBackendUnavailable(
+                f"EPICS backend {backend!r} built a {type(connector).__name__}, which does not implement "
+                "PVConnector (backend_name, start, close, get, put, subscribe, describe)"
+            )
+        return connector
     raise EpicsBackendUnavailable(
         f"Unknown EPICS backend {backend!r}. Valid backends: 'simulation', 'epics', or a 'module:Class' dotted path."
     )
@@ -42,8 +49,10 @@ def _resolve_backend_class(path: str) -> type[PVConnector]:
         raise EpicsBackendUnavailable(f"EPICS backend {path!r} is not a 'module.path:ClassName' dotted path")
     try:
         module = importlib.import_module(module_path)
-    except ImportError as exc:
-        raise EpicsBackendUnavailable(f"Cannot import module '{module_path}' of EPICS backend {path!r}: {exc}") from exc
+    except Exception as exc:  # a SyntaxError or a failing top-level statement, as well as an ImportError
+        raise EpicsBackendUnavailable(
+            f"Cannot import module '{module_path}' of EPICS backend {path!r}: {type(exc).__name__}: {exc}"
+        ) from exc
     cls = getattr(module, class_name, None)
     if cls is None:
         raise EpicsBackendUnavailable(f"Class '{class_name}' of EPICS backend {path!r} not found in '{module_path}'")
