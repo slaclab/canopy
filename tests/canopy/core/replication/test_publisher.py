@@ -12,9 +12,7 @@ from canopy.core.replication.publisher import (
     publication_state,
 )
 
-from .conftest import privileges, direct_grants
-
-PRESENT = sorted(REGISTRY.replicated)
+from .conftest import PRESENT, privileges, direct_grants, present_tables
 
 
 async def _published(conn) -> list[str]:
@@ -75,12 +73,14 @@ async def test_publish_converges_a_stale_publication(db, config):
 async def test_a_retired_table_already_dropped_is_not_reported_missing(db, config, caplog, monkeypatch):
     # Retired tables stay registered for databases that still hold them; one that has
     # dropped the table shouldn't log it as "not here yet" on every deploy.
-    monkeypatch.setattr("canopy.core.replication.publisher.RETIRED", frozenset({"squirrel.pv_facility"}))
+    retired = frozenset({"squirrel.pv_facility"})
+    monkeypatch.setattr("canopy.core.replication.publisher.RETIRED", retired)
     await db.execute("DROP TABLE squirrel.pv_facility")
     caplog.set_level(logging.INFO, logger="canopy.core.replication")
     result = await publish(db, role="primary", config=config)
     assert result["missing"] == []
     assert "Not in this database yet" not in caplog.text
+    assert await _published(db) == present_tables(retired)  # what PRESENT becomes once it's retired
 
 
 async def test_publish_picks_up_a_registered_table_once_it_exists(db, config, caplog):

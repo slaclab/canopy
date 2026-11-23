@@ -30,15 +30,21 @@ from canopy.core.replication.subscriber import (
     subscriber_status,
 )
 
-from .conftest import DB_DSN, privileges, build_schema, direct_grants
+from .conftest import (
+    DB_DSN,
+    PRESENT,
+    privileges,
+    build_schema,
+    direct_grants,
+    present_tables,
+)
 
-PRESENT = sorted(REGISTRY.replicated)
 DSN = "postgresql://replicator:s3cret-pw@arm1.example.org/canopy"
 ARMS = {"arm1": Arm(publisher_dsn=SecretStr(DSN))}
 
 
 HEAD = "head"
-ROOTS = sorted(t for t in REGISTRY.replicated if not REGISTRY.owner_chain(t))
+ROOTS = sorted(t for t in PRESENT if not REGISTRY.owner_chain(t))
 RW = {"SELECT", "INSERT", "UPDATE", "DELETE"}
 
 
@@ -86,6 +92,19 @@ async def test_grants_reads_every_row_and_writes_only_the_heads(db, config):
             await db.execute("UPDATE squirrel.tag_group SET owner_instance = 'arm1' WHERE owner_instance = $1", HEAD)
     finally:
         await db.execute("RESET ROLE")
+
+
+async def test_grants_leaves_out_a_retired_table_once_it_is_dropped(db, config):
+    # What PRESENT and ROOTS become once a table is retired: its model is gone, so a
+    # database built from the models doesn't hold it, and grants covers the rest.
+    retired = frozenset({"magpie.config"})
+    await db.execute(f'CREATE ROLE "{config.app_role}"')
+    await db.execute("DROP TABLE magpie.config")
+
+    result = await grants(db, role="mirror", head=HEAD, config=config)
+
+    assert result["replicated"] == present_tables(retired)
+    assert result["row_security"] == sorted(set(ROOTS) - retired)
 
 
 async def test_a_permissive_policy_added_by_hand_doesnt_widen_writes(db, config):
