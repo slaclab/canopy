@@ -86,10 +86,10 @@ before deleting a facility on an arm, and re-grant them afterwards.
 The names are the defaults of `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_ROLE`,
 `__APP_ROLE` and `__HEARTBEAT_ROLE`. Each arm's `pg_hba.conf` admits `replicator`,
 `canopy_reader` and, where it prunes, `canopy_heartbeat` over `hostssl` with SCRAM
-from the head's network only. The head reaches each arm with two secrets:
-`CANOPY_ARMS__<arm>__PUBLISHER_DSN` (libpq, as the replication role) and
-`CANOPY_ARMS__<arm>__READER_DSN` (a `postgresql://` URI, as the reader role), plus
-`CANOPY_ARMS__<arm>__HEARTBEAT_DSN` (a URI, as the heartbeat role) for an arm that prunes.
+from the head's network only. The head reaches each arm with two secrets, each a
+`postgresql://` URI: `CANOPY_ARMS__<arm>__PUBLISHER_DSN`, as the replication role, and
+`CANOPY_ARMS__<arm>__READER_DSN`, as the reader role, plus
+`CANOPY_ARMS__<arm>__HEARTBEAT_DSN`, as the heartbeat role, for an arm that prunes.
 
 Each arm's Postgres needs `wal_level = logical`, enough `max_replication_slots`
 and `max_wal_senders`, and `max_slot_wal_keep_size` set **before the first slot

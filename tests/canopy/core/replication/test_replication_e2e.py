@@ -192,7 +192,8 @@ async def test_a_failed_subscribe_never_shows_the_password(octopus: Octopus, cap
     o, arm = octopus, octopus.arm
     await publish(arm.admin, role="primary", config=o.config)
     wrong = "wrong-" + uuid4().hex
-    arms = {arm.name: Arm(publisher_dsn=SecretStr(arm.publisher_dsn.rsplit("password=", 1)[0] + f"password={wrong}"))}
+    dsn = make_url(arm.publisher_dsn).set(password=wrong).render_as_string(hide_password=False)
+    arms = {arm.name: Arm(publisher_dsn=SecretStr(dsn))}
 
     with pytest.raises(ReplicationError, match=f"failed for {arm.name}") as caught:
         await subscribe(o.head.conn, role="mirror", head=o.head.name, arms=arms, connect_arm=o.connect_arm)
@@ -308,6 +309,26 @@ async def test_subscribe_refuses_a_slug_another_owner_already_has(octopus: Octop
     assert not await o.arms[second].admin.fetchval(
         "SELECT count(*) FROM pg_replication_slots WHERE database = current_database()"
     )
+
+
+async def test_subscribe_waits_for_another_arms_copy_of_a_keyed_table(octopus: Octopus):
+    o = octopus
+    first, second = o.arms
+    for name, arm in o.arms.items():
+        await publish(arm.admin, role="primary", config=o.config)
+        await seed_rows(arm.admin, name)
+    # The first arm's subscription exists but hasn't started: its tables wait in the init state.
+    # Both are made by the fixture (a plain name, a URI with a hex password), so plain quotes do.
+    await o.head.admin.execute(
+        f'CREATE SUBSCRIPTION "{subscription_name(first)}" '
+        f"CONNECTION '{o.arms[first].publisher_dsn}' PUBLICATION canopy_history WITH (enabled = false)"
+    )
+
+    with pytest.raises(Refused, match=f"while {subscription_name(first)} is still copying core.facility"):
+        await _subscribe(o, only=second)
+    assert not (await subscriber_status(o.head.admin, arms=o.arms_config.arms, only=second))["subscriptions"][0][
+        "exists"
+    ]
 
 
 @one_arm
