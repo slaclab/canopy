@@ -32,6 +32,7 @@ from .conftest import (
     _reader_dsn,
     _subscribed,
 )
+from .test_drift_e2e import _as_apply
 from .test_replication_e2e import _rows, _in_step
 
 PRESENT = sorted(REGISTRY.replicated)
@@ -665,3 +666,97 @@ async def test_refuses_a_key_another_owner_holds(octopus: Octopus):
     with pytest.raises(Refused, match=f"held here under the same key by {second}"):
         await _reseed_arm(o, first, since=since)
     assert await _everyone_else(o, first) == before
+
+
+def _lock(conn: asyncpg.Connection, name: str):
+    return conn.fetchval("SELECT pg_try_advisory_lock(hashtext($1), hashtext($2))", reseed_module.LOCK_NAMESPACE, name)
+
+
+def _unlock(conn: asyncpg.Connection, name: str):
+    return conn.fetchval("SELECT pg_advisory_unlock(hashtext($1), hashtext($2))", reseed_module.LOCK_NAMESPACE, name)
+
+
+@one_arm
+async def test_one_run_per_arm_at_a_time(octopus: Octopus):
+    """A second run of the same arm is refused before it touches anything; a finished run lets go."""
+    o = octopus
+    name = subscription_name(o.arm.name)
+    await _subscribed(o)
+    since = await _newest_on_head(o)
+    await _lose_subscription(o)
+    holder = await asyncpg.connect(_head_admin_dsn(o))
+    primary, mirror = await _connections(o)
+    try:
+        assert await _lock(holder, name)
+        with pytest.raises(Refused, match="another reseed of"):
+            await _reseed(o, primary, mirror, since=since)
+        assert not await o.head.admin.fetchval("SELECT count(*) FROM pg_subscription WHERE subname = $1", name)
+        await _unlock(holder, name)
+
+        # A run that refuses for another reason lets go too.
+        with pytest.raises(Refused, match="later than the newest snapshot"):
+            await _reseed(o, primary, mirror, since=since + timedelta(days=1))
+        assert await _lock(holder, name)
+        await _unlock(holder, name)
+
+        assert (await _reseed(o, primary, mirror, since=since))["created"]
+        assert await _lock(holder, name)
+        await _unlock(holder, name)
+        await eventually(lambda: _in_step(o, o.arm.name))
+    finally:
+        for conn in (holder, primary, mirror):
+            await conn.close()
+
+
+@one_arm
+async def test_deletes_links_whose_pv_was_already_gone_here(octopus: Octopus):
+    """The head lost a PV but kept its links; the arm deletes the PV in the gap. The links go too."""
+    o = octopus
+    arm = o.arm.name
+    ids = await _subscribed(o)
+    since = await _newest_on_head(o)
+    await _as_apply(o.head.admin, "DELETE FROM squirrel.pv WHERE id = $1", ids["pv"])
+    await _lose_subscription(o)
+    await o.arm.admin.execute("DELETE FROM squirrel.meta_pv WHERE pv_id = $1", ids["pv"])
+    await o.arm.admin.execute("DELETE FROM squirrel.pv WHERE id = $1", ids["pv"])  # links and values cascade
+
+    primary, mirror = await _connections(o)
+    try:
+        report = await _reseed(o, primary, mirror, since=since)
+        # Found through the tag and the facility they also reference, which name the arm.
+        for table in ("squirrel.pv_tag", "squirrel.pv_facility"):
+            assert not await o.head.conn.fetchval(f"SELECT count(*) FROM {table} WHERE pv_id = $1", ids["pv"])
+            assert report["tables"][table]["deleted"] == 1
+        # A row whose only parent is gone can't be put down to anyone: listed, not deleted.
+        assert report["dangling"] == [
+            {"table": "squirrel.meta_pv", "column": "pv_id", "parent": "squirrel.pv", "owner": None, "rows": 1}
+        ]
+        await eventually(lambda: _in_step(o, arm))
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+@one_arm
+async def test_lists_a_snapshot_whose_facility_the_arm_deleted(octopus: Octopus):
+    """The arm deletes a snapshot, then its facility. The head keeps its history, as replication would."""
+    o = octopus
+    arm = o.arm.name
+    ids = await _subscribed(o)
+    since = await _newest_on_head(o)
+    await _lose_subscription(o)
+    await o.arm.admin.execute("DELETE FROM squirrel.pv_facility WHERE facility_id = $1", ids["facility"])
+    await o.arm.admin.execute("DELETE FROM squirrel.snapshot WHERE id = $1", ids["snapshot"])
+    await o.arm.admin.execute("DELETE FROM core.facility WHERE id = $1", ids["facility"])
+
+    primary, mirror = await _connections(o)
+    try:
+        report = await _reseed(o, primary, mirror, since=since)
+        assert await o.head.conn.fetchval("SELECT count(*) FROM squirrel.snapshot WHERE id = $1", ids["snapshot"])
+        assert not await o.head.conn.fetchval("SELECT count(*) FROM core.facility WHERE id = $1", ids["facility"])
+        assert report["dangling"] == [
+            {"table": "squirrel.snapshot", "column": "facility_id", "parent": "core.facility", "owner": arm, "rows": 1}
+        ]
+    finally:
+        await primary.close()
+        await mirror.close()
