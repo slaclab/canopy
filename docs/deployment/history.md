@@ -178,6 +178,12 @@ its snapshot, a PV's tag link without its tag). Each such row is put down to the
 that owns it, through whichever of its parents survives, and is that arm's drift
 (exit 1 for that arm only). A row nobody can be found to own is reported under `head`
 and fails every run until it is fixed. A reference that is NULL is never flagged.
+While the table such a row is in, or the parent table it misses, is still being copied
+(an initial copy or a `refresh`), the row may only be early: it is listed as `pending`
+and makes the run not checked (exit 2), not drift. For an arm's row that's while that
+arm's subscription doesn't hold both tables ready; for a row under `head`, while any
+subscription doesn't. If the head's own check fails, `head` is not checked, with the
+error, and drift found in the arms still makes the run exit 1.
 
 The JSON report gives `status`, then each arm's report under `arms` (drifting tables
 and days) and the head's under `head`. To repair an arm's drift, find its cause, then
@@ -330,7 +336,13 @@ quieter time.
 
 If `reseed` fails part-way, the subscription stays disabled: run it again. Never enable
 the subscription by hand after a failed run, since replication would resume from where
-the old slot left off, not from the copy.
+the old slot left off, not from the copy. Only one `reseed` of an arm runs at a time; a
+second is refused while the first runs.
+
+`reseed`'s report lists under `dangling` any row of that arm (or of nobody known) that
+still references a missing parent once it is done. The usual cause: the arm deleted a
+facility whose snapshots it had pruned or deleted, while the head keeps those
+snapshots. Replication leaves the same reference.
 
 ### Head PITR
 
@@ -390,7 +402,12 @@ A bad write on an arm (a mass edit, a wrong delete) reaches the head within seco
 Never repair an arm's rows on the head; repair them on that arm and let replication
 carry the fix.
 
-1. Restore the head's backup into a scratch database at a time before the bad write.
+1. Restore the head's backup into a scratch server at a time before the bad write,
+   starting it with `max_logical_replication_workers = 0`, as in "Head PITR". Its
+   restored subscriptions still point at the arms' live slots: with workers enabled
+   it would connect, apply new writes and move the slots on. Never drop a subscription
+   there without `SET (slot_name = NONE)` first, which would drop the arm's live slot.
+   Discard the scratch server when done.
 2. Extract the good rows that arm owns from it (`\copy (SELECT ...) TO`, filtered on
    the owner as in "Arm host lost").
 3. Write them back on the arm, in one transaction, parents before children.

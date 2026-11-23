@@ -239,7 +239,7 @@ async def _sync_publication(conn: asyncpg.Connection, publication: Publication, 
     schemas_removed = sorted(state.schemas)
     if desired and (added or removed or cleared or schemas_removed):
         await conn.execute(f"ALTER PUBLICATION {name} SET TABLE {', '.join(qualified(t) for t in desired)}")
-    elif removed:
+    elif removed or schemas_removed:
         # Nothing left to publish, and SET TABLE needs at least one table.
         if schemas_removed:
             await conn.execute(
@@ -264,9 +264,7 @@ async def _sync_publication(conn: asyncpg.Connection, publication: Publication, 
         )
     if schemas_removed:
         logger.info(
-            "Publication %s: lists its tables instead of publishing schemas %s whole",
-            publication.name,
-            ", ".join(schemas_removed),
+            "Publication %s: no longer publishes schemas %s whole", publication.name, ", ".join(schemas_removed)
         )
     if operations_changed:
         logger.info("Publication %s: now publishes %s", publication.name, ", ".join(publication.operations))
