@@ -102,6 +102,9 @@ class Settings(BaseSettings):
         """Read a blank value as unset rather than as ``""`` or an unparseable int."""
         return blank_keeps_default(cls, value, info)
 
+    # Primary (arm) only: accept writes a history head forwards on a user's behalf.
+    accept_forwarded_writes: bool = False
+
 
 def blank_keeps_default(model: type[BaseModel], value: object, info: ValidationInfo) -> object:
     """Read a blank string, as Helm and compose render an unset variable, as the field's default.
@@ -127,9 +130,6 @@ def blank_keeps_default(model: type[BaseModel], value: object, info: ValidationI
     if isinstance(value, str) and not value.strip():
         return model.model_fields[info.field_name].get_default(call_default_factory=True)
     return value
-
-    # Primary (arm) only: accept writes a history head forwards on a user's behalf.
-    accept_forwarded_writes: bool = False
 
 
 @lru_cache
