@@ -62,9 +62,13 @@ async def _status(o: Octopus) -> dict:
     return (await subscriber_status(o.head.admin, arms=o.arms_config.arms, only=o.arm.name))["subscriptions"][0]
 
 
-async def _lose_subscription(o: Octopus) -> None:
-    """What a lost slot leaves behind once cleaned up: the head's rows, no subscription, no slot."""
-    name = subscription_name(o.arm.name)
+async def _lose_subscription(o: Octopus, arm: str | None = None) -> None:
+    """What a lost slot leaves behind once cleaned up: the head's rows, no subscription, no slot.
+
+    For ``arm``, or the first arm.
+    """
+    arm = arm or o.arm.name
+    name = subscription_name(arm)
     await o.head.admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
 
     async def worker_gone():
@@ -74,10 +78,17 @@ async def _lose_subscription(o: Octopus) -> None:
             name,
         )
 
+    async def slot_released():
+        # The arm's walsender can hold the slot for a moment after the head's worker exits.
+        return not await o.arms[arm].admin.fetchval(
+            "SELECT active FROM pg_replication_slots WHERE slot_name = $1", name
+        )
+
     await eventually(worker_gone)
     await o.head.admin.execute(f'ALTER SUBSCRIPTION "{name}" SET (slot_name = NONE)')
     await o.head.admin.execute(f'DROP SUBSCRIPTION "{name}"')
-    await o.arm.admin.execute("SELECT pg_drop_replication_slot($1)", name)
+    await eventually(slot_released)
+    await o.arms[arm].admin.execute("SELECT pg_drop_replication_slot($1)", name)
 
 
 async def _newest_on_head(o: Octopus) -> datetime:
@@ -563,24 +574,6 @@ async def _two_arms_and_the_heads_rows(o: Octopus) -> dict[str, dict[str, str]]:
     return ids
 
 
-async def _lose(o: Octopus, arm: str) -> None:
-    """``_lose_subscription`` for any arm."""
-    name = subscription_name(arm)
-    await o.head.admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
-
-    async def worker_gone():
-        return not await o.head.admin.fetchval(
-            "SELECT count(*) FROM pg_stat_subscription s JOIN pg_subscription u ON u.oid = s.subid "
-            "WHERE u.subname = $1 AND s.pid IS NOT NULL",
-            name,
-        )
-
-    await eventually(worker_gone)
-    await o.head.admin.execute(f'ALTER SUBSCRIPTION "{name}" SET (slot_name = NONE)')
-    await o.head.admin.execute(f'DROP SUBSCRIPTION "{name}"')
-    await o.arms[arm].admin.execute("SELECT pg_drop_replication_slot($1)", name)
-
-
 async def _reseed_arm(o: Octopus, arm: str, **kwargs) -> dict:
     primary = await asyncpg.connect(await _reader_dsn(o, arm), server_settings=SESSION)
     mirror = await asyncpg.connect(_head_admin_dsn(o), server_settings=SESSION)
@@ -600,7 +593,7 @@ async def test_reseeds_one_arm_and_leaves_every_other_owners_rows_alone(octopus:
     newest = await o.head.conn.fetchval(
         "SELECT max(created_at) FROM squirrel.snapshot WHERE owner_instance = $1", first
     )
-    await _lose(o, first)
+    await _lose_subscription(o, first)
     # The second arm has a newer snapshot than anything the head holds from the first:
     # the floor is per arm.
     await o.arms[second].admin.execute(
@@ -643,7 +636,7 @@ async def test_refuses_a_slug_another_owner_holds(octopus: Octopus):
     first, second = o.arms
     ids = await _two_arms_and_the_heads_rows(o)
     since = await o.head.conn.fetchval("SELECT max(created_at) FROM squirrel.snapshot WHERE owner_instance = $1", first)
-    await _lose(o, first)
+    await _lose_subscription(o, first)
     # Facility slugs are unique across owners; the first arm can't see the second's.
     await o.arms[first].admin.execute(
         "UPDATE core.facility SET slug = $1 WHERE id = $2", f"fac_{second}", ids[first]["facility"]
@@ -661,7 +654,7 @@ async def test_refuses_a_key_another_owner_holds(octopus: Octopus):
     first, second = o.arms
     ids = await _two_arms_and_the_heads_rows(o)
     since = await o.head.conn.fetchval("SELECT max(created_at) FROM squirrel.snapshot WHERE owner_instance = $1", first)
-    await _lose(o, first)
+    await _lose_subscription(o, first)
     # A row on the first arm whose id the head already holds for the second arm's tag group.
     await o.arms[first].admin.execute(
         "INSERT INTO squirrel.tag_group (id, name, owner_instance) VALUES ($1, 'Collides', $2)",
