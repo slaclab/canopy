@@ -722,31 +722,82 @@ async def test_connect_edge_during_a_pending_flush_send_is_described_again(fake_
     assert with_meta["data"]["PV:FLAP"]["value"] == 2.5
 
 
-async def test_client_unsubscribing_during_flush_receives_no_initial(fake_connector):
-    """A client that unsubscribes while an earlier client's send in the same flush is pending gets nothing from it."""
-    broker = PVBroker(fake_connector, HareConfig())
-    first, second = _GatedWebSocket(), _GatedWebSocket()
-    broker.add_client("c1", first)
-    broker.add_client("c2", second)
-    await broker.subscribe("c1", ["PV:SEED"])
-    await broker.subscribe("c2", ["PV:SEED"])
+async def test_client_unsubscribing_between_its_initial_frames_gets_no_later_frame_for_the_pv(fake_connector):
+    """A client that unsubscribes while one of its own ``initial`` frames is pending gets no later frame for that PV."""
+    broker = PVBroker(fake_connector, HareConfig(initial_frame_max_pvs=1))
+    client = _GatedWebSocket()
+    broker.add_client("c1", client)
+    await broker.subscribe("c1", ["PV:FIRST", "PV:SECOND"])
     await broker._drain_nowait()
     await broker.drain_seeds()
-    # Drop the buffered first value so the flush sends initial frames only,
+    # Drop the buffered first values so the flush sends initial frames only,
     # the path whose per-send re-check this test covers.
     broker._buffer.clear()
 
     flush = asyncio.create_task(broker._flush())
-    assert await wait_for(lambda: first.blocked or second.blocked)
-    stayer, leaver, leaver_id = (first, second, "c2") if first.blocked else (second, first, "c1")
-    await broker.unsubscribe(leaver_id, ["PV:SEED"])
-    stayer.release.set()
-    # A send to the leaver would block on its unreleased gate and time this out.
+    assert await wait_for(lambda: client.blocked)
+    await broker.unsubscribe("c1", ["PV:SECOND"])
+    client.release.set()
     await asyncio.wait_for(flush, 1.0)
 
-    assert "PV:SEED" in _initial_frames(stayer)[0]["data"]
-    assert not _initial_frames(leaver)
-    leaver.release.set()
+    (initial,) = _initial_frames(client)
+    assert set(initial["data"]) == {"PV:FIRST"}
+
+
+async def test_a_blocked_client_does_not_hold_up_another_clients_frames(fake_connector):
+    """Clients are sent to concurrently, so one whose socket is backed up delays only its own frames in a flush."""
+    broker = PVBroker(fake_connector, HareConfig())
+    slow, fast = _GatedWebSocket(), FakeWebSocket()
+    # Not armed until the PVs are seeded: the gate blocks the first send after ``blocked`` is cleared.
+    slow.blocked = True
+    broker.add_client("slow", slow)
+    broker.add_client("fast", fast)
+    await broker.subscribe("slow", ["PV:SLOW"])
+    await broker.subscribe("fast", ["PV:FAST"])
+    await settle(broker)
+    slow.blocked = False
+    slow.sent.clear()
+    fast.sent.clear()
+    # Buffered slow-first, so a flush sending clients one after another would reach the slow one first.
+    fake_connector.emit("PV:SLOW", 1.5, ts=9)
+    fake_connector.emit("PV:FAST", 2.5, ts=9)
+    await broker._drain_nowait()
+
+    flush = asyncio.create_task(broker._flush())
+    assert await wait_for(lambda: any(m["type"] == "diff" for m in fast.sent), timeout=1.0)
+    assert slow.blocked and not flush.done()
+    slow.release.set()
+    await asyncio.wait_for(flush, 1.0)
+
+    assert [m["data"]["PV:FAST"]["value"] for m in fast.sent if m["type"] == "diff"] == [2.5]
+    assert [m["data"]["PV:SLOW"]["value"] for m in slow.sent if m["type"] == "diff"] == [1.5]
+
+
+async def test_a_failed_delivery_is_logged_and_the_other_clients_still_get_their_frames(fake_connector, caplog):
+    """An error escaping one client's delivery is logged, and neither stops the flush nor reaches the other clients."""
+    broker = PVBroker(fake_connector, HareConfig())
+    broken, healthy = FakeWebSocket(), FakeWebSocket()
+    broker.add_client("broken", broken)
+    broker.add_client("healthy", healthy)
+    await broker.subscribe("broken", ["PV:SHARED"])
+    await broker.subscribe("healthy", ["PV:SHARED"])
+    await settle(broker)
+    healthy.sent.clear()
+    fake_connector.emit("PV:SHARED", 4.0, ts=11)
+    await broker._drain_nowait()
+    real_send = broker._send
+
+    async def send(client_id, message):
+        if client_id == "broken":
+            raise RuntimeError("delivery failed")
+        await real_send(client_id, message)
+
+    broker._send = send
+    with caplog.at_level("ERROR", logger="canopy.hare.services.broker"):
+        await broker._flush()
+
+    assert [m["data"]["PV:SHARED"]["value"] for m in healthy.sent if m["type"] == "diff"] == [4.0]
+    assert "flush delivery to client broken failed" in caplog.text
 
 
 async def test_connected_updates_do_not_repeat_a_failed_describe(fake_connector):

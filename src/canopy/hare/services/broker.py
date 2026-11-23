@@ -730,13 +730,22 @@ class PVBroker:
         A client gets its queued PVs first, in ``initial`` frames of at most
         ``initial_frame_max_pvs`` PVs carrying the value and metadata of each,
         then one ``diff`` frame. Both are built from one snapshot taken before
-        any send, so a PV in both carries the same value in each and a client
-        applying frames in order never ends on an older value; the PV stays in
+        any send, so a PV in both carries the same value in each; the PV stays in
         the diff so a client that reads only diffs still sees it.
 
-        Sends to earlier clients can await while a client unsubscribes or a PV
+        Each client's frames go out in order, and the clients are sent to
+        concurrently, so a client whose socket is backed up delays only its own
+        frames in this flush. The next flush still waits for every client's
+        sends to finish. A failed delivery is logged and doesn't stop the
+        others.
+
+        A client's sends can await while it unsubscribes, re-subscribes or a PV
         is released, so before each ``initial`` frame its PVs are re-checked
-        against their seed lock and the client's subscriptions.
+        against their seed lock and the client's subscriptions. The snapshot
+        itself isn't re-read: a client that subscribes again to a PV while this
+        flush is still sending to it gets that subscribe's ``initial`` first and
+        this flush's older value after it, until the next flush brings the newer
+        one.
         """
         async with self._buffer_lock:
             if not self._buffer and not self._pending_initial:
@@ -770,15 +779,45 @@ class PVBroker:
             for pv, payload in diff_payloads.items():
                 for client_id in self._registry.subscribers(pv):
                     per_client_diff[client_id][pv] = payload
+        clients = list(dict.fromkeys([*per_client_initial, *per_client_diff]))
+        results = await asyncio.gather(
+            *(
+                self._deliver_flush(
+                    client_id, per_client_initial.get(client_id, []), per_client_diff.get(client_id), ready
+                )
+                for client_id in clients
+            ),
+            return_exceptions=True,
+        )
+        for client_id, result in zip(clients, results):
+            if isinstance(result, Exception):
+                logger.error("flush delivery to client %s failed", client_id, exc_info=result)
+
+    async def _deliver_flush(
+        self,
+        client_id: str,
+        initial_pvs: list[str],
+        diff: dict[str, dict] | None,
+        ready: dict[str, tuple[asyncio.Lock, dict | None, dict | None]],
+    ) -> None:
+        """Send one client its part of a flush: its ``initial`` frames, then its ``diff``.
+
+        Parameters
+        ----------
+        client_id : str
+            Identifier of a client registered with `add_client`.
+        initial_pvs : list[str]
+            Ready PVs the client was subscribed to at snapshot time.
+        diff : dict[str, dict] | None
+            The client's diff payloads, by PV, or ``None`` when it has none.
+        ready : dict[str, tuple[asyncio.Lock, dict | None, dict | None]]
+            The flush's snapshot of ready PVs, as `_send_ready` takes it.
+        """
         cap = max(1, self._config.initial_frame_max_pvs)
-        for client_id in dict.fromkeys([*per_client_initial, *per_client_diff]):
-            pvs = per_client_initial.get(client_id, [])
-            for offset in range(0, len(pvs), cap):
-                await self._send_ready(client_id, pvs[offset : offset + cap], ready)
-            data = per_client_diff.get(client_id)
-            if data:
-                frame = {"type": "diff", "data": data, "count": len(data), "timestamp": time.time()}
-                await self._send(client_id, frame)
+        for offset in range(0, len(initial_pvs), cap):
+            await self._send_ready(client_id, initial_pvs[offset : offset + cap], ready)
+        if diff:
+            await self._send(client_id, {"type": "diff", "data": diff, "count": len(diff), "timestamp": time.time()})
 
     async def _send_ready(
         self, client_id: str, pvs: list[str], ready: dict[str, tuple[asyncio.Lock, dict | None, dict | None]]
