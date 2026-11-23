@@ -1,9 +1,9 @@
 """Core ``Settings``: the log level default and its environment override, and the history fields."""
 
 import pytest
-from pydantic import ValidationError
+from pydantic import Field, BaseModel, ValidationInfo, ValidationError, field_validator
 
-from canopy.core.config import Settings, get_settings
+from canopy.core.config import Settings, get_settings, blank_keeps_default
 
 
 def test_log_level_defaults_to_info(monkeypatch):
@@ -47,6 +47,24 @@ def test_a_blank_history_field_is_unset(monkeypatch, name):
     settings = Settings()
 
     assert (settings.history_url, settings.window_days) == (None, None)
+
+
+class _Probe(BaseModel):
+    limit: int = 7
+    names: list[str] = Field(default_factory=lambda: ["a"])
+    note: str | None = None
+
+    @field_validator("limit", "names", "note", mode="before")
+    @classmethod
+    def _blank(cls, value: object, info: ValidationInfo) -> object:
+        return blank_keeps_default(cls, value, info)
+
+
+def test_a_blank_value_keeps_the_fields_own_default():
+    # Not None: a field whose default is something else keeps that.
+    probe = _Probe(limit="", names=" ", note="")
+
+    assert (probe.limit, probe.names, probe.note) == (7, ["a"], None)
 
 
 def test_instance_is_required(monkeypatch):
