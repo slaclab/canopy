@@ -1,7 +1,9 @@
 """Unit tests for the pure ConversionService (no HTTP layer)."""
 
 import logging
+import tempfile
 from pathlib import Path
+from xml.etree.ElementTree import ParseError
 
 import pytest
 
@@ -77,12 +79,12 @@ def test_bad_kind_raises_unsupported_input(monkeypatch):
         ConversionService().convert(b"whatever", kind="bogus")  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("exc", [KeyError("widget-type"), ValueError("invalid literal for int() with base 10: 'abc'")])
+@pytest.mark.parametrize("exc", [KeyError("widget-type"), TypeError("'NoneType' object is not subscriptable")])
 def test_unexpected_failure_maps_to_conversion_failed_and_logs(monkeypatch, caplog, exc):
-    """Any failure on a known kind is a 422 (ConversionFailed) and is logged.
+    """A failure on a known kind that is not a parse error is a 422 (ConversionFailed) and logs its traceback.
 
-    The catch is intentionally broad (pydmconverter uses ValueError/KeyError for both
-    bad input and bugs), so an unexpected error must still leave a traceback in the log.
+    The catch is intentionally broad (pydmconverter uses KeyError for both bad input
+    and bugs), so an unexpected error must still leave a traceback in the log.
     """
 
     def _boom(*_args, **_kwargs):
@@ -127,3 +129,31 @@ def test_symbol_file_on_search_path_is_found(tmp_path):
     assert any("symbol file" in w.lower() for w in without.warnings)
     assert not any("symbol file" in w.lower() for w in with_paths.warnings)
     assert with_paths.stats.widget_count > without.stats.widget_count
+
+
+@pytest.mark.parametrize(
+    "exc", [ValueError("invalid literal for int() with base 10: 'abc'"), ParseError("syntax error: line 1, column 0")]
+)
+def test_malformed_input_maps_to_conversion_failed_and_warns(monkeypatch, caplog, exc):
+    """A parse error on a known kind is a 422 logged as one warning line, not as a server fault."""
+
+    def _boom(*_args, **_kwargs):
+        raise exc
+
+    monkeypatch.setattr(cs, "convert_bytes", _boom)
+    with caplog.at_level(logging.WARNING, logger=cs.logger.name):
+        with pytest.raises(ConversionFailed):
+            ConversionService().convert(b"data", kind="ui")
+    records = [r for r in caplog.records if r.name == cs.logger.name]
+    assert [r.levelno for r in records] == [logging.WARNING]
+    assert not records[0].exc_info
+
+
+def test_failure_detail_names_the_upload_not_the_staging_dir():
+    """Parser errors quote the staged temp path; the client is shown only the upload's name."""
+    with pytest.raises(ConversionFailed) as info:
+        ConversionService().convert(b'<ui version="4.0"></ui>', kind="ui", filename="bad.ui")
+    detail = info.value.detail
+    assert "bad.ui: no root <widget> element" in detail
+    assert "pydmconv-" not in detail
+    assert tempfile.gettempdir() not in detail

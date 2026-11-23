@@ -19,10 +19,16 @@ from fastapi import Security, APIRouter
 
 from canopy.core.errors import FacilityNotFound
 from canopy.core.security import (
+    APIKeyDep,
     require_read_or_admin_access,
     require_wildcard_facility_access,
 )
-from canopy.core.facilities.schemas import FacilityDTO, FacilityCreate, FacilityUpdate
+from canopy.core.facilities.schemas import (
+    FacilityDTO,
+    FacilityCreate,
+    FacilityUpdate,
+    FacilityAccessDTO,
+)
 from canopy.core.facilities.dependencies import FacilityServiceDep
 
 router = APIRouter(prefix="/v1/facilities", tags=["Facilities"])
@@ -30,8 +36,22 @@ router = APIRouter(prefix="/v1/facilities", tags=["Facilities"])
 
 @router.get("", dependencies=[Security(require_read_or_admin_access)])
 async def list_facilities(service: FacilityServiceDep) -> list[FacilityDTO]:
-    """Full facility hierarchy, flat with ``parent_id`` — the client assembles the tree."""
+    """Full facility hierarchy, flat with ``parent`` — the client assembles the tree."""
     return await service.get_all()
+
+
+@router.get("/access")
+async def get_facility_access(key: APIKeyDep, service: FacilityServiceDep) -> FacilityAccessDTO:
+    """The facilities the *calling* key can reach, so a client can check access before
+    a write instead of discovering it from a 403.
+
+    Gated on any authenticated key, not ``read`` specifically: a write-only,
+    facility-scoped key (an ingestion tool, say) needs this answer before writing as
+    much as a read key does, and the endpoint only describes the caller, so it reveals
+    nothing another key could use. Lives here rather than under ``/v1/api-keys``, which
+    is admin-only: the keys that need this answer are ordinary facility-scoped ones.
+    """
+    return await service.key_access(key.facilities)
 
 
 @router.post("", dependencies=[Security(require_wildcard_facility_access)])
@@ -44,18 +64,18 @@ async def create_facility(data: FacilityCreate, service: FacilityServiceDep) -> 
 @router.put("/{facility_slug}", dependencies=[Security(require_wildcard_facility_access)])
 async def update_facility(facility_slug: str, data: FacilityUpdate, service: FacilityServiceDep) -> FacilityDTO:
     """Update a facility's name, description, or parent. ``slug`` is not editable."""
-    facility = await service.get_by_slug(facility_slug)
-    if not facility:
+    facility_id = await service.id_by_slug(facility_slug)
+    if not facility_id:
         raise FacilityNotFound(f"Facility '{facility_slug}' not found")
-    return await service.update(facility.id, data)
+    return await service.update(facility_id, data)
 
 
 @router.delete("/{facility_slug}", dependencies=[Security(require_wildcard_facility_access)])
 async def delete_facility(facility_slug: str, service: FacilityServiceDep) -> dict[str, bool]:
     """Delete a facility. Refused while it has children, or while any module's data or
     any active key's grant still references it."""
-    facility = await service.get_by_slug(facility_slug)
-    if not facility:
+    facility_id = await service.id_by_slug(facility_slug)
+    if not facility_id:
         raise FacilityNotFound(f"Facility '{facility_slug}' not found")
-    await service.delete(facility.id)
+    await service.delete(facility_id)
     return {"deleted": True}
