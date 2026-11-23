@@ -64,7 +64,7 @@ class FacilityCreate(CanopyModel):
 
 
 class FacilityUpdate(CanopyModel):
-    """Partial update. ``slug`` is not editable — URLs and key grants reference it."""
+    """Partial update. ``slug`` is not editable — URLs and ``?facility=`` filters reference it."""
 
     name: str | None = Field(None, min_length=1, max_length=255)
     description: str | None = None
