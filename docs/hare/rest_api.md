@@ -147,7 +147,8 @@ The broker's rollup. Requires the `read` scope.
 
 `connected` counts the active monitors whose latest value is connected (a
 monitor with no value yet is not connected); `warmMonitors` counts those kept
-warm with no subscriber left. `label`, `notice`, `binding`, `reachable` and
+warm with no subscriber left, which `activeMonitors` and `connected` both
+include. `label`, `notice`, `binding`, `reachable` and
 `writes` are the connector's statement, as in the WebSocket `heartbeat`.
 
 `status` is `degraded` when the broker is not running, or when the connector
