@@ -32,6 +32,7 @@ class ErrorCode(StrEnum):
     KEY_STORE_UNAVAILABLE = auto()
     NOT_OWNER = auto()
     OWNER_MISMATCH = auto()
+    MACHINE_READ_ONLY = auto()
 
     # Mole
     ARCHIVER_NOT_CONFIGURED = auto()
@@ -277,6 +278,17 @@ class OwnerMismatch(CanopyError):
 
     status_code = 409
     error_code = ErrorCode.OWNER_MISMATCH
+
+
+class MachineReadOnly(CanopyError):
+    """A machine write (a PV write, a restore) refused by an instance without machine access.
+
+    The instance takes other writes, just not ones that change the machine
+    (``CANOPY_ROLE=mirror``).
+    """
+
+    status_code = 403
+    error_code = ErrorCode.MACHINE_READ_ONLY
 
 
 def register_canopy_error_handler(app: FastAPI) -> None:
