@@ -398,6 +398,24 @@ async def test_the_backstop_judges_a_moved_tag_by_its_old_group_too(db_session: 
         await db_session.flush()
 
 
+async def test_the_backstop_reads_a_moved_tags_old_group_when_it_wasnt_loaded(db_session: AsyncSession, as_instance):
+    with as_instance("arm2"):
+        theirs = TagGroup(name="Theirs")
+        db_session.add(theirs)
+        await db_session.flush()
+        tag = Tag(name="north", group_id=theirs.id)
+        db_session.add(tag)
+        await db_session.flush()
+    mine = TagGroup(name="Mine")
+    db_session.add(mine)
+    await db_session.flush()
+
+    db_session.expire(tag)  # the old group_id isn't in the history now
+    tag.group_id = mine.id
+    with pytest.raises(NotOwner, match="squirrel.tag row is owned by 'arm2'"):
+        await db_session.flush()
+
+
 async def test_the_backstop_covers_a_tag_attached_to_another_owners_group(db_session: AsyncSession, as_instance):
     # Through the relationship: the flush hasn't copied the group's id into group_id yet.
     with as_instance("arm2"):
@@ -444,6 +462,16 @@ async def test_the_backstop_covers_a_meta_pv_marker(db_session: AsyncSession, as
     db_session.add(MetaPv(pv_id=their_pv.id, display_name="Theirs"))
     with pytest.raises(NotOwner, match="squirrel.meta_pv row is owned by 'arm2'"):
         await db_session.flush()
+
+
+async def test_the_backstop_passes_a_pv_delete_that_cascades_to_its_values(db_session: AsyncSession, as_instance):
+    _, _, my_snapshot, my_pv = await _theirs_and_mine(db_session, as_instance)
+    db_session.add(SnapshotValue(snapshot_id=my_snapshot.id, pv_id=my_pv.id, pv_name="MINE:SP"))
+    await db_session.flush()
+    await db_session.refresh(my_pv, ["snapshot_values"])
+
+    await db_session.delete(my_pv)
+    await db_session.flush()
 
 
 async def test_the_backstop_passes_this_instances_values(db_session: AsyncSession, as_instance):

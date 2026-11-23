@@ -127,6 +127,19 @@ async def test_downgrade_refuses_while_another_owners_rows_are_here(migration_db
     assert "squirrel.tag_group holds rows owned by arm2, not 'arm1'" in out.stderr
 
 
+async def test_downgrade_keeps_this_instances_rows(migration_db):
+    _run("upgrade", _BEFORE)
+    conn = await asyncpg.connect(_DSN)
+    try:
+        await _seed_before_owners(conn)
+        _run("upgrade", _ROW_OWNERS)
+        _run("downgrade", _BEFORE)
+        for table in _OWNED:
+            assert await conn.fetchval(f"SELECT count(*) FROM {table}") == 1, table
+    finally:
+        await conn.close()
+
+
 async def test_downgrade_restores_the_global_uniques(migration_db):
     _run("upgrade", _ROW_OWNERS)
     _run("downgrade", _BEFORE)
