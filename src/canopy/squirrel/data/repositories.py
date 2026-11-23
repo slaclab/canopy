@@ -335,62 +335,6 @@ class PvRepository(BaseRepository[Pv]):
         )
         return result.scalar_one_or_none()
 
-    async def find_by_setpoint(self, setpoint_address: str) -> Pv | None:
-        result = await self.session.execute(
-            select(Pv)
-            .options(selectinload(Pv.tags).selectinload(Tag.group))
-            .where(Pv.setpoint_address == setpoint_address)
-        )
-        return result.scalar_one_or_none()
-
-    async def find_by_readback_without_setpoint(self, readback_address: str) -> Pv | None:
-        """Find a setpoint-less PV by its readback address.
-
-        Parameters
-        ----------
-        readback_address : str
-            Readback address to match.
-
-        Returns
-        -------
-        Pv | None
-            A PV whose ``setpoint_address`` is NULL and whose ``readback_address`` equals
-            ``readback_address``, or ``None`` when no such PV exists.
-        """
-        result = await self.session.execute(
-            select(Pv)
-            .options(selectinload(Pv.tags).selectinload(Tag.group))
-            .where(Pv.setpoint_address.is_(None), Pv.readback_address == readback_address)
-            .limit(1)
-        )
-        return result.scalars().first()
-
-    async def find_by_config_only(self, config_address: str) -> Pv | None:
-        """Find a config-only PV by its config address.
-
-        Parameters
-        ----------
-        config_address : str
-            Config address to match.
-
-        Returns
-        -------
-        Pv | None
-            A PV whose ``setpoint_address`` and ``readback_address`` are both NULL and whose
-            ``config_address`` equals ``config_address``, or ``None`` when no such PV exists.
-        """
-        result = await self.session.execute(
-            select(Pv)
-            .options(selectinload(Pv.tags).selectinload(Tag.group))
-            .where(
-                Pv.setpoint_address.is_(None),
-                Pv.readback_address.is_(None),
-                Pv.config_address == config_address,
-            )
-            .limit(1)
-        )
-        return result.scalars().first()
-
     async def get_existing_setpoints(self, setpoint_addresses: list[str]) -> set[str]:
         """Return the subset of ``setpoint_addresses`` that already exist.
 

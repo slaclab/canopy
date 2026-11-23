@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import uuid
 import logging
-from typing import NamedTuple
+from typing import Literal, NamedTuple
+from collections.abc import Callable, Awaitable
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,7 +14,7 @@ from canopy.core.errors import BadRequest, FacilityNotFound, InsufficientFacilit
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.squirrel.errors import PvNotFound, MetaPvNotFound, PvAlreadyExists
 from canopy.squirrel.schemas.pv import (
-    OnConflict,
+    AddressKind,
     PVElementDTO,
     NewPVElementDTO,
     PVSearchResponse,
@@ -34,7 +35,22 @@ from canopy.squirrel.data.repositories import (
 
 logger = logging.getLogger(__name__)
 
-IDENTITY_KINDS: tuple[str, ...] = ("setpoint", "readback", "config")
+IDENTITY_KINDS: tuple[AddressKind, ...] = ("setpoint", "readback", "config")
+
+# How each identity kind (see `_identity`) is looked up among registered PVs, many
+# addresses at a time: the identifying addresses already registered, and the PVs holding
+# them. Single create and every onConflict mode use these, so they agree on what counts
+# as registered.
+_REGISTERED_ADDRESSES: dict[AddressKind, Callable[[PvRepository, list[str]], Awaitable[set[str]]]] = {
+    "setpoint": PvRepository.get_existing_setpoints,
+    "readback": PvRepository.get_existing_readbacks_without_setpoint,
+    "config": PvRepository.get_existing_config_only,
+}
+_REGISTERED_PVS: dict[AddressKind, Callable[[PvRepository, list[str]], Awaitable[dict[str, Pv]]]] = {
+    "setpoint": PvRepository.get_by_setpoints,
+    "readback": PvRepository.get_by_readbacks_without_setpoint,
+    "config": PvRepository.get_by_config_only,
+}
 
 # How many refused rows a multi-create's 403 names before summarizing the rest
 _REFUSED_ROWS_SHOWN = 10
@@ -44,7 +60,7 @@ def _identity(
     setpoint_address: str | None,
     readback_address: str | None,
     config_address: str | None,
-) -> tuple[str, str]:
+) -> tuple[AddressKind, str]:
     """Resolve the identifying address of a PV.
 
     A PV is identified by its first non-null address in the order setpoint, readback,
@@ -101,7 +117,7 @@ class _ImportRow(NamedTuple):
 
     row: int  # 1-based position in the request
     addresses: tuple[str | None, str | None, str | None]  # normalized setpoint, readback, config
-    kind: str  # identity kind, as `_identity` returns it
+    kind: AddressKind  # identity kind, as `_identity` returns it
     identity_address: str
     data: NewPVElementDTO
 
@@ -111,6 +127,36 @@ class _ImportRow(NamedTuple):
         IDs Postgres returns and a repeated ID adds the tag once. An ID that isn't a UUID
         is kept as sent: no tag has it, so it counts as unknown."""
         return list(dict.fromkeys(_canonical_uuid(tid) or tid for tid in self.data.tags))
+
+
+def _list_refused(refused: list[tuple[_ImportRow, str]]) -> str:
+    """List refused import rows for an error message, as ``row N (address): reason``.
+
+    Parameters
+    ----------
+    refused : list[tuple[_ImportRow, str]]
+        Each refused row with why it was refused, in input order.
+
+    Returns
+    -------
+    str
+        The first ``_REFUSED_ROWS_SHOWN`` rows joined with ``"; "``, followed by how many
+        more there are.
+    """
+    listed = "; ".join(
+        f"row {row.row} ({row.identity_address}): {reason}" for row, reason in refused[:_REFUSED_ROWS_SHOWN]
+    )
+    if len(refused) > _REFUSED_ROWS_SHOWN:
+        listed += f"; and {len(refused) - _REFUSED_ROWS_SHOWN} more"
+    return listed
+
+
+class _FacilityChangeRefusal(NamedTuple):
+    """Why a facility-restricted key may not change a PV's facilities as requested."""
+
+    reason: Literal["unassign", "outside_grant"]
+    # For "outside_grant": the facilities being added or removed that the key doesn't hold
+    facility_ids: frozenset[str] = frozenset()
 
 
 class PvService:
@@ -175,6 +221,42 @@ class PvService:
         if self.facility_scope is None:
             return True
         return bool(row_facility_ids) and row_facility_ids.issubset(self.facility_scope)
+
+    def _facility_change_refusal(self, current: set[str], new_ids: set[str]) -> _FacilityChangeRefusal | None:
+        """Why the calling key may not reassign a PV it can write, if it may not.
+
+        Shared by ``update`` and the ``update`` mode of ``import_many``, which word the
+        refusal themselves. Applies on top of ``_can_write`` for the PV's current
+        facilities. Two rules, both for restricted keys only:
+
+        - A restricted key may not strip a PV down to unassigned: that would hide it from
+          every facility-filtered read and hand write access to every other write-scoped
+          key, including ones with no overlap with the key doing this. Holding every one
+          of the PV's *current* facilities is not enough to grant that — unassigning is
+          its own act, refused for any restricted key.
+        - Every facility being added or removed must be in the grant: "any overlap with
+          the new set" would let a key holding just one of a PV's several facilities
+          silently drop the others on an otherwise-permitted update.
+
+        Parameters
+        ----------
+        current : set[str]
+            The PV's facility ids now.
+        new_ids : set[str]
+            The facility ids it would have after the change.
+
+        Returns
+        -------
+        _FacilityChangeRefusal | None
+            ``None`` if the change is allowed, otherwise which rule refuses it.
+        """
+        if self.facility_scope is None:
+            return None
+        if not new_ids:
+            return _FacilityChangeRefusal("unassign")
+        if outside := (current ^ new_ids) - self.facility_scope:
+            return _FacilityChangeRefusal("outside_grant", frozenset(outside))
+        return None
 
     async def _require_facility_write(self, row_facility_ids: set[str], what: str) -> None:
         """Gate a write on the calling key's facility grant (see ``_can_write``).
@@ -279,27 +361,6 @@ class PvService:
             return None
         return (await self._to_dtos(pvs))[0]
 
-    async def _find_by_identity(self, kind: str, address: str) -> Pv | None:
-        """Look up the PV already holding an identity.
-
-        Parameters
-        ----------
-        kind : str
-            Identity kind as returned by ``_identity``.
-        address : str
-            Address carrying the identity.
-
-        Returns
-        -------
-        Pv | None
-            The PV owning that identity, or ``None`` when the identity is free.
-        """
-        if kind == "setpoint":
-            return await self.pv_repo.find_by_setpoint(address)
-        if kind == "readback":
-            return await self.pv_repo.find_by_readback_without_setpoint(address)
-        return await self.pv_repo.find_by_config_only(address)
-
     async def create(self, data: NewPVElementDTO) -> PVElementDTO:
         """Register a single PV.
 
@@ -331,7 +392,7 @@ class PvService:
         facility_ids = set((await self._resolve_slugs(data.facilities)).values())
         await self._require_facility_for_create(facility_ids, "the requested PV")
 
-        if await self._find_by_identity(kind, identity_address):
+        if identity_address in await _REGISTERED_ADDRESSES[kind](self.pv_repo, [identity_address]):
             raise PvAlreadyExists(f"PV with {kind} address '{identity_address}' already exists")
 
         tags = []
@@ -383,20 +444,17 @@ class PvService:
         """
         rows, identities, ids_by_slug = await self._prepare_import(data_list)
 
-        existence_lookups = (
-            ("setpoint", self.pv_repo.get_existing_setpoints),
-            ("readback", self.pv_repo.get_existing_readbacks_without_setpoint),
-            ("config", self.pv_repo.get_existing_config_only),
-        )
-        for kind, lookup in existence_lookups:
-            existing = await lookup(sorted(identities[kind]))
+        for kind in IDENTITY_KINDS:
+            existing = await _REGISTERED_ADDRESSES[kind](self.pv_repo, sorted(identities[kind]))
             if existing:
                 raise PvAlreadyExists(f"{kind.capitalize()} addresses already exist: {sorted(existing)[:10]}")
 
         tags_by_id = await self._load_import_tags(rows)
         return await self._create_import_rows(rows, ids_by_slug, tags_by_id)
 
-    async def import_many(self, data_list: list[NewPVElementDTO], on_conflict: OnConflict) -> PVImportResultDTO:
+    async def import_many(
+        self, data_list: list[NewPVElementDTO], on_conflict: Literal["skip", "update"]
+    ) -> PVImportResultDTO:
         """Import many PVs, skipping or updating rows whose PV is already registered.
 
         ``create_many`` is the ``on_conflict="error"`` behaviour; this handles the other two.
@@ -426,8 +484,8 @@ class PvService:
         ----------
         data_list : list[NewPVElementDTO]
             Wire payloads for the PVs to import.
-        on_conflict : OnConflict
-            ``"skip"`` or ``"update"``.
+        on_conflict : {"skip", "update"}
+            What to do with a row whose PV is registered. ``"error"`` is ``create_many``.
 
         Returns
         -------
@@ -445,20 +503,16 @@ class PvService:
         PvAlreadyExists
             If a concurrent write registers one of the new rows' addresses first.
         """
+        # The type rules "error" out, but nothing checks types at runtime or in CI.
         if on_conflict not in ("skip", "update"):
             raise ValueError(f"import_many handles onConflict skip or update, not {on_conflict!r}")
         rows, identities, ids_by_slug = await self._prepare_import(data_list)
 
         if on_conflict == "skip":
-            existence_lookups = (
-                ("setpoint", self.pv_repo.get_existing_setpoints),
-                ("readback", self.pv_repo.get_existing_readbacks_without_setpoint),
-                ("config", self.pv_repo.get_existing_config_only),
-            )
             registered = {
                 (kind, address)
-                for kind, lookup in existence_lookups
-                for address in await lookup(sorted(identities[kind]))
+                for kind in IDENTITY_KINDS
+                for address in await _REGISTERED_ADDRESSES[kind](self.pv_repo, sorted(identities[kind]))
             }
             to_create = [row for row in rows if (row.kind, row.identity_address) not in registered]
             skipped = [
@@ -470,14 +524,9 @@ class PvService:
             created = await self._create_import_rows(to_create, ids_by_slug, tags_by_id)
             return PVImportResultDTO(created=created, updated=[], skipped=skipped, address_mismatches=[])
 
-        pv_lookups = (
-            ("setpoint", self.pv_repo.get_by_setpoints),
-            ("readback", self.pv_repo.get_by_readbacks_without_setpoint),
-            ("config", self.pv_repo.get_by_config_only),
-        )
         matched: dict[tuple[str, str], Pv] = {}
-        for kind, lookup in pv_lookups:
-            for address, pv in (await lookup(sorted(identities[kind]))).items():
+        for kind in IDENTITY_KINDS:
+            for address, pv in (await _REGISTERED_PVS[kind](self.pv_repo, sorted(identities[kind]))).items():
                 matched[(kind, address)] = pv
         to_create = [row for row in rows if (row.kind, row.identity_address) not in matched]
         to_update = [
@@ -497,12 +546,7 @@ class PvService:
             and (missing := sorted({tid for tid in row.tag_ids if tid not in tags_by_id}))
         ]
         if unknown_tags:
-            listed = "; ".join(
-                f"row {row.row} ({row.identity_address}): {', '.join(missing)}"
-                for row, missing in unknown_tags[:_REFUSED_ROWS_SHOWN]
-            )
-            if len(unknown_tags) > _REFUSED_ROWS_SHOWN:
-                listed += f"; and {len(unknown_tags) - _REFUSED_ROWS_SHOWN} more"
+            listed = _list_refused([(row, ", ".join(missing)) for row, missing in unknown_tags])
             raise BadRequest(f"Unknown tag IDs on rows that update an existing PV: {listed}")
 
         # Every check has passed; from here on the import only writes.
@@ -590,19 +634,14 @@ class PvService:
         # out-of-scope facility: import creates new rows, so the create-time "must name
         # a facility you hold" rule applies, not the looser existing-row write rule.
         ids_by_slug = await self._resolve_slugs({slug for row in rows for slug in row.data.facilities})
-        refused: list[tuple[int, str, list[str]]] = []
+        refused: list[tuple[_ImportRow, str]] = []
         for row in rows:
             row_facility_ids = {ids_by_slug[slug] for slug in row.data.facilities}
             if self.facility_scope is not None and not (row_facility_ids & self.facility_scope):
-                refused.append((row.row, row.identity_address, sorted(set(row.data.facilities))))
+                refused.append((row, ", ".join(sorted(set(row.data.facilities))) or "(none named)"))
         if refused:
-            unreachable = sorted({slug for _, _, slugs in refused for slug in slugs})
-            listed = "; ".join(
-                f"row {number} ({address}): {', '.join(slugs) or '(none named)'}"
-                for number, address, slugs in refused[:_REFUSED_ROWS_SHOWN]
-            )
-            if len(refused) > _REFUSED_ROWS_SHOWN:
-                listed += f"; and {len(refused) - _REFUSED_ROWS_SHOWN} more"
+            unreachable = sorted({slug for row, _ in refused for slug in row.data.facilities})
+            listed = _list_refused(refused)
             logger.warning(
                 "PV import refused: %d of %d rows name only facilities outside the key's grant (%s)",
                 len(refused),
@@ -624,10 +663,9 @@ class PvService:
     ) -> dict[str, set[str]]:
         """Apply ``update``'s facility rules to every registered PV an import would change.
 
-        A matched PV must be writable by the key (``_can_write``); a row providing
-        ``facilities`` may not unassign the PV with a restricted key, and every facility
-        it adds or removes must be in the grant (as ``_require_facility_containment``).
-        Every row is checked before refusing, so one 403 lists them all.
+        A matched PV must be writable by the key (``_can_write``), and a row providing
+        ``facilities`` must pass ``_facility_change_refusal``, the rule ``update`` applies
+        too. Every row is checked before refusing, so one 403 lists them all.
 
         The refusal does not name the facilities of a PV the key cannot write: the key
         gave only an address, and naming them would tell it where an out-of-scope PV is
@@ -665,20 +703,16 @@ class PvService:
             if "facilities" not in row.data.model_fields_set:
                 continue
             new_ids = {ids_by_slug[slug] for slug in row.data.facilities}
-            if not new_ids and self.facility_scope is not None:
+            refusal = self._facility_change_refusal(current, new_ids)
+            if refusal is None:
+                new_ids_by_pv[pv.id] = new_ids
+            elif refusal.reason == "unassign":
                 refused.append((row, "cannot unassign the PV's last facility"))
-                continue
-            if self.facility_scope is not None and (outside := (current ^ new_ids) - self.facility_scope):
-                slugs = ", ".join(sorted(slug_by_id[fid] for fid in outside))
+            else:
+                slugs = ", ".join(sorted(slug_by_id[fid] for fid in refusal.facility_ids))
                 refused.append((row, f"cannot add or remove facility(s) {slugs}"))
-                continue
-            new_ids_by_pv[pv.id] = new_ids
         if refused:
-            listed = "; ".join(
-                f"row {row.row} ({row.identity_address}): {reason}" for row, reason in refused[:_REFUSED_ROWS_SHOWN]
-            )
-            if len(refused) > _REFUSED_ROWS_SHOWN:
-                listed += f"; and {len(refused) - _REFUSED_ROWS_SHOWN} more"
+            listed = _list_refused(refused)
             logger.warning(
                 "PV import refused: the key may not update %d of %d registered PVs the import matches",
                 len(refused),
@@ -771,19 +805,13 @@ class PvService:
         await self._require_facility_write(facility_ids, "this PV")
         if data.facilities is not None:
             new_ids = set((await self._resolve_slugs(data.facilities)).values())
-            # A restricted key may not strip a PV down to unassigned: that would hide it
-            # from every facility-filtered read and hand write access to every other
-            # write-scoped key, including ones with no overlap with the key doing this.
-            # Holding every one of the PV's *current* facilities is not enough to grant
-            # that — unassigning is its own act, refused for any restricted key.
-            if not new_ids and self.facility_scope is not None:
+            refusal = self._facility_change_refusal(facility_ids, new_ids)
+            if refusal is not None and refusal.reason == "unassign":
                 raise InsufficientFacilityAccess(
                     "API key is scoped to specific facilities; cannot unassign this PV's last facility"
                 )
-            # Every facility being added or removed must be in the grant: "any overlap
-            # with the new set" would let a key holding just one of a PV's several
-            # facilities silently drop the others on an otherwise-permitted update.
-            await self._require_facility_containment(facility_ids ^ new_ids, "the requested change")
+            if refusal is not None:
+                await self._require_facility_containment(set(refusal.facility_ids), "the requested change")
             await self.pv_repo.set_facilities(pv_id, new_ids)
             facility_ids = new_ids
         if data.device is not None:
