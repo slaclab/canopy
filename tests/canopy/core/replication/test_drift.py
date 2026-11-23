@@ -168,6 +168,10 @@ class _Head:
         pass
 
 
+async def _all_ready(_mirror, _registry=None):
+    return {name: frozenset(REGISTRY.replicated) for name in ("arm1", "arm2")}
+
+
 @pytest.fixture
 def head_only(env, monkeypatch):
     """The head connects; no arm does (each arm's ``drift_check`` is replaced)."""
@@ -183,6 +187,7 @@ def head_only(env, monkeypatch):
 
     monkeypatch.setattr(drift.asyncpg, "connect", connect)
     monkeypatch.setattr(drift, "dangling", no_dangling)
+    monkeypatch.setattr(drift, "ready_tables", _all_ready)
     env(
         CANOPY_ROLE="mirror",
         CANOPY_INSTANCE="head",
@@ -208,7 +213,7 @@ async def test_an_arm_without_a_reader_connection_is_not_checked_and_the_others_
     assert report["status"] == "not_checked"
     assert "CANOPY_ARMS__ARM1__READER_DSN" in report["arms"]["arm1"]["error"]
     assert "could not connect" in report["arms"]["arm2"]["error"]
-    assert report["head"] == {"status": "in_step", "dangling": []}
+    assert report["head"] == {"status": "in_step", "dangling": [], "pending": []}
 
 
 async def test_a_failed_arm_never_shows_its_password(head_only, env, caplog, capsys):
@@ -387,3 +392,85 @@ def _report(**fields) -> dict:
 def test_only_a_complete_comparison_is_in_step(fields, expected):
     assert status(_report(**fields)) == expected
     assert EXIT[expected] == {"in_step": 0, "drift": 1, "not_checked": 2}[expected]
+
+
+def _one_arm_copying(table: str):
+    async def ready(_mirror, _registry=None):
+        tables = await _all_ready(_mirror)
+        return {**tables, "arm2": tables["arm2"] - {table}}
+
+    return ready
+
+
+@pytest.mark.parametrize(
+    ("owner", "copying", "expected", "arm_statuses", "head_status"),
+    [
+        # An arm's row, while that arm's copy of a table it involves is still running.
+        ("arm2", "squirrel.tag", 2, {"arm1": "in_step", "arm2": "not_checked"}, "in_step"),
+        ("arm2", "squirrel.pv_tag", 2, {"arm1": "in_step", "arm2": "not_checked"}, "in_step"),
+        # Another arm still copying that table doesn't make arm1's row early.
+        ("arm1", "squirrel.tag", 1, {"arm1": "drift", "arm2": "in_step"}, "in_step"),
+        # A row nobody can be found to own, while any arm is still copying.
+        (None, "squirrel.tag", 2, {"arm1": "in_step", "arm2": "in_step"}, "not_checked"),
+        # Nothing copying: drift.
+        ("arm2", None, 1, {"arm1": "in_step", "arm2": "drift"}, "in_step"),
+        (None, None, 1, {"arm1": "in_step", "arm2": "in_step"}, "drift"),
+    ],
+)
+async def test_a_row_whose_table_is_still_copying_is_pending_not_drift(
+    head_only, env, monkeypatch, capsys, owner, copying, expected, arm_statuses, head_status
+):
+    """A child copied before its parent looks dangling until the parent's copy finishes."""
+    env(
+        CANOPY_ARMS__ARM1__READER_DSN="postgresql://r:pw@arm1-db/db",
+        CANOPY_ARMS__ARM2__READER_DSN="postgresql://r:pw@arm2-db/db",
+    )
+
+    async def connect(dsn, **_kwargs):
+        return _Head()
+
+    async def drift_check(_primary, _mirror, *, arm, **_kwargs):
+        return _arm_report("in_step")
+
+    async def found(_mirror, _registry=None):
+        return _owned_by(owner)
+
+    monkeypatch.setattr(drift.asyncpg, "connect", connect)
+    monkeypatch.setattr(drift, "drift_check", drift_check)
+    monkeypatch.setattr(drift, "dangling", found)
+    if copying:
+        monkeypatch.setattr(drift, "ready_tables", _one_arm_copying(copying))
+    assert await drift.run(ARGS) == expected
+    report = json.loads(capsys.readouterr().out)
+    assert {name: r["status"] for name, r in report["arms"].items()} == arm_statuses
+    assert report["head"]["status"] == head_status
+    holder = report["arms"][owner] if owner else report["head"]
+    assert holder["pending" if expected == 2 else "dangling"] == _owned_by(owner)
+
+
+@pytest.mark.parametrize(("arm_status", "expected"), [("drift", 1), ("in_step", 2)])
+async def test_a_failed_head_check_keeps_the_arms_reports(
+    head_only, env, monkeypatch, capsys, caplog, arm_status, expected
+):
+    secret = "s3cret-reader-pw"
+    env(CANOPY_ARMS__ARM1__READER_DSN=f"postgresql://reader:{secret}@arm1-db/db")
+
+    async def connect(dsn, **_kwargs):
+        return _Head()
+
+    async def drift_check(_primary, _mirror, *, arm, **_kwargs):
+        return _arm_report(arm_status)
+
+    async def broken(_mirror, _registry=None):
+        raise RuntimeError(f"canceling statement due to statement timeout (postgresql://reader:{secret}@x)")
+
+    monkeypatch.setattr(drift.asyncpg, "connect", connect)
+    monkeypatch.setattr(drift, "drift_check", drift_check)
+    monkeypatch.setattr(drift, "dangling", broken)
+    assert await drift.run(ARGS) == expected
+    out = capsys.readouterr().out
+    report = json.loads(out)
+    assert report["arms"]["arm1"]["status"] == arm_status
+    assert report["head"]["status"] == "not_checked"
+    assert "statement timeout" in report["head"]["error"]
+    assert secret not in out and secret not in caplog.text
