@@ -432,6 +432,11 @@ class PvRepository(BaseRepository[Pv]):
     def _any_address(address: str) -> ColumnElement[bool]:
         return or_(Pv.setpoint_address == address, Pv.readback_address == address, Pv.config_address == address)
 
+    async def owner_of(self, pv_id: str) -> str | None:
+        """The PV's ``owner_instance``, or ``None`` when there's no such live PV."""
+        query = select(Pv.owner_instance).where(Pv.id == pv_id, Pv.deleted_at.is_(None))
+        return (await self.session.execute(query)).scalar_one_or_none()
+
     async def owners_by_address(self, address: str) -> set[str]:
         """The owners of the live PVs holding ``address`` as any of their addresses."""
         result = await self.session.execute(
@@ -710,10 +715,37 @@ class PvRepository(BaseRepository[Pv]):
         return list(result.tuples().all())
 
     async def bulk_create(self, pvs: list[Pv]) -> list[Pv]:
+        """Insert PVs and reload them from the database.
+
+        The reload is one ``get_by_ids`` call rather than one ``refresh`` per row, so a
+        large import costs a handful of queries instead of one per PV. The flushed PVs are
+        already in the identity map, so the reload overwrites those same objects like
+        ``refresh`` would, leaving every column and each PV's tags loaded for use outside
+        an async lazy load.
+
+        Parameters
+        ----------
+        pvs : list[Pv]
+            New PVs, and deleted ones being restored (already in the session).
+
+        Returns
+        -------
+        list[Pv]
+            ``pvs`` itself, reloaded, so in the order given.
+
+        Raises
+        ------
+        RuntimeError
+            If the reload doesn't return every flushed PV, which would leave the missing
+            ones half-loaded.
+        """
+        if not pvs:
+            return []
         self.session.add_all(pvs)
         await self.session.flush()
-        for pv in pvs:
-            await self.session.refresh(pv)
+        reloaded = await self.get_by_ids([pv.id for pv in pvs], populate_existing=True)
+        if len(reloaded) != len(pvs):
+            raise RuntimeError(f"Reloaded {len(reloaded)} of {len(pvs)} created PVs")
         return pvs
 
     async def facility_ids_for(self, pv_id: str) -> set[str]:
@@ -750,11 +782,9 @@ class PvRepository(BaseRepository[Pv]):
             )
 
     async def clear_facilities_many(self, pv_ids: list[str]) -> None:
-        """Remove every facility assignment of the given PVs, batched like ``get_by_ids``."""
-        for i in range(0, len(pv_ids), PARAM_BATCH_SIZE):
-            await self.session.execute(
-                delete(pv_facility).where(pv_facility.c.pv_id.in_(pv_ids[i : i + PARAM_BATCH_SIZE]))
-            )
+        """Remove every facility assignment of the given PVs, in one statement like ``get_by_ids``."""
+        if pv_ids:
+            await self.session.execute(delete(pv_facility).where(pv_facility.c.pv_id == any_(_uuid_array(pv_ids))))
 
     async def add_facilities_many(self, assignments: list[tuple[str, set[str]]]) -> None:
         """Bulk-insert ``(pv_id, facility_ids)`` assignments for freshly created PVs."""
@@ -766,33 +796,37 @@ class PvRepository(BaseRepository[Pv]):
         self, ids: list[str], *, include_deleted: bool = False, owner: str | None = None
     ) -> set[str]:
         """The subset of ``ids`` that are PVs here, without loading the rows; ``owner``'s only, if given."""
-        existing: set[str] = set()
-        for i in range(0, len(ids), PARAM_BATCH_SIZE):
-            query = select(Pv.id).where(Pv.id.in_(ids[i : i + PARAM_BATCH_SIZE]))
-            if not include_deleted:
-                query = query.where(Pv.deleted_at.is_(None))
-            if owner is not None:
-                query = query.where(Pv.owner_instance == owner)
-            existing.update((await self.session.execute(query)).scalars())
-        return existing
+        if not ids:
+            return set()
+        query = select(Pv.id).where(Pv.id == any_(_uuid_array(ids)))
+        if not include_deleted:
+            query = query.where(Pv.deleted_at.is_(None))
+        if owner is not None:
+            query = query.where(Pv.owner_instance == owner)
+        return set((await self.session.execute(query)).scalars())
 
-    async def get_by_ids(self, ids: list[str], *, include_deleted: bool = False) -> list[Pv]:
-        """Get many PVs by id, batched under the Postgres parameter limit.
+    async def get_by_ids(
+        self, ids: list[str], *, include_deleted: bool = False, populate_existing: bool = False
+    ) -> list[Pv]:
+        """Get many PVs by id in one query.
 
-        Deleted PVs come back only with ``include_deleted``, which a past snapshot's
-        values need to keep their addresses, tags and tolerances.
+        The ids go as a single ``uuid[]`` parameter (``= ANY(...)``), so the SQL is the same
+        for any number of ids, which lets asyncpg reuse its prepared statement, and it never
+        nears the Postgres parameter limit. Rows come back in database order, not in the
+        order of ``ids``. With ``populate_existing``, PVs already in the session are
+        overwritten with the database's values, as ``session.refresh`` would. Deleted PVs
+        come back only with ``include_deleted``, which a past snapshot's values need to keep
+        their addresses, tags and tolerances.
         """
         if not ids:
             return []
-        all_pvs: list[Pv] = []
-        for i in range(0, len(ids), PARAM_BATCH_SIZE):
-            batch_ids = ids[i : i + PARAM_BATCH_SIZE]
-            query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.id.in_(batch_ids))
-            if not include_deleted:
-                query = query.where(Pv.deleted_at.is_(None))
-            result = await self.session.execute(query)
-            all_pvs.extend(result.scalars().all())
-        return all_pvs
+        query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.id == any_(_uuid_array(ids)))
+        if not include_deleted:
+            query = query.where(Pv.deleted_at.is_(None))
+        if populate_existing:
+            query = query.execution_options(populate_existing=True)
+        result = await self.session.execute(query)
+        return list(result.scalars().all())
 
     async def search_filtered(
         self,

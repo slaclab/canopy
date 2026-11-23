@@ -12,6 +12,12 @@ the app stamps every insert, and replication carries the stamp to a mirror.
 Later data steps on owned tables run on every instance, filtered to
 ``owner_instance = local_instance()``.
 
+An older image can't insert into the owned tables once this has run, so stop its
+API and workers first, and downgrade before rolling back to it (see "Upgrade" in
+``docs/deployment/production.md``). The downgrade refuses while any owned table
+holds another instance's rows, since it would drop their stamps and a later upgrade
+would stamp them with this instance's name.
+
 Revision ID: 89e21441c63c
 Revises: 18ac64c44669
 Create Date: 2026-11-06 12:00:00.000000
@@ -62,29 +68,32 @@ def upgrade() -> None:
     op.create_index("ix_squirrel_snapshot_owner_instance", "snapshot", ["owner_instance"], schema="squirrel")
 
 
-def _refuse_cross_owner_duplicates(table: str, column: str) -> None:
-    """Downgrading puts back a unique index across owners, which two owners' rows would break."""
-    duplicates = (
-        op.get_bind()
-        .execute(
-            sa.text(
-                f"SELECT {column} FROM squirrel.{table} WHERE {column} IS NOT NULL "
-                f"GROUP BY {column} HAVING count(*) > 1 ORDER BY {column} LIMIT 5"
+def _refuse_other_owners() -> None:
+    """Downgrading drops every stamp, so it can't run while another instance's rows are here."""
+    bind, instance = op.get_bind(), get_settings().instance
+    for schema, table in OWNED_TABLES:
+        owners = (
+            bind.execute(
+                sa.text(
+                    f"SELECT DISTINCT owner_instance FROM {schema}.{table} "
+                    "WHERE owner_instance <> :instance ORDER BY owner_instance LIMIT 5"
+                ).bindparams(instance=instance)
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    if duplicates:
-        raise RuntimeError(
-            f"cannot downgrade: squirrel.{table}.{column} has values shared by more than one owner "
-            f"({', '.join(duplicates)}); remove the duplicates first"
-        )
+        if owners:
+            raise RuntimeError(
+                f"cannot downgrade: {schema}.{table} holds rows owned by {', '.join(owners)}, not "
+                f"'{instance}'; downgrading would drop their owner, and an upgrade would stamp them "
+                f"'{instance}'"
+            )
 
 
 def downgrade() -> None:
-    _refuse_cross_owner_duplicates("pv", "setpoint_address")
-    _refuse_cross_owner_duplicates("tag_group", "name")
+    # Every row is this instance's, so no address or name is shared by two owners,
+    # and the unique indexes below can return.
+    _refuse_other_owners()
 
     op.drop_index("ix_squirrel_snapshot_owner_instance", table_name="snapshot", schema="squirrel")
 
