@@ -129,6 +129,18 @@ async def test_stop_closes_monitors_still_in_grace(fake_connector):
     assert not broker._grace
 
 
+async def test_a_release_after_stop_is_not_kept_warm(fake_connector):
+    """A client removed after stop() (a WebSocket handler finishing late) leaves no grace task behind."""
+    broker = PVBroker(fake_connector, HareConfig(monitor_grace_seconds=60.0))
+    broker.add_client("c1", FakeWebSocket())
+    await broker.subscribe("c1", ["LIVE:1"])
+    await broker.stop()
+
+    await broker.remove_client("c1")
+    assert not broker._grace
+    assert "LIVE:1" not in broker._seed_locks
+
+
 async def test_zero_grace_releases_at_once(fake_connector):
     broker = PVBroker(fake_connector, HareConfig(monitor_grace_seconds=0))
     broker.add_client("c1", FakeWebSocket())
