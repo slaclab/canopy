@@ -21,6 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import canopy.magpie.data.models  # noqa: F401 — register magpie tables on Base.metadata
 from canopy.core.db import Base, get_session
 from canopy.magpie.app import app as magpie_app
+from canopy.core.modules import tag_module
+
+# canopy.main tags each app with its module as it mounts it. These tests serve the app
+# unmounted, so the app is tagged here, for every test file that uses it.
+tag_module(magpie_app, "magpie")
 
 # Overridable so CI (or a non-default Postgres) can point these elsewhere.
 TEST_DATABASE_URL = os.environ.get(
