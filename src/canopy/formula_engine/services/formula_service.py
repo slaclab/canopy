@@ -73,8 +73,7 @@ class FormulaService:
         if t0_ns < 0:
             t0_ns = t1_ns + t0_ns
 
-        self._validate_bindings(spec)
-        parsed = self._parser.parse(spec.expression, spec.bindings)
+        parsed = self.check_spec(spec)
 
         match spec.kind:
             case "scalar":
@@ -92,13 +91,44 @@ class FormulaService:
         try:
             if spec.kind == "table":
                 return FormulaValidationResult(valid=True, tokens=self.check_table(spec))
-            self._validate_bindings(spec)
-            parsed = self._parser.parse(spec.expression, spec.bindings)
+            parsed = self.check_spec(spec)
             return FormulaValidationResult(valid=True, tokens=parsed.tokens)
-        except FormulaCircularReference as exc:
-            return FormulaValidationResult(valid=False, errors=[str(exc)])
         except Exception as exc:
             return FormulaValidationResult(valid=False, errors=[str(exc)])
+
+    def check_spec(self, spec: FormulaSpec) -> ParsedFormula:
+        """Check that a spec can be evaluated and return its parsed expression.
+
+        Checks the bindings and parses the expression without touching the
+        data source. `evaluate` and `validate` run this check, and the
+        WebSocket endpoint and subscription manager call it before subscribing
+        to any of the spec's PVs. A table has no single expression and is
+        checked by `check_table` instead.
+
+        Parameters
+        ----------
+        spec : FormulaSpec
+            Formula to check.
+
+        Returns
+        -------
+        ParsedFormula
+            The parsed expression.
+
+        Raises
+        ------
+        FormulaCircularReference
+            If a binding uses the ``formula:`` or retired ``fox:`` prefix.
+        InvalidPVName
+            If a binding is not a well-formed PV name.
+        FormulaParseError
+            If the expression does not parse or its variables do not match
+            the bindings.
+        FormulaUnsafeError
+            If the expression uses a construct that is not allowed.
+        """
+        self._validate_bindings(spec)
+        return self._parser.parse(spec.expression, spec.bindings)
 
     def _validate_bindings(self, spec: FormulaSpec) -> None:
         """Bindings must resolve to well-formed PV names only.
