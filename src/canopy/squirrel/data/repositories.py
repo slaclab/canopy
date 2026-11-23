@@ -736,11 +736,9 @@ class PvRepository(BaseRepository[Pv]):
             )
 
     async def clear_facilities_many(self, pv_ids: list[str]) -> None:
-        """Remove every facility assignment of the given PVs, batched under the parameter limit."""
-        for i in range(0, len(pv_ids), PARAM_BATCH_SIZE):
-            await self.session.execute(
-                delete(pv_facility).where(pv_facility.c.pv_id.in_(pv_ids[i : i + PARAM_BATCH_SIZE]))
-            )
+        """Remove every facility assignment of the given PVs, in one statement like ``get_by_ids``."""
+        if pv_ids:
+            await self.session.execute(delete(pv_facility).where(pv_facility.c.pv_id == any_(_uuid_array(pv_ids))))
 
     async def add_facilities_many(self, assignments: list[tuple[str, set[str]]]) -> None:
         """Bulk-insert ``(pv_id, facility_ids)`` assignments for freshly created PVs."""
