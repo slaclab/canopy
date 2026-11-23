@@ -85,8 +85,8 @@ before deleting a facility on an arm, and re-grant them afterwards.
 The names are the defaults of `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_ROLE`
 and `__APP_ROLE`. Each arm's `pg_hba.conf` admits `replicator` and `canopy_reader`
 over `hostssl` with SCRAM from the head's network only. The head reaches each arm
-with two secrets: `CANOPY_ARMS__<arm>__PUBLISHER_DSN` (libpq, as the replication
-role) and `CANOPY_ARMS__<arm>__READER_DSN` (a `postgresql://` URI, as the reader role).
+with two secrets, each a `postgresql://` URI: `CANOPY_ARMS__<arm>__PUBLISHER_DSN`, as the
+replication role, and `CANOPY_ARMS__<arm>__READER_DSN`, as the reader role.
 
 Each arm's Postgres needs `wal_level = logical`, enough `max_replication_slots`
 and `max_wal_senders`, and `max_slot_wal_keep_size` set **before the first slot
