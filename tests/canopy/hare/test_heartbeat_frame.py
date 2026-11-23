@@ -12,7 +12,11 @@ from the last one pushed, then calls the connector's ``statement_sent()``. The
 keep-alive loop never calls it.
 """
 
+import enum
+import json
+import types
 import asyncio
+import datetime
 from dataclasses import field, dataclass
 
 import pytest
@@ -158,6 +162,75 @@ def test_add_client_alone_sends_nothing():
     channel = FakeWebSocket()
     broker.add_client("in-process", channel)
     assert channel.sent == []
+
+
+# --- a value JSON cannot encode ----------------------------------------------- #
+
+
+class JsonChannel(FakeWebSocket):
+    """A channel that encodes each frame as the WebSocket does, so a bad value raises."""
+
+    async def send_json(self, data) -> None:
+        self.sent.append(json.loads(json.dumps(data, allow_nan=False)))
+
+
+def _unencodable_connector() -> StatementConnector:
+    return StatementConnector(
+        binding=object(),
+        reachable={"state": "no", "since": datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC), "reason": None},
+        writes=types.MappingProxyType({"state": "locked", "reason": float("nan"), "cause": None}),
+    )
+
+
+def test_an_unencodable_value_reads_null_and_the_rest_is_kept(caplog):
+    caplog.set_level("WARNING", logger="canopy.hare.services.broker")
+    broker = PVBroker(_unencodable_connector(), _config())
+    for _ in range(3):
+        frame = broker.heartbeat_frame()
+    json.dumps(frame, allow_nan=False)
+    assert (frame["label"], frame["binding"]) == ("Test ring", None)
+    assert frame["reachable"] == {"state": "no", "since": None, "reason": None}
+    # The lock survives its bad reason: a null `writes` would read as writable.
+    assert frame["writes"] == {"state": "locked", "reason": None, "cause": None}
+    warned = sorted(r.args[0] for r in caplog.records if "JSON cannot encode" in r.getMessage())
+    assert warned == ["binding", "reachable", "writes"]
+
+
+def test_an_unencodable_state_reads_unknown_never_null():
+    """A null `state` could read as no claim, so writable; `unknown` never is."""
+    locked = enum.Enum("WriteState", ["LOCKED"]).LOCKED
+    connector = StatementConnector(writes={"state": locked, "reason": "locked by an operator", "cause": None})
+    frame = PVBroker(connector, _config()).heartbeat_frame()
+    assert frame["writes"] == {"state": "unknown", "reason": "locked by an operator", "cause": None}
+
+
+async def test_an_unencodable_statement_neither_stops_start_nor_drops_clients():
+    connector = _unencodable_connector()
+    broker = PVBroker(connector, _config(ws_batch_interval_ms=100, heartbeat_interval_s=KEEP_ALIVE))
+    clock = FakeClock()
+    broker._sleep = clock.sleep
+    channel = JsonChannel()
+    broker.add_client("c0", channel)
+    await broker.start()
+    await clock.advance(0)
+    try:
+        connector.notice = "changed"
+        await clock.advance(TICK)
+        for _ in range(TICKS_PER_KEEP_ALIVE):
+            await clock.advance(TICK)
+        assert "c0" in broker._channels
+        assert [b["writes"]["state"] for b in _beats(channel)] == ["locked", "locked"]
+    finally:
+        await broker.stop()
+
+
+def test_ws_first_frame_survives_an_unencodable_statement():
+    broker = PVBroker(_unencodable_connector(), _config())
+    with TestClient(_app(broker)) as client:
+        with client.websocket_connect("/ws/pvs") as ws:
+            first = ws.receive_json()
+            assert first["type"] == "heartbeat"
+            assert first["writes"] == {"state": "locked", "reason": None, "cause": None}
 
 
 # --- the machine-statement vectors -------------------------------------------- #

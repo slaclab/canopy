@@ -51,6 +51,9 @@ NEVER_OBSERVE_S = 2.5
 # After an outage, the drop is reported and the values are back within these.
 DROP_REPORT_S = 2.0
 RESTORE_TIMEOUT_S = 10.0
+# No single connector call may take longer than this, so a backend that hangs fails the
+# case instead of stalling the run.
+CALL_TIMEOUT_S = 15.0
 
 _POLL_S = 0.02
 
@@ -132,6 +135,17 @@ async def _wait_for(predicate: Callable[[], bool], timeout: float) -> bool:
         await asyncio.sleep(_POLL_S)
 
 
+async def _bounded(call: Awaitable, what: str):
+    """Await one connector call, failing the case when it outlasts `CALL_TIMEOUT_S`."""
+    try:
+        async with asyncio.timeout(CALL_TIMEOUT_S) as scope:
+            return await call
+    except TimeoutError:
+        if scope.expired():
+            raise AssertionError(f"{what} did not return within {CALL_TIMEOUT_S} s") from None
+        raise
+
+
 def _check_events(events: list[PVValue], pv: str, kind: str) -> None:
     """What holds for every event of a monitor on a served PV."""
     for event in events:
@@ -157,12 +171,12 @@ async def _case_get(factory: ConnectorFactory, driver: ConformanceDriver, kind: 
     first, _ = _VALUES[kind]
     await driver.set_value(pv, first)
     connector = factory()
-    await connector.start()
+    await _bounded(connector.start(), "start()")
     try:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + VALUE_TIMEOUT_S
         while True:
-            value = await connector.get(pv)
+            value = await _bounded(connector.get(pv), f"get({pv!r})")
             if value.connected and _same(value.value, first):
                 break
             assert loop.time() < deadline, f"get({pv!r}) never returned {first!r}; last answer: {value!r}"
@@ -170,7 +184,7 @@ async def _case_get(factory: ConnectorFactory, driver: ConformanceDriver, kind: 
         assert value.pv == pv, f"get({pv!r}) answered for {value.pv!r}"
         assert value.value_kind is _EXPECTED_KIND[kind], f"{pv}: a {kind} PV was read as {value.value_kind.value}"
     finally:
-        await connector.close()
+        await _bounded(connector.close(), "close()")
 
 
 async def _case_monitor(factory: ConnectorFactory, driver: ConformanceDriver, kind: str, form: str) -> None:
@@ -179,10 +193,10 @@ async def _case_monitor(factory: ConnectorFactory, driver: ConformanceDriver, ki
     first, second = _VALUES[kind]
     await driver.set_value(pv, first)
     connector = factory()
-    await connector.start()
+    await _bounded(connector.start(), "start()")
     events: list[PVValue] = []
     try:
-        subscription = await connector.subscribe(pv, events.append)
+        subscription = await _bounded(connector.subscribe(pv, events.append), f"subscribe({pv!r})")
         try:
             assert await _wait_for(lambda: _has_value(events, first), VALUE_TIMEOUT_S), (
                 f"monitor on {pv!r} never delivered the current value {first!r}; got {events!r}"
@@ -192,10 +206,10 @@ async def _case_monitor(factory: ConnectorFactory, driver: ConformanceDriver, ki
                 f"monitor on {pv!r} never delivered the new value {second!r}; got {events!r}"
             )
         finally:
-            await subscription.close()
+            await _bounded(subscription.close(), "Subscription.close()")
         _check_events(events, pv, kind)
     finally:
-        await connector.close()
+        await _bounded(connector.close(), "close()")
 
 
 async def _case_never(factory: ConnectorFactory, driver: ConformanceDriver, form: str) -> None:
@@ -206,20 +220,20 @@ async def _case_never(factory: ConnectorFactory, driver: ConformanceDriver, form
     """
     pv = driver.pv(NEVER, form)
     connector = factory()
-    await connector.start()
+    await _bounded(connector.start(), "start()")
     events: list[PVValue] = []
     try:
-        subscription = await connector.subscribe(pv, events.append)
+        subscription = await _bounded(connector.subscribe(pv, events.append), f"subscribe({pv!r})")
         try:
             await asyncio.sleep(NEVER_OBSERVE_S)
         finally:
-            await subscription.close()
+            await _bounded(subscription.close(), "Subscription.close()")
         for event in events:
             assert event.connected is False, f"never-connecting {pv!r} was reported connected: {event!r}"
             assert event.value is None, f"never-connecting {pv!r} carries the value {event.value!r}"
             assert event.pv == pv, f"event names {event.pv!r}, the monitor was opened on {pv!r}"
     finally:
-        await connector.close()
+        await _bounded(connector.close(), "close()")
 
 
 async def _case_drop_restore(factory: ConnectorFactory, driver: ConformanceDriver, form: str) -> None:
@@ -232,10 +246,10 @@ async def _case_drop_restore(factory: ConnectorFactory, driver: ConformanceDrive
     first, second = _VALUES["scalar"]
     await driver.set_value(pv, first)
     connector = factory()
-    await connector.start()
+    await _bounded(connector.start(), "start()")
     events: list[PVValue] = []
     try:
-        subscription = await connector.subscribe(pv, events.append)
+        subscription = await _bounded(connector.subscribe(pv, events.append), f"subscribe({pv!r})")
         try:
             assert await _wait_for(lambda: _has_value(events, first), VALUE_TIMEOUT_S), (
                 f"monitor on {pv!r} never delivered the current value {first!r}; got {events!r}"
@@ -256,10 +270,10 @@ async def _case_drop_restore(factory: ConnectorFactory, driver: ConformanceDrive
                 f"monitor on {pv!r} did not recover within {RESTORE_TIMEOUT_S} s; got {events[before:]!r}"
             )
         finally:
-            await subscription.close()
+            await _bounded(subscription.close(), "Subscription.close()")
         _check_events(events, pv, "scalar")
     finally:
-        await connector.close()
+        await _bounded(connector.close(), "close()")
 
 
 def _bind(fn, *args) -> Callable[[ConnectorFactory, ConformanceDriver], Awaitable[None]]:

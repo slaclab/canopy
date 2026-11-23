@@ -29,7 +29,7 @@ async def test_list_facilities(facilities_client, session, session_maker, fake_k
     slugs = {f["slug"] for f in r.json()}
     assert {"lcls", "lcls-sc"} <= slugs
     sc = next(f for f in r.json() if f["slug"] == "lcls-sc")
-    assert sc["parentId"] == lcls.id
+    assert sc["parent"] == "lcls"
 
 
 async def test_facilities_require_read_auth(facilities_client):
@@ -56,14 +56,14 @@ async def test_create_then_read_back(facilities_client, session_maker, fake_keys
     )
     assert created.status_code == 200, created.text
     assert created.json()["slug"] == "lcls"
-    assert created.json()["parentId"] is None
+    assert created.json()["parent"] is None
 
     listed = facilities_client.get("/v1/facilities", headers=READ_HEADERS)
     assert [f["slug"] for f in listed.json()] == ["lcls"]
 
 
 async def test_create_child_by_parent_slug(facilities_client, session_maker, fake_keys):
-    parent = facilities_client.post("/v1/facilities", json={"slug": "lcls", "name": "LCLS"}, headers=ADMIN_HEADERS)
+    facilities_client.post("/v1/facilities", json={"slug": "lcls", "name": "LCLS"}, headers=ADMIN_HEADERS)
     child = facilities_client.post(
         "/v1/facilities",
         json={"slug": "lcls-sc", "name": "LCLS-II SC", "parent": "lcls"},
@@ -71,9 +71,7 @@ async def test_create_child_by_parent_slug(facilities_client, session_maker, fak
     )
 
     assert child.status_code == 200, child.text
-    # The request names the parent by slug; the response reports it by id, which is
-    # what a client walks to assemble the tree.
-    assert child.json()["parentId"] == parent.json()["id"]
+    assert child.json()["parent"] == "lcls"
 
 
 async def test_create_rejects_unknown_parent_slug(facilities_client, session_maker, fake_keys):
@@ -128,7 +126,7 @@ async def test_create_rejects_a_slug_reserved_by_react_squirrels_routes(faciliti
 
 async def test_update_name_and_reparent_by_slug(facilities_client, session_maker, fake_keys):
     facilities_client.post("/v1/facilities", json={"slug": "lcls", "name": "LCLS"}, headers=ADMIN_HEADERS)
-    lcls2 = facilities_client.post("/v1/facilities", json={"slug": "lcls2", "name": "LCLS 2"}, headers=ADMIN_HEADERS)
+    facilities_client.post("/v1/facilities", json={"slug": "lcls2", "name": "LCLS 2"}, headers=ADMIN_HEADERS)
     facilities_client.post(
         "/v1/facilities", json={"slug": "lcls-sc", "name": "SC", "parent": "lcls"}, headers=ADMIN_HEADERS
     )
@@ -141,7 +139,7 @@ async def test_update_name_and_reparent_by_slug(facilities_client, session_maker
 
     assert r.status_code == 200, r.text
     assert r.json()["name"] == "LCLS-II Superconducting"
-    assert r.json()["parentId"] == lcls2.json()["id"]
+    assert r.json()["parent"] == "lcls2"
     assert r.json()["slug"] == "lcls-sc"
 
 
@@ -219,3 +217,73 @@ async def test_admin_without_facility_wildcard_may_list_but_not_write(facilities
     listed = facilities_client.get("/v1/facilities", headers=READ_HEADERS)
     assert listed.status_code == 200
     assert [f["name"] for f in listed.json()] == ["LCLS"]
+
+
+# --- GET /v1/facilities/access ------------------------------------------------ #
+
+
+async def _seed_access_hierarchy(session) -> None:
+    """``lcls`` with children ``lcls-sc``/``lcls-nc``, plus an unrelated ``facet``."""
+    lcls = await _seed_facility(session, "lcls")
+    await _seed_facility(session, "lcls-sc", parent_id=lcls.id)
+    await _seed_facility(session, "lcls-nc", parent_id=lcls.id)
+    await _seed_facility(session, "facet")
+
+
+async def test_access_expands_a_parent_grant_to_its_children(facilities_client, session, session_maker, fake_keys):
+    await _seed_access_hierarchy(session)
+
+    r = facilities_client.get("/v1/facilities/access", headers={"X-API-Key": "test-lcls"})
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"unrestricted": False, "facilities": ["lcls", "lcls-nc", "lcls-sc"]}
+
+
+async def test_access_lists_each_granted_facility(facilities_client, session, session_maker, fake_keys):
+    await _seed_access_hierarchy(session)
+
+    r = facilities_client.get("/v1/facilities/access", headers={"X-API-Key": "test-sc-facet"})
+
+    assert r.json() == {"unrestricted": False, "facilities": ["facet", "lcls-sc"]}
+
+
+async def test_access_reports_a_wildcard_grant_as_unrestricted(facilities_client, session, session_maker, fake_keys):
+    await _seed_access_hierarchy(session)
+
+    r = facilities_client.get("/v1/facilities/access", headers={"X-API-Key": "test-wild"})
+
+    assert r.json() == {"unrestricted": True, "facilities": []}
+
+
+async def test_access_for_a_key_with_no_grant_is_empty(facilities_client, session, session_maker, fake_keys):
+    """An admin key reports its own grant like any other key — here none — rather than
+    being treated as unrestricted, matching how the facility gates enforce it.
+
+    Uses the scoped-admin key (``admin``, no facility grant), not ``ADMIN_HEADERS``:
+    the wildcard-facility admin key is what the hierarchy-write tests need, so it no
+    longer doubles as a no-grant admin for this one.
+    """
+    await _seed_access_hierarchy(session)
+
+    r = facilities_client.get("/v1/facilities/access", headers=SCOPED_ADMIN_HEADERS)
+
+    assert r.json() == {"unrestricted": False, "facilities": []}
+
+
+async def test_access_is_reachable_by_a_write_only_key(facilities_client, session, session_maker, fake_keys):
+    """Gated on any authenticated key, not `read` specifically: a write-only,
+    facility-scoped key needs to check its own reach before writing as much as a
+    read key does."""
+    await _seed_access_hierarchy(session)
+
+    r = facilities_client.get("/v1/facilities/access", headers={"X-API-Key": "test-write-only"})
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"unrestricted": False, "facilities": ["lcls", "lcls-nc", "lcls-sc"]}
+
+
+async def test_access_requires_auth_and_core_module_access(facilities_client, session, session_maker, fake_keys):
+    assert facilities_client.get("/v1/facilities/access").status_code == 401
+    r = facilities_client.get("/v1/facilities/access", headers={"X-API-Key": "test-squirrel-only"})
+    assert r.status_code == 403
+    assert r.json()["code"] == "insufficient_module_access"

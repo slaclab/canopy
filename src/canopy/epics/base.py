@@ -235,6 +235,12 @@ class ConnectorStatement(Protocol):
       ``asked`` asks a person before each write (the PUT then carries
       ``confirmed``), ``held`` is a watchdog's hold on the session.
 
+    The statement is one per connector, not per user: every client with read
+    access receives the same frame, so keep host names, user names and other
+    private detail out of it. A value JSON cannot encode is sent as ``None``;
+    inside ``reachable`` or ``writes`` only that entry is, and a ``state`` that
+    cannot be encoded reads ``unknown``.
+
     The broker compares (label, notice, binding, reachable, writes) on every
     flush tick and sends the heartbeat at once when it changed, then calls
     `statement_sent`, so a connector can tell when its new statement is out.

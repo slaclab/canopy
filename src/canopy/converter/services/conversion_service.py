@@ -8,11 +8,15 @@ unknown widgets, hoisted formulas) for the API layer.
 
 from __future__ import annotations
 
+import os
+import re
 import logging
+import tempfile
 from typing import Any, Literal, get_args
 from pathlib import Path
 from dataclasses import dataclass
 from collections.abc import Iterator, Sequence
+from xml.etree.ElementTree import ParseError
 
 from pydmconverter.react import convert_bytes
 from pydmconverter.ir.emit import to_wire_dict
@@ -23,6 +27,11 @@ from pydmconverter.ir.registry import VendoredRegistry
 from canopy.converter.errors import ConversionFailed, UnsupportedInput
 
 logger = logging.getLogger(__name__)
+
+# What pydmconverter's parsers raise for a malformed screen: a bad number or a
+# missing root element (ValueError) or broken XML (ParseError). These are the
+# client's input, so they log one warning line rather than a traceback.
+_INPUT_ERRORS = (ValueError, ParseError)
 
 # The placeholder node type the builder emits for any class it cannot resolve
 # (pydmconverter.ir.builder.UNKNOWN_WIDGET_TYPE, D11). Kept in sync by test.
@@ -128,11 +137,17 @@ class ConversionService:
             # The catch stays broad on purpose: pydmconverter raises bare ValueError
             # *and* KeyError for legitimately malformed input, the same types a server
             # bug or API drift would raise, so the exception type cannot tell them
-            # apart. Mapping all of it to 422 keeps malformed input from 500ing; we log
-            # here so a genuine server-side bug is still observable in the traceback
-            # rather than silently masked as "your input is invalid".
-            logger.exception("convert_bytes failed for a %s screen", kind)
-            raise ConversionFailed(f"Failed to convert {kind} screen: {exc}") from exc
+            # apart. Mapping all of it to 422 keeps malformed input from 500ing. The
+            # parse errors in _INPUT_ERRORS log one warning line (with the traceback
+            # at DEBUG); anything else logs its traceback, so a genuine server-side
+            # bug is still observable rather than masked as "your input is invalid".
+            if isinstance(exc, _INPUT_ERRORS):
+                logger.warning(
+                    "could not convert a %s screen: %s", kind, exc, exc_info=logger.isEnabledFor(logging.DEBUG)
+                )
+            else:
+                logger.exception("convert_bytes failed for a %s screen", kind)
+            raise ConversionFailed(f"Failed to convert {kind} screen: {_without_staging_dir(str(exc))}") from exc
 
         wire = to_wire_dict(screen)
         errors = validate_screen_json(wire)
@@ -179,3 +194,14 @@ def _walk(node: WidgetNode) -> Iterator[WidgetNode]:
     yield node
     for child in node.children:
         yield from _walk(child)
+
+
+def _without_staging_dir(message: str) -> str:
+    """Drop the private directory ``convert_bytes`` stages an upload in from an error message.
+
+    Parser errors quote the staged file's full path (``<tmp>/pydmconv-XXXX/name.ui``);
+    the client is shown just the upload's name, not a server path.
+    """
+    tmp = tempfile.gettempdir()
+    roots = "|".join(re.escape(root) for root in sorted({tmp, os.path.realpath(tmp)}, key=len, reverse=True))
+    return re.sub(rf"(?:{roots})[/\\]pydmconv-[^/\\]+[/\\]", "", message)
