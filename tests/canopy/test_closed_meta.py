@@ -363,7 +363,7 @@ def test_the_query_parameter_does_not_open_an_http_route(closed_app):
     assert TestClient(closed_app).get("/?api_key=test-read").status_code == 401
 
 
-# --- Outside CORS ------------------------------------------------------------------
+# --- Inside CORS and the metrics -------------------------------------------------
 
 
 def test_a_keyless_preflight_is_answered_by_cors(closed_app):
@@ -383,7 +383,22 @@ def test_a_keyless_preflight_is_answered_by_cors(closed_app):
 def test_an_options_request_that_is_not_a_preflight_is_refused(closed_app, headers):
     resp = TestClient(closed_app).options("/hare/v1/health/summary", headers=headers)
     assert resp.status_code == 401
-    assert "access-control-allow-origin" not in resp.headers
+
+
+def test_a_refusal_carries_the_cors_headers_so_a_browser_can_read_it(closed_app):
+    resp = TestClient(closed_app).get("/docs", headers={"Origin": "https://example.org"})
+    assert resp.status_code == 401
+    assert resp.json() == REFUSAL
+    assert "access-control-allow-origin" in resp.headers
+
+
+def test_a_refusal_is_counted_in_the_metrics(closed_app):
+    from canopy.core.metrics import HTTP_REQUESTS
+
+    series = HTTP_REQUESTS.labels(method="GET", module="core", route="unmatched", status="401")
+    before = series._value.get()
+    TestClient(closed_app).get("/docs")
+    assert series._value.get() == before + 1
 
 
 def test_the_request_after_a_preflight_still_needs_a_key(closed_app):

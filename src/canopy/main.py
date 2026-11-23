@@ -89,13 +89,8 @@ def _route_path(scope: Scope) -> str:
 
 
 def _is_open(scope: Scope) -> bool:
-    """``GET /health`` and a CORS preflight pass the closed-meta gate."""
-    if scope["type"] != "http":
-        return False
-    if scope["method"] == "GET" and _route_path(scope) == "/health":
-        return True
-    headers = dict(scope["headers"])
-    return scope["method"] == "OPTIONS" and b"origin" in headers and b"access-control-request-method" in headers
+    """``GET /health`` passes the closed-meta gate."""
+    return scope["type"] == "http" and scope["method"] == "GET" and _route_path(scope) == "/health"
 
 
 class _ClosedMeta:
@@ -115,9 +110,10 @@ class _ClosedMeta:
     when the key store cannot answer and 403 ``insufficient_module_access`` for a
     key scoped elsewhere.
 
-    A CORS preflight (``OPTIONS`` with ``Origin`` and
-    ``Access-Control-Request-Method``) passes: a browser sends it without the key,
-    CORS answers it without routing, and the real request is still gated.
+    The gate sits inside CORSMiddleware and the HTTP metrics middleware. A CORS
+    preflight, which a browser sends without the key, is answered by CORS and
+    never reaches the gate; the real request is gated. A refusal carries the CORS
+    headers, so a browser client can read its 401, and is counted in ``/metrics``.
     """
 
     _DETAIL = "A valid API key is required"
@@ -248,7 +244,11 @@ def build_app(modules: Iterable[str] | str, *, closed_meta: bool | None = None) 
     app.state.modules = selected
     tag_module(app, "core")
 
-    # Registered first so it sits INSIDE CORSMiddleware (Starlette wraps in reverse
+    if closed_meta:
+        # Registered first, so it is the innermost layer: CORS answers a preflight
+        # before it, and its refusals get the CORS headers and are counted.
+        app.add_middleware(_ClosedMeta, router_app=app)
+    # Registered before CORSMiddleware so it sits INSIDE it (Starlette wraps in reverse
     # registration order): preflight OPTIONS requests that CORS answers itself never
     # reach the router, and counting them would only inflate the "unmatched" series.
     app.add_middleware(HTTPMetricsMiddleware)
@@ -260,10 +260,6 @@ def build_app(modules: Iterable[str] | str, *, closed_meta: bool | None = None) 
         allow_headers=["*"],
     )
     app.add_middleware(_SelectedModules, modules=frozenset(selected))
-    if closed_meta:
-        # Added last, so it is the outermost layer; it lets a CORS preflight
-        # through to CORSMiddleware and gates everything else.
-        app.add_middleware(_ClosedMeta, router_app=app)
 
     register_canopy_error_handler(app)
 
