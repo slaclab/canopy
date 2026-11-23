@@ -13,7 +13,7 @@ from canopy.epics.pv_protocol import validate_pv_name
 from canopy.formula_engine.ports import DataSource
 from canopy.formula_engine.config import FormulaEngineConfig
 from canopy.formula_engine.errors import FormulaCircularReference
-from canopy.formula_engine.services.parser import Parser
+from canopy.formula_engine.services.parser import Parser, ParsedFormula
 from canopy.formula_engine.services.scalar_evaluator import evaluate_scalar_formula
 from canopy.formula_engine.services.waveform_evaluator import evaluate_waveform_formula
 from canopy.formula_engine.services.timeseries_evaluator import (
@@ -37,8 +37,7 @@ class FormulaService:
         if t0_ns < 0:
             t0_ns = t1_ns + t0_ns
 
-        self._validate_bindings(spec)
-        parsed = self._parser.parse(spec.expression, spec.bindings)
+        parsed = self.check_spec(spec)
 
         match spec.kind:
             case "scalar":
@@ -54,13 +53,43 @@ class FormulaService:
     async def validate(self, spec: FormulaSpec) -> FormulaValidationResult:
         """Parse + AST-check without touching the data source."""
         try:
-            self._validate_bindings(spec)
-            parsed = self._parser.parse(spec.expression, spec.bindings)
+            parsed = self.check_spec(spec)
             return FormulaValidationResult(valid=True, tokens=parsed.tokens)
-        except FormulaCircularReference as exc:
-            return FormulaValidationResult(valid=False, errors=[str(exc)])
         except Exception as exc:
             return FormulaValidationResult(valid=False, errors=[str(exc)])
+
+    def check_spec(self, spec: FormulaSpec) -> ParsedFormula:
+        """Check that a spec can be evaluated and return its parsed expression.
+
+        Checks the bindings and parses the expression without touching the
+        data source. `evaluate` and `validate` run this check, and the
+        WebSocket endpoint and subscription manager call it before subscribing
+        to any of the spec's PVs.
+
+        Parameters
+        ----------
+        spec : FormulaSpec
+            Formula to check.
+
+        Returns
+        -------
+        ParsedFormula
+            The parsed expression.
+
+        Raises
+        ------
+        FormulaCircularReference
+            If a binding uses the ``formula:`` or retired ``fox:`` prefix.
+        InvalidPVName
+            If a binding is not a well-formed PV name.
+        FormulaParseError
+            If the expression does not parse or its variables do not match
+            the bindings.
+        FormulaUnsafeError
+            If the expression uses a construct that is not allowed.
+        """
+        self._validate_bindings(spec)
+        return self._parser.parse(spec.expression, spec.bindings)
 
     def _validate_bindings(self, spec: FormulaSpec) -> None:
         """Bindings must resolve to well-formed PV names only.

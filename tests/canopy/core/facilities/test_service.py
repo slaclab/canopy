@@ -53,11 +53,13 @@ async def test_resolve_facility_scope_root_slug_returns_everything_beneath(sessi
     assert scope == {root.id, sc.id, nc.id}
 
 
-async def test_resolve_facility_scope_unknown_slug_returns_empty_set_not_none(session, session_maker):
+async def test_resolve_facility_scope_unknown_slug_is_not_found(session, session_maker):
     service = FacilityService(session)
-    scope = await service.resolve_facility_scope("does-not-exist")
-    assert scope == set()
-    assert scope is not None
+    try:
+        await service.resolve_facility_scope("does-not-exist")
+        assert False, "expected FacilityNotFound"
+    except FacilityNotFound:
+        pass
 
 
 async def test_resolve_facility_scope_none_means_no_filter(session, session_maker):
@@ -123,7 +125,7 @@ async def test_update_rejects_reparenting_under_a_descendant(session, session_ma
     sibling = await _seed_facility(session, "lcls-nc", parent_id=root.id)
     await session.commit()
     updated = await service.update(grandchild.id, FacilityUpdate(parent="lcls-nc"))
-    assert updated.parent_id == sibling.id
+    assert updated.parent == sibling.slug
 
 
 async def test_delete_blocked_by_children(session, session_maker):

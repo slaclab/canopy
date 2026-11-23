@@ -10,7 +10,8 @@ byte copy and tests its write-outcome mapping against it.
 It also carries ``heartbeat_vectors.json``: the machine statement a heartbeat
 carries (``reachable`` and ``writes``), the ``since`` phrase, and frame sequences
 with the badge and toasts the viewer shows for them. canopy-sdk-js vendors a
-byte copy of it too.
+byte copy of it too. Its ``summaries`` use the summary DTO's Python field names
+(``connector_ok``); the server sends them in camelCase (``connectorOk``).
 """
 
 import json

@@ -11,6 +11,7 @@ background describe, so a subscribe never waits on the connector.
 """
 
 import copy
+import json
 import time
 import asyncio
 import logging
@@ -87,6 +88,9 @@ class PVBroker:
         # QueueFull path in _on_event then applies backpressure by dropping.
         self._queue: asyncio.Queue[tuple[PVValue, asyncio.Lock]] = asyncio.Queue(maxsize=config.event_queue_maxsize)
         self._running = False
+        # Set by stop(), which cancels the grace tasks: a PV released after it is
+        # released at once instead of starting a grace task nothing would cancel.
+        self._stopped = False
         self._tasks: list[asyncio.Task] = []
         self._activation_hooks: list[tuple[LifecycleHook, set[str]]] = []
         self._deactivation_hooks: list[tuple[LifecycleHook, set[str]]] = []
@@ -95,6 +99,8 @@ class PVBroker:
         # The statement of the last heartbeat the flush loop pushed; unset until
         # start() records the connector's first statement as given.
         self._last_statement: tuple | None = None
+        # Statement fields that held a value JSON cannot encode, logged once until they encode again.
+        self._unencodable: set[str] = set()
         # The background loops' clock; tests replace it to step the loops.
         self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
@@ -110,6 +116,7 @@ class PVBroker:
         await self._connector.start()
         self._last_statement = self._statement(self.heartbeat_frame())
         self._running = True
+        self._stopped = False
         self._tasks = [self._spawn_loop(name) for name in ("consume", "flush", "heartbeat")]
         logger.info(
             "PVBroker started (backend=%s, batch=%dms)",
@@ -150,6 +157,7 @@ class PVBroker:
 
     async def stop(self) -> None:
         self._running = False
+        self._stopped = True
         for task in self._tasks:
             task.cancel()
         for task in self._tasks:
@@ -665,7 +673,8 @@ class PVBroker:
 
         Until then the monitor keeps running and its updates keep the cache
         current, so a client that subscribes again within the grace period is
-        answered from cache. With a grace of 0 the PVs are released at once.
+        answered from cache. With a grace of 0, or once the broker has stopped,
+        the PVs are released at once.
 
         Parameters
         ----------
@@ -673,7 +682,7 @@ class PVBroker:
             PVs that have no subscribers left.
         """
         grace = self._config.monitor_grace_seconds
-        if grace <= 0:
+        if grace <= 0 or self._stopped:
             await self._stop_monitors(pvs)
             return
         for pv in pvs:
@@ -843,6 +852,43 @@ class PVBroker:
         if self._statement_source is not None:
             self._statement_source.statement_sent()
 
+    def _encodable(self, field: str, value: Any) -> Any:
+        """A statement field as the frame can carry it: a value JSON cannot encode reads ``None``.
+
+        A mapping is copied to a plain dict and only its unencodable entries are
+        nulled, so a ``writes`` state such as ``locked`` survives a bad ``reason``;
+        an unencodable ``state`` itself reads ``unknown``.
+        Never raises; a field that needed this is logged once, until it encodes again.
+        """
+
+        def encodes(item: Any) -> bool:
+            try:
+                json.dumps(item, allow_nan=False)
+            except Exception:
+                return False
+            return True
+
+        try:
+            if isinstance(value, Mapping):
+                value = {str(key): item for key, item in value.items()}
+                bad = [key for key, item in value.items() if not encodes(item)]
+                value.update(dict.fromkeys(bad))
+                if "state" in bad:
+                    # Not null, which a viewer may read as no claim: `unknown` is never writable.
+                    value["state"] = "unknown"
+                clean = not bad
+            else:
+                clean = encodes(value)
+                value = value if clean else None
+        except Exception:
+            value, clean = None, False
+        if clean:
+            self._unencodable.discard(field)
+        elif field not in self._unencodable:
+            self._unencodable.add(field)
+            logger.warning("connector %s holds a value JSON cannot encode; the heartbeat sends it as null", field)
+        return value
+
     def heartbeat_frame(self) -> dict:
         """The heartbeat frame: the backend, plus the connector's identity and statement.
 
@@ -851,18 +897,17 @@ class PVBroker:
         so a change shows on the next frame; they are ``None`` (no claim) for a
         connector that does not. One builder for the keep-alive loop, the first
         frame of every ``ws_pvs`` socket, the push on a statement change and
-        ``GET /hare/v1/health/summary``.
+        ``GET /hare/v1/health/summary``. A value JSON cannot encode is sent as
+        ``None`` (see `_encodable`), so one bad value cannot fail every send.
         """
         source = self._statement_source
+        fields = ("label", "notice", "binding", "reachable", "writes")
+        statement = {f: self._encodable(f, getattr(source, f)) if source is not None else None for f in fields}
         return {
             "type": "heartbeat",
             "timestamp": time.time(),
             "backend": getattr(self._connector, "backend_name", None),
-            "label": source.label if source is not None else None,
-            "notice": source.notice if source is not None else None,
-            "binding": source.binding if source is not None else None,
-            "reachable": source.reachable if source is not None else None,
-            "writes": source.writes if source is not None else None,
+            **statement,
         }
 
     async def _flush(self) -> None:
