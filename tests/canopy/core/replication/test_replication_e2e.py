@@ -16,13 +16,7 @@ from pydantic import SecretStr
 from sqlalchemy.engine import make_url
 
 from canopy.core.arms import Arm, subscription_name
-from canopy.core.replication.sql import (
-    Refused,
-    ReplicationError,
-    owner_join,
-    quote_ident,
-    quote_literal,
-)
+from canopy.core.replication.sql import Refused, ReplicationError, owner_join
 from canopy.core.replication.registry import (
     REGISTRY,
     OwnerPath,
@@ -312,9 +306,10 @@ async def test_subscribe_waits_for_another_arms_copy_of_a_keyed_table(octopus: O
         await publish(arm.admin, role="primary", config=o.config)
         await seed_rows(arm.admin, name)
     # The first arm's subscription exists but hasn't started: its tables wait in the init state.
+    # Both are made by the fixture (a plain name, a URI with a hex password), so plain quotes do.
     await o.head.admin.execute(
-        f"CREATE SUBSCRIPTION {quote_ident(subscription_name(first))} "
-        f"CONNECTION {quote_literal(o.arms[first].publisher_dsn)} PUBLICATION canopy_history WITH (enabled = false)"
+        f'CREATE SUBSCRIPTION "{subscription_name(first)}" '
+        f"CONNECTION '{o.arms[first].publisher_dsn}' PUBLICATION canopy_history WITH (enabled = false)"
     )
 
     with pytest.raises(Refused, match=f"while {subscription_name(first)} is still copying core.facility"):
