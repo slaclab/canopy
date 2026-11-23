@@ -69,8 +69,8 @@ def test_mirror_reports_its_role_and_history_fields(client, history_settings):
 
 
 def test_a_head_lists_its_arms_and_their_subscriptions(client, history_settings, monkeypatch):
-    monkeypatch.setenv("CANOPY_ARMS__ARM2__PUBLISHER_DSN", "host=arm2.example.org")
-    monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "host=arm1.example.org")
+    monkeypatch.setenv("CANOPY_ARMS__ARM2__PUBLISHER_DSN", "postgresql://arm2.example.org/canopy")
+    monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "postgresql://arm1.example.org/canopy")
 
     async def states(session, arms):
         assert arms == ["arm1", "arm2"]
@@ -87,8 +87,20 @@ def test_a_head_lists_its_arms_and_their_subscriptions(client, history_settings,
     assert "arm1.example.org" not in resp.text
 
 
+def test_invalid_arms_answer_a_redacted_settings_error(client, history_settings, monkeypatch, caplog):
+    monkeypatch.setenv("CANOPY_ARMS", '{"Bad-Name": {"publisher_dsn": "postgresql://r:s3cret-arm@x/canopy"}}')
+
+    resp = client.get("/v1/instance", headers={"X-API-Key": "ro"})
+
+    assert resp.status_code == 500, resp.text
+    assert resp.json()["code"] == "invalid_settings"
+    assert "arm names must match" in resp.json()["detail"]
+    assert "CANOPY_ARMS" in caplog.text
+    assert "s3cret-arm" not in resp.text + caplog.text
+
+
 def test_a_primary_lists_no_arms_even_if_some_are_set(client, monkeypatch):
-    monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "host=arm1.example.org")
+    monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "postgresql://arm1.example.org/canopy")
     assert client.get("/v1/instance", headers={"X-API-Key": "ro"}).json()["arms"] == []
 
 
