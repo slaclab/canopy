@@ -1,7 +1,7 @@
 from typing import Literal
 from functools import lru_cache
 
-from pydantic import Field, ValidationError, field_validator
+from pydantic import Field, BaseModel, ValidationInfo, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsError, SettingsConfigDict
 
 INSTANCE_NAME_PATTERN = r"^[a-z0-9_]{1,48}$"
@@ -94,11 +94,35 @@ class Settings(BaseSettings):
 
     @field_validator("history_url", "window_days", mode="before")
     @classmethod
-    def _blank_is_unset(cls, value: object) -> object:
+    def _blank_is_unset(cls, value: object, info: ValidationInfo) -> object:
         """Read a blank value as unset rather than as ``""`` or an unparseable int."""
-        if isinstance(value, str) and not value.strip():
-            return None
-        return value
+        return blank_keeps_default(cls, value, info)
+
+
+def blank_keeps_default(model: type[BaseModel], value: object, info: ValidationInfo) -> object:
+    """Read a blank string, as Helm and compose render an unset variable, as the field's default.
+
+    Settings classes call it from a ``mode="before"`` field validator on each field
+    where a blank value means unset.
+
+    Parameters
+    ----------
+    model : type[BaseModel]
+        The settings class being validated.
+    value : object
+        The raw value, a string when it comes from the environment.
+    info : ValidationInfo
+        Names the field being validated.
+
+    Returns
+    -------
+    object
+        The field's default (its factory's value, for a ``default_factory``) when
+        ``value`` is a blank string, otherwise ``value``.
+    """
+    if isinstance(value, str) and not value.strip():
+        return model.model_fields[info.field_name].get_default(call_default_factory=True)
+    return value
 
 
 @lru_cache
