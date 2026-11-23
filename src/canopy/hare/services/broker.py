@@ -76,11 +76,13 @@ class PVBroker:
         self._describe_again: set[str] = set()
         self._buffer: dict[str, PVValue] = {}
         self._buffer_lock = asyncio.Lock()
-        # PVs whose describe or connect timer has finished since the last flush,
-        # each with the seed lock it was queued under. They are sent with the
-        # next flush rather than one frame per PV, so a large subscribe does not
-        # turn into one WebSocket frame per PV as its channels connect.
-        self._pending_initial: dict[str, asyncio.Lock] = {}
+        # PVs whose describe or connect timer has finished since the last flush.
+        # They are sent with the next flush rather than one frame per PV, so a
+        # large subscribe does not turn into one WebSocket frame per PV as its
+        # channels connect. A PV is queued only under its current seed lock and
+        # leaves the queue when it is released, so every queued PV still has the
+        # lock it was queued under.
+        self._pending_initial: set[str] = set()
         # Bounded so a fast producer can't grow the queue without limit; the
         # QueueFull path in _on_event then applies backpressure by dropping.
         self._queue: asyncio.Queue[tuple[PVValue, asyncio.Lock]] = asyncio.Queue(maxsize=config.event_queue_maxsize)
@@ -321,19 +323,30 @@ class PVBroker:
             Validated PV names to report.
         """
         pvs = list(pvs)
-        data = {pv: self._latest[pv] for pv in pvs if pv in self._latest}
-        meta = {pv: self._meta[pv] for pv in pvs if pv in self._meta}
+        await self._send_initial_frame(
+            client_id,
+            {pv: self._latest[pv].model_dump(by_alias=True) for pv in pvs if pv in self._latest},
+            {pv: self._meta[pv].model_dump(by_alias=True) for pv in pvs if pv in self._meta},
+        )
+
+    async def _send_initial_frame(self, client_id: str, data: dict[str, dict], meta: dict[str, dict]) -> None:
+        """Send a client one ``initial`` frame with these value and metadata payloads.
+
+        The one place an ``initial`` frame is built, for the reply to a
+        ``subscribe`` and for a flush alike. Nothing is sent when both are empty.
+
+        Parameters
+        ----------
+        client_id : str
+            Identifier of a client registered with `add_client`.
+        data : dict[str, dict]
+            Dumped ``PVValue`` payloads, by PV.
+        meta : dict[str, dict]
+            Dumped ``PVMeta`` payloads, by PV.
+        """
         if not data and not meta:
             return
-        await self._send(
-            client_id,
-            {
-                "type": "initial",
-                "data": {pv: val.model_dump(by_alias=True) for pv, val in data.items()},
-                "meta": {pv: m.model_dump(by_alias=True) for pv, m in meta.items()},
-                "count": len(data),
-            },
-        )
+        await self._send(client_id, {"type": "initial", "data": data, "meta": meta, "count": len(data)})
 
     def _schedule_seed(self, pv: str) -> None:
         """Start whatever a just-subscribed PV still needs: a connect timer or a describe.
@@ -545,7 +558,7 @@ class PVBroker:
             The PV's seed lock when the queuing task started.
         """
         if self._seed_locks.get(pv) is lock:
-            self._pending_initial[pv] = lock
+            self._pending_initial.add(pv)
 
     @staticmethod
     def _cancel_task(tasks: dict[str, asyncio.Task], pv: str) -> None:
@@ -645,7 +658,7 @@ class PVBroker:
             self._seed_retry_after.pop(pv, None)
             self._seed_locks.pop(pv, None)
             self._describe_again.discard(pv)
-            self._pending_initial.pop(pv, None)
+            self._pending_initial.discard(pv)
             self._cancel_task(self._connect_timers, pv)
             self._cancel_task(self._describe_tasks, pv)
 
@@ -755,7 +768,7 @@ class PVBroker:
             updates = self._buffer
             self._buffer = {}
             pending = self._pending_initial
-            self._pending_initial = {}
+            self._pending_initial = set()
             # Snapshot under the lock, with no await, so the initial and diff
             # payloads come from the same instant and each PV is dumped once
             # however many clients receive it.
@@ -763,9 +776,9 @@ class PVBroker:
             ready: dict[str, tuple[asyncio.Lock, dict | None, dict | None]] = {}
             # Ready PVs whose initial value is the very update buffered for the diff.
             in_both: set[str] = set()
-            for pv, lock in pending.items():
-                if self._seed_locks.get(pv) is not lock:
-                    continue
+            for pv in pending:
+                # Present: a release drops the PV from the queue (see `_stop_monitors`).
+                lock = self._seed_locks[pv]
                 value = self._latest.get(pv)
                 meta = self._meta.get(pv)
                 if value is None and meta is None:
@@ -849,20 +862,17 @@ class PVBroker:
             Per PV, the seed lock it was queued under and its value and
             metadata payloads at snapshot time.
         """
-        held = self._registry.client_pvs(client_id)
         data: dict[str, dict] = {}
         meta: dict[str, dict] = {}
         for pv in pvs:
             lock, value, pv_meta = ready[pv]
-            if self._seed_locks.get(pv) is not lock or pv not in held:
+            if self._seed_locks.get(pv) is not lock or not self._registry.is_subscribed(client_id, pv):
                 continue
             if value is not None:
                 data[pv] = value
             if pv_meta is not None:
                 meta[pv] = pv_meta
-        if not data and not meta:
-            return
-        await self._send(client_id, {"type": "initial", "data": data, "meta": meta, "count": len(data)})
+        await self._send_initial_frame(client_id, data, meta)
 
     async def _heartbeat_loop(self) -> None:
         while self._running:

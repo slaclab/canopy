@@ -408,10 +408,12 @@ class _GatedWebSocket(FakeWebSocket):
         super().__init__()
         self.release = asyncio.Event()
         self.blocked = False
+        self.held: dict | None = None
 
     async def send_json(self, data) -> None:
         if not self.blocked:
             self.blocked = True
+            self.held = data
             await self.release.wait()
         await super().send_json(data)
 
@@ -737,12 +739,14 @@ async def test_client_unsubscribing_between_its_initial_frames_gets_no_later_fra
 
     flush = asyncio.create_task(broker._flush())
     assert await wait_for(lambda: client.blocked)
-    await broker.unsubscribe("c1", ["PV:SECOND"])
+    (in_flight,) = client.held["data"]
+    (later,) = {"PV:FIRST", "PV:SECOND"} - {in_flight}
+    await broker.unsubscribe("c1", [later])
     client.release.set()
     await asyncio.wait_for(flush, 1.0)
 
     (initial,) = _initial_frames(client)
-    assert set(initial["data"]) == {"PV:FIRST"}
+    assert set(initial["data"]) == {in_flight}
 
 
 async def test_a_blocked_client_does_not_hold_up_another_clients_frames(fake_connector):
@@ -1198,12 +1202,8 @@ class TestBatchedInitialFrames:
         broker.add_client("c1", first)
         await broker.subscribe("c1", ["SIM:FLIP"])
         await broker._drain_nowait()
-        stale = broker._seed_locks["SIM:FLIP"]
         await broker.unsubscribe("c1", ["SIM:FLIP"])
-        # No code path leaves a PV queued under a released lock (_queue_initial
-        # checks the lock and the release pops the entry), so the check in
-        # _flush is defensive and this test writes the stale entry by hand.
-        broker._pending_initial["SIM:FLIP"] = stale
+        assert "SIM:FLIP" not in broker._pending_initial
 
         second = FakeWebSocket()
         broker.add_client("c2", second)
