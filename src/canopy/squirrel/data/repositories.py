@@ -796,15 +796,14 @@ class PvRepository(BaseRepository[Pv]):
         self, ids: list[str], *, include_deleted: bool = False, owner: str | None = None
     ) -> set[str]:
         """The subset of ``ids`` that are PVs here, without loading the rows; ``owner``'s only, if given."""
-        existing: set[str] = set()
-        for i in range(0, len(ids), PARAM_BATCH_SIZE):
-            query = select(Pv.id).where(Pv.id.in_(ids[i : i + PARAM_BATCH_SIZE]))
-            if not include_deleted:
-                query = query.where(Pv.deleted_at.is_(None))
-            if owner is not None:
-                query = query.where(Pv.owner_instance == owner)
-            existing.update((await self.session.execute(query)).scalars())
-        return existing
+        if not ids:
+            return set()
+        query = select(Pv.id).where(Pv.id == any_(_uuid_array(ids)))
+        if not include_deleted:
+            query = query.where(Pv.deleted_at.is_(None))
+        if owner is not None:
+            query = query.where(Pv.owner_instance == owner)
+        return set((await self.session.execute(query)).scalars())
 
     async def get_by_ids(
         self, ids: list[str], *, include_deleted: bool = False, populate_existing: bool = False
