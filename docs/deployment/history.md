@@ -500,7 +500,14 @@ meanwhile) refuses it with 409 `import_would_skip`, naming the PVs. A failure th
 nothing about the snapshot (unreachable, 5xx, the head's key refused) keeps it pending
 and backs off, from `RETRY_INITIAL_S` doubling to `RETRY_MAX_S`; a queued snapshot
 never gives up. A refusal of the snapshot itself (facility gone, PVs moved, id clash)
-marks it failed, and the arm's queue goes on without it.
+marks it failed, and the arm's queue goes on without it. A resend the arm refuses with
+403 `insufficient_facility_access` (the user's grant no longer reaches the facility) may
+be of a snapshot an earlier attempt saved, its answer lost: the arm answers the same
+either way, so as not to tell that user the snapshot exists. If the snapshot has
+replicated back, it's delivered. If not, it stays pending for
+`CANOPY_SQUIRREL__OUTBOX__RESEND_WAIT_S` seconds (default 60), its reason saying
+"resent", with the arm's queue waiting behind it, and fails if the arm refuses it again.
+A failed snapshot that replicates back later is removed from the outbox.
 
 **Caps.** Each arm's queue holds at most `CANOPY_SQUIRREL__OUTBOX__MAX_SNAPSHOTS`
 snapshots and `MAX_BYTES` bytes, failed rows included, and so are snapshots saved on

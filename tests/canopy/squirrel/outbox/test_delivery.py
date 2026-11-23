@@ -216,6 +216,97 @@ async def test_a_refusal_fails_the_row_with_the_arms_reason_and_the_queue_goes_o
     assert refused in caplog.text
 
 
+# What the arm answers a resend whose caller's grant no longer reaches the facility,
+# whether or not an earlier send saved the snapshot.
+GRANT_NARROWED = ArmRefused("arm2", 403, "insufficient_facility_access", "API key is not scoped to facility: lab-b")
+
+
+async def test_a_resend_refused_for_the_grant_ends_if_its_snapshot_is_here(db_session, seeded: Seeded):
+    resent = await queue(db_session, seeded, attempts=1, last_error="arm2 did not answer")
+    after = await queue(db_session, seeded, minutes=1)
+    sends = []
+
+    async def replicated_during_the_send(arm, document, caller, strict):
+        sends.append(json.loads(document)["id"])
+        if len(sends) == 1:
+            db_session.add(
+                Snapshot(id=resent, title="queued save", facility_id=seeded.facility_id, created_at=CAPTURED)
+            )
+            await db_session.commit()
+            raise GRANT_NARROWED
+
+    counts = await deliver_arm("arm2", replicated_during_the_send, config=CONFIG)
+
+    assert sends == [resent, after]
+    assert counts == {"delivered": 2, "retried": 0, "failed": 0}
+    rows = await _rows(db_session)
+    assert set(rows) == {after} and rows[after].state == "delivered"
+
+
+@pytest.mark.parametrize("comes_back", [True, False], ids=["comes-back", "never-saved"])
+async def test_a_resend_refused_for_the_grant_waits_briefly_then_fails(db_session, seeded: Seeded, comes_back, caplog):
+    resent = await queue(db_session, seeded, attempts=1, last_error="arm2 did not answer")
+    after = await queue(db_session, seeded, minutes=1)
+    now = datetime.now(UTC) + timedelta(seconds=1)
+    arm = FakeArm(GRANT_NARROWED, *([] if comes_back else [GRANT_NARROWED]))
+
+    counts = await deliver_arm("arm2", arm, config=CONFIG, clock=lambda: now)
+
+    # Pending for resend_wait_s, not the back-off, holding the queue: it may be on its way back.
+    assert _ids(arm) == [resent]
+    assert counts == {"delivered": 0, "retried": 1, "failed": 0}
+    rows = await _rows(db_session)
+    assert rows[resent].state == "pending" and rows[resent].attempts == 2
+    assert rows[resent].last_error.startswith("insufficient_facility_access: API key is not scoped")
+    assert rows[resent].next_attempt_at == now + timedelta(seconds=CONFIG.resend_wait_s)
+
+    if comes_back:
+        db_session.add(Snapshot(id=resent, title="queued save", facility_id=seeded.facility_id, created_at=CAPTURED))
+        await db_session.commit()
+    arm.sent.clear()
+    later = now + timedelta(seconds=CONFIG.resend_wait_s)
+    counts = await deliver_arm("arm2", arm, config=CONFIG, clock=lambda: later)
+
+    rows = await _rows(db_session)
+    if comes_back:
+        # The run's sweep ends the row before any resend; the queue goes on.
+        assert _ids(arm) == [after] and set(rows) == {after} and rows[after].state == "delivered"
+        return
+    # Refused again after the wait: failed with the arm's reason and the resend note, and
+    # the queue goes on to the next row.
+    assert _ids(arm) == [resent, after]
+    assert counts == {"delivered": 1, "retried": 0, "failed": 1}
+    assert rows[resent].state == "failed" and rows[resent].attempts == 3
+    assert rows[resent].last_error == (
+        f"{GRANT_NARROWED.code}: {GRANT_NARROWED.detail}; resent, so it may be saved there already"
+    )
+    assert rows[after].state == "delivered"
+
+    # A late arrival after all: the sweep removes the failed row, loudly.
+    db_session.add(Snapshot(id=resent, title="queued save", facility_id=seeded.facility_id, created_at=CAPTURED))
+    await db_session.commit()
+    with caplog.at_level(logging.WARNING, logger="canopy.squirrel.outbox.delivery"):
+        await deliver_arm("arm2", FakeArm(), config=CONFIG)
+    assert resent not in await _rows(db_session)
+    assert resent in caplog.text
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ArmRefused("arm2", 409, "snapshot_id_conflict", "Snapshot {sid} is already here, as another snapshot"),
+        ArmRefused("arm2", 404, "facility_not_found", "Facility 'lab-b' not found"),
+    ],
+    ids=["id-conflict", "facility-gone"],
+)
+async def test_a_resend_refused_otherwise_fails_at_once(db_session, seeded: Seeded, error):
+    sid = await queue(db_session, seeded, attempts=1, last_error="arm2 did not answer")
+    arm = FakeArm(ArmRefused(error.arm, error.status, error.code, error.detail.format(sid=sid)))
+
+    assert await deliver_arm("arm2", arm, config=CONFIG) == {"delivered": 0, "retried": 0, "failed": 1}
+    assert (await _rows(db_session))[sid].state == "failed"
+
+
 async def test_a_snapshot_already_back_is_removed_at_once(db_session, seeded: Seeded):
     sid = await queue(db_session, seeded)
 
@@ -289,8 +380,10 @@ def test_settings_from_the_environment(monkeypatch):
 
     monkeypatch.setenv("CANOPY_SQUIRREL__OUTBOX__MAX_SNAPSHOTS", "50")
     monkeypatch.setenv("CANOPY_SQUIRREL__OUTBOX__MAX_BYTES", "1048576")
+    monkeypatch.setenv("CANOPY_SQUIRREL__OUTBOX__RESEND_WAIT_S", "120")
     outbox = get_squirrel_config().outbox
     assert (outbox.max_snapshots, outbox.max_bytes, outbox.retry_initial_s, outbox.interval_s) == (50, 1048576, 30, 30)
+    assert outbox.resend_wait_s == 120 and OutboxConfig().resend_wait_s == 60
 
     with pytest.raises(ValidationError, match="retry_initial_s"):
         OutboxConfig(retry_initial_s=1000, retry_max_s=10)
