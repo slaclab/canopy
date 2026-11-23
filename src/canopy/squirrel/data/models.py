@@ -200,6 +200,16 @@ class SnapshotValue(UUIDMixin, Base):
     snapshot: Mapped[Snapshot] = relationship("Snapshot", back_populates="values")
     pv: Mapped[Pv] = relationship("Pv", back_populates="snapshot_values")
 
+    @staticmethod
+    def __owner_parent__() -> tuple[type[Snapshot], str]:
+        """A value is owned by its snapshot's owner (``canopy.core.ownership``)."""
+        return Snapshot, "snapshot_id"
+
+    @staticmethod
+    def __owner_peers__() -> tuple[tuple[type[Pv], str], ...]:
+        """A value's PV shares its snapshot's owner."""
+        return ((Pv, "pv_id"),)
+
 
 # --------------------------------------------------------------------------- #
 # Meta-PVs
@@ -216,6 +226,11 @@ class MetaPv(Base):
 
     __tablename__ = "meta_pv"
     __table_args__ = {"schema": SQUIRREL_SCHEMA}
+
+    @staticmethod
+    def __owner_parent__() -> tuple[type[Pv], str]:
+        """A meta-PV marker is owned by its PV's owner (``canopy.core.ownership``)."""
+        return Pv, "pv_id"
 
     pv_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey(_fk("pv.id")), primary_key=True)
     display_name: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("''"))
