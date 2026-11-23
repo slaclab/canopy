@@ -131,6 +131,21 @@ async def test_publish_before_any_table_exists_reports_each_role(db, config):
     assert result["missing"] == PRESENT
 
 
+async def test_publish_drops_a_whole_schema_even_with_no_table_to_publish(db, config):
+    # Set by hand before the first migration: a later table in that schema would be published unasked.
+    for schema in REGISTRY.schemas:
+        await db.execute(f'DROP SCHEMA "{schema}" CASCADE')
+    await db.execute("CREATE SCHEMA core")
+    await db.execute("CREATE PUBLICATION canopy_history FOR TABLES IN SCHEMA core")
+
+    result = await publish(db, role="primary", config=config)
+
+    assert result["publications"]["canopy_history"]["schemas_removed"] == ["core"]
+    assert (await publication_state(db, "canopy_history")).schemas == frozenset()
+    await db.execute("CREATE TABLE core.api_key_like (id int PRIMARY KEY)")
+    assert await _published(db) == []
+
+
 async def test_publish_refuses_an_unclassified_table_and_changes_nothing(db, config):
     await db.execute("CREATE TABLE squirrel.mystery (id int PRIMARY KEY)")
 
