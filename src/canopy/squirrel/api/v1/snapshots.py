@@ -25,6 +25,7 @@ from canopy.core.security import (
     require_read_access,
     require_write_access,
     report_commit_position,
+    require_machine_access,
 )
 from canopy.contracts.jobs import JobCreatedDTO
 from canopy.core.ownership import OwnerQuery, require_create_owner
@@ -307,10 +308,14 @@ async def restore_snapshot(
     service: SnapshotServiceDep,
     request: RestoreRequestDTO | None = None,
 ) -> JobCreatedDTO:
-    """Enqueue a restore of a snapshot's setpoints to EPICS (``pv_ids=None`` restores all)."""
+    """Enqueue a restore of a snapshot's setpoints to EPICS (``pv_ids=None`` restores all).
+
+    Only on a primary; a mirror answers ``machine_read_only``.
+    """
     snapshot_id = require_uuid(snapshot_id, SnapshotNotFound, f"Snapshot {snapshot_id} not found")
     if not await service.snapshot_exists(snapshot_id):
         raise SnapshotNotFound(f"Snapshot {snapshot_id} not found")
+    require_machine_access()
     # Narrow the write set to the key's facilities here, pre-enqueue — the worker has no
     # caller identity to check against.
     pv_ids, skipped = await service.plan_restore(snapshot_id, request.pv_ids if request else None)

@@ -392,6 +392,14 @@ async def test_restore_existing_enqueues_with_pv_ids(client: AsyncClient, db_ses
     assert enqueued[-1][2] == {"snapshot_id": sid, "pv_ids": ["p1", "p2"], "skipped_pv_ids": []}
 
 
+async def test_a_mirror_refuses_a_restore(client: AsyncClient, db_session: AsyncSession, enqueued: list, mirror_role):
+    # A restore writes the machine, which only a primary does.
+    sid = await _seed_snapshot(db_session, "restore-me")
+    r = await client.post(f"/v1/snapshots/{sid}/restore", headers=WRITE_HEADERS, json={})
+    assert r.status_code == 403 and r.json()["code"] == "machine_read_only"
+    assert enqueued == []
+
+
 async def test_restore_missing_is_404_and_does_not_enqueue(client: AsyncClient, enqueued: list):
     r = await client.post("/v1/snapshots/00000000-0000-0000-0000-000000000000/restore", headers=WRITE_HEADERS, json={})
     assert r.status_code == 404

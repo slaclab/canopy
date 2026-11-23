@@ -84,9 +84,11 @@ class Pv(UUIDMixin, TimestampMixin, OwnedMixin, SoftDeleteMixin, Base):
     rel_tolerance: Mapped[float] = mapped_column(Float, nullable=False, server_default=text("0.0"))
 
     tags: Mapped[list[Tag]] = relationship("Tag", secondary=pv_tag, back_populates="pvs", lazy="selectin")
-    # No ORM cascade: a PV's values belong to the snapshots that captured them.
+    # No ORM cascade: a PV's values belong to the snapshots that captured them. "all"
+    # also keeps the ORM from nulling a loaded value's pv_id when a PV row is removed;
+    # the foreign key's ON DELETE CASCADE removes the values instead.
     snapshot_values: Mapped[list[SnapshotValue]] = relationship(
-        "SnapshotValue", back_populates="pv", passive_deletes=True
+        "SnapshotValue", back_populates="pv", passive_deletes="all"
     )
 
 
@@ -211,6 +213,16 @@ class SnapshotValue(UUIDMixin, Base):
     snapshot: Mapped[Snapshot] = relationship("Snapshot", back_populates="values")
     pv: Mapped[Pv] = relationship("Pv", back_populates="snapshot_values")
 
+    @staticmethod
+    def __owner_parent__() -> tuple[type[Snapshot], str]:
+        """A value is owned by its snapshot's owner (``canopy.core.ownership``)."""
+        return Snapshot, "snapshot_id"
+
+    @staticmethod
+    def __owner_peers__() -> tuple[tuple[type[Pv], str], ...]:
+        """A value's PV shares its snapshot's owner."""
+        return ((Pv, "pv_id"),)
+
 
 # --------------------------------------------------------------------------- #
 # Meta-PVs
@@ -227,6 +239,11 @@ class MetaPv(Base):
 
     __tablename__ = "meta_pv"
     __table_args__ = {"schema": SQUIRREL_SCHEMA}
+
+    @staticmethod
+    def __owner_parent__() -> tuple[type[Pv], str]:
+        """A meta-PV marker is owned by its PV's owner (``canopy.core.ownership``)."""
+        return Pv, "pv_id"
 
     pv_id: Mapped[str] = mapped_column(UUID(as_uuid=False), ForeignKey(_fk("pv.id")), primary_key=True)
     display_name: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("''"))

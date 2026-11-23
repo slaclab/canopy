@@ -105,6 +105,11 @@ class Settings(BaseSettings):
     # Primary (arm) only: accept writes a history head forwards on a user's behalf.
     accept_forwarded_writes: bool = False
 
+    @property
+    def machine_writes(self) -> bool:
+        """Whether this instance may change the machine (a Hare PV write, a restore): a primary only."""
+        return self.role == "primary"
+
 
 def blank_keeps_default(model: type[BaseModel], value: object, info: ValidationInfo) -> object:
     """Read a blank string, as Helm and compose render an unset variable, as the field's default.
