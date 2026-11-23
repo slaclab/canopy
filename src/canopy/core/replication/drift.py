@@ -37,6 +37,11 @@ reference points at nothing and is never dangling. A dangling row belongs to its
 its own, its owner-path parent's, or else the owner of another parent it references
 that survives. It is that arm's drift; a row nobody can be found to own (or owned by
 the head or an instance that isn't a configured arm) is the head's, and fails every run.
+While a table such a row involves (its own, or the parent it misses) is still being
+copied, the row may only be early, so it is reported as ``pending`` and makes the run
+not checked instead: for an arm's row, while that arm's subscription doesn't hold both
+tables ready; for the head's, while any subscription doesn't. A failure of the head
+check makes the head not checked, and the arms' reports still count.
 
 ``--days`` limits time-series buckets to recent days; once an arm prunes old rows,
 only its window can match. ``--arm`` checks one arm; the head check runs every time.
@@ -65,7 +70,13 @@ from collections.abc import Mapping, Callable, Awaitable
 
 import asyncpg
 
-from canopy.core.arms import Arm, ArmsConfigError, get_arms_config, subscription_name
+from canopy.core.arms import (
+    _SUBSCRIPTION_PREFIX,
+    Arm,
+    ArmsConfigError,
+    get_arms_config,
+    subscription_name,
+)
 from canopy.core.config import get_settings
 from canopy.core.replication.sql import (
     Refused,
@@ -82,6 +93,7 @@ from canopy.core.replication.subscriber import (
     _subscription,
     _selected_arms,
     _subscribed_tables,
+    _history_subscriptions,
 )
 
 logger = logging.getLogger(__name__)
@@ -508,13 +520,31 @@ def _log_dangling(found: dict, arm: str | None) -> None:
     )
 
 
+def _log_pending(found: dict, arm: str | None) -> None:
+    logger.warning(
+        "Not checked yet: %d rows of %s, owned by %s, whose %s finds no %s while a table is still being copied",
+        found["rows"],
+        found["table"],
+        found["owner"] or "nobody known",
+        found["column"],
+        found["parent"],
+        extra={"arm": arm} if arm else {},
+    )
+
+
 def _log_report(report: dict) -> None:
     for arm, arm_report in report["arms"].items():
         for found in arm_report["dangling"]:
             _log_dangling(found, arm)
+        for found in arm_report["pending"]:
+            _log_pending(found, arm)
         _log_arm(arm, arm_report)
     for found in report["head"]["dangling"]:
         _log_dangling(found, None)
+    for found in report["head"]["pending"]:
+        _log_pending(found, None)
+    if "error" in report["head"]:
+        logger.warning("The head's own reference check couldn't finish: %s", report["head"]["error"])
 
 
 async def references(conn: asyncpg.Connection, registry: ReplicationRegistry = REGISTRY) -> list[tuple]:
@@ -541,6 +571,46 @@ async def references(conn: asyncpg.Connection, registry: ReplicationRegistry = R
     return sorted(found)
 
 
+def owner_of(
+    registry: ReplicationRegistry, refs: list[tuple], table: str, *, alias: str = "t", skip_column: str | None = None
+) -> str:
+    """SQL for the owner of row ``alias`` of ``table``, even when its owner path is broken.
+
+    The first found of: its own owner through its owner path (a root's own column, or
+    the chain of parents), then the owner of each other parent it references in
+    ``refs`` (all but ``skip_column``'s), through that parent's owner path. NULL when
+    no parent survives to tell. ``alias`` must not be ``x`` or ``p``, which it uses.
+    """
+    join_sql, owner_sql = owner_join(registry, table, alias="x")
+    candidates = [f"(SELECT {owner_sql} FROM {qualified(table)} x {join_sql} WHERE x.ctid = {alias}.ctid)"]
+    for other_table, other_column, other_parent, other_parent_column in refs:
+        if other_table != table or other_column == skip_column:
+            continue
+        join_p, owner_p = owner_join(registry, other_parent, alias="p")
+        candidates.append(
+            f"(SELECT {owner_p} FROM {qualified(other_parent)} p {join_p} "
+            f"WHERE p.{quote_ident(other_parent_column)} = {alias}.{quote_ident(other_column)})"
+        )
+    return f"coalesce({', '.join(candidates)})"
+
+
+async def ready_tables(mirror: asyncpg.Connection, registry: ReplicationRegistry = REGISTRY) -> dict[str, frozenset]:
+    """Per arm with a subscription here, the replicated tables it holds in state ready.
+
+    A table the subscription doesn't hold at all (published since, ``refresh`` not run
+    yet) isn't ready either.
+    """
+    ready = {}
+    for name in await _history_subscriptions(mirror):
+        if (sub := await _subscription(mirror, name)) is None:
+            continue  # dropped since it was listed
+        states = await _subscribed_tables(mirror, sub["oid"])
+        ready[name.removeprefix(_SUBSCRIPTION_PREFIX)] = frozenset(
+            table for table, state in states.items() if state == "ready" and table in registry.replicated
+        )
+    return ready
+
+
 async def dangling(mirror: asyncpg.Connection, registry: ReplicationRegistry = REGISTRY) -> list[dict]:
     """Rows on the head whose reference points at a parent that isn't there, by owner.
 
@@ -560,18 +630,9 @@ async def dangling(mirror: asyncpg.Connection, registry: ReplicationRegistry = R
     refs = await references(mirror, registry)
     found = []
     for table, column, parent, parent_column in refs:
-        join_sql, owner_sql = owner_join(registry, table, alias="x")
-        candidates = [f"(SELECT {owner_sql} FROM {qualified(table)} x {join_sql} WHERE x.ctid = t.ctid)"]
-        for other_table, other_column, other_parent, other_parent_column in refs:
-            if other_table != table or other_column == column:
-                continue
-            join_p, owner_p = owner_join(registry, other_parent, alias="p")
-            candidates.append(
-                f"(SELECT {owner_p} FROM {qualified(other_parent)} p {join_p} "
-                f"WHERE p.{quote_ident(other_parent_column)} = t.{quote_ident(other_column)})"
-            )
+        owner = owner_of(registry, refs, table, skip_column=column)
         rows = await mirror.fetch(
-            f"SELECT coalesce({', '.join(candidates)}) AS owner, count(*) AS rows FROM {qualified(table)} t "
+            f"SELECT {owner} AS owner, count(*) AS rows FROM {qualified(table)} t "
             f"WHERE t.{quote_ident(column)} IS NOT NULL AND NOT EXISTS (SELECT 1 FROM {qualified(parent)} q "
             f"WHERE q.{quote_ident(parent_column)} = t.{quote_ident(column)}) GROUP BY 1 ORDER BY 1 NULLS LAST"
         )
@@ -593,6 +654,7 @@ def _not_checked(reason: str) -> dict:
         "attempts": 0,
         "drift": {},
         "dangling": [],
+        "pending": [],
     }
 
 
@@ -634,6 +696,11 @@ async def _check_arm(mirror: asyncpg.Connection, name: str, arm: Arm, *, days, s
             await primary.close()
 
 
+def _copying(row: dict, ready: frozenset) -> bool:
+    """Whether a table a dangling ``row`` involves isn't ready in a subscription holding ``ready``."""
+    return row["table"] not in ready or row["parent"] not in ready
+
+
 async def check_arms(
     mirror: asyncpg.Connection,
     arms: Mapping[str, Arm],
@@ -650,25 +717,43 @@ async def check_arms(
     dict
         ``status`` over everything (see ``overall``); ``arms``: each arm's report, as
         ``drift_check`` returns it, plus the ``dangling`` rows it owns (which make it
-        drift); and ``head``: the dangling rows no configured arm owns, and its ``status``.
+        drift) and the ``pending`` ones (a table they involve is still being copied,
+        which makes it not checked); and ``head``: the same for rows no configured arm
+        owns, its ``status``, and an ``error`` when its check couldn't finish.
     """
     secrets = [arm.reader_dsn.get_secret_value() for arm in arms.values() if arm.reader_dsn]
     reports = {
         name: await _check_arm(mirror, name, arms[name], days=days, settle_s=settle_s, secrets=secrets)
         for name in names
     }
-    head_rows = []
-    for row in await dangling(mirror, registry):
-        if row["owner"] in reports:
-            reports[row["owner"]].setdefault("dangling", []).append(row)
-        elif row["owner"] not in arms:  # nobody, the head itself, or an instance that isn't an arm
-            head_rows.append(row)
-        # else: another configured arm's row; that arm's own run reports it
     for report in reports.values():
         report.setdefault("dangling", [])
+        report.setdefault("pending", [])
+    head = {"status": "in_step", "dangling": [], "pending": []}
+    try:
+        ready = await ready_tables(mirror, registry)
+        found = await dangling(mirror, registry)
+    except Exception as exc:  # the arms' reports still count: drift found there still wins
+        head["error"] = redact(str(exc) or repr(exc), secrets)
+        found = []
+    for row in found:
+        owner = row["owner"]
+        if owner in reports:
+            early = _copying(row, ready.get(owner, frozenset()))
+            reports[owner]["pending" if early else "dangling"].append(row)
+        elif owner not in arms:  # nobody, the head itself, or an instance that isn't an arm
+            early = any(_copying(row, tables) for tables in ready.values())
+            head["pending" if early else "dangling"].append(row)
+        # else: another configured arm's row; that arm's own run reports it
+    for report in reports.values():
         if report["dangling"]:
             report["status"], report["in_step"] = "drift", False
-    head = {"status": "drift" if head_rows else "in_step", "dangling": head_rows}
+        elif report["pending"] and report["status"] == "in_step":
+            report["status"], report["in_step"] = "not_checked", False
+    if head["dangling"]:
+        head["status"] = "drift"
+    elif head["pending"] or "error" in head:
+        head["status"] = "not_checked"
     return {
         "status": overall([report["status"] for report in reports.values()] + [head["status"]]),
         "arms": reports,

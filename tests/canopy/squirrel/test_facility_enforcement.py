@@ -476,6 +476,23 @@ async def test_scoped_key_must_name_a_facility_to_create_a_snapshot(
     assert len(enqueued) == 1
 
 
+async def test_a_capture_outside_the_grant_isnt_told_the_facilitys_owner(
+    client: AsyncClient, db_session: AsyncSession, as_instance, enqueued: list
+):
+    # The facility gate runs before the owner check, as on the other write paths.
+    await _seed_hierarchy(db_session)
+    with as_instance("arm2"):
+        db_session.add(Facility(slug="remote", name="Remote"))
+        await db_session.commit()
+
+    r = await client.post("/v1/snapshots", headers=SC_HEADERS, json={"title": "T", "facility": "remote"})
+
+    assert r.status_code == 403
+    assert r.json()["code"] == "insufficient_facility_access"
+    assert "arm2" not in r.text
+    assert enqueued == []
+
+
 async def test_unrestricted_key_may_create_an_unassigned_snapshot(
     client: AsyncClient, db_session: AsyncSession, enqueued: list
 ):
