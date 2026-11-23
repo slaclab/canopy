@@ -9,10 +9,21 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from canopy.core.errors import NotOwner
-from canopy.squirrel.data.models import Pv, Tag, Snapshot
+from canopy.core.errors import NotOwner, InsufficientFacilityAccess
+from canopy.squirrel.errors import SnapshotNotFound
+from canopy.squirrel.schemas.pv import UpdatePVElementDTO
+from canopy.squirrel.data.models import (
+    Pv,
+    Tag,
+    MetaPv,
+    Snapshot,
+    TagGroup,
+    SnapshotValue,
+)
 from canopy.core.facilities.models import Facility
 from canopy.squirrel.schemas.snapshot import NewSnapshotDTO
+from canopy.squirrel.data.repositories import PvRepository
+from canopy.squirrel.services.pv_service import PvService
 from canopy.squirrel.services.snapshot_service import SnapshotService
 
 from .conftest import WRITE_HEADERS
@@ -222,6 +233,30 @@ async def test_another_owners_snapshot_cant_be_edited_or_deleted(client, db_sess
     _refused(await client.delete(f"/v1/snapshots/{snapshot.id}", headers=WRITE_HEADERS), "not_owner", 403)
 
 
+async def test_a_caller_outside_the_facility_isnt_told_the_owner(db_session: AsyncSession, as_instance):
+    # The facility gate runs first, so a guessed id gets what GET would give it.
+    with as_instance("arm2"):
+        facility = Facility(slug="remote", name="Remote")
+        db_session.add(facility)
+        await db_session.flush()
+        snapshot = Snapshot(title="theirs", facility_id=facility.id)
+        pv = Pv(setpoint_address="REMOTE:SP")
+        db_session.add_all([snapshot, pv])
+        await db_session.flush()
+        await PvRepository(db_session).set_facilities(pv.id, {facility.id})
+    snapshots = SnapshotService(db_session, FakeEpicsIO({}), restore_hooks=[_NoHook()], facility_scope={"elsewhere"})
+    pvs = PvService(db_session, facility_scope={"elsewhere"})
+
+    with pytest.raises(SnapshotNotFound):
+        await snapshots.update_snapshot_metadata(snapshot.id, title="mine")
+    with pytest.raises(SnapshotNotFound):
+        await snapshots.delete_snapshot(snapshot.id)
+    with pytest.raises(InsufficientFacilityAccess):
+        await pvs.update(pv.id, UpdatePVElementDTO(device="X"))
+    with pytest.raises(InsufficientFacilityAccess):
+        await pvs.delete(pv.id)
+
+
 async def test_a_capture_with_no_facility_takes_only_this_instances_pvs(db_session: AsyncSession, as_instance):
     with as_instance("arm2"):
         db_session.add(Pv(setpoint_address="THEIRS:SP"))
@@ -313,8 +348,6 @@ async def test_the_backstop_answers_403_when_a_service_check_is_missing(client, 
 
 async def test_the_backstop_covers_a_tag_through_its_group(db_session: AsyncSession, as_instance):
     with as_instance("arm2"):
-        from canopy.squirrel.data.models import TagGroup
-
         group = TagGroup(name="Area")
         db_session.add(group)
         await db_session.flush()
@@ -322,3 +355,132 @@ async def test_the_backstop_covers_a_tag_through_its_group(db_session: AsyncSess
     db_session.add(Tag(name="north", group_id=group.id))
     with pytest.raises(NotOwner, match="squirrel.tag"):
         await db_session.flush()
+
+
+async def _theirs_and_mine(db_session: AsyncSession, as_instance) -> tuple[Snapshot, Pv, Snapshot, Pv]:
+    with as_instance("arm2"):
+        theirs = (Snapshot(title="theirs"), Pv(setpoint_address="THEIRS:SP"))
+        db_session.add_all(theirs)
+        await db_session.flush()
+    mine = (Snapshot(title="mine"), Pv(setpoint_address="MINE:SP"))
+    db_session.add_all(mine)
+    await db_session.flush()
+    return *theirs, *mine
+
+
+@pytest.mark.parametrize("stored", ["arm2", "arm1"])
+async def test_the_backstop_refuses_a_change_to_a_stored_owner(db_session: AsyncSession, as_instance, stored):
+    # Taking another instance's row, or giving one away.
+    with as_instance(stored):
+        pv = Pv(setpoint_address="A:SP")
+        db_session.add(pv)
+        await db_session.flush()
+
+    pv.owner_instance = "arm1" if stored == "arm2" else "arm2"
+    with pytest.raises(NotOwner, match=f"owned by '{stored}', and its owner_instance never changes"):
+        await db_session.flush()
+
+
+async def test_the_backstop_judges_a_moved_tag_by_its_old_group_too(db_session: AsyncSession, as_instance):
+    with as_instance("arm2"):
+        theirs = TagGroup(name="Theirs")
+        db_session.add(theirs)
+        await db_session.flush()
+        tag = Tag(name="north", group_id=theirs.id)
+        db_session.add(tag)
+        await db_session.flush()
+    mine = TagGroup(name="Mine")
+    db_session.add(mine)
+    await db_session.flush()
+
+    tag.group_id = mine.id
+    with pytest.raises(NotOwner, match="'arm2'"):
+        await db_session.flush()
+
+
+async def test_the_backstop_reads_a_moved_tags_old_group_when_it_wasnt_loaded(db_session: AsyncSession, as_instance):
+    with as_instance("arm2"):
+        theirs = TagGroup(name="Theirs")
+        db_session.add(theirs)
+        await db_session.flush()
+        tag = Tag(name="north", group_id=theirs.id)
+        db_session.add(tag)
+        await db_session.flush()
+    mine = TagGroup(name="Mine")
+    db_session.add(mine)
+    await db_session.flush()
+
+    db_session.expire(tag)  # the old group_id isn't in the history now
+    tag.group_id = mine.id
+    with pytest.raises(NotOwner, match="squirrel.tag row is owned by 'arm2'"):
+        await db_session.flush()
+
+
+async def test_the_backstop_covers_a_tag_attached_to_another_owners_group(db_session: AsyncSession, as_instance):
+    # Through the relationship: the flush hasn't copied the group's id into group_id yet.
+    with as_instance("arm2"):
+        theirs = TagGroup(name="Theirs")
+        db_session.add(theirs)
+        await db_session.flush()
+
+    db_session.add(Tag(name="north", group=theirs))
+    with pytest.raises(NotOwner, match="squirrel.tag row is owned by 'arm2'"):
+        await db_session.flush()
+
+
+@pytest.mark.parametrize("foreign", ["snapshot", "pv"])
+async def test_the_backstop_covers_a_new_snapshot_value(db_session: AsyncSession, as_instance, foreign):
+    their_snapshot, their_pv, my_snapshot, my_pv = await _theirs_and_mine(db_session, as_instance)
+    snapshot, pv = (their_snapshot, my_pv) if foreign == "snapshot" else (my_snapshot, their_pv)
+
+    db_session.add(SnapshotValue(snapshot_id=snapshot.id, pv_id=pv.id, pv_name=pv.setpoint_address))
+    with pytest.raises(NotOwner, match="squirrel.snapshot_value row is owned by 'arm2'"):
+        await db_session.flush()
+
+
+@pytest.mark.parametrize("write", ["update", "delete"])
+async def test_the_backstop_covers_another_owners_snapshot_value(db_session: AsyncSession, as_instance, write):
+    their_snapshot, their_pv, _, _ = await _theirs_and_mine(db_session, as_instance)
+    with as_instance("arm2"):
+        value = SnapshotValue(snapshot_id=their_snapshot.id, pv_id=their_pv.id, pv_name="THEIRS:SP")
+        db_session.add(value)
+        await db_session.flush()
+
+    if write == "update":
+        value.pv_name = "MINE:SP"
+    else:
+        await db_session.delete(value)
+    with pytest.raises(NotOwner, match="squirrel.snapshot_value"):
+        await db_session.flush()
+
+
+async def test_the_backstop_covers_a_meta_pv_marker(db_session: AsyncSession, as_instance):
+    _, their_pv, _, my_pv = await _theirs_and_mine(db_session, as_instance)
+    db_session.add(MetaPv(pv_id=my_pv.id, display_name="Mine"))
+    await db_session.flush()
+
+    db_session.add(MetaPv(pv_id=their_pv.id, display_name="Theirs"))
+    with pytest.raises(NotOwner, match="squirrel.meta_pv row is owned by 'arm2'"):
+        await db_session.flush()
+
+
+async def test_the_backstop_passes_a_pv_delete_that_cascades_to_its_values(db_session: AsyncSession, as_instance):
+    _, _, my_snapshot, my_pv = await _theirs_and_mine(db_session, as_instance)
+    db_session.add(SnapshotValue(snapshot_id=my_snapshot.id, pv_id=my_pv.id, pv_name="MINE:SP"))
+    await db_session.flush()
+    await db_session.refresh(my_pv, ["snapshot_values"])
+
+    await db_session.delete(my_pv)
+    await db_session.flush()
+
+
+async def test_the_backstop_passes_this_instances_values(db_session: AsyncSession, as_instance):
+    _, _, my_snapshot, my_pv = await _theirs_and_mine(db_session, as_instance)
+    value = SnapshotValue(snapshot_id=my_snapshot.id, pv_id=my_pv.id, pv_name="MINE:SP")
+    db_session.add(value)
+    await db_session.flush()
+
+    value.pv_name = "MINE:SP2"
+    await db_session.flush()
+    await db_session.delete(value)
+    await db_session.flush()

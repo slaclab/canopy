@@ -29,13 +29,18 @@ from pydantic import (
     Field,
     BaseModel,
     SecretStr,
+    ValidationInfo,
     ValidationError,
     field_validator,
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsError, SettingsConfigDict
 
-from canopy.core.config import INSTANCE_NAME_PATTERN, describe_settings_error
+from canopy.core.config import (
+    INSTANCE_NAME_PATTERN,
+    blank_keeps_default,
+    describe_settings_error,
+)
 
 _SUBSCRIPTION_PREFIX = "canopy_history_"
 
@@ -89,11 +94,9 @@ class Arm(BaseModel):
 
     @field_validator("forward_url", "service_key", mode="before")
     @classmethod
-    def _blank_is_unset(cls, value: object) -> object:
+    def _blank_is_unset(cls, value: object, info: ValidationInfo) -> object:
         """Read a blank value, as Helm and compose render an unset one, as unset."""
-        if isinstance(value, str) and not value.strip():
-            return None
-        return value
+        return blank_keeps_default(cls, value, info)
 
     @field_validator("forward_url")
     @classmethod

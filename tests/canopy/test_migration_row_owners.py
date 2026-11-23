@@ -104,15 +104,18 @@ async def test_the_same_address_is_allowed_once_per_owner(migration_db):
         await conn.close()
 
 
-async def test_downgrade_refuses_while_two_owners_share_an_address(migration_db):
+@pytest.mark.parametrize("theirs", ["Area", "North"])
+async def test_downgrade_refuses_while_another_owners_rows_are_here(migration_db, theirs):
+    # Shared name or not: a downgrade would drop arm2's stamp, and an upgrade restamp it arm1.
     _run("upgrade", _ROW_OWNERS)
     conn = await asyncpg.connect(_DSN)
     try:
-        for owner in ("arm1", "arm2"):
+        for owner, name in (("arm1", "Area"), ("arm2", theirs)):
             await conn.execute(
                 "INSERT INTO squirrel.tag_group (id, name, owner_instance, created_at, updated_at) "
-                "VALUES (gen_random_uuid(), 'Area', $1, now(), now())",
+                "VALUES (gen_random_uuid(), $2, $1, now(), now())",
                 owner,
+                name,
             )
     finally:
         await conn.close()
@@ -121,7 +124,20 @@ async def test_downgrade_refuses_while_two_owners_share_an_address(migration_db)
     out = _alembic("downgrade", _BEFORE, role="mirror")
 
     assert out.returncode != 0
-    assert "squirrel.tag_group.name has values shared by more than one owner (Area)" in out.stderr
+    assert "squirrel.tag_group holds rows owned by arm2, not 'arm1'" in out.stderr
+
+
+async def test_downgrade_keeps_this_instances_rows(migration_db):
+    _run("upgrade", _BEFORE)
+    conn = await asyncpg.connect(_DSN)
+    try:
+        await _seed_before_owners(conn)
+        _run("upgrade", _ROW_OWNERS)
+        _run("downgrade", _BEFORE)
+        for table in _OWNED:
+            assert await conn.fetchval(f"SELECT count(*) FROM {table}") == 1, table
+    finally:
+        await conn.close()
 
 
 async def test_downgrade_restores_the_global_uniques(migration_db):

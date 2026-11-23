@@ -9,8 +9,10 @@ configs, so tests can vary the environment freely.
 
 from __future__ import annotations
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from canopy.core.config import blank_keeps_default
 
 
 class ForwardConfig(BaseSettings):
@@ -41,11 +43,9 @@ class ForwardConfig(BaseSettings):
 
     @field_validator("ca_bundle", mode="before")
     @classmethod
-    def _blank_is_unset(cls, value: object) -> object:
+    def _blank_is_unset(cls, value: object, info: ValidationInfo) -> object:
         """Read a blank value, as Helm and compose render an unset one, as unset (like ``Settings``)."""
-        if isinstance(value, str) and not value.strip():
-            return None
-        return value
+        return blank_keeps_default(cls, value, info)
 
 
 def get_forward_config() -> ForwardConfig:
