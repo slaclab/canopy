@@ -25,7 +25,6 @@ from canopy.core.errors import (
     CanopyError,
     InvalidAPIKey,
     KeyStoreUnavailable,
-    InsufficientReadAccess,
     InsufficientModuleAccess,
     register_canopy_error_handler,
 )
@@ -87,16 +86,8 @@ def _is_open(scope: Scope) -> bool:
     return scope["method"] == "OPTIONS" and b"origin" in headers and b"access-control-request-method" in headers
 
 
-# Parent routes whose own dependency admits an admin-only key.
-_ADMIN_PATHS = ("/v1/api-keys", "/v1/facilities")
-
-
-def _is_admin_path(path: str) -> bool:
-    return any(path == prefix or path.startswith(f"{prefix}/") for prefix in _ADMIN_PATHS)
-
-
 class _ClosedMeta:
-    """Refuse every request whose key cannot read the module it targets, except ``GET /health``.
+    """Refuse every request without a registry key for the module it targets, except ``GET /health``.
 
     Per-route dependencies cannot do this: the docs and OpenAPI pages of the
     parent and of each mounted sub-app, the root document and the per-module
@@ -104,17 +95,13 @@ class _ClosedMeta:
 
     The target module is the one the router would dispatch to: the first route
     that fully matches the scope, its sub-app's tag for a mount and ``core`` for
-    a parent route (or none). A key is admitted iff it is scoped to that module
-    and reads it. The key and facility management routes (``/v1/api-keys``,
-    ``/v1/facilities``) also admit an admin-only key, because their own
-    dependencies do (``require_admin_access``, ``require_read_or_admin_access``):
-    a provisioning key carries no read scope. Every other route, ``/metrics`` and
-    the docs among them, needs read. Each route still checks the scope it needs.
-    Refusals are the
-    route dependencies' own errors: 401 ``invalid_api_key`` for a missing or
-    unknown key, 503 ``key_store_unavailable`` when the key store cannot answer,
-    403 ``insufficient_module_access`` for a key scoped elsewhere and 403
-    ``insufficient_read_access`` for a key in the module without read.
+    a parent route (or none). A key is admitted iff it is scoped to that module,
+    whatever its scopes: each route still checks the scope it needs, so a
+    write-only key can write and an admin-only key can manage keys, as without
+    the gate. Refusals are the route dependencies' own errors: 401
+    ``invalid_api_key`` for a missing or unknown key, 503 ``key_store_unavailable``
+    when the key store cannot answer and 403 ``insufficient_module_access`` for a
+    key scoped elsewhere.
 
     A CORS preflight (``OPTIONS`` with ``Origin`` and
     ``Access-Control-Request-Method``) passes: a browser sends it without the key,
@@ -148,9 +135,7 @@ class _ClosedMeta:
         module = self._module_for(scope)
         if not key.allows_module(module):
             return InsufficientModuleAccess(f"API key is not scoped to '{module}'")
-        if key.read or (key.admin and module == "core" and _is_admin_path(scope["path"])):
-            return None
-        return InsufficientReadAccess("API key does not have read access")
+        return None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] not in ("http", "websocket"):
