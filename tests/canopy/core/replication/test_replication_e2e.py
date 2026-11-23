@@ -16,7 +16,13 @@ from pydantic import SecretStr
 from sqlalchemy.engine import make_url
 
 from canopy.core.arms import Arm, subscription_name
-from canopy.core.replication.sql import Refused, ReplicationError, owner_join
+from canopy.core.replication.sql import (
+    Refused,
+    ReplicationError,
+    owner_join,
+    quote_ident,
+    quote_literal,
+)
 from canopy.core.replication.registry import (
     REGISTRY,
     OwnerPath,
@@ -296,6 +302,25 @@ async def test_subscribe_refuses_a_slug_another_owner_already_has(octopus: Octop
     assert not await o.arms[second].admin.fetchval(
         "SELECT count(*) FROM pg_replication_slots WHERE database = current_database()"
     )
+
+
+async def test_subscribe_waits_for_another_arms_copy_of_a_keyed_table(octopus: Octopus):
+    o = octopus
+    first, second = o.arms
+    for name, arm in o.arms.items():
+        await publish(arm.admin, role="primary", config=o.config)
+        await seed_rows(arm.admin, name)
+    # The first arm's subscription exists but hasn't started: its tables wait in the init state.
+    await o.head.admin.execute(
+        f"CREATE SUBSCRIPTION {quote_ident(subscription_name(first))} "
+        f"CONNECTION {quote_literal(o.arms[first].publisher_dsn)} PUBLICATION canopy_history WITH (enabled = false)"
+    )
+
+    with pytest.raises(Refused, match=f"while {subscription_name(first)} is still copying core.facility"):
+        await _subscribe(o, only=second)
+    assert not (await subscriber_status(o.head.admin, arms=o.arms_config.arms, only=second))["subscriptions"][0][
+        "exists"
+    ]
 
 
 @one_arm

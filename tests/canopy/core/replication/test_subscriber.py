@@ -3,6 +3,7 @@
 ``/v1/instance``'s arms. Subscribing for real is in ``test_replication_e2e.py``."""
 
 from uuid import uuid4
+from contextlib import asynccontextmanager
 
 import pytest
 import asyncpg
@@ -276,28 +277,54 @@ async def test_only_that_arms_rows_count(db):
     ]
 
 
-@pytest_asyncio.fixture
-async def arm_db(db):
-    """A second database on the same server, standing in for an arm the CLI reads.
+@asynccontextmanager
+async def _arm_databases(db, names: list[str]):
+    """A database per arm on the same server, standing in for arms the CLI reads.
 
-    Only the checks before ``CREATE SUBSCRIPTION`` can run against it: a
+    Only the checks before ``CREATE SUBSCRIPTION`` can run against them: a
     subscription to a database on its own server waits forever for its slot.
     """
-    name = f"rt_arm_{uuid4().hex[:8]}"
-    await db.execute(f'CREATE DATABASE "{name}"')
-    dsn = make_url(DB_DSN).set(database=name).render_as_string(hide_password=False)
+    conns, arms = {}, {}
     try:
-        await build_schema(dsn)
-        conn = await asyncpg.connect(dsn)
-        url = make_url(dsn)
-        # As an arm's setting would hold it: key=value, which the CLI turns into a URI to read the arm.
-        conninfo = f"host={url.host} port={url.port} dbname={name} user={url.username} password='{url.password}'"
-        try:
-            yield conn, {"arm1": Arm(publisher_dsn=SecretStr(conninfo))}
-        finally:
-            await conn.close()
+        for arm in names:
+            name = f"rt_{arm}_{uuid4().hex[:8]}"
+            await db.execute(f'CREATE DATABASE "{name}"')
+            dsn = make_url(DB_DSN).set(database=name).render_as_string(hide_password=False)
+            conns[arm] = (name, None)
+            await build_schema(dsn)
+            conns[arm] = (name, await asyncpg.connect(dsn))
+            url = make_url(dsn)
+            # As an arm's setting would hold it: key=value, which the CLI turns into a URI to read the arm.
+            conninfo = f"host={url.host} port={url.port} dbname={name} user={url.username} password='{url.password}'"
+            arms[arm] = Arm(publisher_dsn=SecretStr(conninfo))
+        yield {arm: conn for arm, (_, conn) in conns.items()}, arms
     finally:
-        await db.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
+        for name, conn in conns.values():
+            if conn is not None:
+                await conn.close()
+            await db.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
+
+
+@pytest_asyncio.fixture
+async def arm_db(db):
+    """arm1's stand-in database and the arms setting that reaches it."""
+    async with _arm_databases(db, ["arm1"]) as (conns, arms):
+        yield conns["arm1"], arms
+
+
+@pytest_asyncio.fixture
+async def two_arm_dbs(db):
+    """arm1's and arm2's stand-in databases and the arms setting that reaches them."""
+    async with _arm_databases(db, ["arm1", "arm2"]) as found:
+        yield found
+
+
+async def _same_facility_slug_on(conns) -> None:
+    for name, conn in conns.items():
+        await conn.execute(
+            "INSERT INTO core.facility (id, slug, name, owner_instance) VALUES (gen_random_uuid(), 'lab', 'L', $1)",
+            name,
+        )
 
 
 async def test_subscribe_reads_the_arm_and_refuses_a_slug_clash(db, arm_db):
@@ -312,6 +339,26 @@ async def test_subscribe_reads_the_arm_and_refuses_a_slug_clash(db, arm_db):
     with pytest.raises(Refused, match=r"core.facility.slug 'lab' \(here, owned by head\)"):
         await subscribe(db, role="mirror", head="head", arms=arms)
     assert await _subscriptions_here(db) == 0
+
+
+async def test_subscribe_refuses_a_slug_two_arms_would_both_copy(db, two_arm_dbs):
+    conns, arms = two_arm_dbs
+    await _same_facility_slug_on(conns)
+
+    # Neither arm's rows are here yet, so only comparing the two finds it.
+    with pytest.raises(Refused, match=r"arms arm1 and arm2: core.facility.slug 'lab' \(both copy it\)"):
+        await subscribe(db, role="mirror", head="head", arms=arms)
+    assert await _subscriptions_here(db) == 0
+
+
+async def test_refresh_refuses_a_slug_two_arms_would_both_copy(
+    db, two_arm_dbs, stray_subscription_for_arm1, stray_subscription_for_arm2
+):
+    conns, arms = two_arm_dbs
+    await _same_facility_slug_on(conns)
+
+    with pytest.raises(Refused, match=r"arms arm1 and arm2: core.facility.slug 'lab' \(both copy it\)"):
+        await refresh(db, role="mirror", arms=arms)
 
 
 async def test_refresh_checks_the_slugs_of_tables_about_to_be_copied(db, arm_db, stray_subscription_for_arm1):
@@ -378,6 +425,13 @@ async def stray_subscription(db):
 async def stray_subscription_for_arm1(db):
     """arm1's subscription, holding no table yet: a refresh would copy every one."""
     async for name in _unconnected_subscription(db, "canopy_history_arm1"):
+        yield name
+
+
+@pytest_asyncio.fixture
+async def stray_subscription_for_arm2(db):
+    """arm2's subscription, like arm1's."""
+    async for name in _unconnected_subscription(db, "canopy_history_arm2"):
         yield name
 
 
