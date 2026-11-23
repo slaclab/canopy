@@ -20,12 +20,13 @@ Plus one attribute:
 
 The value types come from `canopy.contracts.pv` (`PVValue`, `PVMeta`, `PVWriteValue`, `ValueKind`) and `canopy.contracts.sample` (`AlarmSeverity`).
 
-### Behaviour Hare relies on
+### Behaviour Canopy relies on
 
 - `on_event` must not block, and runs on the event loop thread. A client library that delivers updates on its own threads marshals them onto the loop first (`loop.call_soon_threadsafe`).
 - A monitor fires `on_event` when its channel connects and on every update, and with a `PVValue(connected=False, value=None)` when an established channel drops.
 - A monitor on a channel that never connects may stay silent. Hare reports such a PV `connected: false` itself after `CANOPY_HARE__SEED_TIMEOUT_S`.
 - `get` on an unreachable channel returns a `PVValue` with `connected=False` rather than raising, and `describe` returns a bare `PVMeta(pv=pv)`, as the `epics` backend does.
+- `get` and `put` return within `timeout`, or within a bounded default of your own when it is `None`, and can be cancelled. Snapshot capture keeps up to `CANOPY_SQUIRREL__EPICS_CONCURRENCY` reads in flight and cancels them when its job times out, so a read that never returns holds up the whole snapshot.
 
 ### PV names
 
@@ -52,14 +53,33 @@ Canopy's error handler maps each to its HTTP status with the right slug in the `
 
 ## 2. Load via dotted path
 
-Install your package alongside Canopy and name the class in the `module:Class` form:
+Install your package alongside Canopy, in both the `canopy-api` and `canopy-worker` processes (normally one image), and name the class in the `module:Class` form:
 
 ```bash
 CANOPY_EPICS__BACKEND=labxyz.canopy_plugin:LabXYZConnector
 ```
 
-Hare imports the module and builds the connector via `from_config(cfg)` at startup. A module that does not import, a missing class, or a class without a `from_config` classmethod stops startup with an `EpicsBackendUnavailable` that names the path.
+At startup, Hare in `canopy-api` and `canopy-worker`, which runs snapshot capture and restore, each import the module and build their own connector via `from_config(cfg)`. A module that fails to import for any reason, a missing class, a class without a `from_config` classmethod, or a `from_config` that returns an object missing part of the Protocol stops startup with an `EpicsBackendUnavailable` that names the path.
+
+The value is trusted configuration: Canopy imports the named module, running its top-level code, before it checks the class. Set it only through the deployment's own environment.
 
 ## 3. Working example
 
 `canopy.epics.backends.simulation.SimulationConnector` implements the full Protocol with no external dependencies. Loading it by path, `CANOPY_EPICS__BACKEND=canopy.epics.backends.simulation:SimulationConnector`, is a quick check that the dotted-path form works in a deployment.
+
+## 4. Test your backend
+
+`canopy.epics.testing.conformance` holds the cases both shipped backends pass: one-shot reads and monitors of a scalar, an enum and a waveform under bare, `ca://` and `pva://` names, a PV that never connects, and an optional outage. It checks reads and monitors only, not `put` or `describe`. Give it a factory that returns a fresh, unstarted connector and a driver (`ConformanceDriver`) that names the PVs and sets their values in your control system, then run each case:
+
+```python
+from canopy.epics.testing import conformance
+
+@pytest.mark.parametrize("case_id", conformance.case_ids())
+async def test_conformance(case_id, driver):
+    try:
+        await conformance.run_case(case_id, make_connector, driver)
+    except conformance.CaseSkipped as skip:
+        pytest.skip(str(skip))
+```
+
+`tests/canopy/epics/test_conformance_simulation.py` drives the simulation backend this way, and `test_conformance_epics.py` drives the `epics` backend against a soft IOC and a PV Access server.

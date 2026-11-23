@@ -82,6 +82,9 @@ class PVBroker:
         # QueueFull path in _on_event then applies backpressure by dropping.
         self._queue: asyncio.Queue[tuple[PVValue, asyncio.Lock]] = asyncio.Queue(maxsize=config.event_queue_maxsize)
         self._running = False
+        # Set by stop(), which cancels the grace tasks: a PV released after it is
+        # released at once instead of starting a grace task nothing would cancel.
+        self._stopped = False
         self._tasks: list[asyncio.Task] = []
         self._activation_hooks: list[tuple[LifecycleHook, set[str]]] = []
         self._deactivation_hooks: list[tuple[LifecycleHook, set[str]]] = []
@@ -97,6 +100,7 @@ class PVBroker:
             return
         await self._connector.start()
         self._running = True
+        self._stopped = False
         self._tasks = [self._spawn_loop(name) for name in ("consume", "flush", "heartbeat")]
         logger.info(
             "PVBroker started (backend=%s, batch=%dms)",
@@ -137,6 +141,7 @@ class PVBroker:
 
     async def stop(self) -> None:
         self._running = False
+        self._stopped = True
         for task in self._tasks:
             task.cancel()
         for task in self._tasks:
@@ -627,7 +632,8 @@ class PVBroker:
 
         Until then the monitor keeps running and its updates keep the cache
         current, so a client that subscribes again within the grace period is
-        answered from cache. With a grace of 0 the PVs are released at once.
+        answered from cache. With a grace of 0, or once the broker has stopped,
+        the PVs are released at once.
 
         Parameters
         ----------
@@ -635,7 +641,7 @@ class PVBroker:
             PVs that have no subscribers left.
         """
         grace = self._config.monitor_grace_seconds
-        if grace <= 0:
+        if grace <= 0 or self._stopped:
             await self._stop_monitors(pvs)
             return
         for pv in pvs:
