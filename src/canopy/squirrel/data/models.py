@@ -84,9 +84,11 @@ class Pv(UUIDMixin, TimestampMixin, OwnedMixin, SoftDeleteMixin, Base):
     rel_tolerance: Mapped[float] = mapped_column(Float, nullable=False, server_default=text("0.0"))
 
     tags: Mapped[list[Tag]] = relationship("Tag", secondary=pv_tag, back_populates="pvs", lazy="selectin")
-    # No ORM cascade: a PV's values belong to the snapshots that captured them.
+    # No ORM cascade: a PV's values belong to the snapshots that captured them. "all"
+    # also keeps the ORM from nulling a loaded value's pv_id when a PV row is removed;
+    # the foreign key's ON DELETE CASCADE removes the values instead.
     snapshot_values: Mapped[list[SnapshotValue]] = relationship(
-        "SnapshotValue", back_populates="pv", passive_deletes=True
+        "SnapshotValue", back_populates="pv", passive_deletes="all"
     )
 
 
