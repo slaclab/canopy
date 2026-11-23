@@ -534,24 +534,27 @@ async def test_a_malformed_tag_id_is_an_unknown_tag(client: AsyncClient):
 # --- updated_at ---------------------------------------------------------------- #
 
 
-async def test_update_moves_updated_at_only_for_rows_that_change_a_pv_column(client: AsyncClient):
-    """A tags-only change issues no UPDATE on ``pv``, so its ``updated_at`` stays, as with
-    ``PUT /v1/pvs/{id}``."""
+async def test_update_moves_updated_at_only_for_rows_that_change_a_pv_column(client: AsyncClient, facilities):
+    """A tags- or facilities-only change issues no UPDATE on ``pv``, so its
+    ``updated_at`` stays, as with ``PUT /v1/pvs/{id}``."""
     [tag] = await _tags(client, "kept")
-    column = await _create(client, setpointAddress="SIM:DEV:00001:SET")
-    tags_only = await _create(client, setpointAddress="SIM:DEV:00002:SET")
+    before = [await _create(client, setpointAddress=f"SIM:DEV:{n:05d}:SET", facilities=["alpha"]) for n in range(1, 5)]
 
     rows = [
         {"setpointAddress": "SIM:DEV:00001:SET", "description": "changed"},
         {"setpointAddress": "SIM:DEV:00002:SET", "tags": [tag]},
+        {"setpointAddress": "SIM:DEV:00003:SET", "facilities": ["beta"]},
+        {"setpointAddress": "SIM:DEV:00004:SET"},
     ]
     r = await _import(client, rows, "update")
 
     assert r.status_code == 200, r.text
-    first, second = r.json()["updated"]
-    assert first["lastModifiedDate"] > column["lastModifiedDate"]
-    assert second["lastModifiedDate"] == tags_only["lastModifiedDate"]
-    assert [t["id"] for t in second["tags"]] == [tag]
+    updated = r.json()["updated"]
+    assert updated[0]["lastModifiedDate"] > before[0]["lastModifiedDate"]
+    assert [pv["lastModifiedDate"] for pv in updated[1:]] == [pv["lastModifiedDate"] for pv in before[1:]]
+    assert [t["id"] for t in updated[1]["tags"]] == [tag]
+    assert updated[2]["facilities"] == ["beta"]
     after = await _all_pvs(client)
-    assert after["SIM:DEV:00001:SET"]["lastModifiedDate"] == first["lastModifiedDate"]
-    assert after["SIM:DEV:00002:SET"]["lastModifiedDate"] == second["lastModifiedDate"]
+    assert [after[pv["setpointAddress"]]["lastModifiedDate"] for pv in updated] == [
+        pv["lastModifiedDate"] for pv in updated
+    ]

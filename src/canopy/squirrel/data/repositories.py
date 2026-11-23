@@ -28,6 +28,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import noload, selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.dialects.postgresql import UUID
 
 from canopy.core.db import BaseRepository
@@ -517,35 +518,44 @@ class PvRepository(BaseRepository[Pv]):
         return pvs
 
     async def update_many(self, pvs: list[Pv]) -> list[Pv]:
-        """Flush changes made to loaded PVs and reload them in one batched pass.
+        """Flush changes made to loaded PVs and read back the ``updated_at`` it set.
 
-        The many-row counterpart of ``update``: the reload replaces a ``refresh`` per row,
-        and picks up the ``updated_at`` the database set on each ``pv`` row the flush
-        updated. A PV whose only changes are its tags or facilities gets no ``pv`` UPDATE,
-        so its ``updated_at`` stays as it was, just as with ``update``.
+        The many-row counterpart of ``update``. The PVs come in fully loaded, tags and
+        all, and the flush keeps every value it wrote, so ``updated_at`` is the one
+        attribute left to read: the database sets it on each ``pv`` row the flush
+        updates, and the flush expires it. One query reads ``(id, updated_at)`` for every
+        PV instead of reloading the rows and their tags. A PV whose only changes are its
+        tags or facilities gets no ``pv`` UPDATE, so its ``updated_at`` stays as it was,
+        just as with ``update``.
 
         Parameters
         ----------
         pvs : list[Pv]
-            PVs already in the session, with their changes applied.
+            PVs already in the session, loaded, with their changes applied.
 
         Returns
         -------
         list[Pv]
-            ``pvs`` itself, reloaded, so in the order given.
+            ``pvs`` itself, in the order given, with ``updated_at`` loaded.
 
         Raises
         ------
         RuntimeError
-            If the reload doesn't return every PV, which would leave the missing ones
-            half-loaded.
+            If the read-back doesn't return every PV, which would leave the missing ones
+            with an unloaded ``updated_at``.
         """
         if not pvs:
             return []
         await self.session.flush()
-        reloaded = await self.get_by_ids([pv.id for pv in pvs], populate_existing=True)
-        if len(reloaded) != len(pvs):
-            raise RuntimeError(f"Reloaded {len(reloaded)} of {len(pvs)} updated PVs")
+        result = await self.session.execute(
+            select(Pv.id, Pv.updated_at).where(Pv.id == any_(_uuid_array([pv.id for pv in pvs])))
+        )
+        updated_at = dict(result.tuples().all())
+        if len(updated_at) != len(pvs):
+            raise RuntimeError(f"Reloaded {len(updated_at)} of {len(pvs)} updated PVs")
+        for pv in pvs:
+            # Loads the value without marking the PV changed, as a refresh would.
+            set_committed_value(pv, "updated_at", updated_at[pv.id])
         return pvs
 
     async def _get_by_identity(self, address_column, addresses: list[str], *conditions) -> dict[str, Pv]:
