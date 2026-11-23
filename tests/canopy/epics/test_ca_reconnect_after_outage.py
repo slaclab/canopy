@@ -29,8 +29,10 @@ The helper is this file, run as a script with ``--helper``.
 import os
 import sys
 import json
+import random
 import socket
 import asyncio
+import functools
 import subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -298,22 +300,38 @@ def _helper_main(result_path: str, spec_json: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
+@functools.cache
+def _ephemeral_floor() -> int:
+    """The lowest port the OS hands out by itself, or 32768 where that is unknown."""
+    try:
+        if sys.platform == "darwin":
+            cmd = ["sysctl", "-n", "net.inet.ip.portrange.first"]
+            out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+        else:
+            out = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text()
+        return int(out.split()[0])
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return 32768
+
+
 def _free_port(taken: set[int]) -> int:
-    """A loopback port free for both TCP and UDP, outside the default CA ports and
-    `taken`."""
-    for _ in range(200):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
-            tcp.bind(("127.0.0.1", 0))
-            port = tcp.getsockname()[1]
-            if port in _FORBIDDEN_CA_PORTS or port in taken:
-                continue
+    """A loopback port free for both TCP and UDP, below the ephemeral range, outside
+    the default CA ports and `taken`.
+
+    The port lies unbound until its helper starts, and again for the whole outage.
+    One from the ephemeral range can meanwhile be handed to any socket that binds
+    port 0, as the helpers' own clients do, and the server then cannot bind it again."""
+    candidates = [p for p in range(20000, _ephemeral_floor()) if p not in _FORBIDDEN_CA_PORTS and p not in taken]
+    for port in random.sample(candidates, min(200, len(candidates))):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
+                tcp.bind(("127.0.0.1", port))
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
-                try:
-                    udp.bind(("127.0.0.1", port))
-                except OSError:
-                    continue
-            return port
-    raise RuntimeError("no free loopback port found")
+                udp.bind(("127.0.0.1", port))
+        except OSError:
+            continue
+        return port
+    raise RuntimeError("no free loopback port found below the ephemeral range")
 
 
 def _bind_repeater_port(taken: set[int]) -> socket.socket:
@@ -416,6 +434,14 @@ def records(tmp_path_factory) -> dict:
     finally:
         for repeater in repeaters.values():
             repeater.close()
+
+
+def test_server_ports_lie_below_the_ephemeral_range():
+    taken: set[int] = set()
+    for _ in range(5):
+        taken.add(_free_port(taken))
+    assert len(taken) == 5, "a port was chosen twice"
+    assert max(taken) < _ephemeral_floor(), f"a port lies in the ephemeral range: {sorted(taken)}"
 
 
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
