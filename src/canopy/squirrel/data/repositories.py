@@ -576,7 +576,9 @@ class PvRepository(BaseRepository[Pv]):
         """Flush changes made to loaded PVs and reload them in one batched pass.
 
         The many-row counterpart of ``update``: the reload replaces a ``refresh`` per row,
-        and picks up ``updated_at``, which the database sets on update.
+        and picks up the ``updated_at`` the database set on each ``pv`` row the flush
+        updated. A PV whose only changes are its tags or facilities gets no ``pv`` UPDATE,
+        so its ``updated_at`` stays as it was, just as with ``update``.
 
         Parameters
         ----------

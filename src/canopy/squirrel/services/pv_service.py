@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 import logging
 from typing import NamedTuple
 
@@ -76,6 +77,25 @@ def _identity(
     raise BadRequest("At least one address (setpoint, readback, or config) is required")
 
 
+def _canonical_uuid(value: str) -> str | None:
+    """``value`` in the lowercase, hyphenated form Postgres returns a UUID in.
+
+    Parameters
+    ----------
+    value : str
+        A UUID in any form ``uuid.UUID`` accepts, such as uppercase or without hyphens.
+
+    Returns
+    -------
+    str | None
+        The canonical form, or ``None`` if ``value`` isn't a UUID.
+    """
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return None
+
+
 class _ImportRow(NamedTuple):
     """One normalized row of a bulk import."""
 
@@ -84,6 +104,13 @@ class _ImportRow(NamedTuple):
     kind: str  # identity kind, as `_identity` returns it
     identity_address: str
     data: NewPVElementDTO
+
+    @property
+    def tag_ids(self) -> list[str]:
+        """The row's tag IDs in canonical form, first occurrence kept, so they match the
+        IDs Postgres returns and a repeated ID adds the tag once. An ID that isn't a UUID
+        is kept as sent: no tag has it, so it counts as unknown."""
+        return list(dict.fromkeys(_canonical_uuid(tid) or tid for tid in self.data.tags))
 
 
 class PvService:
@@ -467,7 +494,7 @@ class PvService:
             (row, missing)
             for row, _ in to_update
             if "tags" in row.data.model_fields_set
-            and (missing := sorted({tid for tid in row.data.tags if tid not in tags_by_id}))
+            and (missing := sorted({tid for tid in row.tag_ids if tid not in tags_by_id}))
         ]
         if unknown_tags:
             listed = "; ".join(
@@ -487,7 +514,7 @@ class PvService:
                 if field in provided and value is not None:
                     setattr(pv, field, value)
             if "tags" in provided:
-                pv.tags = [tags_by_id[tid] for tid in dict.fromkeys(row.data.tags)]
+                pv.tags = [tags_by_id[tid] for tid in row.tag_ids]
             for kind, requested in zip(IDENTITY_KINDS, row.addresses):
                 stored = getattr(pv, f"{kind}_address")
                 if kind != row.kind and requested is not None and requested != stored:
@@ -665,8 +692,12 @@ class PvService:
         return new_ids_by_pv
 
     async def _load_import_tags(self, rows: list[_ImportRow]) -> dict[str, Tag]:
-        """Every tag the rows name, by id, in one query. Unknown ids are absent."""
-        tag_ids = {tid for row in rows for tid in row.data.tags}
+        """Every tag the rows name, by canonical id, in one query. Unknown ids are absent.
+
+        An id that isn't a UUID is left out of the query, since Postgres would refuse it
+        as a ``uuid`` parameter; it can't name a tag, so it is simply unknown.
+        """
+        tag_ids = {tid for row in rows for tid in row.tag_ids if _canonical_uuid(tid)}
         if not tag_ids:
             return {}
         return {tag.id: tag for tag in await self.tag_repo.get_by_ids(list(tag_ids))}
@@ -711,7 +742,7 @@ class PvService:
                     description=row.data.description,
                     abs_tolerance=row.data.abs_tolerance,
                     rel_tolerance=row.data.rel_tolerance,
-                    tags=[tags_by_id[tid] for tid in row.data.tags if tid in tags_by_id],
+                    tags=[tags_by_id[tid] for tid in row.tag_ids if tid in tags_by_id],
                 )
             )
 

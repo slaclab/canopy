@@ -472,3 +472,86 @@ async def test_statement_count_does_not_grow_with_the_row_count(
         return statements
 
     assert await run(1, 5) == await run(1000, 50)
+
+
+# --- tag ids ----------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("mode", [None, "skip", "update"])
+async def test_a_new_row_matches_tag_ids_in_any_case(client: AsyncClient, mode: str | None):
+    """Postgres returns tag ids in lowercase; a row may send them in uppercase, as ``POST
+    /v1/pvs`` accepts."""
+    [tag] = await _tags(client, "kept")
+
+    r = await _import(client, [{"setpointAddress": "SIM:DEV:00001:SET", "tags": [tag.upper()]}], mode)
+
+    assert r.status_code == 200, r.text
+    [pv] = r.json() if mode is None else r.json()["created"]
+    assert [t["id"] for t in pv["tags"]] == [tag]
+
+
+async def test_an_update_row_matches_tag_ids_in_any_case(client: AsyncClient):
+    first, second = await _tags(client, "first", "second")
+    await _create(client, setpointAddress="SIM:DEV:00001:SET", tags=[first])
+
+    rows = [{"setpointAddress": "SIM:DEV:00001:SET", "tags": [first.upper(), second.upper()]}]
+    r = await _import(client, rows, "update")
+
+    assert r.status_code == 200, r.text
+    assert sorted(t["id"] for t in r.json()["updated"][0]["tags"]) == sorted([first, second])
+
+
+@pytest.mark.parametrize("mode", [None, "skip", "update"])
+async def test_a_tag_id_repeated_on_a_new_row_is_attached_once(client: AsyncClient, mode: str | None):
+    [tag] = await _tags(client, "kept")
+
+    rows = [{"setpointAddress": "SIM:DEV:00001:SET", "tags": [tag, tag.upper(), tag]}]
+    r = await _import(client, rows, mode)
+
+    assert r.status_code == 200, r.text
+    [pv] = r.json() if mode is None else r.json()["created"]
+    assert [t["id"] for t in pv["tags"]] == [tag]
+
+
+async def test_a_malformed_tag_id_is_an_unknown_tag(client: AsyncClient):
+    """Not a UUID at all: dropped from a new row and refused on an update row, like any
+    other unknown tag, rather than reaching the database as a uuid it can't parse."""
+    [tag] = await _tags(client, "kept")
+    await _create(client, setpointAddress="SIM:DEV:00001:SET", tags=[tag])
+
+    r = await _import(client, [{"setpointAddress": "SIM:DEV:00002:SET", "tags": ["not-a-uuid", tag]}], None)
+    assert r.status_code == 200, r.text
+    assert [t["id"] for t in r.json()[0]["tags"]] == [tag]
+
+    r = await _import(client, [{"setpointAddress": "SIM:DEV:00001:SET", "tags": ["not-a-uuid"]}], "update")
+    assert r.status_code == 400
+    assert r.json()["detail"] == (
+        "Unknown tag IDs on rows that update an existing PV: row 1 (SIM:DEV:00001:SET): not-a-uuid"
+    )
+    assert [t["id"] for t in (await _all_pvs(client))["SIM:DEV:00001:SET"]["tags"]] == [tag]
+
+
+# --- updated_at ---------------------------------------------------------------- #
+
+
+async def test_update_moves_updated_at_only_for_rows_that_change_a_pv_column(client: AsyncClient):
+    """A tags-only change issues no UPDATE on ``pv``, so its ``updated_at`` stays, as with
+    ``PUT /v1/pvs/{id}``."""
+    [tag] = await _tags(client, "kept")
+    column = await _create(client, setpointAddress="SIM:DEV:00001:SET")
+    tags_only = await _create(client, setpointAddress="SIM:DEV:00002:SET")
+
+    rows = [
+        {"setpointAddress": "SIM:DEV:00001:SET", "description": "changed"},
+        {"setpointAddress": "SIM:DEV:00002:SET", "tags": [tag]},
+    ]
+    r = await _import(client, rows, "update")
+
+    assert r.status_code == 200, r.text
+    first, second = r.json()["updated"]
+    assert first["lastModifiedDate"] > column["lastModifiedDate"]
+    assert second["lastModifiedDate"] == tags_only["lastModifiedDate"]
+    assert [t["id"] for t in second["tags"]] == [tag]
+    after = await _all_pvs(client)
+    assert after["SIM:DEV:00001:SET"]["lastModifiedDate"] == first["lastModifiedDate"]
+    assert after["SIM:DEV:00002:SET"]["lastModifiedDate"] == second["lastModifiedDate"]

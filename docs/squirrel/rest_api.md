@@ -440,7 +440,8 @@ if any row is rejected, no PV is created or changed.
 
 Unlike [Create a PV](#create-a-pv), a tag id that doesn't exist isn't an
 error on a row that creates a PV: it is ignored, and the PV is created without
-that tag.
+that tag. Tag ids match in any case, and a tag id listed twice on a row adds
+the tag once.
 
 `onConflict` decides what happens to a row whose identifying address is
 already registered:
