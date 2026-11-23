@@ -212,8 +212,8 @@ async def publish(
     (every other table in those schemas is revoked, so neither can read API-key
     hashes); a role that doesn't exist yet is skipped with a notice, and the next
     run grants it. Afterwards each role must be able to do no more than that,
-    counting what it inherits from other roles or PUBLIC; ``publish`` refuses rather
-    than change those shared grants.
+    counting what it inherits from other roles or PUBLIC and what it can reach with
+    ``SET ROLE``; ``publish`` refuses rather than change those shared grants.
 
     Parameters
     ----------
@@ -229,7 +229,8 @@ async def publish(
     Returns
     -------
     dict
-        Per publication, what changed; per role, ``"granted"`` or ``"absent"``; and the
+        Per publication, what changed; per role, ``"granted"``, ``"absent"`` (no such
+        role yet) or ``"nothing_published"`` (no registered table here yet); and the
         registered tables that don't exist here.
 
     Raises
@@ -277,6 +278,9 @@ async def publish(
                     policy="SELECT on the published tables",
                 )
                 result["roles"][grantee] = "granted"
+            else:
+                logger.info("Nothing is published here yet; no grants made for %s", grantee)
+                result["roles"][grantee] = "nothing_published"
     return result
 
 
