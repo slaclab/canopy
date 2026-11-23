@@ -269,7 +269,7 @@ failed check by name:
 | `window_set` | `CANOPY_WINDOW_DAYS` is unset |
 | `no_delete_publication` | Any publication carrying a snapshot table publishes deletes (`canopy_history` still exists) |
 | `slot_active` | The head's slot is missing or no walsender holds it |
-| `streams_split` | The walsender doesn't stream both `canopy_ref` and `canopy_ts`, they don't carry the snapshot tables whole (no row filter or column list), or its command can't be read |
+| `streams_split` | The walsender doesn't stream both `canopy_ref` and `canopy_ts`, they don't carry the snapshot tables whole (inserts and updates, no row filter or column list), or its command can't be read |
 | `no_initial_copy` | A table's initial copy is running (a `pg_<oid>_sync_…` slot exists) |
 | `wal_status_reserved` | The slot's WAL is at risk |
 | `lag` | Flush lag or the head's last reply is older than `CANOPY_PRUNE__MAX_LAG_S` (60 s) |

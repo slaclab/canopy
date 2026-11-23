@@ -20,12 +20,17 @@ STARTED = datetime(2026, 11, 1, 6, 0, tzinfo=UTC)
 
 
 def _status(**slot) -> dict:
-    """A split primary whose mirror streams canopy_ref and canopy_ts, caught up; ``slot`` overrides."""
+    """A split arm whose head streams canopy_ref and canopy_ts, caught up; ``slot`` overrides."""
     return {
         "layout": "split",
         "publications": [
-            {"name": "canopy_ref", "exists": True, "tables": ["squirrel.pv", "squirrel.pv_tag"]},
-            {"name": "canopy_ts", "exists": True, "tables": TABLES},
+            {
+                "name": "canopy_ref",
+                "exists": True,
+                "operations": ["insert", "update", "delete"],
+                "tables": ["squirrel.pv", "squirrel.pv_tag"],
+            },
+            {"name": "canopy_ts", "exists": True, "operations": ["insert", "update"], "tables": TABLES},
         ],
         "slots": [
             {
@@ -66,6 +71,12 @@ def _restricted(status: dict) -> dict:
     return {**status, "publications": [ref, ts]}
 
 
+def _publishing(status: dict, operations: list[str]) -> dict:
+    """``status`` with ``canopy_ts`` publishing only ``operations``."""
+    ref, ts = status["publications"]
+    return {**status, "publications": [ref, {**ts, "operations": operations}]}
+
+
 def _judge(*, status=None, delete_publications=None, heartbeat=HEARTBEAT) -> GateResult:
     return evaluate_gate(
         slot_name=SLOT,
@@ -104,6 +115,8 @@ def test_a_switched_caught_up_mirror_with_good_checks_passes():
         ({"status": _status(walsender_started_at=None)}, "heartbeat_fresh"),
         ({"status": _with_copy(_status())}, "no_initial_copy"),
         ({"status": _restricted(_status())}, "streams_split"),
+        ({"status": _publishing(_status(), ["update"])}, "streams_split"),
+        ({"status": _publishing(_status(), ["insert"])}, "streams_split"),
     ],
     ids=[
         "deletes-published",
@@ -124,6 +137,8 @@ def test_a_switched_caught_up_mirror_with_good_checks_passes():
         "stream-start-unknown",
         "initial-copy",
         "row-filtered",
+        "updates-only",
+        "inserts-only",
     ],
 )
 def test_each_failed_check_is_named(change, failed):
@@ -201,5 +216,8 @@ def test_the_reasons_name_the_new_checks():
 
 def test_a_partly_published_table_doesnt_count_as_carried():
     assert _judge(status=_restricted(_status())).failures == {
-        "streams_split": "the head streams canopy_ref, canopy_ts, which carry no squirrel.snapshot"
+        "streams_split": (
+            "the head streams canopy_ref, canopy_ts, which don't carry squirrel.snapshot whole, "
+            "with inserts and updates"
+        )
     }
