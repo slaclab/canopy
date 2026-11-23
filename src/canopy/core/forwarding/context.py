@@ -19,14 +19,14 @@ REPLICA_STALE_HEADER = "X-Canopy-Replica-Stale"
 class ForwardedWrite:
     """A request a history head sent on someone's behalf, as the arm sees it.
 
-    ``on_behalf_of`` and ``facilities`` (the caller's facility grant, as slugs) are set
-    once the service key's headers have been accepted; ``commit_lsn`` once the request's
-    session committed a write. A route sets ``report_position`` when its answer must
-    carry a position even if it wrote nothing (``core.db._commit_forwarded``).
+    ``on_behalf_of`` and ``facility_ids`` (the caller's facility grant: ids, or ``{"*"}``)
+    are set once the service key's headers have been accepted; ``commit_lsn`` once the
+    request's session committed a write. A route sets ``report_position`` when its answer
+    must carry a position even if it wrote nothing (``core.db._commit_forwarded``).
     """
 
     on_behalf_of: str | None = None
-    facilities: frozenset[str] | None = None
+    facility_ids: frozenset[str] | None = None
     commit_lsn: str | None = None
     report_position: bool = False
 

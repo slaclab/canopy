@@ -33,15 +33,15 @@ from canopy.core.facilities.schemas import (
 )
 from canopy.core.facilities.repositories import FacilityRepository
 
-# Async `(facility_id, slug) -> bool` callables, each answering "is this facility still
+# Async `(facility_id) -> bool` callables, each answering "is this facility still
 # referenced by my data?", paired with a label naming what the operator has to go
 # unassign. Registered at startup so `delete()` can enforce its guard without core
-# importing any referencing module's models. Both the id and the slug are passed because
-# references come in both forms: module data stores ids, key grants store slugs.
-_in_use_checkers: list[tuple[Callable[[str, str], Awaitable[bool]], str]] = []
+# importing any referencing module's models. Module data and key grants both reference
+# a facility by id.
+_in_use_checkers: list[tuple[Callable[[str], Awaitable[bool]], str]] = []
 
 
-def register_in_use_checker(checker: Callable[[str, str], Awaitable[bool]], what: str) -> None:
+def register_in_use_checker(checker: Callable[[str], Awaitable[bool]], what: str) -> None:
     """``what`` completes "Cannot delete a facility that still has ``<what>`` assigned
     to it" — e.g. ``"PVs or snapshots"``."""
     _in_use_checkers.append((checker, what))
@@ -99,11 +99,6 @@ class FacilityService:
             raise FacilityNotFound(f"Parent facility '{parent_slug}' not found")
         return parent
 
-    async def known_slugs(self, slugs: list[str]) -> set[str]:
-        """The subset of ``slugs`` that exist. One query, not one per slug — callers
-        reach this through the gateway, which opens a session per call."""
-        return await self.facility_repo.existing_slugs(slugs)
-
     async def ids_by_slug(self, slugs: list[str] | set[str]) -> dict[str, str]:
         """``{slug: id}`` for the subset of ``slugs`` that exist. One query, not one
         per slug — callers that also need to reject unknown slugs get every unknown
@@ -121,13 +116,13 @@ class FacilityService:
         ``ids_by_slug``, for turning stored ids back into slugs on the way out."""
         return await self.facility_repo.slugs_by_id(ids)
 
-    async def key_access(self, slugs: frozenset[str]) -> FacilityAccessDTO:
+    async def key_access(self, facility_ids: frozenset[str]) -> FacilityAccessDTO:
         """A credential's grant as the slugs it can reach, descendants included.
 
         Built on ``resolve_key_facility_scope``, the same resolution every facility gate
         uses, so what this reports is what a write would be checked against.
         """
-        scope = await self.resolve_key_facility_scope(slugs)
+        scope = await self.resolve_key_facility_scope(facility_ids)
         if scope is None:
             return FacilityAccessDTO(unrestricted=True)
         return FacilityAccessDTO(unrestricted=False, facilities=sorted((await self.slugs_by_id(scope)).values()))
@@ -178,14 +173,14 @@ class FacilityService:
         if await self.facility_repo.get_children(facility_id):
             raise FacilityHasChildren("Cannot delete a facility that has children; reparent or remove them first")
         for checker, what in _in_use_checkers:
-            if await checker(facility_id, facility.slug):
+            if await checker(facility_id):
                 raise FacilityInUse(f"Cannot delete a facility that still has {what} assigned to it")
         await self.facility_repo.delete(facility)
         return True
 
     async def descendant_ids(self, facility_id: str) -> set[str]:
         """``{facility_id, all descendant facility_ids}``. Empty for an unknown id."""
-        return await self.facility_repo.descendant_ids(facility_id)
+        return await self.facility_repo.descendant_ids({facility_id})
 
     async def resolve_facility_scope(self, slug: str | None) -> set[str] | None:
         """Slug -> {facility_id, all descendant facility_ids}.
@@ -203,8 +198,8 @@ class FacilityService:
             raise FacilityNotFound(f"Facility '{slug}' not found")
         return result
 
-    async def resolve_key_facility_scope(self, slugs: frozenset[str]) -> set[str] | None:
-        """A credential's granted slugs -> the union of each one's descendant id set.
+    async def resolve_key_facility_scope(self, facility_ids: frozenset[str]) -> set[str] | None:
+        """A credential's granted facility ids -> the union of each one's descendant id set.
 
         Returns ``None`` — "unrestricted, apply no facility filter" — when the
         grant holds the wildcard, using the same sentinel convention as
@@ -213,15 +208,17 @@ class FacilityService:
         An empty grant yields ``set()``: authenticated, but no facility's data — a
         meaningful provisioned-but-unassigned state, not an error.
 
-        An unknown granted slug contributes nothing rather than raising. Grants are
-        validated at mint time, and a facility this instance's keys grant can't be
-        deleted here. But keys are local to each instance, so a head's key can still
-        name a facility its owner deleted, and rows can predate either guard.
+        A grant holds the ids its slugs named at mint, so it stays bound to those
+        facilities. Descendants come from the hierarchy as it is now, so a grant on a
+        parent covers a child created later. A granted id that no longer exists
+        contributes nothing: a facility this instance's keys grant can't be deleted
+        here, but keys are local to each instance, so a head's key can still name a
+        facility its owner deleted. A facility created later under the same slug, by
+        that owner or another, has a new id, so the key doesn't reach it.
+
+        Each id must be well-formed, as ``APIKey.facility_ids`` and
+        ``core.security.forwarded_facilities`` hold them.
         """
-        if WILDCARD in slugs:
+        if WILDCARD in facility_ids:
             return None
-        scope: set[str] = set()
-        for slug in slugs:
-            if (resolved := await self.facility_repo.resolve_facility_scope(slug)) is not None:
-                scope |= resolved
-        return scope
+        return await self.facility_repo.descendant_ids(facility_ids)

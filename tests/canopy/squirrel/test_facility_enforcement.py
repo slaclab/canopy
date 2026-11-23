@@ -1,4 +1,4 @@
-"""Facility-scoped writes: a key's ``facilities`` grant constrains what it can mutate.
+"""Facility-scoped writes: a key's facility grant constrains what it can mutate.
 
 Auth is injected by rebinding the process-global key registry (the seam
 ``tests/canopy/core/test_module_scoping.py`` already uses) — but multi-key here, since
@@ -22,6 +22,20 @@ from canopy.core.facilities import service as facilities_service
 from canopy.squirrel.data.models import Snapshot, SnapshotValue
 from canopy.core.facilities.models import Facility
 from canopy.core.facilities.routes import router as facilities_router
+
+# Fixed ids for the hierarchy ``_seed_hierarchy`` makes, so the keys can grant it.
+FACILITY_IDS = {
+    "lcls": "00000000-0000-4000-8000-00000000000a",
+    "lcls-sc": "00000000-0000-4000-8000-00000000000b",
+    "lcls-nc": "00000000-0000-4000-8000-00000000000c",
+    "facet": "00000000-0000-4000-8000-00000000000d",
+}
+
+
+def granting(*slugs: str) -> frozenset[str]:
+    """The grant of a key minted with ``slugs``."""
+    return frozenset(FACILITY_IDS[slug] for slug in slugs)
+
 
 SC_HEADERS = {"X-API-Key": "sc-key"}
 NC_HEADERS = {"X-API-Key": "nc-key"}
@@ -53,36 +67,38 @@ def scoped_keys():
                     read=True,
                     write=True,
                     modules=frozenset({WILDCARD}),
-                    facilities=frozenset({"lcls-sc"}),
+                    facility_ids=granting("lcls-sc"),
                 ),
                 APIKey(
                     token="nc-key",
                     read=True,
                     write=True,
                     modules=frozenset({WILDCARD}),
-                    facilities=frozenset({"lcls-nc"}),
+                    facility_ids=granting("lcls-nc"),
                 ),
                 APIKey(
                     token="lcls-key",
                     read=True,
                     write=True,
                     modules=frozenset({WILDCARD}),
-                    facilities=frozenset({"lcls"}),
+                    facility_ids=granting("lcls"),
                 ),
-                APIKey(token="none-key", read=True, write=True, modules=frozenset({WILDCARD}), facilities=frozenset()),
+                APIKey(
+                    token="none-key", read=True, write=True, modules=frozenset({WILDCARD}), facility_ids=frozenset()
+                ),
                 APIKey(
                     token="sc-facet-key",
                     read=True,
                     write=True,
                     modules=frozenset({WILDCARD}),
-                    facilities=frozenset({"lcls-sc", "facet"}),
+                    facility_ids=granting("lcls-sc", "facet"),
                 ),
                 APIKey(
                     token="wild-key",
                     read=True,
                     write=True,
                     modules=frozenset({WILDCARD}),
-                    facilities=frozenset({WILDCARD}),
+                    facility_ids=frozenset({WILDCARD}),
                 ),
                 APIKey(
                     token="admin-key",
@@ -90,7 +106,7 @@ def scoped_keys():
                     write=True,
                     admin=True,
                     modules=frozenset({WILDCARD}),
-                    facilities=frozenset({WILDCARD}),
+                    facility_ids=frozenset({WILDCARD}),
                 ),
             ]
         )
@@ -101,12 +117,12 @@ def scoped_keys():
 
 async def _seed_hierarchy(session: AsyncSession) -> dict[str, Facility]:
     """``lcls`` with children ``lcls-sc``/``lcls-nc``, plus an unrelated ``facet``."""
-    lcls = Facility(slug="lcls", name="LCLS")
-    facet = Facility(slug="facet", name="FACET")
+    lcls = Facility(id=FACILITY_IDS["lcls"], slug="lcls", name="LCLS")
+    facet = Facility(id=FACILITY_IDS["facet"], slug="facet", name="FACET")
     session.add_all([lcls, facet])
     await session.commit()
-    sc = Facility(slug="lcls-sc", name="SC", parent_id=lcls.id)
-    nc = Facility(slug="lcls-nc", name="NC", parent_id=lcls.id)
+    sc = Facility(id=FACILITY_IDS["lcls-sc"], slug="lcls-sc", name="SC", parent_id=lcls.id)
+    nc = Facility(id=FACILITY_IDS["lcls-nc"], slug="lcls-nc", name="NC", parent_id=lcls.id)
     session.add_all([sc, nc])
     await session.commit()
     return {"lcls": lcls, "lcls-sc": sc, "lcls-nc": nc, "facet": facet}

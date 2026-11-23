@@ -72,16 +72,15 @@ API_MODULES = (
 )
 
 
-async def _facility_granted_to_key(facility_id: str, slug: str) -> bool:
-    """Is any active API key's facility grant still naming this facility?
+async def _facility_granted_to_key(facility_id: str) -> bool:
+    """Does any active API key still grant this facility?
 
     Registered from here, not from ``core.keys``, to keep ``core.facilities`` free of
     imports out of ``core.keys`` — the reverse edge already exists, since
-    ``keys.service`` validates grants through the facilities gateway. Grants store
-    slugs, so ``facility_id`` is unused.
+    ``keys.service`` validates grants through the facilities gateway.
     """
     async with session_scope() as session:
-        return await ApiKeyRepository(session).count_granting(slug) > 0
+        return await ApiKeyRepository(session).count_granting(facility_id) > 0
 
 
 @asynccontextmanager

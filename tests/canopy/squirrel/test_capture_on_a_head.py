@@ -31,7 +31,7 @@ from tests.canopy.squirrel.test_services_snapshot import FakeEpicsIO, _ev, _NoHo
 
 ARM1 = "https://arm1.example.org"
 IMPORT = f"{ARM1}/squirrel/v1/snapshots/import?mode=captured"
-CALLER = {"on_behalf_of": "console@head", "facilities": ["*"]}
+CALLER = {"on_behalf_of": "console@head", "facility_ids": ["*"]}
 
 
 @pytest.fixture
@@ -83,7 +83,7 @@ class TestTheRoute:
         assert kwargs["arm"] == "arm1"
         assert kwargs["facility_id"] == sites["arm1"]["facility"]
         assert kwargs["caller"]["on_behalf_of"].endswith("@head")
-        assert kwargs["caller"]["facilities"] == ["*"]
+        assert kwargs["caller"]["facility_ids"] == ["*"]
 
     async def test_a_read_only_arms_facility_is_refused_before_queueing(self, client, sites, enqueued):
         resp = await client.post("/v1/snapshots", json={"title": "t", "facility": "arm2-site"}, headers=WRITE_HEADERS)

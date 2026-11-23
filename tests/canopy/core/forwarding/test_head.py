@@ -13,24 +13,32 @@ from httpx import AsyncClient, ASGITransport
 from sqlalchemy import text
 from pytest_httpx import HTTPXMock
 
-from canopy.core import db
+from canopy.core import db, security
 from canopy.main import app
 from canopy.core.modules import WILDCARD
 from canopy.core.security import APIKey
 from canopy.core.forwarding import middleware
+from canopy.core.keys.service import ApiKeyService
+from canopy.core.keys.registry import DbKeyRegistry
 from canopy.squirrel.data.models import Pv, Snapshot, pv_facility
 from canopy.core.facilities.models import Facility
 
 from .conftest import ARM1, ARM1_SERVICE_KEY
 
 EVERY = frozenset({WILDCARD})
-WRITER = APIKey(token="writer", read=True, write=True, modules=EVERY, facilities=EVERY, name="console")
-OPS = APIKey(token="ops", read=True, write=True, admin=True, modules=EVERY, facilities=EVERY, name="ops")
+WRITER = APIKey(token="writer", read=True, write=True, modules=EVERY, facility_ids=EVERY, name="console")
+OPS = APIKey(token="ops", read=True, write=True, admin=True, modules=EVERY, facility_ids=EVERY, name="ops")
 HEADERS = {"X-API-Key": "writer"}
+# Each owner's facility ``<owner>-site`` has a fixed id, so a key can grant it.
+SITE_IDS = {
+    "head": "00000000-0000-4000-8000-000000000001",
+    "arm1": "00000000-0000-4000-8000-000000000002",
+    "arm2": "00000000-0000-4000-8000-000000000003",
+}
 # Keys limited to one facility: the head's own, and arm1's.
-LAB = APIKey(token="lab", read=True, write=True, modules=EVERY, facilities=frozenset({"head-site"}), name="lab")
+LAB = APIKey(token="lab", read=True, write=True, modules=EVERY, facility_ids=frozenset({SITE_IDS["head"]}), name="lab")
 ARM1_LAB = APIKey(
-    token="arm1-lab", read=True, write=True, modules=EVERY, facilities=frozenset({"arm1-site"}), name="a1"
+    token="arm1-lab", read=True, write=True, modules=EVERY, facility_ids=frozenset({SITE_IDS["arm1"]}), name="a1"
 )
 
 
@@ -47,7 +55,7 @@ async def copy(database, head, as_instance, bind_keys, monkeypatch):
     for owner in ("head", "arm1", "arm2"):
         with as_instance(owner):
             async with db.get_session_maker()() as session:
-                facility = Facility(slug=f"{owner}-site", name=owner)
+                facility = Facility(id=SITE_IDS[owner], slug=f"{owner}-site", name=owner)
                 pv = Pv(setpoint_address=f"{owner.upper()}:PV")
                 session.add_all([facility, pv])
                 await session.flush()
@@ -250,10 +258,12 @@ class TestOutsideTheCallersFacilities:
         )
 
         assert resp.status_code == 200, resp.text
-        assert json.loads(httpx_mock.get_request().headers["X-Canopy-On-Behalf-Of-Facilities"]) == ["arm1-site"]
+        assert json.loads(httpx_mock.get_request().headers["X-Canopy-On-Behalf-Of-Facilities"]) == [SITE_IDS["arm1"]]
 
     async def test_an_arm2_row_in_the_callers_facility_is_still_not_owned(self, http, copy, bind_keys):
-        arm2_lab = APIKey(token="arm2-lab", read=True, write=True, modules=EVERY, facilities=frozenset({"arm2-site"}))
+        arm2_lab = APIKey(
+            token="arm2-lab", read=True, write=True, modules=EVERY, facility_ids=frozenset({SITE_IDS["arm2"]})
+        )
         bind_keys(arm2_lab)
 
         resp = await http.delete(
@@ -261,3 +271,81 @@ class TestOutsideTheCallersFacilities:
         )
 
         assert (resp.status_code, resp.json()["code"]) == (403, "not_owner")
+
+
+class TestARecreatedSlug:
+    """A key the head minted granting ``north``, after the arm owning it deleted it and arm1 created ``north`` again.
+
+    Replication brings the delete and the new facility to the head as plain row changes,
+    with no check of the head's keys. Parametrized on who deleted the old ``north``: arm1
+    itself, or arm2, the new one being arm1's either way, so writes to it are forwarded.
+    """
+
+    OLD = "00000000-0000-4000-8000-0000000000f1"
+
+    @pytest_asyncio.fixture(params=["arm1", "arm2"])
+    async def north(self, request, copy, as_instance) -> dict:
+        with as_instance(request.param):
+            async with db.get_session_maker()() as session:
+                session.add(Facility(id=self.OLD, slug="north", name="North"))
+                await session.commit()
+        async with db.get_session_maker()() as session:
+            minted = await ApiKeyService(session).create_key(
+                "lab", read=True, write=True, modules=[WILDCARD], facilities=["north"]
+            )
+            await session.commit()
+        security.bind_key_registry(DbKeyRegistry())  # the copy fixture's bind_keys restores the registry
+        headers = {"X-API-Key": minted.token}
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            before = await client.get("/v1/facilities/access", headers=headers)
+        assert before.json() == {"unrestricted": False, "facilities": ["north"]}
+
+        async with db.get_session_maker()() as session:
+            await session.execute(Facility.__table__.delete().where(Facility.id == self.OLD))
+            await session.commit()
+        with as_instance("arm1"):
+            async with db.get_session_maker()() as session:
+                facility = Facility(slug="north", name="North again")
+                pv = Pv(setpoint_address="NORTH:PV")
+                session.add_all([facility, pv])
+                await session.flush()
+                snapshot = Snapshot(title="S", facility_id=facility.id)
+                session.add(snapshot)
+                await session.execute(pv_facility.insert().values(pv_id=pv.id, facility_id=facility.id))
+                await session.commit()
+        return {"headers": headers, "id": facility.id, "pv": pv.id, "snapshot": snapshot.id}
+
+    async def test_the_key_doesnt_read_the_new_facility(self, http, north):
+        access = await http.get("/v1/facilities/access", headers=north["headers"])
+        listed = await http.get("/squirrel/v1/snapshots", headers=north["headers"])
+        one = await http.get(f"/squirrel/v1/snapshots/{north['snapshot']}", headers=north["headers"])
+        pvs = await http.get("/squirrel/v1/pvs", headers=north["headers"])
+
+        assert access.json() == {"unrestricted": False, "facilities": []}
+        assert listed.status_code == 200, listed.text
+        assert north["snapshot"] not in {snapshot["id"] for snapshot in listed.json()["results"]}
+        assert (one.status_code, one.json()["code"]) == (404, "snapshot_not_found")
+        assert north["pv"] not in {pv["id"] for pv in pvs.json()}
+
+    async def test_a_change_to_the_new_facilitys_row_is_answered_here(self, http, north, httpx_mock: HTTPXMock):
+        resp = await http.patch(
+            f"/squirrel/v1/snapshots/{north['snapshot']}", json={"title": "x"}, headers=north["headers"]
+        )
+
+        assert (resp.status_code, resp.json()["code"]) == (404, "snapshot_not_found")
+        assert httpx_mock.get_requests() == []
+
+    async def test_a_create_in_the_new_facility_goes_with_the_minted_grant(self, http, north, httpx_mock: HTTPXMock):
+        # The arm decides a create; the head sends the grant as minted, which names the old id.
+        httpx_mock.add_response(
+            method="POST",
+            url=f"{ARM1}/squirrel/v1/pvs",
+            status_code=403,
+            json={"code": "insufficient_facility_access", "detail": "API key is not scoped to the PV's facility(s)"},
+        )
+
+        body = {"setpointAddress": "NORTH:NEW", "facilities": ["north"]}
+        resp = await http.post("/squirrel/v1/pvs", json=body, headers=north["headers"])
+
+        assert resp.status_code == 403
+        assert json.loads(httpx_mock.get_request().headers["X-Canopy-On-Behalf-Of-Facilities"]) == [self.OLD]

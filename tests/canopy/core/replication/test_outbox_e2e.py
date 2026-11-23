@@ -27,7 +27,7 @@ from .test_forward_e2e import (  # noqa: F401 — head_app is a fixture
     _captured_import,
 )
 
-CALLER = Caller(on_behalf_of="operator@head", facilities=["*"])
+CALLER = Caller(on_behalf_of="operator@head", facility_ids=["*"])
 CONFIG = OutboxConfig()
 pytestmark = pytest.mark.usefixtures("head_app")
 

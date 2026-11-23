@@ -25,7 +25,7 @@ from canopy.squirrel.services.snapshot_service import SnapshotService
 
 
 async def get_facility_scope(key: APIKeyDep) -> set[str] | None:
-    scope = await facilities_gateway.resolve_key_facility_scope(key.facilities)
+    scope = await facilities_gateway.resolve_key_facility_scope(key.facility_ids)
     # A history head's service key acts for a caller whose grant comes with the
     # request; the request reaches only what both keys reach.
     if (caller := forwarded_facilities()) is not None:

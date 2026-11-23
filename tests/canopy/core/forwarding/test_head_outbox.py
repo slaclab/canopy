@@ -42,7 +42,7 @@ async def _queue(copy: dict, **state) -> str:  # noqa: F811 — the fixture's na
             arm="arm1",
             bundle=bundle,
             facility_id=facility_id,
-            caller={"on_behalf_of": "console@head", "facilities": ["*"]},
+            caller={"on_behalf_of": "console@head", "facility_ids": ["*"]},
             config=OutboxConfig(),
         )
         if state:

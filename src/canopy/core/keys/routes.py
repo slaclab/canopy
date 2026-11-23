@@ -31,7 +31,7 @@ async def create_key(
         modules=data.modules,
         acting_key_modules=list(key.modules),
         facilities=data.facilities,
-        acting_key_facilities=list(key.facilities),
+        acting_key_facility_ids=key.facility_ids,
     )
 
 
@@ -61,5 +61,5 @@ async def deactivate_key(
         acting_key_id=key.id,
         acting_key_modules=list(key.modules),
         force=force,
-        acting_key_facilities=list(key.facilities),
+        acting_key_facility_ids=key.facility_ids,
     )

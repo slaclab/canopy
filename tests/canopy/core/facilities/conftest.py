@@ -35,6 +35,20 @@ _SCHEMA = "core"
 
 _CORE_TABLES = [t for t in Base.metadata.sorted_tables if t.schema == _SCHEMA]
 
+# Fixed ids for the facilities these tests seed, so a key bound before seeding can grant
+# them: a grant holds facility ids (``APIKey.facility_ids``).
+FACILITY_IDS = {
+    "lcls": "00000000-0000-4000-8000-00000000000a",
+    "lcls-sc": "00000000-0000-4000-8000-00000000000b",
+    "lcls-nc": "00000000-0000-4000-8000-00000000000c",
+    "facet": "00000000-0000-4000-8000-00000000000d",
+}
+
+
+def granting(*slugs: str) -> frozenset[str]:
+    """The grant of a key minted with ``slugs``, once they're seeded with ``FACILITY_IDS``."""
+    return frozenset(FACILITY_IDS[slug] for slug in slugs)
+
 
 @pytest.fixture(autouse=True)
 def _reset_in_use_checkers():
@@ -111,7 +125,7 @@ def fake_keys():
             write=True,
             admin=True,
             modules=frozenset({WILDCARD}),
-            facilities=frozenset({WILDCARD}),
+            facility_ids=frozenset({WILDCARD}),
             name="admin",
         ),
         "test-admin-only": APIKey(
@@ -120,7 +134,7 @@ def fake_keys():
             write=False,
             admin=True,
             modules=frozenset({WILDCARD}),
-            facilities=frozenset({WILDCARD}),
+            facility_ids=frozenset({WILDCARD}),
             name="admin-only",
         ),
         "test-scoped-admin": APIKey(
@@ -129,36 +143,36 @@ def fake_keys():
             write=True,
             admin=True,
             modules=frozenset({WILDCARD}),
-            facilities=frozenset(),
+            facility_ids=frozenset(),
             name="scoped-admin",
         ),
         # Facility-granted keys, for GET /v1/facilities/access
         "test-lcls": APIKey(
-            token="test-lcls", read=True, write=True, modules=frozenset({WILDCARD}), facilities=frozenset({"lcls"})
+            token="test-lcls", read=True, write=True, modules=frozenset({WILDCARD}), facility_ids=granting("lcls")
         ),
         "test-sc-facet": APIKey(
             token="test-sc-facet",
             read=True,
             write=True,
             modules=frozenset({WILDCARD}),
-            facilities=frozenset({"lcls-sc", "facet"}),
+            facility_ids=granting("lcls-sc", "facet"),
         ),
         "test-wild": APIKey(
-            token="test-wild", read=True, write=True, modules=frozenset({WILDCARD}), facilities=frozenset({WILDCARD})
+            token="test-wild", read=True, write=True, modules=frozenset({WILDCARD}), facility_ids=frozenset({WILDCARD})
         ),
         "test-squirrel-only": APIKey(
             token="test-squirrel-only",
             read=True,
             write=True,
             modules=frozenset({"squirrel"}),
-            facilities=frozenset({"lcls"}),
+            facility_ids=granting("lcls"),
         ),
         "test-write-only": APIKey(
             token="test-write-only",
             read=False,
             write=True,
             modules=frozenset({WILDCARD}),
-            facilities=frozenset({"lcls"}),
+            facility_ids=granting("lcls"),
         ),
     }
 

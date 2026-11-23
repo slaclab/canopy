@@ -14,9 +14,7 @@ from canopy.squirrel.data.repositories import facility_in_use
 logger = logging.getLogger(__name__)
 
 
-async def _facility_in_use(facility_id: str, slug: str) -> bool:
-    # `slug` is unused: Squirrel's PV and snapshot rows reference a facility by id.
-    # The hook passes both because a key grant references one by slug instead.
+async def _facility_in_use(facility_id: str) -> bool:
     async with session_scope() as session:
         return await facility_in_use(session, facility_id)
 

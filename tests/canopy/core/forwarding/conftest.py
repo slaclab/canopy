@@ -19,6 +19,7 @@ from sqlalchemy import text
 from sqlalchemy.pool import NullPool
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+import canopy.core.keys.models  # noqa: F401
 import canopy.magpie.data.models  # noqa: F401 — register the tables on Base.metadata
 import canopy.squirrel.data.models  # noqa: F401
 import canopy.core.facilities.models  # noqa: F401
@@ -70,8 +71,13 @@ TEST_DATABASE_URL = os.environ.get(
 _ADMIN_DSN = os.environ.get("CANOPY_TEST_ADMIN_DSN", "postgresql://canopy:canopy@localhost:5432/postgres")
 _TEST_DB_NAME = TEST_DATABASE_URL.rsplit("/", 1)[-1].split("?")[0]
 _SCHEMAS = ("squirrel", "magpie", "core")
-# Of core's tables only the facility tree: the keys here are fakes.
-_TABLES = [t for t in Base.metadata.sorted_tables if t.schema in _SCHEMAS[:2] or t.fullname == "core.facility"]
+# Of core's tables the facility tree, and the keys for a test that mints one; most keys
+# here are fakes.
+_TABLES = [
+    t
+    for t in Base.metadata.sorted_tables
+    if t.schema in _SCHEMAS[:2] or t.fullname in ("core.facility", "core.api_key")
+]
 
 
 @pytest_asyncio.fixture

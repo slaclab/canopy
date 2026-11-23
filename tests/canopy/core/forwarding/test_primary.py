@@ -5,6 +5,7 @@ The header-trust tests use fake keys. The commit-position tests run the real app
 against Postgres (the ``database`` fixture in this directory's conftest).
 """
 
+import json
 from uuid import uuid4
 
 import pytest
@@ -28,13 +29,16 @@ from canopy.core.forwarding.context import forwarded_write
 from .conftest import FakeRegistry
 
 EVERY = frozenset({WILDCARD})
+# Fixed facility ids, so keys and headers can grant the sites the tests seed. The head
+# sends a grant as ids, the same ids the arm holds.
+SITE_IDS = {"site-a": "00000000-0000-4000-8000-0000000000a1", "site-b": "00000000-0000-4000-8000-0000000000b2"}
 SERVICE = APIKey(
     token="svc",
     read=True,
     write=True,
     is_service=True,
     modules=EVERY,
-    facilities=EVERY,
+    facility_ids=EVERY,
     name="head-service",
 )
 # A service key granted only site-a, for the intersection tests.
@@ -44,14 +48,19 @@ SERVICE_A = APIKey(
     write=True,
     is_service=True,
     modules=EVERY,
-    facilities=frozenset({"site-a"}),
+    facility_ids=frozenset({SITE_IDS["site-a"]}),
     name="head-service-site-a",
 )
-CLIENT = APIKey(token="cli", read=True, write=True, modules=EVERY, facilities=EVERY, name="console")
+CLIENT = APIKey(token="cli", read=True, write=True, modules=EVERY, facility_ids=EVERY, name="console")
 
 
 def _for(facilities: str) -> dict[str, str]:
     return {"X-Canopy-On-Behalf-Of": "operator@head", "X-Canopy-On-Behalf-Of-Facilities": facilities}
+
+
+def granting(*slugs: str) -> str:
+    """The header's value for a caller granted ``slugs``: their ids."""
+    return json.dumps([SITE_IDS[slug] for slug in slugs])
 
 
 ON_BEHALF = _for('["*"]')
@@ -153,7 +162,11 @@ class TestTrust:
         assert resp.status_code == 400
         assert "X-Canopy-On-Behalf-Of-Facilities" in resp.json()["detail"]
 
-    @pytest.mark.parametrize("value", ["site-a", '{"site-a": true}', "[1]", '"*"'])
+    # A slug is refused too: the grant names facilities by id, so a mixed-version head
+    # sending slugs fails closed.
+    @pytest.mark.parametrize(
+        "value", ["site-a", '{"site-a": true}', "[1]", '"*"', '["site-a"]', '["*", "site-a"]', "[null]"]
+    )
     def test_malformed_facilities(self, actor_client, accepting, value):
         resp = actor_client.post("/actor", headers={"X-API-Key": "svc", **_for(value)})
 
@@ -246,7 +259,7 @@ async def test_a_forwarded_import_keeps_the_author_and_logs_the_caller(http, cap
 async def sites(http) -> dict[str, str]:
     """Facilities site-a and site-b, by slug."""
     async with db.get_session_maker()() as session:
-        rows = [Facility(slug=slug, name=slug) for slug in ("site-a", "site-b")]
+        rows = [Facility(id=facility_id, slug=slug, name=slug) for slug, facility_id in SITE_IDS.items()]
         session.add_all(rows)
         await session.commit()
         return {row.slug: row.id for row in rows}
@@ -265,7 +278,7 @@ def captures(monkeypatch) -> list[dict]:
 
 
 async def test_a_forwarded_write_reaches_only_the_callers_facilities(http, sites, captures):
-    headers = {"X-API-Key": "svc", **_for('["site-a"]')}
+    headers = {"X-API-Key": "svc", **_for(granting("site-a"))}
 
     own = await http.post("/squirrel/v1/snapshots", json={"title": "t", "facility": "site-a"}, headers=headers)
     other = await http.post("/squirrel/v1/snapshots", json={"title": "t", "facility": "site-b"}, headers=headers)
@@ -292,6 +305,58 @@ async def test_a_caller_with_no_facilities_reaches_none(http, sites, captures):
 
     assert resp.status_code == 403
     assert captures == []
+
+
+class TestARecreatedSlug:
+    """A head's caller granted a facility this arm deleted, then created again under its slug.
+
+    The head sends the grant its key was minted with: the deleted facility's id, which
+    names nothing here. The new facility has a new id, so the caller doesn't reach it.
+    """
+
+    OLD = "00000000-0000-4000-8000-0000000000c3"
+
+    @pytest_asyncio.fixture
+    async def north(self, http) -> str:
+        """The new ``north``'s id, created after the one with ``OLD`` was deleted."""
+        async with db.get_session_maker()() as session:
+            session.add(Facility(id=self.OLD, slug="north", name="North"))
+            await session.commit()
+            await session.execute(Facility.__table__.delete().where(Facility.id == self.OLD))
+            await session.commit()
+            facility = Facility(slug="north", name="North again")
+            session.add(facility)
+            await session.commit()
+            return facility.id
+
+    @staticmethod
+    def _as_caller(*facility_ids: str) -> dict[str, str]:
+        return {"X-API-Key": "svc", **_for(json.dumps(list(facility_ids)))}
+
+    async def test_a_snapshot_create_in_the_new_facility_is_refused(self, http, north, captures):
+        resp = await http.post(
+            "/squirrel/v1/snapshots", json={"title": "t", "facility": "north"}, headers=self._as_caller(self.OLD)
+        )
+
+        assert (resp.status_code, resp.json()["code"]) == (403, "insufficient_facility_access")
+        assert captures == []
+
+    async def test_a_pv_create_in_the_new_facility_is_refused(self, http, north):
+        body = {"setpointAddress": "SIM:NORTH:SP", "facilities": ["north"]}
+
+        resp = await http.post("/squirrel/v1/pvs", json=body, headers=self._as_caller(self.OLD))
+
+        assert (resp.status_code, resp.json()["code"]) == (403, "insufficient_facility_access")
+        async with db.get_session_maker()() as session:
+            assert await session.scalar(text("SELECT count(*) FROM squirrel.pv")) == 0
+
+    async def test_the_new_facilitys_own_id_reaches_it(self, http, north, captures):
+        resp = await http.post(
+            "/squirrel/v1/snapshots", json={"title": "t", "facility": "north"}, headers=self._as_caller(north)
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert [call["facility_id"] for call in captures] == [north]
 
 
 async def test_a_forwarded_restore_logs_the_caller(http, monkeypatch, caplog):
@@ -354,14 +419,16 @@ class TestForwardedImport:
         )
 
     async def test_a_pv_outside_the_callers_grant_is_left_out(self, http, site_pvs):
-        resp = await self._import(http, self._bundle("site-a", site_pvs["site-a"], site_pvs["site-b"]), '["site-a"]')
+        resp = await self._import(
+            http, self._bundle("site-a", site_pvs["site-a"], site_pvs["site-b"]), granting("site-a")
+        )
 
         assert resp.status_code == 200, resp.text
         assert resp.json()["snapshot"]["pvCount"] == 1
         assert [value["pvId"] for value in resp.json()["skipped"]] == [site_pvs["site-b"]]
 
     async def test_only_pvs_outside_the_callers_grant_is_refused(self, http, site_pvs):
-        resp = await self._import(http, self._bundle("site-a", site_pvs["site-b"]), '["site-a"]')
+        resp = await self._import(http, self._bundle("site-a", site_pvs["site-b"]), granting("site-a"))
 
         assert resp.status_code == 400
         assert resp.json()["code"] == "nothing_to_import"
@@ -369,7 +436,7 @@ class TestForwardedImport:
             assert await session.scalar(text("SELECT count(*) FROM squirrel.snapshot")) == 0
 
     async def test_pvs_in_the_callers_grant_import_whole(self, http, site_pvs):
-        resp = await self._import(http, self._bundle("site-a", site_pvs["site-a"]), '["site-a"]')
+        resp = await self._import(http, self._bundle("site-a", site_pvs["site-a"]), granting("site-a"))
 
         assert resp.status_code == 200, resp.text
         assert resp.json()["skipped"] == []
@@ -377,7 +444,7 @@ class TestForwardedImport:
     async def test_a_pv_outside_the_bundles_facility_is_left_out_even_when_the_caller_holds_it(self, http, site_pvs):
         bundle = self._bundle("site-a", site_pvs["site-a"], site_pvs["site-b"])
 
-        resp = await self._import(http, bundle, '["site-a", "site-b"]')
+        resp = await self._import(http, bundle, granting("site-a", "site-b"))
 
         assert resp.status_code == 200, resp.text
         assert [value["pvId"] for value in resp.json()["skipped"]] == [site_pvs["site-b"]]

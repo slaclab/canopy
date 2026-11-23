@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from uuid import UUID
+from collections.abc import Collection
 
 from canopy.core.errors import (
     BadRequest,
@@ -78,32 +79,37 @@ def _require_module_containment(target_modules, acting_modules) -> None:
         raise InsufficientModuleAccess(f"Acting API key is not scoped to module(s) {sorted(outside)}")
 
 
-async def _require_facility_containment(target_facilities: list[str], acting_key_facilities: list[str] | None) -> None:
+async def _require_facility_containment(
+    target_grant: Collection[str], acting_key_facility_ids: Collection[str] | None
+) -> None:
     """Refuse an admin action that reaches outside the acting key's own facility grant.
 
+    Both grants are facility ids, or ``{"*"}``, as ``APIKey.facility_ids`` holds them.
     Mirrors ``_require_module_containment``, but facility containment needs hierarchy
-    expansion — a grant on a parent covers a child the target list names directly —
-    so each target slug is checked by resolving its descendant set and testing it
-    against the acting key's own resolved scope, rather than comparing slug sets
-    directly. ``acting_key_facilities`` is ``None`` for the CLI, which stays
-    unrestricted, same as module containment.
+    expansion — a grant on a parent covers a child the target names directly — so each
+    target id is checked by resolving its descendant set and testing it against the
+    acting key's own resolved scope, rather than comparing id sets directly.
+    ``acting_key_facility_ids`` is ``None`` for the CLI, which stays unrestricted, same
+    as module containment.
 
     An acting key not holding the wildcard can never delegate the wildcard: there is
     no finite resolved scope to compare it against, since a future facility would
     fall inside it too.
     """
-    if acting_key_facilities is None or WILDCARD in acting_key_facilities:
+    if acting_key_facility_ids is None or WILDCARD in acting_key_facility_ids:
         return
-    if WILDCARD in target_facilities:
+    if WILDCARD in target_grant:
         raise InsufficientFacilityAccess("Acting API key is not scoped to every facility and cannot delegate '*'")
-    acting_scope = await facilities_gateway.resolve_key_facility_scope(frozenset(acting_key_facilities))
+    acting_scope = await facilities_gateway.resolve_key_facility_scope(frozenset(acting_key_facility_ids))
     outside = set()
-    for slug in target_facilities:
-        slug_scope = await facilities_gateway.resolve_key_facility_scope(frozenset({slug}))
-        if slug_scope and not slug_scope <= acting_scope:
-            outside.add(slug)
+    for facility_id in target_grant:
+        scope = await facilities_gateway.resolve_key_facility_scope(frozenset({facility_id}))
+        if scope and not scope <= acting_scope:
+            outside.add(facility_id)
     if outside:
-        raise InsufficientFacilityAccess(f"Acting API key is not scoped to facility/facilities {sorted(outside)}")
+        slugs = await facilities_gateway.slugs_by_id(outside)
+        named = sorted(slugs.get(facility_id, facility_id) for facility_id in outside)
+        raise InsufficientFacilityAccess(f"Acting API key is not scoped to facility/facilities {named}")
 
 
 def _normalize_facilities(facilities: list[str]) -> list[str]:
@@ -140,7 +146,7 @@ class ApiKeyService:
         modules: list[str],
         acting_key_modules: list[str] | None = None,
         facilities: list[str] | None = None,
-        acting_key_facilities: list[str] | None = None,
+        acting_key_facility_ids: Collection[str] | None = None,
     ) -> ApiKeyCreateResultDTO:
         """Mint a key and return it with its plaintext token — the only time the
         token exists outside the caller's hands. Only its hash is stored.
@@ -160,7 +166,11 @@ class ApiKeyService:
         implicit ``[WILDCARD]`` — unlike modules, an unassigned key is a valid,
         unprivileged state here, not a mistake.
 
-        ``acting_key_facilities`` (``None`` for the CLI) is the same delegation check
+        ``facilities`` names slugs, and the key records the ids of the facilities
+        holding them now. Every check resolves those ids, so the grant stays bound to
+        these facilities: one created later under the same slug isn't covered.
+
+        ``acting_key_facility_ids`` (``None`` for the CLI) is the same delegation check
         as ``acting_key_modules``, for facility scope: a facility-scoped admin cannot
         mint a key granted a facility outside its own resolved scope, or the wildcard.
 
@@ -176,18 +186,21 @@ class ApiKeyService:
         module_list = _normalize_modules(modules)
         _require_module_containment(module_list, acting_key_modules)
         facility_list = _normalize_facilities(facilities or [])
-        # A grant naming a nonexistent facility is a hard reject: it resolves to
-        # "matches nothing" at request time, so the key would authenticate and then
-        # see and write nothing, with no error to point at the typo. `[WILDCARD]`
-        # names no slug, so there's nothing to check.
+        # A grant naming a nonexistent facility is a hard reject: it would match
+        # nothing at request time, so the key would authenticate and then see and
+        # write nothing, with no error to point at the typo. `[WILDCARD]` names no
+        # slug, so there's nothing to check, and it records no ids.
+        facility_ids: list[str] = []
         if facility_list and facility_list != [WILDCARD]:
-            unknown = set(facility_list) - await facilities_gateway.known_slugs(facility_list)
-            if unknown:
+            ids_by_slug = await facilities_gateway.ids_by_slug(facility_list)
+            if unknown := set(facility_list) - ids_by_slug.keys():
                 raise BadRequest(
                     f"Unknown facility slug(s) {sorted(unknown)}; create them first "
                     f"(scripts/create_facility.py or POST /v1/facilities)"
                 )
-        await _require_facility_containment(facility_list, acting_key_facilities)
+            facility_ids = sorted(ids_by_slug.values())
+        grant = [WILDCARD] if facility_list == [WILDCARD] else facility_ids
+        await _require_facility_containment(grant, acting_key_facility_ids)
 
         token = mint_token()
         created = await self.repo.create(
@@ -200,6 +213,7 @@ class ApiKeyService:
                 is_service=service,
                 modules=module_list,
                 facilities=facility_list,
+                facility_ids=facility_ids,
             )
         )
         # The token itself is never logged — app_name and id are the audit trail.
@@ -240,7 +254,7 @@ class ApiKeyService:
         acting_key_id: str | None = None,
         acting_key_modules: list[str] | None = None,
         force: bool = False,
-        acting_key_facilities: list[str] | None = None,
+        acting_key_facility_ids: Collection[str] | None = None,
     ) -> ApiKeyDTO:
         """Soft-delete a key. Idempotent-adjacent: deactivating an already inactive
         key is a no-op rather than an error, so a retried revocation still succeeds.
@@ -252,14 +266,14 @@ class ApiKeyService:
 
         ``acting_key_modules`` (``None`` for the CLI) contains the same delegation
         check as ``create_key``: a module-scoped admin cannot deactivate a key
-        scoped to a module it does not itself hold. ``acting_key_facilities`` is the
-        same check for facility scope.
+        scoped to a module it does not itself hold. ``acting_key_facility_ids`` is the
+        same check for facility scope, against the facilities the key was minted with.
         """
         api_key = await self._find(key_id)
         if api_key is None:
             raise ApiKeyNotFound(f"No API key with id '{key_id}'")
         _require_module_containment(api_key.modules, acting_key_modules)
-        await _require_facility_containment(api_key.facilities, acting_key_facilities)
+        await _require_facility_containment(api_key.facility_grant, acting_key_facility_ids)
         if not force and acting_key_id is not None and api_key.id == acting_key_id:
             raise ApiKeySelfDeactivation(
                 "Refusing to deactivate the API key authenticating this request; pass force=true to override"

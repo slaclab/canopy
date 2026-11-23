@@ -51,16 +51,16 @@ class ApiKeyRepository(BaseRepository[ApiKey]):
         result = await self.session.execute(query)
         return result.scalar() or 0
 
-    async def count_granting(self, slug: str) -> int:
-        """How many *active* keys grant this facility slug.
+    async def count_granting(self, facility_id: str) -> int:
+        """How many *active* keys grant this facility, by id.
 
-        Consulted before a facility is deleted: since a grant stores the slug, not
-        an id, deleting the facility would silently turn every key holding it into
-        a deny-all credential that still authenticates. Inactive keys are excluded
-        — a revoked key must not pin a facility in place forever.
+        Consulted before a facility is deleted: deleting it would silently turn every
+        key holding it into a credential that still authenticates but no longer
+        reaches that facility's data. Inactive keys are excluded — a revoked key must
+        not pin a facility in place forever.
         """
         result = await self.session.execute(
-            select(func.count()).select_from(ApiKey).where(ApiKey.facilities.any(slug), ApiKey.is_active)
+            select(func.count()).select_from(ApiKey).where(ApiKey.facility_ids.any(facility_id), ApiKey.is_active)
         )
         return result.scalar() or 0
 

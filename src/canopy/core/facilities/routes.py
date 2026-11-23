@@ -52,13 +52,13 @@ async def get_facility_access(key: APIKeyDep, service: FacilityServiceDep) -> Fa
     nothing another key could use. Lives here rather than under ``/v1/api-keys``, which
     is admin-only: the keys that need this answer are ordinary facility-scoped ones.
     """
-    return await service.key_access(key.facilities)
+    return await service.key_access(key.facility_ids)
 
 
 @router.post("", dependencies=[Security(require_wildcard_facility_access)])
 async def create_facility(data: FacilityCreate, service: FacilityServiceDep, owner: OwnerQuery = None) -> FacilityDTO:
-    """Define a facility. ``slug`` is immutable once created — key grants and
-    ``?facility=`` filters reference it, so renaming would silently invalidate them.
+    """Define a facility. ``slug`` is immutable once created — ``?facility=`` filters
+    and clients reference it, so renaming would silently invalidate them.
 
     A facility with a parent is owned by the parent's owner. A root facility is owned
     by ``owner``, or by this instance."""

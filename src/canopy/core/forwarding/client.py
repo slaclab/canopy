@@ -54,15 +54,16 @@ def on_behalf_of(key: APIKey) -> str:
 class Caller:
     """Who a forwarded request is for: the name the arm records, and the facility grant it applies.
 
+    The grant is the key's facility ids, or ``["*"]``: the arm holds the same ids.
     Plain data, so a queued job can carry it and rebuild it later.
     """
 
     on_behalf_of: str
-    facilities: list[str]
+    facility_ids: list[str]
 
     @classmethod
     def of(cls, key: APIKey) -> Caller:
-        return cls(on_behalf_of=on_behalf_of(key), facilities=sorted(key.facilities))
+        return cls(on_behalf_of=on_behalf_of(key), facility_ids=sorted(key.facility_ids))
 
 
 @dataclass(frozen=True)
@@ -152,7 +153,7 @@ async def send_to_arm(
         # Keeping @ and : readable costs nothing, since % itself is always encoded.
         ON_BEHALF_OF_HEADER: quote(caller.on_behalf_of, safe="@:"),
         # The arm limits the request to the facilities both keys reach.
-        ON_BEHALF_OF_FACILITIES_HEADER: json.dumps(caller.facilities),
+        ON_BEHALF_OF_FACILITIES_HEADER: json.dumps(caller.facility_ids),
     }
     url = arm.url + path + (f"?{query}" if query else "")
     try:

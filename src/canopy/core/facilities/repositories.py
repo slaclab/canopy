@@ -7,6 +7,8 @@ schemas, which this repository can't reach without a cross-schema query. See
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,13 +29,6 @@ class FacilityRepository(BaseRepository[Facility]):
     async def get_children(self, facility_id: str) -> list[Facility]:
         result = await self.session.execute(select(Facility).where(Facility.parent_id == facility_id))
         return list(result.scalars().all())
-
-    async def existing_slugs(self, slugs: list[str]) -> set[str]:
-        """The subset of ``slugs`` that exist, in one query."""
-        if not slugs:
-            return set()
-        result = await self.session.execute(select(Facility.slug).where(Facility.slug.in_(slugs)))
-        return {row[0] for row in result.all()}
 
     async def ids_by_slug(self, slugs: list[str] | set[str]) -> dict[str, str]:
         """``{slug: id}`` for the subset of ``slugs`` that exist, in one query. An
@@ -72,11 +67,17 @@ class FacilityRepository(BaseRepository[Facility]):
         root = await self.get_by_slug(slug)
         if root is None:
             return None
-        return await self.descendant_ids(root.id)
+        return await self.descendant_ids({root.id})
 
-    async def descendant_ids(self, facility_id: str) -> set[str]:
-        """``{facility_id, all descendant facility_ids}``, by id rather than slug."""
-        hierarchy = select(Facility.id).where(Facility.id == facility_id).cte("facility_scope", recursive=True)
+    async def descendant_ids(self, facility_ids: Collection[str]) -> set[str]:
+        """Each of ``facility_ids`` that exists, and all their descendants, by id rather than slug.
+
+        An id that names no facility contributes nothing. Each id must be a well-formed
+        UUID: anything else is a database error, not a miss.
+        """
+        if not facility_ids:
+            return set()
+        hierarchy = select(Facility.id).where(Facility.id.in_(list(facility_ids))).cte("facility_scope", recursive=True)
         children = select(Facility.id).join(hierarchy, Facility.parent_id == hierarchy.c.id)
         hierarchy = hierarchy.union(children)
 
