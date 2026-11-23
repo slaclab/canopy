@@ -63,3 +63,20 @@ Hare imports the module and builds the connector via `from_config(cfg)` at start
 ## 3. Working example
 
 `canopy.epics.backends.simulation.SimulationConnector` implements the full Protocol with no external dependencies. Loading it by path, `CANOPY_EPICS__BACKEND=canopy.epics.backends.simulation:SimulationConnector`, is a quick check that the dotted-path form works in a deployment.
+
+## 4. Test your backend
+
+`canopy.epics.testing.conformance` holds the cases both shipped backends pass: one-shot reads and monitors of a scalar, an enum and a waveform under bare, `ca://` and `pva://` names, a PV that never connects, and an optional outage. It checks reads and monitors only, not `put` or `describe`. Give it a factory that returns a fresh, unstarted connector and a driver (`ConformanceDriver`) that names the PVs and sets their values in your control system, then run each case:
+
+```python
+from canopy.epics.testing import conformance
+
+@pytest.mark.parametrize("case_id", conformance.case_ids())
+async def test_conformance(case_id, driver):
+    try:
+        await conformance.run_case(case_id, make_connector, driver)
+    except conformance.CaseSkipped as skip:
+        pytest.skip(str(skip))
+```
+
+`tests/canopy/epics/test_conformance_simulation.py` drives the simulation backend this way, and `test_conformance_epics.py` drives the `epics` backend against a soft IOC and a PV Access server.
