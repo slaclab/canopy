@@ -82,6 +82,27 @@ async def test_grants_reads_every_row_and_writes_only_the_heads(db, config):
         await db.execute("RESET ROLE")
 
 
+async def test_a_permissive_policy_added_by_hand_doesnt_widen_writes(db, config):
+    await db.execute(f'CREATE ROLE "{config.app_role}"')
+    await db.execute("CREATE POLICY wide ON squirrel.tag_group FOR ALL TO PUBLIC USING (true) WITH CHECK (true)")
+    await grants(db, role="mirror", head=HEAD, config=config)
+    await db.execute(
+        "INSERT INTO squirrel.tag_group (id, name, owner_instance) VALUES (gen_random_uuid(), 'A', 'arm1')"
+    )
+
+    await db.execute(f'SET ROLE "{config.app_role}"')
+    try:
+        assert await db.fetchval("SELECT count(*) FROM squirrel.tag_group") == 1
+        assert await db.execute("UPDATE squirrel.tag_group SET description = 'x'") == "UPDATE 0"
+        assert await db.execute("DELETE FROM squirrel.tag_group") == "DELETE 0"
+        with pytest.raises(asyncpg.InsufficientPrivilegeError, match="row-level security"):
+            await db.execute(
+                "INSERT INTO squirrel.tag_group (id, name, owner_instance) VALUES (gen_random_uuid(), 'B', 'arm1')"
+            )
+    finally:
+        await db.execute("RESET ROLE")
+
+
 async def test_grants_makes_tables_created_later_readable(db, config):
     await db.execute(f'CREATE ROLE "{config.app_role}"')
     await grants(db, role="mirror", head=HEAD, config=config)
@@ -101,7 +122,7 @@ async def test_grants_twice_is_harmless_and_follows_a_new_head_name(db, config):
     await grants(db, role="mirror", head="renamed", config=config)
     checks = await db.fetch(
         "SELECT coalesce(with_check, qual) AS rule FROM pg_policies "
-        "WHERE schemaname = 'squirrel' AND tablename = 'pv' AND policyname <> 'canopy_read'"
+        "WHERE schemaname = 'squirrel' AND tablename = 'pv' AND policyname <> 'canopy_access'"
     )
     assert len(checks) == 3 and all("'renamed'" in row["rule"] for row in checks)
 
@@ -161,6 +182,25 @@ async def test_grants_refusals(db, config):
             ],
             r"belongs to rt_reader_\w+, which owns registered tables",
             id="member-of-a-table-owner",
+        ),
+        pytest.param(
+            [
+                'CREATE ROLE "{helper}"',
+                'GRANT TRUNCATE ON squirrel.snapshot TO "{helper}"',
+                'GRANT "{helper}" TO "{app}" WITH INHERIT FALSE, SET TRUE',
+            ],
+            r"TRUNCATE on squirrel\.snapshot \(as rt_reader_\w+, through SET ROLE\)",
+            id="set-role-to-a-role-that-holds-more",
+        ),
+        pytest.param(
+            ['CREATE ROLE "{helper}" SUPERUSER', 'GRANT "{helper}" TO "{app}" WITH INHERIT FALSE, SET TRUE'],
+            r"belongs to rt_reader_\w+, a superuser",
+            id="member-of-a-superuser",
+        ),
+        pytest.param(
+            ['CREATE ROLE "{helper}" BYPASSRLS', 'GRANT "{helper}" TO "{app}" WITH INHERIT FALSE, SET TRUE'],
+            r"belongs to rt_reader_\w+, which bypasses row-level security",
+            id="member-of-a-role-that-bypasses-row-security",
         ),
     ],
 )

@@ -468,26 +468,30 @@ async def refresh(
     return {"subscriptions": _in_order(results, selected)}
 
 
-_POLICIES = ("canopy_read", "canopy_insert", "canopy_update", "canopy_delete")
+_POLICIES = ("canopy_access", "canopy_insert", "canopy_update", "canopy_delete")
 
 
 async def _limit_writes_to_the_head(conn: asyncpg.Connection, table: str, column: str, app: str, head: str) -> None:
-    """Row-level security on one root table: the app role reads every row, writes only the head's.
+    """Row-level security on one root table: the app role reads every row, and no role writes another owner's.
 
     Enabled, not forced: the table's owner, which applies every arm's changes,
-    isn't bound by it. Policies are dropped and created again, so a renamed app role
-    or head is picked up. An UPDATE or DELETE of an arm's row matches no row, and an
-    INSERT of one is an error.
+    isn't bound by it. ``canopy_access`` lets the app role at every row. The write
+    policies are restrictive and apply to every role, so they hold alongside any
+    permissive policy, ours or one added by hand: an UPDATE or DELETE of a row the
+    head doesn't own matches no row, and an INSERT of one is an error. Policies are
+    dropped and created again, so a renamed app role or head is picked up.
     """
     name, ident, own = qualified(table), quote_ident(app), f"{quote_ident(column)} = {quote_literal(head)}"
     await conn.execute(f"ALTER TABLE {name} ENABLE ROW LEVEL SECURITY")
     await conn.execute(f"ALTER TABLE {name} NO FORCE ROW LEVEL SECURITY")
     for policy in _POLICIES:
         await conn.execute(f"DROP POLICY IF EXISTS {quote_ident(policy)} ON {name}")
-    await conn.execute(f"CREATE POLICY canopy_read ON {name} FOR SELECT TO {ident} USING (true)")
-    await conn.execute(f"CREATE POLICY canopy_insert ON {name} FOR INSERT TO {ident} WITH CHECK ({own})")
-    await conn.execute(f"CREATE POLICY canopy_update ON {name} FOR UPDATE TO {ident} USING ({own}) WITH CHECK ({own})")
-    await conn.execute(f"CREATE POLICY canopy_delete ON {name} FOR DELETE TO {ident} USING ({own})")
+    await conn.execute(f"CREATE POLICY canopy_access ON {name} FOR ALL TO {ident} USING (true) WITH CHECK (true)")
+    await conn.execute(f"CREATE POLICY canopy_insert ON {name} AS RESTRICTIVE FOR INSERT TO PUBLIC WITH CHECK ({own})")
+    await conn.execute(
+        f"CREATE POLICY canopy_update ON {name} AS RESTRICTIVE FOR UPDATE TO PUBLIC USING ({own}) WITH CHECK ({own})"
+    )
+    await conn.execute(f"CREATE POLICY canopy_delete ON {name} AS RESTRICTIVE FOR DELETE TO PUBLIC USING ({own})")
 
 
 async def grants(
@@ -507,8 +511,8 @@ async def grants(
     - on replicated tables, every privilege revoked, then SELECT, INSERT, UPDATE and
       DELETE;
     - on each root table (one that names its row's owner), row-level security: the
-      app role reads every row and may insert, update or delete only rows whose
-      owner is ``head``;
+      app role reads every row, and it (or any role but the tables' owner) may
+      insert, update or delete only rows whose owner is ``head``;
     - SELECT, INSERT, UPDATE and DELETE on local tables (DB-key auth writes
       ``core.api_key.last_used_at``, and key management writes keys);
     - default privileges, for each owner of the registered tables, so a table a later
@@ -523,8 +527,8 @@ async def grants(
     head``, as the tables' owner, so a new table gets its grants too.
 
     Afterwards the app role must hold nothing more, counting what it inherits from
-    other roles or PUBLIC. ``grants`` refuses rather than change those shared grants,
-    and the refusal rolls back its own.
+    other roles or PUBLIC and what it can reach with ``SET ROLE``. ``grants`` refuses
+    rather than change those shared grants, and the refusal rolls back its own.
 
     Raises
     ------
@@ -586,6 +590,7 @@ async def grants(
             allowed={table: (read_write if table in registry.tables else {"SELECT"}) for table in present},
             command="grants",
             policy="read-write on registered tables (rows of other owners blocked by row-level security)",
+            row_security=True,
         )
     logger.info(
         "Granted %s: read-write on %d replicated tables (writes to %s's rows only on %s) and on %s",

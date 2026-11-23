@@ -301,6 +301,25 @@ async def owner_memberships(conn: asyncpg.Connection, role: str, tables: Iterabl
     return [row["owner"] for row in rows]
 
 
+async def member_roles(conn: asyncpg.Connection, role: str) -> list[asyncpg.Record]:
+    """Every other role ``role`` belongs to, directly or through others, whatever the options.
+
+    Each row has the role's ``name``, whether it is a ``superuser`` or can
+    ``bypass_rls``, and whether ``role`` ``inherited`` its privileges. Those it
+    doesn't inherit it may still use with ``SET ROLE``, so they count too.
+    """
+    return await conn.fetch(
+        """
+        SELECT r.rolname AS name, r.rolsuper AS superuser, r.rolbypassrls AS bypass_rls,
+               pg_has_role($1, r.oid, 'USAGE') AS inherited
+        FROM pg_roles r
+        WHERE r.rolname <> $1 AND pg_has_role($1, r.oid, 'MEMBER')
+        ORDER BY r.rolname
+        """,
+        role,
+    )
+
+
 async def require_confined(
     conn: asyncpg.Connection,
     role: str,
@@ -309,27 +328,49 @@ async def require_confined(
     allowed: Mapping[str, set[str]],
     command: str,
     policy: str,
+    row_security: bool = False,
 ) -> None:
     """Refuse unless ``role`` can do no more on ``tables`` than ``allowed``.
 
-    Run it after the command's own grants, inside its transaction, so the refusal
-    rolls them back. It changes no grants itself: access that comes from PUBLIC or
-    another role is shared, so the fix belongs where it was granted.
+    Counts every role ``role`` belongs to, not only those it inherits from: one it
+    can switch to with ``SET ROLE`` lends it that role's privileges too. Run it after
+    the command's own grants, inside its transaction, so the refusal rolls them back.
+    It changes no grants itself: access that comes from PUBLIC or another role is
+    shared, so the fix belongs where it was granted.
+
+    Parameters
+    ----------
+    row_security : bool
+        The tables rely on row-level security, so a role that bypasses it, or one
+        ``role`` belongs to, is refused as well.
 
     Raises
     ------
     Refused
-        When ``role`` is a superuser, belongs to an owner of ``tables``, or holds a
-        privilege beyond ``allowed``; the message names each one.
+        When ``role`` is a superuser or belongs to one, belongs to an owner of
+        ``tables`` (or, with ``row_security``, to a role that bypasses row-level
+        security), or holds a privilege beyond ``allowed`` itself or through a role
+        it can switch to; the message names each one.
     """
     tables = sorted(tables)
     if await is_superuser(conn, role):
         problems = ["it is a superuser"]
     else:
-        problems = [
-            f"it belongs to {owner}, which owns Canopy tables" for owner in await owner_memberships(conn, role, tables)
-        ]
+        owners = await owner_memberships(conn, role, tables)
+        problems = [f"it belongs to {owner}, which owns Canopy tables" for owner in owners]
         problems += await access_outside(conn, role, tables=tables, allowed=allowed)
+        for member in await member_roles(conn, role):
+            if member["name"] in owners:
+                continue
+            if member["superuser"]:
+                problems.append(f"it belongs to {member['name']}, a superuser")
+            elif row_security and member["bypass_rls"]:
+                problems.append(f"it belongs to {member['name']}, which bypasses row-level security")
+            elif not member["inherited"]:
+                problems += [
+                    f"{held} (as {member['name']}, through SET ROLE)"
+                    for held in await access_outside(conn, member["name"], tables=tables, allowed=allowed)
+                ]
     if problems:
         raise Refused(
             f"role {role} must have no more than {policy}, but {'; '.join(problems)}. Remove that access where it "

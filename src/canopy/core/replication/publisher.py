@@ -211,8 +211,8 @@ async def publish(
     (every other table in those schemas is revoked, so neither can read API-key
     hashes); a role that doesn't exist yet is skipped with a notice, and the next
     run grants it. Afterwards each role must be able to do no more than that,
-    counting what it inherits from other roles or PUBLIC; ``publish`` refuses rather
-    than change those shared grants.
+    counting what it inherits from other roles or PUBLIC and what it can reach with
+    ``SET ROLE``; ``publish`` refuses rather than change those shared grants.
 
     Parameters
     ----------
