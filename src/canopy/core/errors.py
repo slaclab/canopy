@@ -33,6 +33,7 @@ class ErrorCode(StrEnum):
     NOT_OWNER = auto()
     OWNER_MISMATCH = auto()
     MACHINE_READ_ONLY = auto()
+    INVALID_SETTINGS = auto()
 
     # Mole
     ARCHIVER_NOT_CONFIGURED = auto()

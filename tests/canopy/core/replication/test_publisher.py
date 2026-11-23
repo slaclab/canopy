@@ -116,6 +116,32 @@ async def test_publish_grants_existing_roles_select_on_published_tables_only(db,
         assert await privileges(db, role, "core.api_key") == set()
 
 
+async def test_publish_refuses_a_role_that_can_switch_to_one_reading_token_hashes(db, config):
+    for role in (config.replicator_role, config.reader_role):
+        await db.execute(f'CREATE ROLE "{role}"')
+    # Not inherited, but SET ROLE reaches it. The app role isn't used on an arm, so it is the helper.
+    await db.execute(f'CREATE ROLE "{config.app_role}"')
+    await db.execute(f'GRANT USAGE ON SCHEMA core TO "{config.app_role}"')
+    await db.execute(f'GRANT SELECT ON core.api_key TO "{config.app_role}"')
+    await db.execute(f'GRANT "{config.app_role}" TO "{config.reader_role}" WITH INHERIT FALSE, SET TRUE')
+
+    with pytest.raises(Refused, match=rf"SELECT on core\.api_key \(as {config.app_role}, through SET ROLE\)"):
+        await publish(db, role="primary", config=config)
+    assert await db.fetchval("SELECT count(*) FROM pg_publication") == 0
+
+
+async def test_publish_before_any_table_exists_reports_each_role(db, config):
+    # A role provisioned before the first migration: nothing to grant it yet.
+    for schema in REGISTRY.schemas:
+        await db.execute(f'DROP SCHEMA "{schema}" CASCADE')
+    await db.execute(f'CREATE ROLE "{config.reader_role}"')
+
+    result = await publish(db, role="primary", config=config)
+
+    assert result["roles"] == {config.replicator_role: "absent", config.reader_role: "nothing_published"}
+    assert result["missing"] == PRESENT
+
+
 async def test_publish_refuses_an_unclassified_table_and_changes_nothing(db, config):
     await db.execute("CREATE TABLE squirrel.mystery (id int PRIMARY KEY)")
 
