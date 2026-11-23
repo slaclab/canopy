@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 import logging
+import functools
 from typing import Literal, NamedTuple
 from collections.abc import Callable, Awaitable
 
@@ -93,8 +94,11 @@ def _identity(
     raise BadRequest("At least one address (setpoint, readback, or config) is required")
 
 
+@functools.lru_cache(maxsize=4096)
 def _canonical_uuid(value: str) -> str | None:
     """``value`` in the lowercase, hyphenated form Postgres returns a UUID in.
+
+    Cached: an import names the same few tag IDs on many rows.
 
     Parameters
     ----------
