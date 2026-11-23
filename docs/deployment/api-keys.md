@@ -238,6 +238,15 @@ mistake. Define the facility first (see
 [Defining facilities](docker.md#defining-facilities)). `*` names no slug, so it
 needs nothing defined.
 
+A grant is bound when the key is minted: the key records the ids of the facilities
+its slugs name then, and every check resolves those ids. `GET /v1/api-keys` still
+shows the slugs it was minted with. Descendants come from the hierarchy at request
+time, so a grant on a parent covers a child created later. A facility created later
+under the slug of one that was deleted is a different facility, and the key doesn't
+reach it. On a single instance that can't happen to an active key (see below); on a
+history head it can, since an arm deletes its facilities without seeing the head's
+keys (see [Instance roles](history/index.md#instance-roles)).
+
 For the same reason, a facility that any *active* key grants cannot be deleted:
 `DELETE /v1/facilities/{slug}` is refused with `facility_in_use` until the grants
 are gone. Deactivating a key releases its grants.

@@ -158,11 +158,13 @@ Magpie configs) and logs it for imports.
 
 The caller's facility grant goes with the request too, in
 `X-Canopy-On-Behalf-Of-Facilities`, and the arm requires it alongside
-`X-Canopy-On-Behalf-Of`. The arm's facility checks then allow only what both the
-service key and the caller reach, so a caller keeps its own facility limits through
-the head. Everything a forwarded write may change is that arm's own: the arm applies
-its own rules to it, as for one of its local users, and the service key bounds the
-rest.
+`X-Canopy-On-Behalf-Of`: a JSON list of the ids of the facilities the caller's key
+was granted, or `["*"]`. The arm holds the same ids, and refuses anything else, a
+slug included, with 400 `bad_request`. The arm's facility checks then allow only what
+both the service key and the caller reach, so a caller keeps its own facility limits
+through the head. Everything a forwarded write may change is that arm's own: the arm
+applies its own rules to it, as for one of its local users, and the service key
+bounds the rest.
 
 The head checks the caller's grant first, for a snapshot change or a PV edit or
 delete. A caller whose grant shares no facility with the row gets the head's own

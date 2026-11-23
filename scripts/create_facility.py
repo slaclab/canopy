@@ -4,8 +4,8 @@ The bootstrap path: ``POST /v1/facilities`` needs an existing ``admin`` key, and
 minting a key with a facility grant needs the facility to exist, so the first facility
 has to be created here. Needs nothing but ``CANOPY_DATABASE_URL``.
 
-``slug`` is immutable — ``?facility=`` filters and key grants reference it, so there is
-no rename; fixing a typo means delete and recreate. Slugs are lowercase alphanumerics
+``slug`` is immutable — ``?facility=`` filters reference it, and key grants name it at
+mint, so there is no rename; fixing a typo means delete and recreate. Slugs are lowercase alphanumerics
 with internal hyphens (``lcls``, ``lcls-sc``); ``LCLS`` is rejected, not lowercased.
 
 Run::
@@ -31,7 +31,7 @@ from canopy.core.facilities.service import FacilityService
 
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Create a Canopy facility.")
-    parser.add_argument("slug", help="Immutable identifier used in API key grants and ?facility= filters")
+    parser.add_argument("slug", help="Immutable identifier named by API key grants and ?facility= filters")
     parser.add_argument("--name", required=True, help="Human-readable display name")
     parser.add_argument("--description", help="Optional longer description")
     parser.add_argument(
