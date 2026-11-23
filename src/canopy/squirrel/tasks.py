@@ -20,6 +20,7 @@ from arq import Retry
 from canopy.core.db import session_scope
 from canopy.jobs.gateway import report_progress
 from canopy.squirrel.config import get_squirrel_config
+from canopy.squirrel.pv_cache.reader import PVCacheReader
 from canopy.squirrel.schemas.snapshot import NewSnapshotDTO, RestoreRequestDTO
 from canopy.squirrel.adapters.epics_io import EpicsIO
 from canopy.squirrel.services.snapshot_service import SnapshotService
@@ -58,18 +59,38 @@ def _maybe_retry(exc: Exception) -> None:
 
 
 async def create_snapshot_task(
-    ctx: dict, title: str, description: str | None = None, created_by: str | None = None
+    ctx: dict,
+    title: str,
+    description: str | None = None,
+    created_by: str | None = None,
+    facility_id: str | None = None,
+    use_cache: bool = False,
 ) -> dict:
-    """Read every registered PV from EPICS and persist a snapshot. Returns ``{"type":"snapshot","id":...}``."""
-    logger.info("create_snapshot_task: job_id=%s title=%r", ctx.get("job_id"), title)
+    """Read the facility's PVs (or every PV) from EPICS and persist a snapshot. Returns
+    ``{"type":"snapshot","id":...}``.
+
+    The facility arrives as a resolved **id**, not a slug: the route had to resolve it to
+    check the caller's facility grant before enqueueing, and re-resolving here would
+    re-read a slug that may have changed in the interim.
+
+    With ``use_cache``, values the PV cache can vouch for come from it and the rest
+    are read live from EPICS.
+    """
+    logger.info("create_snapshot_task: job_id=%s title=%r use_cache=%s", ctx.get("job_id"), title, use_cache)
     try:
         epics_io = _build_epics_io(ctx)
+        pv_cache = None
+        if use_cache:
+            cache_cfg = get_squirrel_config().pv_cache
+            pv_cache = PVCacheReader(ctx["redis"], heartbeat_max_age_s=cache_cfg.heartbeat_max_age_s)
         async with session_scope() as session:
             service = SnapshotService(session, epics_io)
             summary = await service.create_snapshot(
                 NewSnapshotDTO(title=title, description=description),
                 created_by=created_by,
                 progress_callback=_progress_sink(ctx),
+                facility_id=facility_id,
+                pv_cache=pv_cache,
             )
             await session.commit()
         return {"type": "snapshot", "id": summary.id}
@@ -79,12 +100,19 @@ async def create_snapshot_task(
         raise
 
 
-async def restore_snapshot_task(ctx: dict, snapshot_id: str, pv_ids: list[str] | None = None) -> dict:
-    """Restore a snapshot's setpoints to EPICS. Returns the restore summary (opaque to Jobs)."""
+async def restore_snapshot_task(
+    ctx: dict, snapshot_id: str, pv_ids: list[str] | None = None, skipped_pv_ids: list[str] | None = None
+) -> dict:
+    """Restore a snapshot's setpoints to EPICS. Returns the restore summary (opaque to Jobs).
+
+    ``skipped_pv_ids`` are PVs the route already dropped from ``pv_ids`` because the
+    caller's key isn't granted their facility; they're carried through only so the result
+    can report them.
+    """
     logger.info("restore_snapshot_task: job_id=%s snapshot_id=%s", ctx.get("job_id"), snapshot_id)
     try:
         epics_io = _build_epics_io(ctx)
-        request = RestoreRequestDTO(pv_ids=pv_ids) if pv_ids else None
+        request = RestoreRequestDTO(pv_ids=pv_ids) if pv_ids is not None else None
         async with session_scope() as session:  # read-only (restore writes to EPICS, not the DB)
             service = SnapshotService(session, epics_io)
             result = await service.restore_snapshot(snapshot_id, request, progress_callback=_progress_sink(ctx))
@@ -95,6 +123,7 @@ async def restore_snapshot_task(ctx: dict, snapshot_id: str, pv_ids: list[str] |
             "successCount": result.success_count,
             "failureCount": result.failure_count,
             "failures": result.failures[:50],
+            "skippedPvIds": skipped_pv_ids or [],
         }
     except Exception as exc:
         logger.exception("restore_snapshot_task failed: job_id=%s", ctx.get("job_id"))

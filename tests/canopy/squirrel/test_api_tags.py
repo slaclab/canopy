@@ -1,5 +1,7 @@
 """API tests for the tag / tag-group endpoints."""
 
+from uuid import uuid4
+
 from httpx import AsyncClient
 
 from tests.canopy.squirrel.conftest import READ_HEADERS, WRITE_HEADERS
@@ -25,9 +27,10 @@ async def test_duplicate_group_conflicts(client: AsyncClient, sample_tag_group: 
 
 
 async def test_get_group_bad_uuid_is_404(client: AsyncClient):
-    r = await client.get("/v1/tags/not-a-uuid", headers=READ_HEADERS)
-    assert r.status_code == 404
-    assert r.json()["code"] == "tag_group_not_found"
+    for bad in ("not-a-uuid", "{" + str(uuid4()) + "}"):  # the braced form used to reach asyncpg and 500
+        r = await client.get(f"/v1/tags/{bad}", headers=READ_HEADERS)
+        assert r.status_code == 404, f"{bad!r} -> {r.status_code} {r.text}"
+        assert r.json()["code"] == "tag_group_not_found"
 
 
 async def test_get_group_wraps_in_list(client: AsyncClient, sample_tag_group: dict):

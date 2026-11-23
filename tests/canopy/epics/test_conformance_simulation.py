@@ -1,5 +1,7 @@
 """The simulation backend against the `PVConnector` conformance suite."""
 
+import asyncio
+
 import pytest
 
 from canopy.contracts.pv import PVWriteValue
@@ -50,3 +52,14 @@ async def test_conformance(case_id):
         await conformance.run_case(case_id, driver.make_connector, driver)
     except conformance.CaseSkipped as skip:
         pytest.skip(str(skip))
+
+
+class _HangingGet(SimulationConnector):
+    async def get(self, pv, *, timeout=None):
+        await asyncio.Event().wait()
+
+
+async def test_a_hanging_call_fails_its_case_instead_of_stalling_the_run(monkeypatch):
+    monkeypatch.setattr(conformance, "CALL_TIMEOUT_S", 0.2)
+    with pytest.raises(AssertionError, match=r"get\('SIM:CONFORMANCE:SCALAR'\) did not return within 0.2 s"):
+        await conformance.run_case("get-scalar-bare", _HangingGet, SimulationDriver())
