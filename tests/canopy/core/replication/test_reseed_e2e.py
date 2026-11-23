@@ -21,10 +21,10 @@ from canopy.core.arms import subscription_name
 from canopy.core.replication.sql import Refused
 from canopy.core.replication.drift import SESSION, drift_check
 from canopy.core.replication.reseed import reseed
-from canopy.core.replication.registry import REGISTRY
 from canopy.core.replication.subscriber import subscriber_status
 
 from .conftest import (
+    PRESENT,
     HEAD_SERVER,
     Octopus,
     eventually,
@@ -35,7 +35,6 @@ from .conftest import (
 from .test_drift_e2e import _as_apply
 from .test_replication_e2e import _rows, _in_step
 
-PRESENT = sorted(REGISTRY.replicated)
 one_arm = pytest.mark.parametrize("octopus", [1], indirect=True)
 
 
