@@ -71,6 +71,22 @@ async def test_bare_metadata_is_described_again_by_a_later_subscribe_after_backo
         assert "PV:BARE" not in broker._seed_retry_after
 
 
+async def test_steady_updates_skip_the_metadata_check(fake_connector, monkeypatch):
+    """Only a connect edge asks whether metadata is missing, not every update."""
+    broker = PVBroker(fake_connector, HareConfig())
+    broker.add_client("c1", FakeWebSocket())
+    await broker.subscribe("c1", ["PV:STEADY"])
+    fake_connector.emit("PV:STEADY", 1.0)
+    await settle(broker)
+    checks: list[str] = []
+    real = broker._meta_is_missing
+    monkeypatch.setattr(broker, "_meta_is_missing", lambda pv: checks.append(pv) or real(pv))
+    for i in range(5):
+        fake_connector.emit("PV:STEADY", float(i), ts=3 + i)
+    await settle(broker)
+    assert checks == []
+
+
 async def test_a_reconnect_describes_a_pv_whose_metadata_is_bare(fake_connector):
     """The connect edge describes again whatever the deadline: the channel answers now."""
     broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=3600))

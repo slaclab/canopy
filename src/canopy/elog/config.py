@@ -21,9 +21,9 @@ from pydantic_settings import BaseSettings, SettingsError, SettingsConfigDict
 class ElogPlusConfig(BaseModel):
     """Settings for the ``elog_plus`` provider (https://github.com/slaclab/elog-plus).
 
-    ``base_url`` must be elog-plus' application-token ingress. At SLAC that is
-    ``/api/elog-apptoken``, not ``/api/elog``: the latter sits behind Vouch,
-    which strips the token header before it reaches elog-plus.
+    ``base_url`` must be elog-plus' application-token ingress, not an ingress
+    behind an authenticating proxy such as Vouch, which strips the token header
+    before it reaches elog-plus.
     """
 
     base_url: str = ""

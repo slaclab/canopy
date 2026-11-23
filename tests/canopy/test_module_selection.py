@@ -202,3 +202,45 @@ def test_an_unknown_name_in_canopy_modules_fails_startup(tmp_path):
     proc = _run_python("import canopy.main", tmp_path, CANOPY_MODULES="hare,badger")
     assert proc.returncode != 0
     assert "badger" in proc.stderr
+
+
+# --- A selected module whose extra is not installed ------------------------------------
+
+
+def _block_and_import(package: str) -> str:
+    """Code that imports ``canopy.main`` as if ``package`` were not installed."""
+    return f"import sys\nsys.modules[{package!r}] = None\nimport canopy.main\n"
+
+
+def test_a_module_whose_extra_is_missing_names_the_extra_and_the_setting(tmp_path):
+    """Unset, CANOPY_MODULES selects every module, so an install without `data` stops at squirrel."""
+    env = {key: value for key, value in os.environ.items() if key != "CANOPY_MODULES"}
+    proc = subprocess.run(
+        [sys.executable, "-c", _block_and_import("sqlalchemy")],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode != 0
+    last = proc.stderr.strip().splitlines()[-1]
+    assert last.startswith("ModuleNotFoundError: The squirrel module needs the 'data' extra")
+    assert "canopy[data]" in last
+    assert "CANOPY_MODULES" in last
+
+
+def test_the_converter_without_its_extra_names_the_convert_extra(tmp_path):
+    proc = _run_python(_block_and_import("pydmconverter"), tmp_path, CANOPY_MODULES="hare,converter")
+    assert proc.returncode != 0
+    last = proc.stderr.strip().splitlines()[-1]
+    assert "The converter module needs the 'convert' extra" in last
+    assert "canopy[convert]" in last
+
+
+def test_a_missing_package_no_extra_provides_is_reported_unchanged(tmp_path):
+    """Only a package an extra provides is reworded; anything else is a broken install."""
+    proc = _run_python(_block_and_import("nh3"), tmp_path, CANOPY_MODULES="elog")
+    assert proc.returncode != 0
+    last = proc.stderr.strip().splitlines()[-1]
+    assert last == "ModuleNotFoundError: import of nh3 halted; None in sys.modules"

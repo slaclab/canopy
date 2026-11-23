@@ -60,6 +60,9 @@ def _parse_raw_arrays(content: bytes, archiver: str) -> ArchiveBlock:
     return ArchiveBlock(ts, values, severities)
 
 
+_NS_PER_MS = 1_000_000
+
+
 def _ns_to_iso(ts_ns: int) -> str:
     """Convert UTC nanoseconds to Appliance-friendly ISO-8601 with ms precision and `Z` suffix."""
     dt = datetime.fromtimestamp(ts_ns / 1_000_000_000, tz=UTC)
@@ -150,22 +153,32 @@ class EpicsArchiverApplianceAdapter:
         return await fetch_window_budgeted_via(self._fetch_block, pv, t0_ns, t1_ns, budget=budget)
 
     async def _fetch_block(self, pv: str, lo_ns: int, hi_ns: int, include_last_before: bool) -> ArchiveBlock:
-        block = await self._get_block(pv, lo_ns, hi_ns)
-        mask = (block.ts_ns >= lo_ns) & (block.ts_ns <= hi_ns)
-        block = ArchiveBlock(block.ts_ns[mask], block.values[mask], block.severities[mask])
-        if include_last_before and lo_ns > 0:
-            prior = await self._get_block(pv, lo_ns - 1, lo_ns - 1)
-            mask = prior.ts_ns <= lo_ns - 1
-            if mask.any():
-                idx = np.flatnonzero(mask)[-1]
+        want_prior = include_last_before and lo_ns > 0
+        # The prior sample is the newest at or before lo - 1, and the wire is
+        # ms-precise: a zero-width query at the whole ms below lo - 1 finds it up
+        # to that ms, and starting this window's own request there finds it after.
+        prior_at = (lo_ns - 1) // _NS_PER_MS * _NS_PER_MS
+        raw = await self._get_block(pv, prior_at if want_prior else lo_ns, hi_ns)
+        mask = (raw.ts_ns >= lo_ns) & (raw.ts_ns <= hi_ns)
+        block = ArchiveBlock(raw.ts_ns[mask], raw.values[mask], raw.severities[mask])
+        if want_prior:
+            candidates = ArchiveBlock.concat([await self._get_block(pv, prior_at, prior_at), raw])
+            before = np.flatnonzero(candidates.ts_ns <= lo_ns - 1)
+            if len(before):
+                i = before[-1]
                 prior = ArchiveBlock(
-                    prior.ts_ns[idx : idx + 1], prior.values[idx : idx + 1], prior.severities[idx : idx + 1]
+                    candidates.ts_ns[i : i + 1], candidates.values[i : i + 1], candidates.severities[i : i + 1]
                 )
                 block = ArchiveBlock.concat([prior, block])
         return block
 
     async def _get_block(self, pv: str, from_ns: int, to_ns: int) -> ArchiveBlock:
-        params = {"pv": pv, "from": _ns_to_iso(from_ns), "to": _ns_to_iso(to_ns), "donotchunk": "true"}
+        # Widen to whole ms (floor `from`, ceil `to`, in integers): the next
+        # window ends at lo - 1 ns, so a floored `to` would drop the samples in
+        # the last sub-ms before every seam. Callers mask back to ns.
+        from_ms = from_ns // _NS_PER_MS * _NS_PER_MS
+        to_ms = -(-to_ns // _NS_PER_MS) * _NS_PER_MS
+        params = {"pv": pv, "from": _ns_to_iso(from_ms), "to": _ns_to_iso(to_ms), "donotchunk": "true"}
         response = await self._safe_get("/retrieval/data/getData.json", params=params, pv=pv)
         return await asyncio.to_thread(_parse_raw_arrays, response.content, self.name)
 

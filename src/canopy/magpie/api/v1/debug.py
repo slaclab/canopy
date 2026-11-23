@@ -10,13 +10,13 @@ contract. Read scope only; they never mutate.
 
 from fastapi import Query, Security, APIRouter
 
-from canopy.core.errors import BadRequest
 from canopy.core.security import require_read_access
 from canopy.magpie.errors import ConfigNotFound
+from canopy.core.validation import parse_continuation_token
 from canopy.magpie.dependencies import ConfigServiceDep
 from canopy.contracts.pagination import PagedResult
 from canopy.magpie.schemas.config import ConfigDTO
-from canopy.magpie.api.v1._validation import is_slug, is_uuid
+from canopy.magpie.api.v1._validation import is_slug
 
 router = APIRouter(prefix="/_debug", tags=["Magpie / Debug"])
 
@@ -29,14 +29,10 @@ async def list_all_configs(
     continuationToken: str | None = Query(None),
 ) -> PagedResult[ConfigDTO]:
     """Every config across all apps (keyset-paginated). Not app-scoped — debug only."""
-    # Same token guard as the app-scoped list: a malformed one would reach asyncpg as a
-    # bad UUID comparison and surface as a 500 rather than a 400.
-    if continuationToken is not None and not is_uuid(continuationToken):
-        raise BadRequest("Invalid continuationToken")
     return await service.list_all(
         search=search,
         page_size=pageSize,
-        continuation_token=continuationToken,
+        continuation_token=parse_continuation_token(continuationToken),
     )
 
 
