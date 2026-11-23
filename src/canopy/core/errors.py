@@ -309,9 +309,9 @@ class ArchivedImmutable(CanopyError):
 class PrimaryUnavailable(CanopyError):
     """A history head couldn't get an answer from the arm that owns a write.
 
-    502 when the arm couldn't be reached (nothing was sent); a subclass with
-    504 when it stopped answering after the request went out, so the write may
-    or may not have been applied.
+    502 when the arm couldn't be reached (nothing was sent), or answered a job poll
+    with an error; a subclass with 504 when it stopped answering after the request
+    went out, so the write may or may not have been applied.
     """
 
     status_code = 502

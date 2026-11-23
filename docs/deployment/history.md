@@ -331,7 +331,9 @@ creates a new snapshot there.
 
 A forwarded capture or restore runs as a job on the arm. Clients poll it on the head
 as usual: `GET /jobs/v1/{id}` asks that arm about a job the head started there, for a
-day after it started.
+day after it started. The arm's 404 is answered as 404 `job_not_found`; any other
+error from the arm is a 502, `service_key_refused` when it refused the head's key and
+`primary_unavailable` naming the arm's answer otherwise.
 
 ### Who wrote it
 
