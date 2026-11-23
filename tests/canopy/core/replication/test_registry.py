@@ -7,6 +7,7 @@ adds a table fails here until it says whether the history mirror receives it.
 import pkgutil
 import importlib
 
+import pytest
 from sqlalchemy import UniqueConstraint
 
 import canopy
@@ -112,14 +113,14 @@ def test_every_replicated_table_has_an_owner_path_and_no_local_one_does():
 
 def test_root_tables_carry_their_owner_column():
     for name, path in REGISTRY.owner_paths.items():
-        if path.column is not None:
+        if path.column is not None and name not in RETIRED:
             column = METADATA_TABLES[name].c[path.column]
             assert not column.nullable, f"{name}.{path.column} must be NOT NULL"
 
 
 def test_child_keys_point_at_their_parents_id():
     for name, path in REGISTRY.owner_paths.items():
-        if path.parent is not None:
+        if path.parent is not None and name not in RETIRED:
             targets = {
                 (fk.column.table.fullname, fk.column.name) for fk in METADATA_TABLES[name].c[path.key].foreign_keys
             }
@@ -145,11 +146,35 @@ def _unique_column_sets(table) -> set[tuple[str, ...]]:
 
 def test_shared_keys_are_exactly_the_unique_keys_without_the_owner():
     # A key unique per owner (it includes owner_instance) can't clash across arms; any
-    # other unique key can, and the subscribe and refresh checks must know about it.
+    # other unique key can, and the subscribe and refresh checks must know about it. A
+    # retired table has no model to check, but keeps its shared key for databases that
+    # still hold it.
     found = {}
-    for name in REGISTRY.replicated:
+    for name in set(REGISTRY.replicated) - RETIRED:
         table = METADATA_TABLES[name]
         for columns in _unique_column_sets(table):
             if "owner_instance" not in columns and set(columns) != {c.name for c in table.primary_key.columns}:
                 found.setdefault(name, set()).add(columns)
-    assert found == {name: {columns} for name, columns in REGISTRY.shared_keys.items()}
+    assert found == {name: {columns} for name, columns in REGISTRY.shared_keys.items() if name not in RETIRED}
+
+
+# The checks above that read a table's model. A retired table has no model, so each
+# must skip it, while the registry-only checks keep covering it.
+_MODEL_CHECKS = [
+    test_every_table_is_classified,
+    test_every_registered_table_has_a_model,
+    test_retired_tables_keep_their_class_and_lose_their_model,
+    test_replicated_tables_have_primary_keys,
+    test_root_tables_carry_their_owner_column,
+    test_child_keys_point_at_their_parents_id,
+    test_shared_keys_are_exactly_the_unique_keys_without_the_owner,
+]
+
+
+@pytest.mark.parametrize("check", _MODEL_CHECKS, ids=lambda check: check.__name__.removeprefix("test_"))
+@pytest.mark.parametrize("table", ["magpie.config", "squirrel.pv_facility"])  # a root with a shared key, a child
+def test_the_model_checks_hold_once_a_table_is_retired(monkeypatch, table, check):
+    """Retire a table as CONTRIBUTING.md says: its name goes in RETIRED, and its model goes away."""
+    monkeypatch.setitem(globals(), "RETIRED", RETIRED | {table})
+    monkeypatch.delitem(METADATA_TABLES, table)
+    check()

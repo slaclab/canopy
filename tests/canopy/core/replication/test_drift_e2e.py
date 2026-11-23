@@ -26,10 +26,16 @@ from canopy.core.replication.drift import (
 from canopy.core.replication.registry import REGISTRY, TableClass, ReplicationRegistry
 from canopy.core.replication.publisher import publish
 
-from .conftest import Octopus, eventually, _reader_dsn, _subscribed, _arm_connections
+from .conftest import (
+    PRESENT,
+    Octopus,
+    eventually,
+    _reader_dsn,
+    _subscribed,
+    _arm_connections,
+)
 from .test_replication_e2e import _in_step
 
-PRESENT = sorted(REGISTRY.replicated)
 one_arm = pytest.mark.parametrize("octopus", [1], indirect=True)
 
 

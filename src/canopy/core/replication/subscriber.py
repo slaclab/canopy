@@ -192,7 +192,9 @@ async def _shared_keys_of(
     """What ``arm``'s copy of ``tables`` would bring of each key unique across owners.
 
     Every row the arm publishes is copied, whoever it names as owner, so every value
-    counts. Connects to the arm only when ``tables`` hold such a key.
+    counts. Only tables the arm publishes are read: one it doesn't (an older arm,
+    while the head deploys first) isn't copied yet, and may not exist there.
+    Connects to the arm only when ``tables`` hold such a key.
 
     Raises
     ------
@@ -204,11 +206,22 @@ async def _shared_keys_of(
         return {}
     arm_conn = await connect(arm)
     try:
+        # Any publication counts, whichever layout the arm is on: a table read needlessly can only
+        # refuse a clash early, while one missed would let it through.
+        published = {
+            row[0]
+            for row in await arm_conn.fetch(
+                "SELECT schemaname || '.' || tablename FROM pg_publication_tables "
+                "WHERE schemaname || '.' || tablename = ANY($1::text[])",
+                sorted({table for table, _ in keyed}),
+            )
+        }
         return {
             (table, column): {
                 row[0] for row in await arm_conn.fetch(f"SELECT {quote_ident(column)} FROM {qualified(table)}")
             }
             for table, column in keyed
+            if table in published
         }
     finally:
         await arm_conn.close()
