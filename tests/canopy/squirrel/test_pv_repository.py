@@ -2,6 +2,7 @@
 
 import random
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -63,7 +64,8 @@ async def test_bulk_create_returns_input_order_with_attributes_loaded(db_session
     pvs = _new_pvs(12, tags)
     expected = [pv.setpoint_address for pv in pvs]
 
-    # The reload must map rows back by id, not trust the database's row order.
+    # The reload refreshes the given objects in place, so the order the database returns
+    # rows in can't change the result's order.
     repo = PvRepository(db_session)
     real_get_by_ids = repo.get_by_ids
 
@@ -74,6 +76,7 @@ async def test_bulk_create_returns_input_order_with_attributes_loaded(db_session
     created = await repo.bulk_create(pvs)
 
     assert [pv.setpoint_address for pv in created] == expected
+    assert all(got is given for got, given in zip(created, pvs, strict=True))
     for pv in created:
         _assert_loaded(pv)
         assert len(pv.tags) == 2
@@ -93,6 +96,20 @@ async def test_bulk_create_reloads_across_several_batches(db_session: AsyncSessi
     assert len({pv.id for pv in created}) == 11
     for pv in created:
         _assert_loaded(pv)
+
+
+async def test_bulk_create_fails_clearly_if_the_reload_misses_a_row(db_session: AsyncSession, monkeypatch):
+    """A row missing from the reload is a clear error, not a ``KeyError`` or a half-loaded PV."""
+    tags = await _seed_tags(db_session, 3)
+    repo = PvRepository(db_session)
+    real_get_by_ids = repo.get_by_ids
+
+    async def short_get_by_ids(ids, **kwargs):
+        return (await real_get_by_ids(ids, **kwargs))[1:]
+
+    monkeypatch.setattr(repo, "get_by_ids", short_get_by_ids)
+    with pytest.raises(RuntimeError, match="Reloaded 2 of 3 created PVs"):
+        await repo.bulk_create(_new_pvs(3, tags))
 
 
 async def test_bulk_create_of_nothing_is_a_no_op(db_session: AsyncSession):

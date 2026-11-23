@@ -541,10 +541,11 @@ class PvRepository(BaseRepository[Pv]):
     async def bulk_create(self, pvs: list[Pv]) -> list[Pv]:
         """Insert PVs and reload them from the database.
 
-        The reload is batched (``get_by_ids``) rather than one ``refresh`` per row, so a
-        large import costs a handful of queries instead of one per PV. It overwrites the
-        identity-map copies like ``refresh`` would, leaving every column and each PV's
-        tags loaded for use outside an async lazy load.
+        The reload is one ``get_by_ids`` call rather than one ``refresh`` per row, so a
+        large import costs a handful of queries instead of one per PV. The flushed PVs are
+        already in the identity map, so the reload overwrites those same objects like
+        ``refresh`` would, leaving every column and each PV's tags loaded for use outside
+        an async lazy load.
 
         Parameters
         ----------
@@ -554,15 +555,22 @@ class PvRepository(BaseRepository[Pv]):
         Returns
         -------
         list[Pv]
-            The created PVs, in the order given.
+            ``pvs`` itself, reloaded, so in the order given.
+
+        Raises
+        ------
+        RuntimeError
+            If the reload doesn't return every flushed PV, which would leave the missing
+            ones half-loaded.
         """
         if not pvs:
             return []
         self.session.add_all(pvs)
         await self.session.flush()
-        ids = [pv.id for pv in pvs]
-        by_id = {pv.id: pv for pv in await self.get_by_ids(ids, populate_existing=True)}
-        return [by_id[pv_id] for pv_id in ids]
+        reloaded = await self.get_by_ids([pv.id for pv in pvs], populate_existing=True)
+        if len(reloaded) != len(pvs):
+            raise RuntimeError(f"Reloaded {len(reloaded)} of {len(pvs)} created PVs")
+        return pvs
 
     async def facility_ids_for(self, pv_id: str) -> set[str]:
         """The facility ids a PV is assigned to — empty if it's unassigned.
