@@ -223,6 +223,12 @@ class Octopus:
         return await asyncpg.connect(self.arms[name].dsn)
 
 
+def _publisher_uri(conninfo: str, *, database: str, user: str, password: str) -> str:
+    """An arm's publisher DSN from its ``host=… port=…`` as the head's server sees it."""
+    where = dict(part.split("=", 1) for part in conninfo.split())
+    return f"postgresql://{user}:{password}@{where['host']}:{where.get('port', '5432')}/{database}"
+
+
 @asynccontextmanager
 async def _topology(count: int, *, schema: bool):
     """``count`` arms and a head, with every table built when ``schema`` is set.
@@ -270,7 +276,7 @@ async def _topology(count: int, *, schema: bool):
                 dsn=arm_dsn,
                 replicator=replicator,
                 reader=reader,
-                publisher_dsn=f"{conninfo} dbname={arm_db} user={replicator} password={replicator_pw}",
+                publisher_dsn=_publisher_uri(conninfo, database=arm_db, user=replicator, password=replicator_pw),
             )
         topology = Octopus(
             arms=arms,
