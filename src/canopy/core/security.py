@@ -315,6 +315,8 @@ def static_key_registry(settings: Settings) -> KeyRegistry:
     with it, and a file that cannot supply a registry raises ``KeysFileError``.
     """
     if settings.api_keys_file:
+        if settings.api_keys.strip():
+            logger.warning("CANOPY_API_KEYS is set but ignored: CANOPY_API_KEYS_FILE supplies the static key tier")
         return load_keys_file(settings.api_keys_file)
     return EnvKeyRegistry(settings.api_keys)
 

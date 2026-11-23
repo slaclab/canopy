@@ -13,6 +13,7 @@ SQLAlchemy, as an install without the ``data`` extra lacks it.
 import os
 import sys
 import asyncio
+import logging
 import subprocess
 
 import pytest
@@ -87,6 +88,25 @@ def test_a_set_file_supplies_the_static_tier_and_the_environment_value_is_ignore
     read, write = _get(registry, "file-read"), _get(registry, "file-write")
     assert (read.read, read.write, read.admin, read.modules) == (True, False, False, frozenset({"*"}))
     assert (write.read, write.write, write.admin, write.modules) == (True, True, False, frozenset({"hare"}))
+
+
+def test_an_ignored_environment_value_is_warned_about_without_its_keys(monkeypatch, tmp_path, caplog):
+    monkeypatch.setitem(sys.modules, "sqlalchemy", None)
+    path = _keys_file(tmp_path, "file-read:read@*")
+    with caplog.at_level(logging.WARNING, logger="canopy.core.security"):
+        build_key_registry(Settings(api_keys="env-key:read+write@*", api_keys_file=str(path)))
+    warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    assert warnings == ["CANOPY_API_KEYS is set but ignored: CANOPY_API_KEYS_FILE supplies the static key tier"]
+    assert "env-key" not in caplog.text
+    assert "file-read" not in caplog.text
+
+
+def test_a_keys_file_alone_warns_about_nothing(monkeypatch, tmp_path, caplog):
+    monkeypatch.setitem(sys.modules, "sqlalchemy", None)
+    path = _keys_file(tmp_path, "file-read:read@*")
+    with caplog.at_level(logging.WARNING, logger="canopy.core.security"):
+        build_key_registry(Settings(api_keys="", api_keys_file=str(path)))
+    assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
 
 
 def test_an_empty_file_setting_counts_as_unset(monkeypatch):
