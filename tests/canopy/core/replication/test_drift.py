@@ -10,6 +10,7 @@ from sqlalchemy.sql import sqltypes
 
 import canopy
 from canopy.core.db import Base
+from canopy.core.arms import ArmsConfigError, get_arms_config
 from canopy.core.config import get_settings
 from canopy.core.replication import drift
 from canopy.core.replication.drift import (
@@ -317,6 +318,22 @@ async def test_invalid_arms_are_refused_without_their_values(env, caplog):
     )
     assert await drift.run(ARGS) == 2
     assert "refused: CANOPY_ARMS" in caplog.text and "s3cret" not in caplog.text
+
+
+async def test_a_key_value_reader_dsn_is_refused_without_its_password(env, caplog, capsys):
+    secret = "s3cret-reader"
+    env(
+        CANOPY_ROLE="mirror",
+        CANOPY_INSTANCE="head",
+        CANOPY_ARMS__ARM1__READER_DSN=f"host=arm1-db user=canopy_reader password={secret}",
+    )
+    with pytest.raises(ArmsConfigError) as raised:
+        get_arms_config()
+    assert secret not in str(raised.value) and secret not in repr(raised.value)
+    assert await drift.run(ARGS) == 2
+    out = caplog.text + capsys.readouterr().out
+    assert "refused: CANOPY_ARMS__ARM1__READER_DSN" in out
+    assert secret not in out
 
 
 async def test_arm_checks_one_arm(head_only, env, monkeypatch, capsys):

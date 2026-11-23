@@ -51,7 +51,7 @@ class Arm(BaseModel):
         ),
     )
 
-    @field_validator("publisher_dsn")
+    @field_validator("publisher_dsn", "reader_dsn")
     @classmethod
     def _is_a_uri(cls, dsn: SecretStr | None) -> SecretStr | None:
         # The message never quotes the value, which holds a password.
