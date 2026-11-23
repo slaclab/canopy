@@ -67,6 +67,8 @@ PRIMARY_PHASE = "Setpoints"
 
 # Title prefix of a snapshot created by ``import_bundle``.
 IMPORTED_TITLE_PREFIX = "Restored from history: "
+# A meta-PV value's own fields, which come from its stored row, never from its blob.
+_META_PV_IDENTIFIERS = frozenset({"pv_id", "pv_name", "pvId", "pvName"})
 # How many skipped PVs a strict import's refusal names; it gives the total too.
 _SKIPPED_NAMED = 20
 
@@ -310,13 +312,12 @@ class SnapshotService:
         meta_pv_values: list[MetaPVValueDTO] = []
         if pv_ids:
             for value in await self.value_repo.get_by_snapshot_and_pvs(snapshot_id, pv_ids):
-                data = _parse_jsonb(value.setpoint_value) or _parse_jsonb(value.readback_value)
+                data = _parse_jsonb(value.setpoint_value) or _parse_jsonb(value.readback_value) or {"value": None}
+                # The stored row names the PV. An imported blob may carry keys of its own
+                # (kept as they are in the row), and one spelling a PV field must not win.
+                blob = {key: item for key, item in data.items() if key not in _META_PV_IDENTIFIERS}
                 meta_pv_values.append(
-                    MetaPVValueDTO(
-                        pv_id=value.pv_id,
-                        pv_name=value.pv_name,
-                        **(data or {"value": None}),
-                    )
+                    MetaPVValueDTO.model_validate({**blob, "pv_id": value.pv_id, "pv_name": value.pv_name})
                 )
         return meta_pv_values
 
