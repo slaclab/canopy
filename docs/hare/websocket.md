@@ -125,7 +125,8 @@ itself — never the other PVs in the batch, nor later `subscribe`,
 Merge `initial` frames by PV name: a PV may appear in a later frame with the
 metadata an earlier one lacked, and a frame may carry any mix of PVs from
 earlier `subscribe` messages. Within one flush a client's `initial` frames
-come before its `diff`, carrying the same values; a PV can appear in both.
+come before its `diff`, and a PV whose value is in one of them is left out of
+that `diff`. So take values from `initial` frames as well as from diffs.
 
 `data` maps PV name to its current value; `meta` maps PV name to its static
 display metadata (units, precision, `enumChoices`, limits) — read `meta` once,

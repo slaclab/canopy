@@ -730,8 +730,10 @@ class PVBroker:
         A client gets its queued PVs first, in ``initial`` frames of at most
         ``initial_frame_max_pvs`` PVs carrying the value and metadata of each,
         then one ``diff`` frame. Both are built from one snapshot taken before
-        any send, so a PV in both carries the same value in each; the PV stays in
-        the diff so a client that reads only diffs still sees it.
+        any send. A PV whose value goes to a client in one of those ``initial``
+        frames is left out of that client's diff, since it would carry the same
+        value again; clients take values from ``initial`` frames as well as
+        diffs, as the protocol already requires.
 
         Each client's frames go out in order, and the clients are sent to
         concurrently, so a client whose socket is backed up delays only its own
@@ -759,6 +761,8 @@ class PVBroker:
             # however many clients receive it.
             diff_payloads = {pv: value.model_dump(by_alias=True) for pv, value in updates.items()}
             ready: dict[str, tuple[asyncio.Lock, dict | None, dict | None]] = {}
+            # Ready PVs whose initial value is the very update buffered for the diff.
+            in_both: set[str] = set()
             for pv, lock in pending.items():
                 if self._seed_locks.get(pv) is not lock:
                     continue
@@ -766,11 +770,12 @@ class PVBroker:
                 meta = self._meta.get(pv)
                 if value is None and meta is None:
                     continue
-                ready[pv] = (
-                    lock,
-                    None if value is None else value.model_dump(by_alias=True),
-                    None if meta is None else meta.model_dump(by_alias=True),
-                )
+                if value is not None and updates.get(pv) is value:
+                    in_both.add(pv)
+                    value_payload = diff_payloads[pv]
+                else:
+                    value_payload = None if value is None else value.model_dump(by_alias=True)
+                ready[pv] = (lock, value_payload, None if meta is None else meta.model_dump(by_alias=True))
             per_client_initial: dict[str, list[str]] = defaultdict(list)
             for pv in ready:
                 for client_id in self._registry.subscribers(pv):
@@ -779,6 +784,13 @@ class PVBroker:
             for pv, payload in diff_payloads.items():
                 for client_id in self._registry.subscribers(pv):
                     per_client_diff[client_id][pv] = payload
+            # A client gets such a PV's value in its initial frame, so not again in its diff.
+            for client_id, pvs in per_client_initial.items():
+                diff = per_client_diff.get(client_id)
+                if diff:
+                    for pv in pvs:
+                        if pv in in_both:
+                            diff.pop(pv, None)
         clients = list(dict.fromkeys([*per_client_initial, *per_client_diff]))
         results = await asyncio.gather(
             *(

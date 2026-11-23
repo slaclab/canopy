@@ -35,8 +35,9 @@ async def ws_pvs(websocket: WebSocket, broker: PVBrokerDep) -> None:
       background (monitor connected and metadata fetched, or reported
       ``connected: false`` after the seed timeout) follow in the next diff flush,
       grouped into ``initial`` frames of at most ``initial_frame_max_pvs`` PVs
-      sent just before that flush's ``diff``, so a channel that never connects
-      delays only itself; merge ``initial`` frames by PV name. ``data`` is the dynamic value; ``meta`` is the static per-channel
+      sent just before that flush's ``diff``, which then leaves those PVs out,
+      so a channel that never connects delays only itself; merge ``initial``
+      frames by PV name and take values from them as well as from diffs. ``data`` is the dynamic value; ``meta`` is the static per-channel
       metadata (``valueKind``, units, precision, ``enumChoices``,
       display/control/alarm limits) a client reads once to configure a display.
     - ``{"type": "diff", "data": {"PV1": {...PVValue}}, "count": N, "timestamp": T}``

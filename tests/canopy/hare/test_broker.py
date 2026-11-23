@@ -1239,8 +1239,8 @@ class TestBatchedInitialFrames:
         assert "SIM:SHARED" in _initial_frames(stayer)[0]["meta"]
         assert not leaver.sent
 
-    async def test_initial_frame_precedes_the_diff_and_carries_the_same_value(self, fake_connector):
-        """A PV both queued and buffered reaches the client as ``initial`` then ``diff``, with the newest value in both."""
+    async def test_a_pv_whose_value_is_in_an_initial_frame_is_left_out_of_that_flushs_diff(self, fake_connector):
+        """A PV both queued and buffered reaches the client once, in the ``initial`` frame, with the newest value."""
         broker = PVBroker(fake_connector, HareConfig())
         ws = FakeWebSocket()
         broker.add_client("c1", ws)
@@ -1251,10 +1251,31 @@ class TestBatchedInitialFrames:
         await broker._drain_nowait()
         await broker._flush()
 
-        assert [m["type"] for m in ws.sent] == ["initial", "diff"]
-        initial, diff = ws.sent
+        (initial,) = ws.sent
+        assert initial["type"] == "initial"
         assert initial["data"]["SIM:ORDER"]["value"] == 7.5
-        assert diff["data"]["SIM:ORDER"]["value"] == 7.5
+
+    async def test_the_diff_still_carries_pvs_that_are_not_in_this_flushs_initial(self, fake_connector):
+        """Only a PV going out in this flush's ``initial`` frames is left out of the diff; an already-seeded PV stays."""
+        broker = PVBroker(fake_connector, HareConfig())
+        ws = FakeWebSocket()
+        broker.add_client("c1", ws)
+        await broker.subscribe("c1", ["SIM:SEEDED"])
+        await settle(broker)
+        await broker.subscribe("c1", ["SIM:NEW"])
+        await broker._drain_nowait()
+        await broker.drain_seeds()
+        fake_connector.emit("SIM:SEEDED", 1.25, ts=6)
+        fake_connector.emit("SIM:NEW", 2.5, ts=6)
+        await broker._drain_nowait()
+        ws.sent.clear()
+        await broker._flush()
+
+        initial, diff = ws.sent
+        assert (initial["type"], set(initial["data"])) == ("initial", {"SIM:NEW"})
+        assert (diff["type"], diff["data"]["SIM:SEEDED"]["value"]) == ("diff", 1.25)
+        assert set(diff["data"]) == {"SIM:SEEDED"}
+        assert diff["count"] == 1
 
     async def test_metadata_arriving_after_the_value_is_delivered_once(self, fake_connector):
         """A PV whose value goes out in a diff before its describe completes gets its metadata in one later ``initial``."""
