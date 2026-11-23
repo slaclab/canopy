@@ -214,8 +214,9 @@ class FacilityService:
         meaningful provisioned-but-unassigned state, not an error.
 
         An unknown granted slug contributes nothing rather than raising. Grants are
-        validated at mint time and a granted facility can't be deleted, so this is a
-        backstop for rows predating either guard.
+        validated at mint time, and a facility this instance's keys grant can't be
+        deleted here. But keys are local to each instance, so a head's key can still
+        name a facility its owner deleted, and rows can predate either guard.
         """
         if WILDCARD in slugs:
             return None
