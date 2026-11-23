@@ -164,8 +164,10 @@ then rely on diffs for the values.
 
 A channel that has delivered no value within `CANOPY_HARE__SEED_TIMEOUT_S`
 (default 2 s) arrives with `connected: false` and no `meta`, in the next
-flush's `initial` frames. When it later connects, its first `diff` carries the
-value and a further `initial` carries the metadata Hare fetches at that point. If nothing in a batch yields a value or metadata,
+flush's `initial` frames. When it later connects, a `diff` carries its value
+and a further `initial` carries the metadata Hare fetches at that point. When
+both land in the same flush, that `initial` carries the value too and the
+`diff` leaves it out. If nothing in a batch yields a value or metadata,
 no `initial` is sent, so do not treat it as a subscribe acknowledgement.
 
 ### diff
