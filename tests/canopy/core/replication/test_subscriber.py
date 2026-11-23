@@ -16,7 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from canopy.core.arms import Arm
 from canopy.core.instance import arm_states
-from canopy.core.replication.sql import Refused, ReplicationError, tables_with_rows_of
+from canopy.core.replication.sql import (
+    Refused,
+    ReplicationError,
+    qualified,
+    tables_with_rows_of,
+)
 from canopy.core.replication.registry import REGISTRY
 from canopy.core.replication.subscriber import (
     grants,
@@ -293,6 +298,10 @@ async def _arm_databases(db, names: list[str]):
             conns[arm] = (name, None)
             await build_schema(dsn)
             conns[arm] = (name, await asyncpg.connect(dsn))
+            # As publish leaves it: the key checks read only what the arm publishes.
+            await conns[arm][1].execute(
+                f"CREATE PUBLICATION canopy_history FOR TABLE {', '.join(qualified(t) for t in PRESENT)}"
+            )
             arms[arm] = Arm(publisher_dsn=SecretStr(dsn))
         yield {arm: conn for arm, (_, conn) in conns.items()}, arms
     finally:
@@ -356,6 +365,23 @@ async def test_refresh_refuses_a_slug_two_arms_would_both_copy(
 
     with pytest.raises(Refused, match=r"arms arm1 and arm2: core.facility.slug 'lab' \(both copy it\)"):
         await refresh(db, role="mirror", arms=arms)
+
+
+async def test_a_keyed_table_the_arm_doesnt_publish_yet_isnt_read(db, arm_db):
+    # An older arm while the head deploys first: no magpie.config there at all.
+    arm, arms = arm_db
+    await arm.execute("ALTER PUBLICATION canopy_history DROP TABLE magpie.config")
+    await arm.execute("DROP TABLE magpie.config")
+    await arm.execute(
+        "INSERT INTO core.facility (id, slug, name, owner_instance) VALUES (gen_random_uuid(), 'lab', 'L', 'arm1')"
+    )
+    await db.execute(
+        "INSERT INTO core.facility (id, slug, name, owner_instance) VALUES (gen_random_uuid(), 'lab', 'L', 'head')"
+    )
+
+    # The facility check still runs; the missing table neither fails nor skips it.
+    with pytest.raises(Refused, match=r"core.facility.slug 'lab' \(here, owned by head\)"):
+        await subscribe(db, role="mirror", head="head", arms=arms)
 
 
 async def test_refresh_checks_the_slugs_of_tables_about_to_be_copied(db, arm_db, stray_subscription_for_arm1):
