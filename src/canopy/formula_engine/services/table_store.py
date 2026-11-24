@@ -740,9 +740,11 @@ class TableStore:
         bound = self.searched_from if self.searched_from is not None else oldest
         if view.trigger_pv is not None:
             hi = (bound - 1) if bound is not None else now
-            if oldest is not None and bound is not None and _bucket_start(bound - 1) == _bucket_start(oldest):
+            # The oldest held row, final or (with no final rows yet) the oldest tail row.
+            held = oldest if oldest is not None else (int(self.tail_ts[0]) if self.tail_ts else None)
+            if held is not None and bound is not None and _bucket_start(bound - 1) == _bucket_start(held):
                 # The oldest held row already stands for its whole bucket.
-                hi = _bucket_start(oldest) - 1
+                hi = _bucket_start(held) - 1
             if hi < lo:
                 return
             row_ts, arrival, trig_history, failed = await self._trigger_rows(view.trigger_pv, lo, hi, need)
