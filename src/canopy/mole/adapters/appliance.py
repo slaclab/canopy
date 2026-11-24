@@ -186,24 +186,37 @@ class EpicsArchiverApplianceAdapter:
         """Most recent stored sample at or before `ts_ns`, or `None`.
 
         A zero-width `getData.json` query (`from == to`) makes the Appliance
-        return the last known sample at or before that instant. `_ns_to_iso`
-        floors to millisecond precision, so a sample landing within the final
-        millisecond before `ts_ns` may be missed — negligible for archive
-        lookback.
+        return the last known sample at or before that instant, but the wire is
+        ms-precise. So the lookup asks at the whole ms at or after `ts_ns`: one
+        request, and exact unless the answer lands after `ts_ns` inside that ms.
+        Only then does it read that ms itself (`[floor, ceil]`), and when nothing
+        there is at or before `ts_ns`, ask at the whole ms below. A sample in the
+        last sub-millisecond before `ts_ns` -- an input stamped by the same event
+        as a table row, say -- is never missed.
         """
-        at = _ns_to_iso(ts_ns)
-        params = {
-            "pv": pv,
-            "from": at,
-            "to": at,
-            "donotchunk": "true",
-        }
+        ceil_ms = -(-ts_ns // _NS_PER_MS) * _NS_PER_MS
+        latest = await self._last_at_or_before(pv, ceil_ms)
+        if latest is None or latest.ts_ns <= ts_ns:
+            return latest
+        floor_ms = ts_ns // _NS_PER_MS * _NS_PER_MS
+        inside = [s for s in await self._query_samples(pv, floor_ms, ceil_ms) if s.ts_ns <= ts_ns]
+        if inside:
+            return inside[-1]
+        return await self._last_at_or_before(pv, floor_ms)
+
+    async def _last_at_or_before(self, pv: str, at_ms: int) -> Sample | None:
+        """The zero-width query at the whole ms `at_ms`: the last sample at or before it."""
+        candidates = [s for s in await self._query_samples(pv, at_ms, at_ms) if s.ts_ns <= at_ms]
+        return candidates[-1] if candidates else None
+
+    async def _query_samples(self, pv: str, from_ms: int, to_ms: int) -> list[Sample]:
+        """One `getData.json` request between two whole-ms bounds, parsed to samples."""
+        params = {"pv": pv, "from": _ns_to_iso(from_ms), "to": _ns_to_iso(to_ms), "donotchunk": "true"}
         response = await self._safe_get("/retrieval/data/getData.json", params=params, pv=pv)
         payload = self._parse_json(response)
         if not isinstance(payload, list) or not payload:
-            return None
-        candidates = [s for s in self._parse_raw_block(payload[0]) if s.ts_ns <= ts_ns]
-        return candidates[-1] if candidates else None
+            return []
+        return self._parse_raw_block(payload[0])
 
     async def fetch_binned(
         self,

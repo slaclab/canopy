@@ -263,6 +263,47 @@ class TestApplianceWindowSeams:
         assert block.ts_ns.tolist() == fake.ts[want].tolist()
 
 
+@pytest.mark.parametrize("prepend_prior", [False, True], ids=["range-only", "prepends-prior"])
+class TestApplianceLastBeforeSubMs:
+    """``fetch_last_before`` is exact to the ns though the wire takes whole ms."""
+
+    TS = T1 + 123_456_789  # mid-ms: 500 us past a whole ms is T1 + 123_500_000
+
+    async def _ask(self, appliance, httpx_mock, ts_list, at, prepend_prior):
+        fake = _MsPreciseAppliance(ts_list, prepend_prior=prepend_prior)
+        httpx_mock.add_callback(fake, url=GETDATA, is_reusable=True)
+        got = await appliance.fetch_last_before("SIM:SEAM", at)
+        return got, len(httpx_mock.get_requests())
+
+    async def test_a_sample_in_the_last_sub_ms_before_ts_is_found_in_one_request(
+        self, appliance, httpx_mock: HTTPXMock, prepend_prior
+    ):
+        got, requests = await self._ask(
+            appliance, httpx_mock, [self.TS - 5 * S, self.TS - 200_000], self.TS, prepend_prior
+        )
+        assert got is not None and got.ts_ns == self.TS - 200_000
+        assert requests == 1
+
+    async def test_a_sample_exactly_at_ts_is_found(self, appliance, httpx_mock: HTTPXMock, prepend_prior):
+        got, _ = await self._ask(appliance, httpx_mock, [self.TS - 5 * S, self.TS], self.TS, prepend_prior)
+        assert got is not None and got.ts_ns == self.TS
+
+    async def test_a_sample_after_ts_in_the_same_ms_is_skipped(self, appliance, httpx_mock: HTTPXMock, prepend_prior):
+        ts_list = [self.TS - 5 * S, self.TS - 200_000, self.TS + 100_000]
+        got, _ = await self._ask(appliance, httpx_mock, ts_list, self.TS, prepend_prior)
+        assert got is not None and got.ts_ns == self.TS - 200_000
+
+    async def test_only_an_older_sample_besides_one_after_ts_in_the_same_ms(
+        self, appliance, httpx_mock: HTTPXMock, prepend_prior
+    ):
+        got, _ = await self._ask(appliance, httpx_mock, [self.TS - 5 * S, self.TS + 100_000], self.TS, prepend_prior)
+        assert got is not None and got.ts_ns == self.TS - 5 * S
+
+    async def test_nothing_at_or_before_ts_is_none(self, appliance, httpx_mock: HTTPXMock, prepend_prior):
+        got, _ = await self._ask(appliance, httpx_mock, [self.TS + 100_000, self.TS + S], self.TS, prepend_prior)
+        assert got is None
+
+
 # --- service / gateway ------------------------------------------------------------ #
 
 
