@@ -287,6 +287,11 @@ class VoleDataSource:
                     # is cut. Leave it unprovisioned (marking would also recreate a dropped
                     # ring) and retry after provision_retry_s, when there may be room.
                     self._buffer.defer_provision(canonical, now + self._buffer.provision_retry_ns)
+                    if size is None:
+                        # Eviction dropped the ring and released its live ingest: do not
+                        # subscribe it straight back, which would rebuild the ring it just
+                        # dropped. The deferred retry provisions it once there is room.
+                        to_subscribe.remove(pv)
                     logger.info("PV %s: seeded history was trimmed under memory pressure; retrying later", pv)
                     continue
                 self._buffer.mark_provisioned(canonical)
