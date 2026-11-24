@@ -223,6 +223,11 @@ screens may write (`{"state": "on" | "asked" | "off" | "locked" | "applying" |
 "held", "reason", "cause"}`): `asked` asks a person before each write, which the
 `PUT` then sends with `confirmed: true`; `held` is a watchdog's hold on the
 session. Treat a `state` you do not know as `unknown` and as not writable.
+The statement is one per connector, not per user: every client with read access
+receives the same frame, so a connector keeps host names, user names and other
+private detail out of it. A value JSON cannot encode is sent as `null`; inside
+`reachable` or `writes` only that entry is, and a `state` that cannot be
+encoded reads `unknown`.
 When any of these change, a heartbeat is sent at once, within one batching
 window, without waiting for the next keep-alive.
 

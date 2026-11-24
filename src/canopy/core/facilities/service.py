@@ -20,7 +20,12 @@ from canopy.core.errors import (
 )
 from canopy.core.modules import WILDCARD
 from canopy.core.facilities.models import Facility
-from canopy.core.facilities.schemas import FacilityDTO, FacilityCreate, FacilityUpdate
+from canopy.core.facilities.schemas import (
+    FacilityDTO,
+    FacilityCreate,
+    FacilityUpdate,
+    FacilityAccessDTO,
+)
 from canopy.core.facilities.repositories import FacilityRepository
 
 # Async `(facility_id, slug) -> bool` callables, each answering "is this facility still
@@ -44,28 +49,42 @@ class FacilityService:
         self.session = session
         self.facility_repo = FacilityRepository(session)
 
-    def _to_dto(self, facility: Facility) -> FacilityDTO:
+    def _to_dto(self, facility: Facility, parent_slug: str | None) -> FacilityDTO:
         return FacilityDTO(
             id=facility.id,
             slug=facility.slug,
             name=facility.name,
             description=facility.description,
-            parent_id=facility.parent_id,
+            parent=parent_slug,
         )
+
+    async def _with_parent(self, facility: Facility) -> FacilityDTO:
+        """``_to_dto`` for a single row, looking up its parent's slug."""
+        parent = await self.facility_repo.get_by_id(facility.parent_id) if facility.parent_id else None
+        return self._to_dto(facility, parent.slug if parent else None)
 
     async def get_all(self) -> list[FacilityDTO]:
         """Full hierarchy, flat — unfiltered by key. Facility existence isn't a
         secret, only the data is filtered."""
         facilities = await self.facility_repo.get_all()
-        return [self._to_dto(f) for f in facilities]
+        # Every parent is in the same list, so no extra query is needed.
+        slug_by_id = {f.id: f.slug for f in facilities}
+        return [self._to_dto(f, slug_by_id.get(f.parent_id)) for f in facilities]
 
     async def get_by_id(self, facility_id: str) -> FacilityDTO | None:
         facility = await self.facility_repo.get_by_id(facility_id)
-        return self._to_dto(facility) if facility else None
+        return await self._with_parent(facility) if facility else None
 
     async def get_by_slug(self, slug: str) -> FacilityDTO | None:
         facility = await self.facility_repo.get_by_slug(slug)
-        return self._to_dto(facility) if facility else None
+        return await self._with_parent(facility) if facility else None
+
+    async def id_by_slug(self, slug: str) -> str | None:
+        """Facility slug -> id, without ``get_by_slug``'s extra query resolving the
+        parent's slug. For a write path that only needs the id, not a ``FacilityDTO``
+        to hand back to the client."""
+        facility = await self.facility_repo.get_by_slug(slug)
+        return facility.id if facility else None
 
     async def _resolve_parent_id(self, parent_slug: str) -> str:
         """Parent *slug* -> its id. Unknown slug is a hard ``FacilityNotFound``."""
@@ -79,6 +98,29 @@ class FacilityService:
         reach this through the gateway, which opens a session per call."""
         return await self.facility_repo.existing_slugs(slugs)
 
+    async def ids_by_slug(self, slugs: list[str] | set[str]) -> dict[str, str]:
+        """``{slug: id}`` for the subset of ``slugs`` that exist. One query, not one
+        per slug — callers that also need to reject unknown slugs get every unknown
+        one back at once (``slugs - result.keys()``) rather than discovering them one
+        at a time."""
+        return await self.facility_repo.ids_by_slug(slugs)
+
+    async def slugs_by_id(self, ids: list[str] | set[str]) -> dict[str, str]:
+        """``{id: slug}`` for the subset of ``ids`` that exist. The reverse of
+        ``ids_by_slug``, for turning stored ids back into slugs on the way out."""
+        return await self.facility_repo.slugs_by_id(ids)
+
+    async def key_access(self, slugs: frozenset[str]) -> FacilityAccessDTO:
+        """A credential's grant as the slugs it can reach, descendants included.
+
+        Built on ``resolve_key_facility_scope``, the same resolution every facility gate
+        uses, so what this reports is what a write would be checked against.
+        """
+        scope = await self.resolve_key_facility_scope(slugs)
+        if scope is None:
+            return FacilityAccessDTO(unrestricted=True)
+        return FacilityAccessDTO(unrestricted=False, facilities=sorted((await self.slugs_by_id(scope)).values()))
+
     async def create(self, data: FacilityCreate) -> FacilityDTO:
         if await self.facility_repo.get_by_slug(data.slug):
             raise FacilitySlugConflict(f"Facility with slug '{data.slug}' already exists")
@@ -88,7 +130,7 @@ class FacilityService:
             facility = await self.facility_repo.create(facility)
         except IntegrityError as e:
             raise FacilitySlugConflict(f"Facility with slug '{data.slug}' already exists") from e
-        return self._to_dto(facility)
+        return self._to_dto(facility, data.parent)
 
     async def update(self, facility_id: str, data: FacilityUpdate) -> FacilityDTO | None:
         facility = await self.facility_repo.get_by_id(facility_id)
@@ -107,7 +149,9 @@ class FacilityService:
         if data.description is not None:
             facility.description = data.description
         facility = await self.facility_repo.update(facility)
-        return self._to_dto(facility)
+        # A reparent's `data.parent` is already the slug `_resolve_parent_id` just
+        # looked up — skip `_with_parent`'s redundant query for that case.
+        return self._to_dto(facility, data.parent) if data.parent is not None else await self._with_parent(facility)
 
     async def delete(self, facility_id: str) -> bool:
         facility = await self.facility_repo.get_by_id(facility_id)
@@ -121,19 +165,25 @@ class FacilityService:
         await self.facility_repo.delete(facility)
         return True
 
+    async def descendant_ids(self, facility_id: str) -> set[str]:
+        """``{facility_id, all descendant facility_ids}``. Empty for an unknown id."""
+        return await self.facility_repo.descendant_ids(facility_id)
+
     async def resolve_facility_scope(self, slug: str | None) -> set[str] | None:
         """Slug -> {facility_id, all descendant facility_ids}.
 
         ``slug=None`` means "no filter requested" and returns ``None``, so the caller
-        applies no facility filter. A given-but-unknown slug returns ``set()`` —
-        "filter requested, nothing matches" — never ``None``, which would leak every
-        facility's data for a typo'd slug. Callers must test ``is not None``, not
-        truthiness.
+        applies no facility filter. A given-but-unknown slug raises ``FacilityNotFound``
+        rather than degrading to "no filter", which would leak every facility's data for
+        a typo'd slug. Facility existence isn't a secret (``GET /v1/facilities`` lists
+        them all), so the 404 reveals nothing.
         """
-        if slug is None:
+        if not slug:
             return None
         result = await self.facility_repo.resolve_facility_scope(slug)
-        return result if result is not None else set()
+        if result is None:
+            raise FacilityNotFound(f"Facility '{slug}' not found")
+        return result
 
     async def resolve_key_facility_scope(self, slugs: frozenset[str]) -> set[str] | None:
         """A credential's granted slugs -> the union of each one's descendant id set.

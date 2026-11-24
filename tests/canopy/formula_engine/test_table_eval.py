@@ -144,6 +144,23 @@ class TestWiring:
         assert sorted(rig.capacity) == ["X", "Y1"]
         await rig.mgr.shutdown()
 
+    async def test_live_ingest_keeps_each_bindings_protocol(self):
+        """``pva://X`` is subscribed as written (a bare name would open over CA); pins stay canonical."""
+        rig = Rig()
+        spec = FormulaSpec(
+            kind="table",
+            bindings={"x": "pva://SIM:X", "y": "ca://SIM:Y", "z": "SIM:Z", "trig": "pva://SIM:TRIG"},
+            columns={"x": "{x}", "y": "{y}", "z": "{z}"},
+            index="first_input",
+            trigger="trig",
+        )
+        await rig.sub("c", "s", spec, Collector())
+        assert rig.pinned() == {"SIM:X", "SIM:Y", "SIM:Z", "SIM:TRIG"}
+        await wait_for(lambda: rig.subscribed)
+        assert rig.subscribed == [("pva://SIM:X", "ca://SIM:Y", "SIM:Z", "pva://SIM:TRIG")]
+        assert sorted(rig.capacity) == ["SIM:TRIG", "SIM:X", "SIM:Y", "SIM:Z"]
+        await rig.mgr.shutdown()
+
     @pytest.mark.parametrize("client_interval", [0, 50])
     async def test_interval_is_server_derived(self, client_interval):
         rig = Rig(poll_ms=500)
@@ -309,6 +326,37 @@ class TestSharingAndCarryOver:
         assert new_calls, "older rows need the archive"
         assert all(t1 < oldest for _, _, _, t1 in new_calls)
         assert len(b.tables()[-1]["tsNs"]) == 2000
+        await rig.mgr.shutdown()
+
+    @staticmethod
+    async def _rolled_n5(rig: Rig, collector: Collector) -> list[int]:
+        """An n=5 table whose row ring has rolled over; returns every trigger time, oldest first."""
+        archived = [(T0 - 60 * S + k * S, float(k)) for k in range(60)]
+        for pv in ("TRIG", "X", "Y1"):
+            rig.h.archived(pv, archived)
+        await rig.sub("a", "s", trigger_spec(n=5), collector, t0=-60 * S)
+        await wait_for(lambda: collector.results())
+        live = []
+        for k in range(8):
+            rig.h.advance(S)
+            ts = rig.h.now - 10 * MS
+            live.append(ts)
+            for pv in ("TRIG", "X", "Y1"):
+                await rig.h.live(pv, ts, float(100 + k))
+            await asyncio.sleep(0.05)
+        rig.h.advance(5 * S)  # every live row final
+        await asyncio.sleep(0.1)
+        return [t for t, _ in archived] + live
+
+    @pytest.mark.parametrize("same_client", [False, True], ids=["second-client", "same-sub-id"])
+    async def test_a_larger_n_copied_from_a_rolled_store_has_no_hole(self, same_client):
+        """Rows the source ring dropped are searched again, not skipped (one client re-subscribing, too)."""
+        rig = Rig()
+        triggers = await self._rolled_n5(rig, Collector())
+        c20 = Collector()
+        client = "a" if same_client else "b"
+        await rig.sub(client, "s", trigger_spec(n=20), c20, t0=-60 * S)
+        await wait_for(lambda: c20.results() and c20.tables()[-1]["tsNs"] == triggers[-20:])
         await rig.mgr.shutdown()
 
     async def test_a_new_trigger_pv_seeds_from_scratch(self):
@@ -642,3 +690,32 @@ class TestWebSocketUnreachable:
                 seen.setdefault(msg["type"], msg)
             assert time.monotonic() - start < 1.0
         assert seen["result"]["data"]["table"]["inputs"]["y1"]["history"] == "not-archived"
+
+
+@pytest.mark.parametrize("debug", [False, True])
+async def test_a_failed_tick_sends_its_detail_only_in_debug_mode(monkeypatch, debug):
+    from canopy.core.config import get_settings
+    from canopy.formula_engine.services import table_store
+
+    monkeypatch.setattr(get_settings(), "debug", debug)
+    rig = Rig()
+    seed_archive(rig.h, ["X", "Y1"])
+    c = Collector()
+    await rig.sub("c", "s", timer_spec(), c)
+    await wait_for(lambda: c.results())
+    calls = {"n": 0}
+    real_tick = table_store.TableStore.tick
+
+    def failing_tick(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyError("SIM:INTERNAL:NAME")
+        return real_tick(self, *args, **kwargs)
+
+    monkeypatch.setattr(table_store.TableStore, "tick", failing_tick)
+    failures = lambda: [e for e in c.errors() if e["code"] == "unhandled_exception"]  # noqa: E731
+    await wait_for(failures)
+    message = failures()[-1]["message"]
+    assert ("SIM:INTERNAL:NAME" in message) is debug
+    assert message.startswith("table evaluation failed")
+    await rig.mgr.shutdown()

@@ -28,13 +28,13 @@ essentials:
 | Variable | Purpose |
 |----------|---------|
 | `CANOPY_API_KEYS` | API-key registry — see below. Unset means every gated endpoint returns 401 |
-| `CANOPY_EPICS__BACKEND` | `simulation` (default) or `epics`, or a `module:Class` path to an [out-of-tree backend](../how_to/custom_epics_backend.md). **Production must set `epics`** |
+| `CANOPY_EPICS__BACKEND` | `simulation` (default) or `epics`, or a `module:Class` path to an [out-of-tree backend](../how_to/custom_epics_backend.md). **Production must not use `simulation`** |
 | `EPICS_CA_ADDR_LIST`, `EPICS_PVA_ADDR_LIST`, ... | Standard EPICS network discovery variables (only with the `epics` backend) |
 | `CANOPY_DATABASE_URL` | Postgres, asyncpg driver: `postgresql+asyncpg://user:pass@host:port/db` |
 | `CANOPY_REDIS_URL` | Redis: `redis://[:password@]host:port/0` |
 | `CANOPY_DEBUG` | Verbose errors in responses; keep `false` in production |
 | `CANOPY_LOG_LEVEL` | Root log level for the API and worker (`DEBUG`, `INFO`, `WARNING`, ...). Default `INFO`; an unknown name falls back to `INFO` |
-| `CANOPY_SQUIRREL__RESTORE_HOOKS` | Comma-separated restore hooks, applied in order; empty means none run. Once a hook's write fails for a PV, later hooks skip it, so list `write_to_con` before `magnet_trim` to trim a magnet only after its BCON is updated. Must reach the **worker**, which performs restores. Verify with `GET /squirrel/v1/health/restore-hooks`: `worker` is what the worker reported loading at startup, `api` is the API's view, and `matchesApi: false` flags a mismatch |
+| `CANOPY_SQUIRREL__RESTORE_HOOKS` | Extra writes Squirrel makes during a snapshot restore, such as magnet trims. Empty means none. Must reach the **worker**, which performs restores. See [Restore hooks](../squirrel/restore_hooks.md) |
 | `CANOPY_<MODULE>__<FIELD>` | Per-module tuning (e.g. `CANOPY_VOLE__GLOBAL_BYTES_MAX`) |
 
 The annotated template
@@ -82,4 +82,4 @@ its first migration.
 | `GET /health` | Process liveness — used by the container healthchecks and post-deploy checks |
 | `GET /<module>/v1/health/watchdog` | Per-module liveness heartbeat (version, uptime) |
 | `GET /<module>/v1/health/summary` | Per-module status rollup (requires read access) — e.g. Hare's reports backend, client and monitor counts |
-| `GET /metrics` | Prometheus exposition (unauthenticated, like `/health`): request counts and latency per module route, plus module gauges — see [Metrics](../observability/metrics.md) |
+| `GET /metrics` | Prometheus exposition (unauthenticated, like `/health`, unless [`CANOPY_CLOSED_META`](api-keys.md#closed-meta-routes) is on): request counts and latency per module route, plus module gauges — see [Metrics](../observability/metrics.md) |

@@ -14,9 +14,11 @@ through in-process gateways, so the whole platform runs as one API process
 | `/raccoon` | Raccoon | PV name-lookup proxy over the lab directory service |
 | `/vole` | [Vole](../vole/index.md) | In-memory per-PV buffers merging Hare live data with Mole history |
 | `/formula-engine` | [Formula Engine](../formula-engine/index.md) | Expressions over live and historical PV data |
-| `/squirrel` | Squirrel | Machine-state snapshots: save, restore, and compare (Postgres-backed) |
+| `/squirrel` | [Squirrel](../squirrel/index.md) | Machine-state snapshots: save, restore, and compare (Postgres-backed) |
+| `/magpie` | Magpie | Generic config store: save and share app configs by short slug (Postgres-backed) |
 | `/jobs` | Jobs | Background-job status over the Arq/Redis queue |
 | `/converter` | Converter | Legacy screen converter — EDM `.edl` / Qt `.ui` to Canopy Screen IR |
+| `/analytics` | [Analytics](../observability/index.md#frontend-analytics-error-ingestion) | Frontend usage and error events, recorded as structured log lines |
 | `/elog` | [E-log](../elog/index.md) | Posts e-log entries for client apps, with one e-log token per app held server-side |
 
 Modules without a guide here yet are documented by their interactive API docs
@@ -54,12 +56,15 @@ text or HTTP status alone.
 **JSON casing.** Wire payloads use `camelCase` field names (`tsNs`,
 `valueKind`, `pvNames`).
 
-**Health.** Each module exposes two endpoints under `/<module>/v1/health`:
+**Health.** Each module exposes health endpoints under `/<module>/v1/health`:
 
 - `GET /<module>/v1/health/watchdog` — liveness heartbeat (module, version,
-  uptime). No auth, touches nothing external.
+  uptime). Every module has it. No auth, touches nothing external.
 - `GET /<module>/v1/health/summary` — module status rollup (backend state,
-  counters). Requires read access.
+  counters). Requires read access. Hare, Mole, Raccoon, Vole, and E-log have it.
+
+Some modules add their own checks, such as Squirrel's
+[`/health/restore-hooks`](../squirrel/restore_hooks.md#checking-the-configuration).
 
 The root `GET /health` is a plain process-liveness check used by container
 health probes.

@@ -13,6 +13,7 @@ SQLAlchemy, as an install without the ``data`` extra lacks it.
 import os
 import sys
 import asyncio
+import logging
 import subprocess
 
 import pytest
@@ -89,6 +90,25 @@ def test_a_set_file_supplies_the_static_tier_and_the_environment_value_is_ignore
     assert (write.read, write.write, write.admin, write.modules) == (True, True, False, frozenset({"hare"}))
 
 
+def test_an_ignored_environment_value_is_warned_about_without_its_keys(monkeypatch, tmp_path, caplog):
+    monkeypatch.setitem(sys.modules, "sqlalchemy", None)
+    path = _keys_file(tmp_path, "file-read:read@*")
+    with caplog.at_level(logging.WARNING, logger="canopy.core.security"):
+        build_key_registry(Settings(api_keys="env-key:read+write@*", api_keys_file=str(path)))
+    warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    assert warnings == ["CANOPY_API_KEYS is set but ignored: CANOPY_API_KEYS_FILE supplies the static key tier"]
+    assert "env-key" not in caplog.text
+    assert "file-read" not in caplog.text
+
+
+def test_a_keys_file_alone_warns_about_nothing(monkeypatch, tmp_path, caplog):
+    monkeypatch.setitem(sys.modules, "sqlalchemy", None)
+    path = _keys_file(tmp_path, "file-read:read@*")
+    with caplog.at_level(logging.WARNING, logger="canopy.core.security"):
+        build_key_registry(Settings(api_keys="", api_keys_file=str(path)))
+    assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
+
+
 def test_an_empty_file_setting_counts_as_unset(monkeypatch):
     monkeypatch.setitem(sys.modules, "sqlalchemy", None)
     registry = build_key_registry(Settings(api_keys="env-key:read@*", api_keys_file=""))
@@ -100,6 +120,13 @@ def test_a_trailing_newline_in_the_file_is_not_part_of_a_key(tmp_path):
     assert isinstance(registry, FileKeyRegistry)
     assert registry._keys.keys() == {"file-read"}
     assert _get(registry, "file-read").read is True
+
+
+def test_a_byte_order_mark_is_not_part_of_the_first_key(tmp_path):
+    path = tmp_path / "data.keys"
+    path.write_bytes("\ufefffile-read:read@*\n".encode())
+    registry = load_keys_file(path)
+    assert registry._keys.keys() == {"file-read"}
 
 
 def test_entries_on_separate_lines_are_separate_keys(tmp_path):

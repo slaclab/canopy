@@ -271,7 +271,8 @@ def load_keys_file(path: str | Path) -> FileKeyRegistry:
     ``canopy.core.keys``, so a lean install can read a keys file.
     """
     try:
-        raw = Path(path).read_text(encoding="utf-8")
+        # utf-8-sig: an editor that saves a BOM must not glue it to the first token.
+        raw = Path(path).read_text(encoding="utf-8-sig")
     except (OSError, ValueError) as exc:
         reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
         raise KeysFileError(f"CANOPY_API_KEYS_FILE {path}: cannot be read ({reason})") from None
@@ -314,6 +315,8 @@ def static_key_registry(settings: Settings) -> KeyRegistry:
     with it, and a file that cannot supply a registry raises ``KeysFileError``.
     """
     if settings.api_keys_file:
+        if settings.api_keys.strip():
+            logger.warning("CANOPY_API_KEYS is set but ignored: CANOPY_API_KEYS_FILE supplies the static key tier")
         return load_keys_file(settings.api_keys_file)
     return EnvKeyRegistry(settings.api_keys)
 

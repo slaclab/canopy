@@ -82,6 +82,8 @@ class HareIngestService:
         self._by_canonical: dict[str, set[str]] = {}
         self._running = False
         self._watermark_ns = 0
+        # Newest receive stamp handed out: stamps only ever increase (see `_stamp`).
+        self._last_recv_ns = 0
         self._seen: set[str] = set()  # PVs that have stored at least one sample
         self._disconnected: set[str] = set()  # PVs whose last entry was disconnected
 
@@ -162,8 +164,19 @@ class HareIngestService:
         """Receive time of the newest Hare flush ingest has fully applied (0 before the first)."""
         return self._watermark_ns
 
+    def _stamp(self) -> int:
+        """The next receive stamp: the clock, but always after the previous stamp.
+
+        Readers resume from a receive-time cursor (``samples_since``) and the
+        watermark only moves forward, so a wall clock stepped back (or two frames
+        on the same clock tick) must not stamp a sample at or before one already
+        handed out -- the reader would skip it for good.
+        """
+        self._last_recv_ns = max(self._buffer.clock.now_ns(), self._last_recv_ns + 1)
+        return self._last_recv_ns
+
     def _on_flush(self) -> None:
-        self._watermark_ns = self._buffer.clock.now_ns()
+        self._watermark_ns = self._stamp()
 
     async def _handle_frame(self, data: dict[str, dict], frame_type: str = "diff") -> None:
         """Process a diff/initial frame: convert each PVValue to a Sample and append.
@@ -172,7 +185,7 @@ class HareIngestService:
         non-numeric ``tsNs``) skips only that PV — the rest of the frame still
         lands, and no exception propagates back to the broker.
         """
-        recv_ns = self._buffer.clock.now_ns()
+        recv_ns = self._stamp()
         for pv_name, pv_dict in data.items():
             if not isinstance(pv_dict, dict):
                 continue

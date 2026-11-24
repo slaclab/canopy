@@ -12,7 +12,8 @@ to it. Updates land in a cache of latest values and are fanned out to
 subscribers as batched diffs. New subscribers get the current value
 immediately from the cache — no extra load on the IOC. When a PV's last
 subscriber leaves, its monitor and cached value stay warm for a grace period
-before they are released.
+before they are released. A warm PV still has its monitor, so it counts in the
+health summary's `activeMonitors` and in `canopy_hare_active_monitors`.
 
 ```mermaid
 graph LR
