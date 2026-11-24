@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 import asyncio
 import threading
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
@@ -40,6 +40,7 @@ from tests.canopy.mole.adapters._fakes import FakeArchiverAdapter
 from canopy.mole.services.archiver_service import ArchiverService
 
 S = 1_000_000_000
+MS = 1_000_000
 T1 = 1_790_769_600 * S  # 2026-09-30T12:00:00Z
 GETDATA = re.compile(r".*/retrieval/data/getData\.json.*")
 
@@ -94,7 +95,8 @@ class TestApplianceBudgeted:
     ):
         def respond(request):
             lo, hi = _window_of(request)
-            rows = _rows(lo, hi, 1.0) if lo != hi else [{"secs": lo // S - 7, "nanos": 0, "val": -1.0, "severity": 0}]
+            prior = [{"secs": T1 // S - 127, "nanos": 0, "val": -1.0, "severity": 0}]
+            rows = _rows(lo, hi, 1.0) if lo != hi else prior
             return appliance_module.httpx.Response(200, json=[{"meta": {"name": "P"}, "data": rows}])
 
         httpx_mock.add_callback(respond, url=GETDATA, is_reusable=True)
@@ -126,13 +128,14 @@ class TestApplianceBudgeted:
 
         widths = [(hi - lo) // S for lo, hi in windows]
         assert widths[0] == 60  # the first window is 60 s
-        # Newest first, contiguous (the wire is ms-precise, so adjacent windows meet within a ms).
-        assert windows[0][1] == T1 and all(windows[i][0] >= windows[i + 1][1] for i in range(len(windows) - 1))
+        # Newest first with no gap: the wire is ms-precise, so adjacent windows overlap by up to a ms.
+        assert windows[0][1] == T1 and all(windows[i][0] <= windows[i + 1][1] for i in range(len(windows) - 1))
         assert 95 <= widths[1] <= 100  # 61 samples over 60 s at 1 Hz: budget / rate
         # A window over 2x the budget (10 Hz) shrinks the next one proportionally, never doubling.
         over = next(i for i, (lo, hi) in enumerate(windows) if hi <= step_at)
         assert widths[over + 1] <= widths[over] // 5
-        assert windows[-1][0] == T1 - 3600 * S  # covers the whole lookback
+        # Covers the whole lookback; the oldest window reaches back a ms for the prior sample.
+        assert T1 - 3600 * S - MS <= windows[-1][0] <= T1 - 3600 * S
 
     async def test_quiet_newest_window_cannot_balloon_the_next_request(self):
         """An empty recent window grows the next one at most WINDOW_GROWTH_MAX-fold, not by budget/1."""
@@ -164,6 +167,141 @@ class TestApplianceBudgeted:
 
     def test_event_faithful(self):
         assert EpicsArchiverApplianceAdapter.event_faithful is True
+
+
+# --- Appliance: window seams ----------------------------------------------------- #
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _wire_ns(value: str) -> int:
+    """A wire bound in ns, parsed exactly (the bound is whole ms)."""
+    return (datetime.fromisoformat(value.replace("Z", "+00:00")) - _EPOCH) // timedelta(milliseconds=1) * MS
+
+
+def _just_past_every_ms(t0_ns: int, t1_ns: int) -> list[int]:
+    """One sample 1 ns past every ms boundary, so every seam's sub-ms gap holds one wherever the seam falls."""
+    return list(range(t0_ns // MS * MS + 1, t1_ns + 1, MS))
+
+
+class _MsPreciseAppliance:
+    """``getData.json`` over ns-stamped samples, with ms-precise bounds compared inclusively.
+
+    A range query returns every sample with ``from <= ts <= to``; a zero-width query returns the
+    last sample at or before that instant. With ``prepend_prior`` a range query also starts with
+    the last sample before ``from``, as Appliance raw responses may.
+    """
+
+    def __init__(self, ts: list[int], *, prepend_prior: bool) -> None:
+        self.ts = np.asarray(sorted(ts), dtype=np.int64)
+        self.prepend_prior = prepend_prior
+        self.ranges: list[tuple[int, int]] = []
+
+    def __call__(self, request):
+        q = parse_qs(urlsplit(str(request.url)).query)
+        lo, hi = _wire_ns(q["from"][0]), _wire_ns(q["to"][0])
+        start = int(np.searchsorted(self.ts, lo, "left"))
+        end = int(np.searchsorted(self.ts, hi, "right"))
+        if lo == hi:
+            picked = range(max(end - 1, 0), end)
+        else:
+            self.ranges.append((lo, hi))
+            picked = range(start - 1 if self.prepend_prior and start else start, end)
+        rows = [
+            {"secs": int(self.ts[i]) // S, "nanos": int(self.ts[i]) % S, "val": float(i), "severity": 0} for i in picked
+        ]
+        return appliance_module.httpx.Response(200, json=[{"meta": {"name": "SIM:SEAM"}, "data": rows}])
+
+    def truth(self, t0_ns: int, t1_ns: int) -> np.ndarray:
+        """Indices of the right answer: the last sample before ``t0_ns``, then every one in ``[t0_ns, t1_ns]``."""
+        start = int(np.searchsorted(self.ts, t0_ns, "left"))
+        end = int(np.searchsorted(self.ts, t1_ns, "right"))
+        return np.arange(max(start - 1, 0), end)
+
+
+@pytest.mark.parametrize("prepend_prior", [False, True], ids=["range-only", "prepends-prior"])
+class TestApplianceWindowSeams:
+    """Windows meet at ``hi = lo - 1`` in ns, but the wire takes ms: no sample may fall between."""
+
+    async def test_no_sample_is_lost_at_a_window_seam(
+        self, appliance, httpx_mock: HTTPXMock, monkeypatch, prepend_prior
+    ):
+        t1 = T1 + 123_457  # mid-ms, so the seams land mid-ms too
+        t0 = T1 - 60 * S - 300 * MS  # past the 60 s first window, so a small budget cuts many seams
+        fake = _MsPreciseAppliance(_just_past_every_ms(t0 - 5 * MS, t1), prepend_prior=prepend_prior)
+        httpx_mock.add_callback(fake, url=GETDATA, is_reusable=True)
+        seams: list[int] = []
+        fetch_block = appliance._fetch_block
+
+        async def spy(pv, lo, hi, include_last_before):
+            seams.append(lo - 1)  # the older window's hi
+            return await fetch_block(pv, lo, hi, include_last_before)
+
+        monkeypatch.setattr(appliance, "_fetch_block", spy)
+        block = await appliance.fetch_window_budgeted("SIM:SEAM", t0, t1, budget=20)
+
+        # Most seams sit well inside a ms, where a floored wire `to` would leave a gap.
+        assert sum(1 for hi in seams[:-1] if 1_000 < hi % MS < MS - 1_000) > 10
+        assert all(fake.ranges[i][0] <= fake.ranges[i + 1][1] for i in range(len(fake.ranges) - 1))
+        want = fake.truth(t0, t1)
+        assert block.ts_ns.tolist() == fake.ts[want].tolist()
+        assert block.values.tolist() == want.astype(float).tolist()
+
+    @pytest.mark.parametrize("t0_in_ms", [0, 500_000], ids=["t0-on-ms", "t0-mid-ms"])
+    async def test_prior_sample_is_the_newest_before_t0(
+        self, appliance, httpx_mock: HTTPXMock, prepend_prior, t0_in_ms
+    ):
+        t0 = T1 - S + t0_in_ms  # one window: only the oldest seam
+        # A sample exactly at t0 too: it belongs to the window, never the prior.
+        fake = _MsPreciseAppliance(_just_past_every_ms(t0 - 5 * MS, T1) + [t0], prepend_prior=prepend_prior)
+        httpx_mock.add_callback(fake, url=GETDATA, is_reusable=True)
+
+        block = await appliance.fetch_window_budgeted("SIM:SEAM", t0, T1)
+
+        want = fake.truth(t0, T1)
+        assert block.ts_ns[0] == fake.ts[want[0]] == (t0 - 1) // MS * MS + 1  # in the sub-ms before t0
+        assert block.ts_ns.tolist() == fake.ts[want].tolist()
+
+
+@pytest.mark.parametrize("prepend_prior", [False, True], ids=["range-only", "prepends-prior"])
+class TestApplianceLastBeforeSubMs:
+    """``fetch_last_before`` is exact to the ns though the wire takes whole ms."""
+
+    TS = T1 + 123_456_789  # mid-ms: 500 us past a whole ms is T1 + 123_500_000
+
+    async def _ask(self, appliance, httpx_mock, ts_list, at, prepend_prior):
+        fake = _MsPreciseAppliance(ts_list, prepend_prior=prepend_prior)
+        httpx_mock.add_callback(fake, url=GETDATA, is_reusable=True)
+        got = await appliance.fetch_last_before("SIM:SEAM", at)
+        return got, len(httpx_mock.get_requests())
+
+    async def test_a_sample_in_the_last_sub_ms_before_ts_is_found_in_one_request(
+        self, appliance, httpx_mock: HTTPXMock, prepend_prior
+    ):
+        got, requests = await self._ask(
+            appliance, httpx_mock, [self.TS - 5 * S, self.TS - 200_000], self.TS, prepend_prior
+        )
+        assert got is not None and got.ts_ns == self.TS - 200_000
+        assert requests == 1
+
+    async def test_a_sample_exactly_at_ts_is_found(self, appliance, httpx_mock: HTTPXMock, prepend_prior):
+        got, _ = await self._ask(appliance, httpx_mock, [self.TS - 5 * S, self.TS], self.TS, prepend_prior)
+        assert got is not None and got.ts_ns == self.TS
+
+    async def test_a_sample_after_ts_in_the_same_ms_is_skipped(self, appliance, httpx_mock: HTTPXMock, prepend_prior):
+        ts_list = [self.TS - 5 * S, self.TS - 200_000, self.TS + 100_000]
+        got, _ = await self._ask(appliance, httpx_mock, ts_list, self.TS, prepend_prior)
+        assert got is not None and got.ts_ns == self.TS - 200_000
+
+    async def test_only_an_older_sample_besides_one_after_ts_in_the_same_ms(
+        self, appliance, httpx_mock: HTTPXMock, prepend_prior
+    ):
+        got, _ = await self._ask(appliance, httpx_mock, [self.TS - 5 * S, self.TS + 100_000], self.TS, prepend_prior)
+        assert got is not None and got.ts_ns == self.TS - 5 * S
+
+    async def test_nothing_at_or_before_ts_is_none(self, appliance, httpx_mock: HTTPXMock, prepend_prior):
+        got, _ = await self._ask(appliance, httpx_mock, [self.TS + 100_000, self.TS + S], self.TS, prepend_prior)
+        assert got is None
 
 
 # --- service / gateway ------------------------------------------------------------ #

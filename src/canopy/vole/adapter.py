@@ -280,6 +280,15 @@ class VoleDataSource:
                     stored = await self._buffer.seed(canonical, samples, max_points=self._buffer.max_points)
                 else:
                     stored = await self._buffer.seed(canonical, samples)
+                size = self._buffer.ring_max_points(canonical)
+                if size is None or (grow and size < self._buffer.max_points):
+                    # The seed itself tipped Vole over its memory ceiling and the ring was
+                    # dropped, or (pinned) shrunk to its settle depth: the history it holds
+                    # is cut. Leave it unprovisioned (marking would also recreate a dropped
+                    # ring) and retry after provision_retry_s, when there may be room.
+                    self._buffer.defer_provision(canonical, now + self._buffer.provision_retry_ns)
+                    logger.info("PV %s: seeded history was trimmed under memory pressure; retrying later", pv)
+                    continue
                 self._buffer.mark_provisioned(canonical)
                 logger.info("Auto-provisioned PV %s: seeded %d/%d samples from Mole", pv, stored, len(samples))
 

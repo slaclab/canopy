@@ -27,23 +27,42 @@ def test_unknown_backend_raises():
         build_connector(EpicsConfig(backend="bogus"))
 
 
-class _OutOfTreeConnector:
-    backend_name = "out-of-tree"
+class _PartialConnector:
+    """Builds and starts, but has none of the read, write or monitor methods."""
+
+    backend_name = "partial"
 
     def __init__(self, cfg) -> None:
         self.cfg = cfg
 
     @classmethod
-    def from_config(cls, cfg) -> "_OutOfTreeConnector":
+    def from_config(cls, cfg):
         return cls(cfg)
+
+    async def start(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+
+class _OutOfTreeConnector(_PartialConnector):
+    backend_name = "out-of-tree"
+
+    async def get(self, pv, *, timeout=None): ...
+
+    async def put(self, pv, value, *, timeout=None, wait=True): ...
+
+    async def subscribe(self, pv, on_event): ...
+
+    async def describe(self, pv): ...
 
 
 @pytest.fixture
 def backend_module(monkeypatch):
-    """An importable module holding one usable backend class and two unusable ones."""
+    """An importable module holding one usable backend class and three unusable ones."""
     name = "canopy_test_out_of_tree_backend"
     module = types.ModuleType(name)
     module.Connector = _OutOfTreeConnector
+    module.Partial = _PartialConnector
     module.NoFromConfig = type("NoFromConfig", (), {"backend_name": "broken"})
     module.FromConfigIsData = type("FromConfigIsData", (), {"from_config": "not callable"})
     monkeypatch.setitem(sys.modules, name, module)
@@ -80,6 +99,28 @@ def test_module_whose_own_import_fails_raises(monkeypatch, tmp_path):
         build_connector(EpicsConfig(backend="canopy_test_broken_backend:Connector"))
     assert "canopy_test_broken_backend" in str(err.value)
     assert "canopy_no_such_dependency" in str(err.value)
+
+
+@pytest.mark.parametrize(
+    ("source", "error"),
+    [("raise RuntimeError('client library refused to start')\n", RuntimeError), ("def broken(:\n", SyntaxError)],
+    ids=["runtime-error", "syntax-error"],
+)
+def test_module_that_fails_to_import_otherwise_raises_naming_the_path(monkeypatch, tmp_path, source, error):
+    (tmp_path / "canopy_test_failing_backend.py").write_text(source)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    path = "canopy_test_failing_backend:Connector"
+    with pytest.raises(EpicsBackendUnavailable, match=error.__name__) as err:
+        build_connector(EpicsConfig(backend=path))
+    assert repr(path) in str(err.value)
+    assert isinstance(err.value.__cause__, error)
+
+
+def test_class_that_builds_a_partial_connector_raises(backend_module):
+    path = f"{backend_module}:Partial"
+    with pytest.raises(EpicsBackendUnavailable, match="does not implement PVConnector") as err:
+        build_connector(EpicsConfig(backend=path))
+    assert repr(path) in str(err.value)
 
 
 def test_missing_class_raises(backend_module):

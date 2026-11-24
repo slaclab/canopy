@@ -13,7 +13,16 @@ from canopy.contracts import load_heartbeat_vectors
 from canopy.hare.api.v1 import health as health_module
 from canopy.hare.config import HareConfig
 from canopy.core.security import require_read_access
-from canopy.contracts.health import HareHealthSummaryDTO
+from canopy.contracts.health import (
+    DATA_DEGRADED,
+    DATA_UNAVAILABLE,
+    HealthDTO,
+    WritesDTO,
+    ReachableDTO,
+    ChannelCountsDTO,
+    HareHealthSummaryDTO,
+    FrontHealthSummaryDTO,
+)
 from canopy.hare.dependencies import get_pv_broker
 from tests.canopy.hare.conftest import FakeConnector, FakeWebSocket
 from canopy.hare.services.broker import PVBroker
@@ -55,6 +64,41 @@ def test_the_summary_body_is_the_shared_contract():
     assert resp.status_code == 200
     parsed = HareHealthSummaryDTO.model_validate_json(resp.content, strict=True)
     assert parsed.model_dump(by_alias=True, mode="json") == resp.json()
+
+
+# canopy-mcp imports these and parses Hare's summary strictly, and nothing in canopy
+# reads the front-end ones: a renamed, retyped or newly required field breaks it unseen.
+_CANOPY_MCP_FIELDS = {
+    HareHealthSummaryDTO: {
+        **dict.fromkeys(["status", "backend", "connectorOk", "clients", "activeMonitors", "connected"], True),
+        "warmMonitors": False,
+        "subscriptions": True,
+        **dict.fromkeys(["label", "notice", "binding", "reachable", "writes"], False),
+    },
+    ReachableDTO: {"state": True, "since": False, "reason": False},
+    WritesDTO: {"state": True, "reason": False, "cause": False},
+    ChannelCountsDTO: {"connected": True, "total": True},
+    FrontHealthSummaryDTO: {"status": True, "degraded": False, "channels": False, "reachable": False},
+    HealthDTO: {"status": True},
+}
+
+
+@pytest.mark.parametrize("model", list(_CANOPY_MCP_FIELDS), ids=lambda m: m.__name__)
+def test_the_contracts_canopy_mcp_imports_keep_their_fields(model):
+    fields = {info.alias or name: info.is_required() for name, info in model.model_fields.items()}
+    assert fields == _CANOPY_MCP_FIELDS[model]
+
+
+def test_the_front_summary_round_trips_strictly():
+    assert (DATA_UNAVAILABLE, DATA_DEGRADED) == ("data-unavailable", "data-degraded")
+    body = {
+        "status": "degraded",
+        "degraded": [DATA_DEGRADED],
+        "channels": {"connected": 52, "total": 53},
+        "reachable": {"state": "no", "since": 1760699400.0, "reason": None},
+    }
+    parsed = FrontHealthSummaryDTO.model_validate_json(json.dumps(body), strict=True)
+    assert parsed.model_dump(by_alias=True, mode="json") == body
 
 
 def test_summary_requires_a_key():

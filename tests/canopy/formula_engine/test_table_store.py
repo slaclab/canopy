@@ -901,3 +901,20 @@ class TestEdgeSeedReach:
         await feed(h, store, base, sparse_seq(), tick_each=False)
         backfilled = [t - base for t in settle(h, store)["tsNs"]]
         assert seeded == backfilled == expected
+
+
+async def test_a_new_inputs_live_cursor_starts_at_the_watermark_when_it_leads_the_clock():
+    """After a backward clock step the receive stamps (and watermark) run ahead of the clock."""
+    from tests.canopy.formula_engine.table_harness import S, Harness, timer_spec
+    from canopy.formula_engine.services.table_store import (
+        TableStore,
+        TableSettings,
+        build_view,
+    )
+
+    h = Harness()
+    h.wm = h.now + 3 * S
+    store = TableStore(build_view(timer_spec(), {"x": None, "y1": None}, 3600 * S), TableSettings(), h.port())
+    store.adopt(store.view)
+    assert {st.last_seen_recv for st in store.inputs.values()} == {h.wm}
+    store.cancel()
