@@ -3,6 +3,7 @@
 ``/v1/instance``'s arms. Subscribing for real is in ``test_replication_e2e.py``."""
 
 from uuid import uuid4
+from contextlib import asynccontextmanager
 
 import pytest
 import asyncpg
@@ -15,7 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from canopy.core.arms import Arm
 from canopy.core.instance import arm_states
-from canopy.core.replication.sql import Refused, ReplicationError, tables_with_rows_of
+from canopy.core.replication.sql import (
+    Refused,
+    ReplicationError,
+    qualified,
+    tables_with_rows_of,
+)
 from canopy.core.replication.registry import REGISTRY
 from canopy.core.replication.subscriber import (
     grants,
@@ -24,15 +30,21 @@ from canopy.core.replication.subscriber import (
     subscriber_status,
 )
 
-from .conftest import DB_DSN, privileges, build_schema, direct_grants
+from .conftest import (
+    DB_DSN,
+    PRESENT,
+    privileges,
+    build_schema,
+    direct_grants,
+    present_tables,
+)
 
-PRESENT = sorted(REGISTRY.replicated)
-DSN = "host=arm1.example.org dbname=canopy user=replicator password=s3cret-pw"
+DSN = "postgresql://replicator:s3cret-pw@arm1.example.org/canopy"
 ARMS = {"arm1": Arm(publisher_dsn=SecretStr(DSN))}
 
 
 HEAD = "head"
-ROOTS = sorted(t for t in REGISTRY.replicated if not REGISTRY.owner_chain(t))
+ROOTS = sorted(t for t in PRESENT if not REGISTRY.owner_chain(t))
 RW = {"SELECT", "INSERT", "UPDATE", "DELETE"}
 
 
@@ -82,6 +94,40 @@ async def test_grants_reads_every_row_and_writes_only_the_heads(db, config):
         await db.execute("RESET ROLE")
 
 
+async def test_grants_leaves_out_a_retired_table_once_it_is_dropped(db, config):
+    # What PRESENT and ROOTS become once a table is retired: its model is gone, so a
+    # database built from the models doesn't hold it, and grants covers the rest.
+    retired = frozenset({"magpie.config"})
+    await db.execute(f'CREATE ROLE "{config.app_role}"')
+    await db.execute("DROP TABLE magpie.config")
+
+    result = await grants(db, role="mirror", head=HEAD, config=config)
+
+    assert result["replicated"] == present_tables(retired)
+    assert result["row_security"] == sorted(set(ROOTS) - retired)
+
+
+async def test_a_permissive_policy_added_by_hand_doesnt_widen_writes(db, config):
+    await db.execute(f'CREATE ROLE "{config.app_role}"')
+    await db.execute("CREATE POLICY wide ON squirrel.tag_group FOR ALL TO PUBLIC USING (true) WITH CHECK (true)")
+    await grants(db, role="mirror", head=HEAD, config=config)
+    await db.execute(
+        "INSERT INTO squirrel.tag_group (id, name, owner_instance) VALUES (gen_random_uuid(), 'A', 'arm1')"
+    )
+
+    await db.execute(f'SET ROLE "{config.app_role}"')
+    try:
+        assert await db.fetchval("SELECT count(*) FROM squirrel.tag_group") == 1
+        assert await db.execute("UPDATE squirrel.tag_group SET description = 'x'") == "UPDATE 0"
+        assert await db.execute("DELETE FROM squirrel.tag_group") == "DELETE 0"
+        with pytest.raises(asyncpg.InsufficientPrivilegeError, match="row-level security"):
+            await db.execute(
+                "INSERT INTO squirrel.tag_group (id, name, owner_instance) VALUES (gen_random_uuid(), 'B', 'arm1')"
+            )
+    finally:
+        await db.execute("RESET ROLE")
+
+
 async def test_grants_makes_tables_created_later_readable(db, config):
     await db.execute(f'CREATE ROLE "{config.app_role}"')
     await grants(db, role="mirror", head=HEAD, config=config)
@@ -101,7 +147,7 @@ async def test_grants_twice_is_harmless_and_follows_a_new_head_name(db, config):
     await grants(db, role="mirror", head="renamed", config=config)
     checks = await db.fetch(
         "SELECT coalesce(with_check, qual) AS rule FROM pg_policies "
-        "WHERE schemaname = 'squirrel' AND tablename = 'pv' AND policyname <> 'canopy_read'"
+        "WHERE schemaname = 'squirrel' AND tablename = 'pv' AND policyname <> 'canopy_access'"
     )
     assert len(checks) == 3 and all("'renamed'" in row["rule"] for row in checks)
 
@@ -161,6 +207,25 @@ async def test_grants_refusals(db, config):
             ],
             r"belongs to rt_reader_\w+, which owns registered tables",
             id="member-of-a-table-owner",
+        ),
+        pytest.param(
+            [
+                'CREATE ROLE "{helper}"',
+                'GRANT TRUNCATE ON squirrel.snapshot TO "{helper}"',
+                'GRANT "{helper}" TO "{app}" WITH INHERIT FALSE, SET TRUE',
+            ],
+            r"TRUNCATE on squirrel\.snapshot \(as rt_reader_\w+, through SET ROLE\)",
+            id="set-role-to-a-role-that-holds-more",
+        ),
+        pytest.param(
+            ['CREATE ROLE "{helper}" SUPERUSER', 'GRANT "{helper}" TO "{app}" WITH INHERIT FALSE, SET TRUE'],
+            r"belongs to rt_reader_\w+, a superuser",
+            id="member-of-a-superuser",
+        ),
+        pytest.param(
+            ['CREATE ROLE "{helper}" BYPASSRLS', 'GRANT "{helper}" TO "{app}" WITH INHERIT FALSE, SET TRUE'],
+            r"belongs to rt_reader_\w+, which bypasses row-level security",
+            id="member-of-a-role-that-bypasses-row-security",
         ),
     ],
 )
@@ -236,28 +301,55 @@ async def test_only_that_arms_rows_count(db):
     ]
 
 
-@pytest_asyncio.fixture
-async def arm_db(db):
-    """A second database on the same server, standing in for an arm the CLI reads.
+@asynccontextmanager
+async def _arm_databases(db, names: list[str]):
+    """A database per arm on the same server, standing in for arms the CLI reads.
 
-    Only the checks before ``CREATE SUBSCRIPTION`` can run against it: a
+    Only the checks before ``CREATE SUBSCRIPTION`` can run against them: a
     subscription to a database on its own server waits forever for its slot.
     """
-    name = f"rt_arm_{uuid4().hex[:8]}"
-    await db.execute(f'CREATE DATABASE "{name}"')
-    dsn = make_url(DB_DSN).set(database=name).render_as_string(hide_password=False)
+    conns, arms = {}, {}
     try:
-        await build_schema(dsn)
-        conn = await asyncpg.connect(dsn)
-        url = make_url(dsn)
-        # As an arm's setting would hold it: key=value, which the CLI turns into a URI to read the arm.
-        conninfo = f"host={url.host} port={url.port} dbname={name} user={url.username} password='{url.password}'"
-        try:
-            yield conn, {"arm1": Arm(publisher_dsn=SecretStr(conninfo))}
-        finally:
-            await conn.close()
+        for arm in names:
+            name = f"rt_{arm}_{uuid4().hex[:8]}"
+            await db.execute(f'CREATE DATABASE "{name}"')
+            dsn = make_url(DB_DSN).set(database=name).render_as_string(hide_password=False)
+            conns[arm] = (name, None)
+            await build_schema(dsn)
+            conns[arm] = (name, await asyncpg.connect(dsn))
+            # As publish leaves it: the key checks read only what the arm publishes.
+            await conns[arm][1].execute(
+                f"CREATE PUBLICATION canopy_history FOR TABLE {', '.join(qualified(t) for t in PRESENT)}"
+            )
+            arms[arm] = Arm(publisher_dsn=SecretStr(dsn))
+        yield {arm: conn for arm, (_, conn) in conns.items()}, arms
     finally:
-        await db.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
+        for name, conn in conns.values():
+            if conn is not None:
+                await conn.close()
+            await db.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
+
+
+@pytest_asyncio.fixture
+async def arm_db(db):
+    """arm1's stand-in database and the arms setting that reaches it."""
+    async with _arm_databases(db, ["arm1"]) as (conns, arms):
+        yield conns["arm1"], arms
+
+
+@pytest_asyncio.fixture
+async def two_arm_dbs(db):
+    """arm1's and arm2's stand-in databases and the arms setting that reaches them."""
+    async with _arm_databases(db, ["arm1", "arm2"]) as found:
+        yield found
+
+
+async def _same_facility_slug_on(conns) -> None:
+    for name, conn in conns.items():
+        await conn.execute(
+            "INSERT INTO core.facility (id, slug, name, owner_instance) VALUES (gen_random_uuid(), 'lab', 'L', $1)",
+            name,
+        )
 
 
 async def test_subscribe_reads_the_arm_and_refuses_a_slug_clash(db, arm_db):
@@ -272,6 +364,43 @@ async def test_subscribe_reads_the_arm_and_refuses_a_slug_clash(db, arm_db):
     with pytest.raises(Refused, match=r"core.facility.slug 'lab' \(here, owned by head\)"):
         await subscribe(db, role="mirror", head="head", arms=arms)
     assert await _subscriptions_here(db) == 0
+
+
+async def test_subscribe_refuses_a_slug_two_arms_would_both_copy(db, two_arm_dbs):
+    conns, arms = two_arm_dbs
+    await _same_facility_slug_on(conns)
+
+    # Neither arm's rows are here yet, so only comparing the two finds it.
+    with pytest.raises(Refused, match=r"arms arm1 and arm2: core.facility.slug 'lab' \(both copy it\)"):
+        await subscribe(db, role="mirror", head="head", arms=arms)
+    assert await _subscriptions_here(db) == 0
+
+
+async def test_refresh_refuses_a_slug_two_arms_would_both_copy(
+    db, two_arm_dbs, stray_subscription_for_arm1, stray_subscription_for_arm2
+):
+    conns, arms = two_arm_dbs
+    await _same_facility_slug_on(conns)
+
+    with pytest.raises(Refused, match=r"arms arm1 and arm2: core.facility.slug 'lab' \(both copy it\)"):
+        await refresh(db, role="mirror", arms=arms)
+
+
+async def test_a_keyed_table_the_arm_doesnt_publish_yet_isnt_read(db, arm_db):
+    # An older arm while the head deploys first: no magpie.config there at all.
+    arm, arms = arm_db
+    await arm.execute("ALTER PUBLICATION canopy_history DROP TABLE magpie.config")
+    await arm.execute("DROP TABLE magpie.config")
+    await arm.execute(
+        "INSERT INTO core.facility (id, slug, name, owner_instance) VALUES (gen_random_uuid(), 'lab', 'L', 'arm1')"
+    )
+    await db.execute(
+        "INSERT INTO core.facility (id, slug, name, owner_instance) VALUES (gen_random_uuid(), 'lab', 'L', 'head')"
+    )
+
+    # The facility check still runs; the missing table neither fails nor skips it.
+    with pytest.raises(Refused, match=r"core.facility.slug 'lab' \(here, owned by head\)"):
+        await subscribe(db, role="mirror", head="head", arms=arms)
 
 
 async def test_refresh_checks_the_slugs_of_tables_about_to_be_copied(db, arm_db, stray_subscription_for_arm1):
@@ -338,6 +467,13 @@ async def stray_subscription(db):
 async def stray_subscription_for_arm1(db):
     """arm1's subscription, holding no table yet: a refresh would copy every one."""
     async for name in _unconnected_subscription(db, "canopy_history_arm1"):
+        yield name
+
+
+@pytest_asyncio.fixture
+async def stray_subscription_for_arm2(db):
+    """arm2's subscription, like arm1's."""
+    async for name in _unconnected_subscription(db, "canopy_history_arm2"):
         yield name
 
 

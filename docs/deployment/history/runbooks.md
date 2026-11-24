@@ -44,7 +44,12 @@ quieter time.
 
 If `reseed` fails part-way, the subscription stays disabled: run it again. Never enable
 the subscription by hand after a failed run, since replication would resume from where
-the old slot left off, not from the copy.
+the old slot left off, not from the copy. Only one `reseed` of an arm runs at a time; a
+second is refused while the first runs.
+
+`reseed`'s report lists under `dangling` any row of that arm (or of nobody known) that
+still references a missing parent once it is done, for example rows a rebuilt or
+out-of-date arm left behind. `drift-check` reports them too; fix them by hand.
 
 ## Head PITR
 
@@ -107,7 +112,12 @@ A bad write on an arm (a mass edit, a wrong delete) reaches the head within seco
 Never repair an arm's rows on the head; repair them on that arm and let replication
 carry the fix.
 
-1. Restore the head's backup into a scratch database at a time before the bad write.
+1. Restore the head's backup into a scratch server at a time before the bad write,
+   starting it with `max_logical_replication_workers = 0`, as in "Head PITR". Its
+   restored subscriptions still point at the arms' live slots: with workers enabled
+   it would connect, apply new writes and move the slots on. Never drop a subscription
+   there without `SET (slot_name = NONE)` first, which would drop the arm's live slot.
+   Discard the scratch server when done.
 2. Extract the good rows that arm owns from it (`\copy (SELECT ...) TO`, filtered on
    the owner as in "Arm host lost").
 3. Write them back on the arm, in one transaction, parents before children.

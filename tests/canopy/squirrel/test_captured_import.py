@@ -88,23 +88,36 @@ async def test_a_repeat_writes_nothing_and_answers_with_what_was_saved(client, d
     assert await _value_count(db_session, bundle["id"]) == 1
 
 
-async def test_a_repeat_is_answered_before_the_rules_run(client, db_session):
-    # Delivered once, then the caller's grant narrowed and a PV moved out of reach. A
-    # resend still reports the snapshot as saved, strict or not, instead of refusing it.
+async def test_a_resend_is_answered_from_what_was_saved_after_a_pv_moved(client, db_session):
+    # Delivered once, then a PV moved out of reach. A resend still reports the snapshot
+    # as saved, strict or not, instead of refusing it.
     bundle = await _captured_bundle(client, db_session)
     await _save(db_session, bundle)
     await db_session.commit()
     bundle["values"].append({**bundle["values"][0], "pvId": str(uuid.uuid4()), "pvName": "GONE:SP"})
 
-    narrowed = SnapshotService(db_session, facility_scope=set())
-    again = await narrowed.import_bundle(
-        SnapshotBundleDTO.model_validate(bundle), captured=True, created_by="alice", strict=True
-    )
+    again = await _save(db_session, bundle, strict=True)
 
     assert not again.created
     assert [s.pv_name for s in again.skipped] == ["GONE:SP"]
-    with pytest.raises(InsufficientFacilityAccess):
-        await narrowed.import_bundle(SnapshotBundleDTO.model_validate({**bundle, "id": str(uuid.uuid4())}))
+
+
+async def test_a_resend_outside_the_grant_gets_what_a_new_import_gets(client, db_session):
+    # The grant is checked first, so a caller outside it can't tell a saved snapshot
+    # from one that never was.
+    bundle = await _captured_bundle(client, db_session)
+    await _save(db_session, bundle)
+    await db_session.commit()
+    narrowed = SnapshotService(db_session, facility_scope=set())
+
+    with pytest.raises(InsufficientFacilityAccess) as saved:
+        await narrowed.import_bundle(SnapshotBundleDTO.model_validate(bundle), captured=True, created_by="alice")
+    with pytest.raises(InsufficientFacilityAccess) as never:
+        await narrowed.import_bundle(
+            SnapshotBundleDTO.model_validate({**bundle, "id": str(uuid.uuid4())}), captured=True, created_by="alice"
+        )
+
+    assert str(saved.value) == str(never.value)
 
 
 async def test_a_snapshot_deleted_since_still_counts_as_saved(client, db_session):
@@ -127,13 +140,35 @@ async def test_a_snapshot_deleted_since_still_counts_as_saved(client, db_session
     ],
     ids=["time", "facility"],
 )
-async def test_an_id_already_used_for_another_snapshot_is_a_conflict(client, db_session, change):
+async def test_an_id_already_used_for_another_snapshot_is_a_bare_conflict(client, db_session, change):
     bundle = await _captured_bundle(client, db_session)
     await _save(db_session, bundle)
+    db_session.add(Facility(slug="elsewhere", name="Elsewhere"))
     await db_session.commit()
 
-    with pytest.raises(SnapshotIdConflict, match=bundle["id"]):
+    with pytest.raises(SnapshotIdConflict) as conflict:
         await _save(db_session, {**bundle, **change})
+
+    # Nothing about the saved snapshot, which the caller may not reach.
+    assert str(conflict.value) == f"Snapshot {bundle['id']} is already here, as another snapshot"
+
+
+async def test_a_key_outside_the_saved_snapshots_facility_learns_nothing_about_it(client, db_session):
+    # The bundle names a facility the key holds; the id is saved in one it doesn't.
+    # The facility gate passes, and the answer says only that the id is taken.
+    bundle = await _captured_bundle(client, db_session)
+    await _save(db_session, bundle)
+    reachable = Facility(slug="elsewhere", name="Elsewhere")
+    db_session.add(reachable)
+    await db_session.commit()
+    restricted = SnapshotService(db_session, facility_scope={reachable.id})
+
+    with pytest.raises(SnapshotIdConflict) as conflict:
+        await restricted.import_bundle(
+            SnapshotBundleDTO.model_validate({**bundle, "facility": "elsewhere"}), captured=True, created_by="alice"
+        )
+
+    assert str(conflict.value) == f"Snapshot {bundle['id']} is already here, as another snapshot"
 
 
 async def test_the_same_time_written_another_way_is_not_a_conflict(client, db_session):
@@ -240,5 +275,7 @@ async def test_an_id_another_instance_holds_is_a_conflict(client, db_session, as
         db_session.add(Snapshot(id=bundle["id"], title=bundle["title"], created_at=TAKEN))
         await db_session.commit()
 
-    with pytest.raises(SnapshotIdConflict, match="owned by 'arm2'"):
+    with pytest.raises(SnapshotIdConflict) as conflict:
         await _save(db_session, bundle)
+
+    assert "arm2" not in str(conflict.value)

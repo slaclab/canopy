@@ -81,6 +81,12 @@ its snapshot, a PV's tag link without its tag). Each such row is put down to the
 that owns it, through whichever of its parents survives, and is that arm's drift
 (exit 1 for that arm only). A row nobody can be found to own is reported under `head`
 and fails every run until it is fixed. A reference that is NULL is never flagged.
+While the table such a row is in, or the parent table it misses, is still being copied
+(an initial copy or a `refresh`), the row may only be early: it is listed as `pending`
+and makes the run not checked (exit 2), not drift. For an arm's row that's while that
+arm's subscription doesn't hold both tables ready; for a row under `head`, while any
+subscription doesn't. If the head's own check fails, `head` is not checked, with the
+error, and drift found in the arms still makes the run exit 1.
 
 The JSON report gives `status`, then each arm's report under `arms` (drifting tables
 and days) and the head's under `head`. To repair an arm's drift, find its cause, then
@@ -143,7 +149,9 @@ creates a new snapshot there.
 
 A forwarded restore runs as a job on the arm. Clients poll it on the head as usual:
 `GET /jobs/v1/{id}` asks that arm about a job the head started there, for a day after
-it started.
+it started. The arm's 404 is answered as 404 `job_not_found`; any other error from the
+arm is a 502, `service_key_refused` when it refused the head's key and
+`primary_unavailable` naming the arm's answer otherwise.
 
 ### Who wrote it
 
@@ -311,7 +319,14 @@ meanwhile) refuses it with 409 `import_would_skip`, naming the PVs. A failure th
 nothing about the snapshot (unreachable, 5xx, the head's key refused) keeps it pending
 and backs off, from `RETRY_INITIAL_S` doubling to `RETRY_MAX_S`; a queued snapshot
 never gives up. A refusal of the snapshot itself (facility gone, PVs moved, id clash)
-marks it failed, and the arm's queue goes on without it.
+marks it failed, and the arm's queue goes on without it. A resend the arm refuses with
+403 `insufficient_facility_access` (the user's grant no longer reaches the facility) may
+be of a snapshot an earlier attempt saved, its answer lost: the arm answers the same
+either way, so as not to tell that user the snapshot exists. If the snapshot has
+replicated back, it's delivered. If not, it stays pending for
+`CANOPY_SQUIRREL__OUTBOX__RESEND_WAIT_S` seconds (default 60), its reason saying
+"resent", with the arm's queue waiting behind it, and fails if the arm refuses it again.
+A failed snapshot that replicates back later is removed from the outbox.
 
 **Caps.** Each arm's queue holds at most `CANOPY_SQUIRREL__OUTBOX__MAX_SNAPSHOTS`
 snapshots and `MAX_BYTES` bytes, failed rows included, and so are snapshots saved on
@@ -424,7 +439,7 @@ failed check by name:
 | `window_set` | `CANOPY_WINDOW_DAYS` is unset |
 | `no_delete_publication` | Any publication carrying a snapshot table publishes deletes (`canopy_history` still exists) |
 | `slot_active` | The head's slot is missing or no walsender holds it |
-| `streams_split` | The walsender doesn't stream both `canopy_ref` and `canopy_ts`, they don't carry the snapshot tables whole (no row filter or column list), or its command can't be read |
+| `streams_split` | The walsender doesn't stream both `canopy_ref` and `canopy_ts`, they don't carry the snapshot tables whole (inserts and updates, no row filter or column list), or its command can't be read |
 | `no_initial_copy` | A table's initial copy is running (a `pg_<oid>_sync_…` slot exists) |
 | `wal_status_reserved` | The slot's WAL is at risk |
 | `lag` | Flush lag or the head's last reply is older than `CANOPY_PRUNE__MAX_LAG_S` (60 s) |
@@ -455,6 +470,7 @@ repo root lists them all with their defaults.
 | `CANOPY_SQUIRREL__OUTBOX__RETRY_INITIAL_S` | A history head only: seconds before the first retry of a delivery to an arm (default 30). The wait doubles after each failure |
 | `CANOPY_SQUIRREL__OUTBOX__RETRY_MAX_S` | A history head only: longest wait between delivery retries (default 900). A queued snapshot never gives up |
 | `CANOPY_SQUIRREL__OUTBOX__INTERVAL_S` | A history head only: how often the **worker** looks for deliveries due, 1–60 seconds (default 30) |
+| `CANOPY_SQUIRREL__OUTBOX__RESEND_WAIT_S` | A history head only: how long a resend the arm refused for the user's grant waits for its snapshot to replicate back before it fails, in seconds, at most 900 (default 60). The arm's queue waits behind it. See [When an arm is unreachable](#when-an-arm-is-unreachable) |
 | `CANOPY_HISTORY_URL`, `CANOPY_WINDOW_DAYS` | Optional. Reported by `GET /v1/instance` with the role, the instance name and the Alembic head shipped in the image: the URL of the history head that holds the instance's full history, and how many days of history it keeps (a whole number of at least 1; unset means all). A blank value counts as unset |
 | `CANOPY_ARMS__<arm>__PUBLISHER_DSN` | History head only (`CANOPY_ROLE=mirror`): one per arm, named after that arm's `CANOPY_INSTANCE` (lowercase letters, digits and underscores, at most 48). A `postgresql://` URI the head's subscription `canopy_history_<arm>` uses to reach the arm as its replication role. `subscribe` and `refresh` also open it themselves before an initial copy, to refuse facility or Magpie slugs the head already holds, so the CLI's network must reach the arm at that address too. Supply it from a secret; the CLI never prints it. The arms can also be set as JSON in `CANOPY_ARMS` |
 | `CANOPY_ARMS__<arm>__READER_DSN` | History head only, for `python -m canopy.core.replication drift-check` and `reseed`: a `postgresql://` URI to that arm as its read-only reader role (asyncpg needs the URI form). A secret, like the publisher DSN |

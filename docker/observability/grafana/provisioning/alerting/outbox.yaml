@@ -57,7 +57,9 @@ groups:
           description: >-
             The snapshot is kept on the head as failed, with the arm's reason, and still holds its share
             of the arm's cap. Fix the cause and `retry` it (with `--allow-skips` for import_would_skip),
-            or export and `discard` it.
+            or export and `discard` it. A reason that says "resent" (insufficient_facility_access on a
+            resend) may be of a snapshot the arm saved after all: check the head's subscription to that
+            arm; if the snapshot replicates back, the head removes the failed row itself.
         data:
           - refId: A
             relativeTimeRange: {from: 600, to: 0}

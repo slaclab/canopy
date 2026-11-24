@@ -70,6 +70,8 @@ PRIMARY_PHASE = "Setpoints"
 
 # Title prefix of a snapshot created by ``import_bundle``.
 IMPORTED_TITLE_PREFIX = "Restored from history: "
+# A meta-PV value's own fields, which come from its stored row, never from its blob.
+_META_PV_IDENTIFIERS = frozenset({"pv_id", "pv_name", "pvId", "pvName"})
 # How many skipped PVs a strict import's refusal names; it gives the total too.
 _SKIPPED_NAMED = 20
 
@@ -375,13 +377,12 @@ class SnapshotService:
                 else await self.value_repo.get_by_snapshot_and_pvs(snapshot_id, pv_ids)
             )
             for value in values:
-                data = _parse_jsonb(value.setpoint_value) or _parse_jsonb(value.readback_value)
+                data = _parse_jsonb(value.setpoint_value) or _parse_jsonb(value.readback_value) or {"value": None}
+                # The stored row names the PV. An imported blob may carry keys of its own
+                # (kept as they are in the row), and one spelling a PV field must not win.
+                blob = {key: item for key, item in data.items() if key not in _META_PV_IDENTIFIERS}
                 meta_pv_values.append(
-                    MetaPVValueDTO(
-                        pv_id=value.pv_id,
-                        pv_name=value.pv_name,
-                        **(data or {"value": None}),
-                    )
+                    MetaPVValueDTO.model_validate({**blob, "pv_id": value.pv_id, "pv_name": value.pv_name})
                 )
         return meta_pv_values
 
@@ -1057,9 +1058,10 @@ class SnapshotService:
           the author; ``imported_from`` stays empty. It is idempotent on the id: if a
           snapshot with that id is already here (deleted or not), with the same facility
           and creation time, nothing is written and the answer has ``created`` false.
-          That is checked first, so a resend is answered from what was saved even if
-          the PVs or the caller's grant have changed since. ``strict`` refuses a bundle
-          that would leave any value out.
+          The bundle's facility is checked first, exactly as for a new snapshot, so a
+          caller outside its grant gets the same refusal whether or not the snapshot is
+          saved; then a resend is answered from what was saved, even if the PVs have
+          changed since. ``strict`` refuses a bundle that would leave any value out.
 
         In both modes the snapshot belongs to this instance, and values are matched to
         PVs here by ``pv_id``, deleted PVs included: a history head replicates its
@@ -1103,11 +1105,8 @@ class SnapshotService:
         InsufficientFacilityAccess
             When the key can't write the bundle's facility.
         """
-        if captured:
-            if not created_by:
-                raise ValueError("a captured import records its author; pass created_by")
-            if (existing := await self.snapshot_repo.get_by_id(str(bundle.id), include_deleted=True)) is not None:
-                return await self._already_saved(existing, bundle)
+        if captured and not created_by:
+            raise ValueError("a captured import records its author; pass created_by")
 
         facility_id = None
         if bundle.facility is not None:
@@ -1117,6 +1116,9 @@ class SnapshotService:
             require_create_owner(facility.owner_instance, None, f"Facility '{bundle.facility}'")
             facility_id = facility.id
         self._require_facility_for_create(facility_id, bundle.facility)
+
+        if captured and (existing := await self.snapshot_repo.get_by_id(str(bundle.id), include_deleted=True)):
+            return await self._already_saved(existing, bundle)
 
         capture_scope = await facilities_gateway.descendant_ids(facility_id) if facility_id is not None else None
         known = await self._importable_pv_ids(sorted({str(value.pv_id) for value in bundle.values}), capture_scope)
@@ -1217,21 +1219,22 @@ class SnapshotService:
     async def _already_saved(self, existing: Snapshot, bundle: SnapshotBundleDTO) -> SnapshotImportResultDTO:
         """The answer to a captured import whose id is already here: what was saved, unchanged.
 
+        Called once the bundle's facility has passed the create gate.
+
         Raises
         ------
         SnapshotIdConflict
             When the saved snapshot is another instance's, or has another facility or
-            creation time than the bundle.
+            creation time than the bundle. The answer names none of them: the saved
+            snapshot may be one the caller can't reach.
         """
-        if existing.owner_instance != local_instance():
-            raise SnapshotIdConflict(f"Snapshot {existing.id} is already here, owned by '{existing.owner_instance}'")
         facility = await self._facility_slug(existing.facility_id)
-        if facility != bundle.facility or existing.created_at != to_utc(bundle.created_date):
-            raise SnapshotIdConflict(
-                f"Snapshot {existing.id} is already saved here with facility {facility or 'none'} and creation time "
-                f"{existing.created_at.isoformat()}, not this bundle's {bundle.facility or 'none'} and "
-                f"{to_utc(bundle.created_date).isoformat()}"
-            )
+        if (
+            existing.owner_instance != local_instance()
+            or facility != bundle.facility
+            or existing.created_at != to_utc(bundle.created_date)
+        ):
+            raise SnapshotIdConflict(f"Snapshot {existing.id} is already here, as another snapshot")
         saved = set(await self.value_repo.get_pv_ids_by_snapshot(existing.id))
         skipped = [
             SkippedValueDTO(pv_id=str(value.pv_id), pv_name=value.pv_name)
