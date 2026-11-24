@@ -680,6 +680,12 @@ class TableStore:
         for pv in view.pvs:
             if pv in shared and pv in source.inputs:
                 self.inputs[pv] = replace(source.inputs[pv])
+        # A full source ring may have dropped rows newer than its search bound, so
+        # only what it still holds is known. ``_reconcile``'s own check cannot see
+        # this once the rows are rebuilt at a larger N.
+        if source.rows.count and source.rows.count >= source.rows.capacity:
+            oldest = source.rows.oldest_ts
+            self.searched_from = max(source.searched_from or oldest, oldest)
 
     async def _extend_older(self, view: TableView, now: int) -> None:
         """Seed rows older than anything searched so far, down to N rows or the lookback."""

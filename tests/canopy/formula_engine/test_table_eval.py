@@ -311,6 +311,37 @@ class TestSharingAndCarryOver:
         assert len(b.tables()[-1]["tsNs"]) == 2000
         await rig.mgr.shutdown()
 
+    @staticmethod
+    async def _rolled_n5(rig: Rig, collector: Collector) -> list[int]:
+        """An n=5 table whose row ring has rolled over; returns every trigger time, oldest first."""
+        archived = [(T0 - 60 * S + k * S, float(k)) for k in range(60)]
+        for pv in ("TRIG", "X", "Y1"):
+            rig.h.archived(pv, archived)
+        await rig.sub("a", "s", trigger_spec(n=5), collector, t0=-60 * S)
+        await wait_for(lambda: collector.results())
+        live = []
+        for k in range(8):
+            rig.h.advance(S)
+            ts = rig.h.now - 10 * MS
+            live.append(ts)
+            for pv in ("TRIG", "X", "Y1"):
+                await rig.h.live(pv, ts, float(100 + k))
+            await asyncio.sleep(0.05)
+        rig.h.advance(5 * S)  # every live row final
+        await asyncio.sleep(0.1)
+        return [t for t, _ in archived] + live
+
+    @pytest.mark.parametrize("same_client", [False, True], ids=["second-client", "same-sub-id"])
+    async def test_a_larger_n_copied_from_a_rolled_store_has_no_hole(self, same_client):
+        """Rows the source ring dropped are searched again, not skipped (one client re-subscribing, too)."""
+        rig = Rig()
+        triggers = await self._rolled_n5(rig, Collector())
+        c20 = Collector()
+        client = "a" if same_client else "b"
+        await rig.sub(client, "s", trigger_spec(n=20), c20, t0=-60 * S)
+        await wait_for(lambda: c20.results() and c20.tables()[-1]["tsNs"] == triggers[-20:])
+        await rig.mgr.shutdown()
+
     async def test_a_new_trigger_pv_seeds_from_scratch(self):
         rig = Rig()
         seed_archive(rig.h, ["X", "Y1"])
