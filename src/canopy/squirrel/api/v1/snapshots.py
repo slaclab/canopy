@@ -179,7 +179,6 @@ async def create_snapshot(
         if facility_id is None:
             raise FacilityNotFound(f"Facility '{data.facility}' not found")
         facility_owner = (await facilities_gateway.owners_by_id({facility_id})).get(facility_id)
-    target = capture_target(facility_owner, owner, f"A snapshot of {data.facility or 'every PV'}")
 
     if key_scope is not None:
         # A facility-restricted key must name a facility it holds. Unlike mutating an
@@ -189,6 +188,8 @@ async def create_snapshot(
             raise InsufficientFacilityAccess("API key is scoped to specific facilities; 'facility' is required")
         if facility_id not in key_scope:
             raise InsufficientFacilityAccess(f"API key is not scoped to facility: {data.facility}")
+    # The facility gate first: a caller who can't reach the facility isn't told its owner.
+    target = capture_target(facility_owner, owner, f"A snapshot of {data.facility or 'every PV'}")
 
     # use_cache goes to the job only when set, so a plain snapshot asks nothing new of the worker.
     extra = {"use_cache": True} if use_cache else {}
@@ -238,9 +239,10 @@ async def import_snapshot(
     **Captured** saves a snapshot a history head captured for one of this instance's
     facilities. Only a service key may send it, naming the user it was taken for in
     ``X-Canopy-On-Behalf-Of``, who becomes its author. It keeps the bundle's id, time,
-    title and description, and is idempotent on the id: a resend answers with
-    ``created`` false and saves nothing. The answer always carries
-    ``X-Canopy-Commit-LSN``, so the head can wait for the snapshot to come back.
+    title and description, and is idempotent on the id: a resend that passes the
+    facility check a new import gets answers with ``created`` false and saves nothing.
+    The answer always carries ``X-Canopy-Commit-LSN``, so the head can wait for the
+    snapshot to come back.
 
     Either way a value is kept only when its PV exists here, the key could restore it,
     and, for a bundle with a facility, the PV is assigned to that facility or one below

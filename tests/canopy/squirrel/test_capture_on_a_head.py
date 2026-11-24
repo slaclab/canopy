@@ -38,7 +38,7 @@ def head(monkeypatch):
     monkeypatch.setenv("CANOPY_INSTANCE", "head")
     monkeypatch.setenv("CANOPY_ARMS__ARM1__FORWARD_URL", ARM1)
     monkeypatch.setenv("CANOPY_ARMS__ARM1__SERVICE_KEY", "arm1-service-token")
-    monkeypatch.setenv("CANOPY_ARMS__ARM2__PUBLISHER_DSN", "host=arm2.example.org")
+    monkeypatch.setenv("CANOPY_ARMS__ARM2__PUBLISHER_DSN", "postgresql://arm2.example.org/canopy")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

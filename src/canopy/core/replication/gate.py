@@ -52,6 +52,9 @@ from canopy.core.replication.config import PruneConfig, ReplicationConfig
 from canopy.core.replication.registry import REGISTRY, ReplicationRegistry
 from canopy.core.replication.publisher import publisher_status
 
+# What a publication must send of a pruned table for the head to hold all of it.
+_CARRIED_OPERATIONS = frozenset({"insert", "update"})
+
 
 @dataclass(frozen=True)
 class GateResult:
@@ -119,12 +122,14 @@ def evaluate_gate(
         failures["slot_active"] = f"slot {slot_name} has no walsender; the head isn't streaming"
     else:
         streamed = slot["walsender_publications"]
-        # A table published with a row filter or column list reaches history only in
-        # part, so it doesn't count as carried.
+        # A table counts as carried only when a streamed publication sends its inserts
+        # and its updates, with no row filter or column list: otherwise part of it never
+        # reaches history, and pruning would remove the only copy.
         carried = {
             table
             for publication in status["publications"]
             if streamed and publication["name"] in streamed and publication["exists"]
+            if _CARRIED_OPERATIONS <= set(publication["operations"])
             for table in publication["tables"]
             if table not in publication.get("restricted", {})
         }
@@ -133,7 +138,10 @@ def evaluate_gate(
         elif absent := sorted(set(split_publications) - set(streamed)):
             failures["streams_split"] = f"the head streams {', '.join(streamed)}, without {', '.join(absent)}"
         elif missing := sorted(set(tables) - carried):
-            failures["streams_split"] = f"the head streams {', '.join(streamed)}, which carry no {', '.join(missing)}"
+            failures["streams_split"] = (
+                f"the head streams {', '.join(streamed)}, which don't carry {', '.join(missing)} whole, "
+                "with inserts and updates"
+            )
         flush_lag, reply_age = slot["walsender_flush_lag_s"], slot["walsender_reply_age_s"]
         if reply_age is None:
             failures["lag"] = "the head hasn't replied to its walsender yet"
