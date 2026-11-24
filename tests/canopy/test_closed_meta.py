@@ -1,8 +1,8 @@
 """The closed-meta gate on the five modules that need no database or job queue.
 
 With ``CANOPY_CLOSED_META=1`` nothing but ``GET /health`` answers without a
-registry key, and a key opens only the modules it is scoped to and only if it
-reads. Everything here must hold on an install without the ``data``
+registry key, and a key opens only the modules it is scoped to; each route
+still checks the scope it needs. Everything here must hold on an install without the ``data``
 extra, so the file imports nothing from the unselected modules; the all-eleven
 cases live in ``test_closed_meta_default.py``.
 """
@@ -159,6 +159,16 @@ def test_only_get_on_the_exact_health_path_is_open(closed_app, method, path):
     assert resp.status_code == 401
 
 
+def test_get_health_answers_without_a_key_behind_a_root_path(closed_app):
+    """uvicorn --root-path puts the prefix in front of the path; the gate matches what the router matches."""
+    client = TestClient(closed_app, root_path="/canopy")
+    resp = client.get("/canopy/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "healthy"}
+    assert client.get("/canopy/docs").status_code == 401
+    assert client.get("/canopy/docs", headers=READ_HEADERS).status_code == 200
+
+
 def test_a_path_that_matches_no_route_is_refused_rather_than_reported_missing(closed_app):
     assert TestClient(closed_app).get("/no/such/route").status_code == 401
 
@@ -187,7 +197,7 @@ def test_the_docs_and_openapi_pages_are_refused_without_a_key(closed_app, path):
     assert resp.json() == REFUSAL
 
 
-# --- Module scope and the read-key rule --------------------------------------------
+# --- Module scope; the routes check scopes ---------------------------------------
 
 
 @pytest.fixture
@@ -226,10 +236,43 @@ def test_the_parent_routes_belong_to_core(closed_app, scoped_keys, path):
     assert client.get(path, headers={"X-API-Key": "core-key"}).status_code != 403
 
 
-def test_a_key_in_the_module_without_read_is_refused(closed_app, scoped_keys):
-    resp = TestClient(closed_app).get("/hare/docs", headers={"X-API-Key": "hare-writer"})
+def test_a_write_only_key_passes_the_gate_and_each_route_checks_its_scope(closed_app):
+    """A write-only key writes as it would without the gate, and a read route still refuses it."""
+    headers = {"X-API-Key": "hare-writer"}
+    with TestClient(closed_app) as client:
+        # Bound after startup: the lifespan binds the registry from the environment.
+        previous = security.get_registry()
+        security.bind_key_registry(security.EnvKeyRegistry("hare-writer:write@hare"))
+        try:
+            assert client.get("/hare/docs", headers=headers).status_code == 200
+            assert client.put("/hare/v1/pvs/SIM:TEST:WO", headers=headers, json={"value": 1}).status_code == 200
+            resp = client.get("/hare/v1/pvs/SIM:TEST:WO", headers=headers)
+        finally:
+            security.bind_key_registry(previous)
     assert resp.status_code == 403
     assert resp.json()["code"] == "insufficient_read_access"
+
+
+def _gate(app):
+    gate = app.middleware_stack
+    while type(gate).__name__ != "_ClosedMeta":
+        gate = gate.app
+    return gate
+
+
+def _scope(path: str, token: bytes) -> dict:
+    return {"type": "http", "method": "GET", "path": path, "headers": [(b"x-api-key", token)], "query_string": b""}
+
+
+@pytest.mark.parametrize("path", ["/v1/facilities/access", "/v1/facilities", "/v1/api-keys"])
+def test_a_write_only_key_for_core_passes_the_gate_on_the_parent_routes(closed_app, path):
+    """Main's GET /v1/facilities/access takes any key in core, a write-only one included."""
+    previous = security.get_registry()
+    security.bind_key_registry(security.EnvKeyRegistry("ingest:write@core"))
+    try:
+        assert asyncio.run(_gate(closed_app)._refusal(_scope(path, b"ingest"))) is None
+    finally:
+        security.bind_key_registry(previous)
 
 
 @pytest.fixture
@@ -246,22 +289,16 @@ def admin_only_key():
 @pytest.mark.parametrize("path", ["/v1/facilities", "/v1/api-keys"])
 def test_an_admin_only_key_passes_the_gate_on_key_and_facility_management(closed_app, admin_only_key, path):
     """Those routes take an admin key without read themselves, so the gate admits it to them."""
-    gate = closed_app.middleware_stack
-    while type(gate).__name__ != "_ClosedMeta":
-        gate = gate.app
-    scope = {"type": "http", "method": "GET", "path": path, "headers": [(b"x-api-key", b"ops")], "query_string": b""}
-    assert asyncio.run(gate._refusal(scope)) is None
+    assert asyncio.run(_gate(closed_app)._refusal(_scope(path, b"ops"))) is None
 
 
-@pytest.mark.parametrize("path", ["/metrics", "/", "/docs", "/openapi.json"])
-def test_an_admin_only_key_is_refused_by_every_other_core_route(closed_app, admin_only_key, path):
-    resp = TestClient(closed_app).get(path, headers=admin_only_key)
-    assert resp.status_code == 403
-    assert resp.json()["code"] == "insufficient_read_access"
+@pytest.mark.parametrize("path", ["/metrics", "/", "/docs", "/openapi.json", "/hare/docs"])
+def test_an_admin_only_key_opens_the_routes_that_have_no_key_dependency(closed_app, admin_only_key, path):
+    assert TestClient(closed_app).get(path, headers=admin_only_key).status_code == 200
 
 
-def test_an_admin_only_key_is_refused_by_a_data_module(closed_app, admin_only_key):
-    resp = TestClient(closed_app).get("/hare/docs", headers=admin_only_key)
+def test_a_data_route_still_refuses_an_admin_only_key(closed_app, admin_only_key):
+    resp = TestClient(closed_app).get("/hare/v1/health/summary", headers=admin_only_key)
     assert resp.status_code == 403
     assert resp.json()["code"] == "insufficient_read_access"
 
@@ -326,7 +363,7 @@ def test_the_query_parameter_does_not_open_an_http_route(closed_app):
     assert TestClient(closed_app).get("/?api_key=test-read").status_code == 401
 
 
-# --- Outside CORS ------------------------------------------------------------------
+# --- Inside CORS and the metrics -------------------------------------------------
 
 
 def test_a_keyless_preflight_is_answered_by_cors(closed_app):
@@ -346,7 +383,22 @@ def test_a_keyless_preflight_is_answered_by_cors(closed_app):
 def test_an_options_request_that_is_not_a_preflight_is_refused(closed_app, headers):
     resp = TestClient(closed_app).options("/hare/v1/health/summary", headers=headers)
     assert resp.status_code == 401
-    assert "access-control-allow-origin" not in resp.headers
+
+
+def test_a_refusal_carries_the_cors_headers_so_a_browser_can_read_it(closed_app):
+    resp = TestClient(closed_app).get("/docs", headers={"Origin": "https://example.org"})
+    assert resp.status_code == 401
+    assert resp.json() == REFUSAL
+    assert "access-control-allow-origin" in resp.headers
+
+
+def test_a_refusal_is_counted_in_the_metrics(closed_app):
+    from canopy.core.metrics import HTTP_REQUESTS
+
+    series = HTTP_REQUESTS.labels(method="GET", module="core", route="unmatched", status="401")
+    before = series._value.get()
+    TestClient(closed_app).get("/docs")
+    assert series._value.get() == before + 1
 
 
 def test_the_request_after_a_preflight_still_needs_a_key(closed_app):
