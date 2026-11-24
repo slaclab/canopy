@@ -359,6 +359,11 @@ def _edge_mask(values: np.ndarray, edge: str, prev: float | None) -> tuple[np.nd
     return fire, float(vv[-1])
 
 
+def _bucket_start(ts_ns: int) -> int:
+    """Start of the flush bucket holding ``ts_ns``."""
+    return ts_ns // FLUSH_BUCKET_NS * FLUSH_BUCKET_NS
+
+
 def _coalesce(ts: np.ndarray, *others: np.ndarray) -> tuple[np.ndarray, ...]:
     """Keep the last sample per flush bucket (``ts`` ascending)."""
     if ts.size == 0:
@@ -703,6 +708,9 @@ class TableStore:
         bound = self.searched_from if self.searched_from is not None else oldest
         if view.trigger_pv is not None:
             hi = (bound - 1) if bound is not None else now
+            if oldest is not None and bound is not None and _bucket_start(bound - 1) == _bucket_start(oldest):
+                # The oldest held row already stands for its whole bucket.
+                hi = _bucket_start(oldest) - 1
             if hi < lo:
                 return
             row_ts, arrival, trig_history, failed = await self._trigger_rows(view.trigger_pv, lo, hi, need)
@@ -810,7 +818,9 @@ class TableStore:
             history = "seeded"
             a_ts = np.empty(0, dtype=np.int64)
             if r_ts.size < need and not ring_covers:
-                a_hi = int(r_ts[0]) - 1 if r_ts.size else hi
+                # Below the ring's oldest *bucket*: its earlier samples are already
+                # coalesced into the ring's row, so they must not make a second one.
+                a_hi = _bucket_start(int(r_ts[0])) - 1 if r_ts.size else hi
                 fetched, history = await _from_archive(
                     self._archive_trigger(pv, lo, a_hi, need - r_ts.size), "table trigger seed", pv
                 )
@@ -898,6 +908,7 @@ class TableStore:
         width = FIRST_SEED_WINDOW_NS
         cur_hi = hi
         found = 0
+        oldest_bucket: int | None = None  # oldest bucket counted so far (faithful walk)
         while cur_hi >= lo:
             a = max(lo, cur_hi - width)
             block = await fetch(pv, a, cur_hi)
@@ -907,7 +918,12 @@ class TableStore:
             elif not faithful:
                 found = len(_changes(ArchiveBlock.concat(blocks), lo))
             else:
-                found += int(np.unique(np.asarray(block.ts_ns)[np.asarray(block.ts_ns) >= a] // FLUSH_BUCKET_NS).size)
+                # One row per flush bucket: a bucket split by this window's lower bound
+                # was already counted by the newer window, so count it once.
+                buckets = np.unique(np.asarray(block.ts_ns)[np.asarray(block.ts_ns) >= a] // FLUSH_BUCKET_NS)
+                found += int(buckets.size) - int(bool(buckets.size) and buckets[-1] == oldest_bucket)
+                if buckets.size:
+                    oldest_bucket = int(buckets[0])
             if found >= need or a == lo:
                 break
             if edge is not None:
