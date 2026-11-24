@@ -365,6 +365,21 @@ def _edge_mask(values: np.ndarray, edge: str, prev: float | None) -> tuple[np.nd
     return fire, float(vv[-1])
 
 
+def _cut_of(block: ArchiveBlock, t0: int, cap: int) -> int | None:
+    """Where a fetch limited to ``cap`` samples stopped, or ``None`` if it covered ``t0``.
+
+    A walk that reaches ``t0`` carries the last sample before it; one stopped
+    by the limit does not, so its first sample is the oldest time it covers.
+    Rows older than that have no archive value from this fetch. (A walk that
+    reached ``t0`` with no older sample in the archive also reads as stopped:
+    its older rows have no value either way.)
+    """
+    if len(block) < cap or not len(block):
+        return None
+    first = int(block.ts_ns[0])
+    return first if first >= t0 else None
+
+
 def _bucket_start(ts_ns: int) -> int:
     """Start of the flush bucket holding ``ts_ns``."""
     return ts_ns // FLUSH_BUCKET_NS * FLUSH_BUCKET_NS
@@ -929,7 +944,8 @@ class TableStore:
         oldest_bucket: int | None = None  # oldest bucket counted so far (faithful walk)
         while cur_hi >= lo:
             a = max(lo, cur_hi - width)
-            block = await fetch(pv, a, cur_hi)
+            # The limit stops Mole's walk inside this window, not just after it.
+            block = await fetch(pv, a, cur_hi, max_samples=self.settings.seed_max_samples - loaded)
             blocks.append(block)
             loaded += len(block)
             if edge is not None:
@@ -1040,7 +1056,10 @@ class TableStore:
             return await self._fetch_capped(pv, t0, t1, cap)
         # Probe the newest window, then decide from the observed rate.
         p_lo = max(t0, t1 - FIRST_SEED_WINDOW_NS)
-        probe = await fetch(pv, p_lo, t1)
+        probe = await fetch(pv, p_lo, t1, max_samples=cap)
+        probe_cut = _cut_of(probe, p_lo, cap)
+        if probe_cut is not None:  # the newest window alone holds the cap
+            return probe, probe_cut
         rate = len(probe) / max(t1 - p_lo, 1)
         requests = math.ceil(rate * (p_lo - t0) / SEED_SAMPLE_BUDGET)
         if requests <= rows / 20:
@@ -1058,28 +1077,14 @@ class TableStore:
     async def _fetch_capped(self, pv: str, t0: int, t1: int, cap: int) -> tuple[ArchiveBlock, int | None]:
         """Archive samples in ``[t0, t1]``, newest first, stopping once ``cap`` are loaded.
 
-        Each request is sized from the previous one's observed rate to about one
-        ``SEED_SAMPLE_BUDGET``, as the trigger walk does, so the cap is overshot by
-        at most one request. Returns the samples and, if the cap stopped the walk
-        before ``t0``, the oldest time it reached (else ``None``).
+        Mole's budgeted walk stops after the response that reaches ``cap``, so
+        the cap is overshot by at most one response (sized to about one budget;
+        more right after a quiet stretch, see `fetch_window_budgeted_via`).
+        Returns the samples and, if
+        the walk stopped short of ``t0``, the oldest time it covers (else ``None``).
         """
-        fetch = self.port.fetch_window_budgeted
-        blocks: list[ArchiveBlock] = []
-        loaded = 0
-        width = FIRST_SEED_WINDOW_NS
-        hi = t1
-        while True:
-            a = max(t0, hi - width)
-            block = await fetch(pv, a, hi)
-            blocks.append(block)
-            loaded += len(block)
-            if a == t0:
-                return ArchiveBlock.concat(blocks), None
-            if loaded >= cap:
-                return ArchiveBlock.concat(blocks), a
-            rate = max(len(block), 1) / max(hi - a, 1)
-            width = int(min(max(SEED_SAMPLE_BUDGET / rate, width), width * 8))
-            hi = a - 1
+        block = await self.port.fetch_window_budgeted(pv, t0, t1, max_samples=cap)
+        return block, _cut_of(block, t0, cap)
 
     # --- tick ---------------------------------------------------------------- #
 

@@ -470,7 +470,7 @@ class TestSeedOutcomes:
 
         dense_calls = []
 
-        async def dense_y(pv, t0, t1, *, budget=None):
+        async def dense_y(pv, t0, t1, *, budget=None, max_samples=None):
             # A 100 Hz PV: return a thin, representative block (values = ts seconds).
             dense_calls.append((t0, t1))
             h.calls.append(("window", pv, t0, t1))
@@ -480,8 +480,8 @@ class TestSeedOutcomes:
         port = h.port()
         orig = port.fetch_window_budgeted
 
-        async def routed(pv, t0, t1, *, budget=None):
-            return await (dense_y if pv == "Y1" else orig)(pv, t0, t1, budget=budget)
+        async def routed(pv, t0, t1, **kwargs):
+            return await (dense_y if pv == "Y1" else orig)(pv, t0, t1, **kwargs)
 
         port.fetch_window_budgeted = routed
         store = TableStore(make_view(trigger_spec(n=1000), day), TableSettings(), port)

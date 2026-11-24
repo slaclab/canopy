@@ -160,6 +160,7 @@ async def fetch_window_budgeted_via(
     *,
     budget: int,
     first_window_ns: int = FIRST_SEED_WINDOW_NS,
+    max_samples: int | None = None,
 ) -> ArchiveBlock:
     """Walk ``[t0_ns, t1_ns]`` newest-first in windows sized from the observed rate.
 
@@ -170,10 +171,16 @@ async def fetch_window_budgeted_via(
     over the budget shrinks it proportionally -- and is never grown by doubling.
     Growth per step is capped at ``WINDOW_GROWTH_MAX``x, so a sparse (or empty)
     recent window cannot balloon the next request over a dense older region.
+
+    With ``max_samples`` the walk stops once it has loaded that many, after the
+    response that reached it (so by at most one response more). A walk stopped
+    short of ``t0_ns`` carries no prior sample: its first sample is the oldest
+    time it covers.
     """
     if t1_ns < t0_ns:
         return ArchiveBlock.empty()
     blocks: list[ArchiveBlock] = []
+    loaded = 0
     hi = t1_ns
     width = max(1, first_window_ns)
     while True:
@@ -183,7 +190,8 @@ async def fetch_window_budgeted_via(
             width = max(1, width // 2)
             continue
         blocks.append(block)
-        if lo == t0_ns:
+        loaded += len(block)
+        if lo == t0_ns or (max_samples is not None and loaded >= max_samples):
             break
         elapsed = hi - lo + 1
         width = max(1, min((elapsed * budget) // max(len(block), 1), (hi - lo) * WINDOW_GROWTH_MAX))
@@ -293,12 +301,15 @@ class SeedCapableAdapter(Protocol):
     event_faithful: bool
 
     async def fetch_window_budgeted(
-        self, pv: str, t0_ns: int, t1_ns: int, *, budget: int = SEED_SAMPLE_BUDGET
+        self, pv: str, t0_ns: int, t1_ns: int, *, budget: int = SEED_SAMPLE_BUDGET, max_samples: int | None = None
     ) -> ArchiveBlock:
         """Raw samples in ``[t0_ns, t1_ns]`` as arrays, fetched newest-first in rate-sized windows.
 
         Every response is parsed off the event loop; the oldest window also
-        carries the last sample before ``t0_ns``.
+        carries the last sample before ``t0_ns``. With ``max_samples`` the walk
+        stops after the response that loads that many (see
+        `fetch_window_budgeted_via`). The parameter is optional for an adapter:
+        the archiver service trims the result of one that does not take it.
         """
         ...
 

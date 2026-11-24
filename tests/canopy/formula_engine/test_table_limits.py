@@ -100,10 +100,8 @@ class TestSeedSampleCap:
         assert ts.size + len(store.tail_ts) == 600  # Z keeps every row
         assert store.inputs["Y"].history == "truncated"
         assert store.inputs["Z"].history == "seeded"
-        # Y's archive calls loaded the cap and at most one more request, not the 70k-sample span.
-        y_calls = h.mole_calls("Y")
-        loaded = sum(int(((dense_ts >= t0) & (dense_ts <= t1)).sum()) for _, _, t0, t1 in y_calls)
-        assert CAP <= loaded <= CAP + 30_000
+        # Y's archive fetch stopped at the cap, not after the 70k-sample span.
+        assert h.loaded["Y"] <= CAP
         # No cell is ever wrong: every Y cell is the last sample at or before its row, or null.
         truth = _last_at_or_before(dense_ts, np.arange(dense_ts.size, dtype=np.float64), ts)
         known = ~np.isnan(y)
@@ -113,6 +111,26 @@ class TestSeedSampleCap:
         first_known = int(np.argmax(known))
         assert known[first_known:].all() and not known[:first_known].any()
         assert np.array_equal(z, _last_at_or_before(sparse_ts, -np.arange(sparse_ts.size, dtype=np.float64), ts))
+
+    async def test_the_cells_fetch_hands_the_cap_to_one_archive_walk(self):
+        """One capped walk, not windows of whole walks (which loaded a dense older stretch whole).
+
+        The harness's walk stops exactly at the limit; how far one real response can
+        overshoot it is Mole's (see ``fetch_window_budgeted_via``).
+        """
+        h = Harness()
+        h.wm = h.now
+        quiet = np.arange(h.now - 2000 * S, h.now, 10 * S, dtype=np.int64)
+        dense = np.arange(h.now - 3000 * S, h.now - 2000 * S, MS, dtype=np.int64)  # 1 kHz, a million samples
+        ts = np.concatenate([dense, quiet])
+        h.archived("Y", [(int(t), float(i)) for i, t in enumerate(ts)])
+        spec = FormulaSpec(
+            kind="table", bindings={"y": "Y"}, columns={"y": "{y}"}, index="grid", grid_dt_ns=5 * S, max_points=600
+        )
+        store = _store(h, spec, {"y": None})
+        await store.wait_ready()
+        assert h.loaded["Y"] <= CAP
+        assert store.inputs["Y"].history == "truncated"
 
     async def test_a_dense_trigger_walk_stops_at_the_cap_and_is_not_walked_again(self):
         h = Harness()
@@ -144,6 +162,8 @@ class TestSeedSampleCap:
 def test_the_caps_come_from_the_config():
     from canopy.formula_engine.config import FormulaEngineConfig
 
+    with pytest.raises(ValueError):
+        FormulaEngineConfig(table_seed_max_samples=0)
     cfg = FormulaEngineConfig(table_max_total=5, table_seed_max_samples=1234)
     settings = TableSettings.from_config(cfg)
     assert (settings.max_total, settings.seed_max_samples) == (5, 1234)

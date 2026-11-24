@@ -160,6 +160,23 @@ class TestApplianceBudgeted:
         assert max(n for _, _, n in requests) <= WINDOW_GROWTH_MAX * 60 * 10 + 1
         assert requests[-1][0] == T1 - 3600 * S and len(block) == 35400
 
+    async def test_max_samples_stops_the_walk_after_the_response_that_reaches_it(self):
+        """A dense PV: the walk stops once the limit is loaded, short of t0 and with no prior sample."""
+        windows: list[tuple[int, int, int]] = []
+
+        async def fetch_block(pv, lo, hi, include_last_before):
+            ts = np.arange(-(-lo // (10 * MS)) * (10 * MS), hi + 1, 10 * MS, dtype=np.int64)  # 100 Hz
+            windows.append((lo, hi, ts.size))
+            return ArchiveBlock(ts, ts.astype(float), np.zeros(ts.size, np.int8))
+
+        t0 = T1 - 3000 * S  # 300 000 samples in all
+        block = await fetch_window_budgeted_via(fetch_block, "P", t0, T1, budget=20_000, max_samples=50_000)
+        assert sum(n for _, _, n in windows[:-1]) < 50_000 <= len(block)
+        assert len(block) - 50_000 < windows[-1][2]  # by less than the response that reached it
+        assert windows[-1][0] > t0 and int(block.ts_ns[0]) >= windows[-1][0]  # short of t0, no prior
+        unlimited = await fetch_window_budgeted_via(fetch_block, "P", t0, T1, budget=20_000)
+        assert len(unlimited) > 290_000
+
     async def test_pv_not_found_propagates_unchanged(self, appliance, httpx_mock: HTTPXMock):
         httpx_mock.add_response(url=GETDATA, status_code=400)
         with pytest.raises(PVNotFoundInArchiver):
@@ -367,6 +384,21 @@ class TestServiceAndGateway:
             assert len(await gateway.fetch_last_before("PV:TEST", [T1, T1 - S])) == 2
         finally:
             gateway.bind(None)
+
+    async def test_an_adapter_that_cannot_stop_early_is_trimmed_to_its_newest_samples(self):
+        class _NoLimit(FakeArchiverAdapter):
+            async def fetch_window_budgeted(self, pv, t0_ns, t1_ns, *, budget=SEED_SAMPLE_BUDGET):
+                ts = np.arange(t0_ns, t1_ns + 1, S, dtype=np.int64)
+                return ArchiveBlock(ts, ts.astype(float), np.zeros(ts.size, np.int8))
+
+        for adapter in (_NoLimit(name="fake"), FakeArchiverAdapter(name="fake")):  # no limit / no budgeted fetch
+            service = ArchiverService(
+                AdapterRegistry({"fake": adapter}, default="fake"), MoleConfig(default_archiver="fake")
+            )
+            _, whole = await service.fetch_window_budgeted("PV:TEST", T1 - 60 * S, T1)
+            _, block = await service.fetch_window_budgeted("PV:TEST", T1 - 60 * S, T1, max_samples=5)
+            assert len(block) == min(5, len(whole))
+            assert block.ts_ns.tolist() == whole.ts_ns[-len(block) :].tolist()
 
     def test_budget_constant(self):
         assert SEED_SAMPLE_BUDGET == 20_000

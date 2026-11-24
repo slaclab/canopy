@@ -37,6 +37,8 @@ class Harness:
         self.archive: dict[str, list[tuple[int, object, AlarmSeverity]]] = {}
         self.errors: dict[str, Exception] = {}
         self.calls: list[tuple[str, str, int, int]] = []
+        # Archive samples each PV's fetch_window_budgeted calls handed out (in range, priors not counted).
+        self.loaded: dict[str, int] = {}
         self.faithful = True
         self.gate: asyncio.Event | None = None
         self.archiver = True  # False: no Mole configured
@@ -73,7 +75,9 @@ class Harness:
     def mole_calls(self, pv: str | None = None) -> list[tuple[str, str, int, int]]:
         return [c for c in self.calls if pv is None or c[1] == pv]
 
-    async def fetch_window_budgeted(self, pv: str, t0: int, t1: int, *, budget: int | None = None) -> ArchiveBlock:
+    async def fetch_window_budgeted(
+        self, pv: str, t0: int, t1: int, *, budget: int | None = None, max_samples: int | None = None
+    ) -> ArchiveBlock:
         self.calls.append(("window", pv, t0, t1))
         if self.gate is not None:
             await self.gate.wait()
@@ -81,6 +85,14 @@ class Harness:
             raise self.errors[pv]
         rows = self.archive.get(pv, [])
         inside = [r for r in rows if t0 <= r[0] <= t1]
+        if max_samples is not None and len(inside) > max_samples:
+            # A walk stopped by the limit: its newest samples, no prior (as Mole's walk).
+            inside = inside[-max_samples:]
+            self.loaded[pv] = self.loaded.get(pv, 0) + len(inside)
+            return ArchiveBlock.from_samples(
+                [Sample(ts_ns=t, value=v, severity=s, source="archive") for t, v, s in inside]
+            )
+        self.loaded[pv] = self.loaded.get(pv, 0) + len(inside)
         prior = [r for r in rows if r[0] < t0]
         if prior:
             inside = [prior[-1], *inside]
