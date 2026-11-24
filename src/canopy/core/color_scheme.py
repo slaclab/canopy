@@ -3,8 +3,8 @@
 ``get_color_scheme(path)`` flattens a ``canopy-color-scheme/1`` file onto the packaged ``canopy-default`` with
 canopy's own flattener (:func:`canopy.core.color_scheme_flatten.load_scheme`) and caches the result per resolved
 absolute path, so each file is read, flattened and (when broken) logged once per process. Which file that is, is
-decided in one place, ``resolve_scheme_path``: an explicit path wins, else ``CANOPY_THEME_FILE``, else
-``canopy-default`` alone.
+decided in one place, ``resolve_scheme_path``: an explicit path wins, else the ``CANOPY_THEME_FILE`` setting
+(:class:`ColorSchemeSettings`), else ``canopy-default`` alone.
 
 Any error is served as ``canopy-default`` with the errors in ``meta`` and ``degraded == ["color-scheme"]``. The
 flattener needs only the standard library and ``jsonschema``, so an install without the ``convert`` extra flattens
@@ -24,6 +24,9 @@ from typing import Any
 from pathlib import Path
 from dataclasses import dataclass
 
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 from canopy.core.color_scheme_flatten import (
     DEFAULT_ID,
     DEFAULT_SCHEME_PATH,
@@ -37,6 +40,7 @@ __all__ = [
     "DEGRADED_KEY",
     "THEME_FILE_ENV",
     "ColorScheme",
+    "ColorSchemeSettings",
     "clear_color_scheme_cache",
     "get_color_scheme",
     "resolve_scheme_path",
@@ -44,8 +48,35 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+#: The environment name of :attr:`ColorSchemeSettings.theme_file`.
 THEME_FILE_ENV = "CANOPY_THEME_FILE"
 DEGRADED_KEY = "color-scheme"
+
+
+class ColorSchemeSettings(BaseSettings):
+    """The deployment's color scheme setting, read with the ``CANOPY_`` prefix.
+
+    Attributes
+    ----------
+    theme_file : Path | None
+        ``CANOPY_THEME_FILE``: the scheme file every process serves unless it has a scheme setting of its own
+        (the converter's ``scheme_path``). ``None`` (unset, empty or whitespace) serves ``canopy-default``.
+
+    Built fresh on each :func:`resolve_scheme_path` call rather than cached like ``get_settings()``, so a changed
+    environment applies after :func:`clear_color_scheme_cache`; only this one field is read, so an unrelated
+    ``CANOPY_*`` value cannot stop a scheme from being served.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="CANOPY_", env_file=".env", extra="ignore")
+
+    theme_file: Path | None = None
+
+    @field_validator("theme_file", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
 
 @dataclass(frozen=True)
@@ -75,7 +106,7 @@ def clear_color_scheme_cache() -> None:
 
 
 def resolve_scheme_path(path: str | os.PathLike[str] | None = None) -> Path | None:
-    """The scheme file to serve: ``path`` when given, else ``CANOPY_THEME_FILE``.
+    """The scheme file to serve: ``path`` when given, else the ``CANOPY_THEME_FILE`` setting.
 
     Returns the resolved absolute path, or ``None`` (serve ``canopy-default`` alone) when neither names a
     file; a blank ``CANOPY_THEME_FILE`` counts as unset. A module with a scheme setting of its own (the
@@ -83,10 +114,9 @@ def resolve_scheme_path(path: str | os.PathLike[str] | None = None) -> Path | No
     everywhere.
     """
     if path is None:
-        env = os.environ.get(THEME_FILE_ENV, "").strip()
-        if not env:
+        path = ColorSchemeSettings().theme_file
+        if path is None:
             return None
-        path = env
     return Path(path).expanduser().resolve()
 
 

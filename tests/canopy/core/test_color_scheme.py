@@ -14,6 +14,7 @@ from canopy.core import color_scheme
 from canopy.core.color_scheme import (
     THEME_FILE_ENV,
     DEFAULT_SCHEME_PATH,
+    ColorSchemeSettings,
     get_color_scheme,
 )
 from canopy.core.color_scheme_flatten import SchemeResult, load_scheme
@@ -131,6 +132,44 @@ def test_second_call_same_path_does_not_reflatten(tmp_path, caplog, monkeypatch)
 def test_default_is_cached_too(monkeypatch):
     first = get_color_scheme()
     assert get_color_scheme(None) is first
+
+
+# -- CANOPY_THEME_FILE through settings -------------------------------------------------------------------------------
+
+
+def test_theme_file_is_a_setting(tmp_path, monkeypatch):
+    path = _facility(tmp_path, "from-setting")
+    monkeypatch.setenv(THEME_FILE_ENV, str(path))
+    assert ColorSchemeSettings().theme_file == path
+    assert ColorSchemeSettings(theme_file="  ").theme_file is None
+    assert ColorSchemeSettings(theme_file=str(path)).theme_file == path
+
+
+def test_theme_file_is_read_from_a_dotenv_file(tmp_path):
+    # In a subprocess: tests/conftest.py turns .env reading off for the whole suite.
+    path = _facility(tmp_path, "from-dotenv")
+    (tmp_path / ".env").write_text(f"{THEME_FILE_ENV}={path}\n")
+    code = "from canopy.core.color_scheme import get_color_scheme; print(get_color_scheme().meta['id'])"
+    proc = subprocess.run(
+        [sys.executable, "-c", code], cwd=tmp_path, capture_output=True, text=True, timeout=60, check=True
+    )
+    assert proc.stdout.strip() == "from-dotenv"
+
+
+def test_changed_env_applies_after_clearing_the_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv(THEME_FILE_ENV, str(_facility(tmp_path, "first", "a.json")))
+    assert get_color_scheme().meta["id"] == "first"
+    monkeypatch.setenv(THEME_FILE_ENV, str(_facility(tmp_path, "second", "b.json")))
+    color_scheme.clear_color_scheme_cache()
+    assert get_color_scheme().meta["id"] == "second"
+    monkeypatch.delenv(THEME_FILE_ENV)
+    assert get_color_scheme().meta["id"] == "canopy-default"
+
+
+def test_an_unrelated_bad_setting_does_not_stop_the_scheme(monkeypatch):
+    monkeypatch.setenv("CANOPY_LOG_FORMAT", "not-a-format")
+    monkeypatch.setenv("CANOPY_DEBUG", "not-a-bool")
+    assert get_color_scheme().meta["served"] == "canopy-default"
 
 
 # -- no converter -----------------------------------------------------------------------------------------------------
