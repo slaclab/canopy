@@ -561,6 +561,10 @@ class TableStore:
         start = max(now, int(port.watermark()) if port.watermark is not None else 0)
         self.inputs: dict[str, InputState] = {pv: InputState(last_seen_recv=start) for pv in view.pvs}
         self.total_final = 0
+        # Oldest row time counted in ``total_final``: a row this old or newer that is
+        # seeded again (a full ring re-searched below its oldest held row) is not
+        # counted twice.
+        self.counted_from: int | None = None
         # Provisional tail: row times, arrivals and the visible (non-all-null) part's cells.
         self.tail_ts: list[int] = []
         self.tail_arrival: list[int] = []
@@ -707,6 +711,7 @@ class TableStore:
         self.rows.vals = {}
         self.rows.rebuild(ts, shared, capacity=view.n)
         self.total_final = source.total_final
+        self.counted_from = source.counted_from
         self.index_hwm = source.index_hwm
         self.searched_from = source.searched_from
         self.tail_ts = list(source.tail_ts)
@@ -816,7 +821,12 @@ class TableStore:
             for pv in set(vals) | set(held_vals)
         }
         self.rows.rebuild(np.concatenate([ts, held_ts]), new_vals)
-        self.total_final += len(ts)
+        if ts.size:
+            # Rows at or after ``counted_from`` were counted when first finalized.
+            fresh = ts if self.counted_from is None else ts[ts < self.counted_from]
+            self.total_final += int(fresh.size)
+            first = int(ts.min())
+            self.counted_from = first if self.counted_from is None else min(self.counted_from, first)
 
     def _apply_history(self, pv: str, fill: _Fill, now: int) -> None:
         st = self.inputs[pv]
@@ -1130,6 +1140,8 @@ class TableStore:
             row = {pv: float(cells[pv][i]) for pv in view.pvs}
             self.rows.append(p_ts[i], row)
             self.total_final += 1
+            if self.counted_from is None:
+                self.counted_from = int(p_ts[i])
             final_seq.append((p_ts[i], tuple(row[pv] for pv in view.pvs)))
         self.tail_ts = p_ts[n_final:]
         self.tail_arrival = p_arr[n_final:]
