@@ -36,6 +36,7 @@ from collections.abc import Callable, Awaitable
 
 import orjson
 
+from canopy.core.config import get_settings
 from canopy.core.errors import ErrorCode, CanopyError, ModuleUnavailable
 from canopy.contracts.formula import FormulaSpec
 from canopy.epics.pv_protocol import strip_protocol_prefix
@@ -896,7 +897,9 @@ class SubscriptionManager:
                     raise
                 except Exception as exc:
                     logger.warning("table %s tick failed: %s", shared.key[:8], exc, exc_info=True)
-                    await self._post_wait(shared, f"table evaluation failed: {exc}", ErrorCode.UNHANDLED_EXCEPTION)
+                    # The detail only in debug mode, like the WS endpoint's unhandled errors.
+                    detail = f"table evaluation failed: {exc}" if get_settings().debug else "table evaluation failed"
+                    await self._post_wait(shared, detail, ErrorCode.UNHANDLED_EXCEPTION)
         except asyncio.CancelledError:
             pass
 

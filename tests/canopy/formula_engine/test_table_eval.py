@@ -690,3 +690,32 @@ class TestWebSocketUnreachable:
                 seen.setdefault(msg["type"], msg)
             assert time.monotonic() - start < 1.0
         assert seen["result"]["data"]["table"]["inputs"]["y1"]["history"] == "not-archived"
+
+
+@pytest.mark.parametrize("debug", [False, True])
+async def test_a_failed_tick_sends_its_detail_only_in_debug_mode(monkeypatch, debug):
+    from canopy.core.config import get_settings
+    from canopy.formula_engine.services import table_store
+
+    monkeypatch.setattr(get_settings(), "debug", debug)
+    rig = Rig()
+    seed_archive(rig.h, ["X", "Y1"])
+    c = Collector()
+    await rig.sub("c", "s", timer_spec(), c)
+    await wait_for(lambda: c.results())
+    calls = {"n": 0}
+    real_tick = table_store.TableStore.tick
+
+    def failing_tick(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyError("SIM:INTERNAL:NAME")
+        return real_tick(self, *args, **kwargs)
+
+    monkeypatch.setattr(table_store.TableStore, "tick", failing_tick)
+    failures = lambda: [e for e in c.errors() if e["code"] == "unhandled_exception"]  # noqa: E731
+    await wait_for(failures)
+    message = failures()[-1]["message"]
+    assert ("SIM:INTERNAL:NAME" in message) is debug
+    assert message.startswith("table evaluation failed")
+    await rig.mgr.shutdown()
