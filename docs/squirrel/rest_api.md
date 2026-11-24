@@ -409,8 +409,10 @@ Requires `write`. Nothing is read from or written to EPICS.
   instance. Only a service key may send it, naming in `X-Canopy-On-Behalf-Of` the
   user it was taken for, who becomes its author. It keeps the bundle's id, time,
   title and description, and is idempotent on the id: sending it again answers
-  `created: false` and saves nothing. The answer always carries
-  `X-Canopy-Commit-LSN`.
+  `created: false` and saves nothing, once it passes the facility check a new
+  import gets. One whose grant doesn't reach the facility is refused with 403
+  `insufficient_facility_access` whether or not the snapshot is here, so the
+  answer doesn't say it exists. The answer always carries `X-Canopy-Commit-LSN`.
 
 Either way, a value is kept only when its PV exists here, the key could restore
 it, and, for a bundle with a facility, the PV is assigned to that facility or one
@@ -1011,3 +1013,4 @@ FastAPI's validation body, which lists each problem under `detail`.
 | `archived_immutable` | 409 | On a history head: the arm no longer holds this snapshot (it was pruned there) |
 | `primary_unavailable` | 502, 504 | On a history head: the arm couldn't be reached (502, nothing sent), didn't answer in time (504, the write may have landed), or answered a job poll with an error other than 404 (502, naming its answer) |
 | `service_key_refused` | 502 | On a history head: the arm refused the head's service key for it, not the caller's key. See [When an arm is unreachable](../deployment/history/operations.md#when-an-arm-is-unreachable) |
+| `invalid_settings` | 500 | On a history head: `CANOPY_ARMS` doesn't parse, so a request that needs an arm can't be routed. The detail names each wrong setting, never its value |
