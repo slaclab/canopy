@@ -45,6 +45,16 @@ class FormulaEngineConfig(BaseSettings):
     # Table row stores kept after their last listener left (for a quick
     # re-subscribe); above this the oldest lingering store is dropped.
     table_max_lingering: int = 64
+    # Live table evaluations the whole server runs at once; a subscribe that
+    # would start one more gets ``table_limit``. Joining a running table (same
+    # spec and lookback) does not count. Matches ``table_max_lingering``, so at
+    # most twice this many row stores exist.
+    table_max_total: int = 64
+    # Archive samples one input of a table may load while seeding (its trigger
+    # walk, or its cells). Rows older than where the cap stopped get no value
+    # for that input, which reports ``truncated``. Matches Vole's per-ring
+    # ``max_points`` default, the most one PV's history fetch already loads.
+    table_seed_max_samples: int = 500_000
 
     # --- live tables --- #
     # A table row is final this long (receive clock) after it arrived, or once

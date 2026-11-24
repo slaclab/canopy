@@ -317,6 +317,9 @@ class SubscriptionManager:
         SubscriptionLimitExceeded
             If the client already holds ``max_subscriptions_per_client`` live
             subscriptions and ``sub_id`` is new.
+        TableLimit
+            If a live table would exceed the client's ``table_max_per_client``,
+            or start one table eval more than the server's ``table_max_total``.
         Exception
             Any error raised while starting a new shared eval, after the
             partially started eval is torn down.
@@ -351,6 +354,7 @@ class SubscriptionManager:
             )
             if tables >= self._table.max_per_client:
                 raise TableLimit(f"a client holds at most {self._table.max_per_client} live table subscriptions")
+            self._check_table_total(client_id, sub_id, _compute_key(spec, t0_ns, interval_ms))
 
         # Find the listener a re-subscribe replaces before anything awaits, and
         # drop it by identity only once the replacement is attached: with
@@ -366,6 +370,29 @@ class SubscriptionManager:
         logger.debug("Client %s subscribed %s → shared eval %s", client_id, sub_id, shared.key[:8])
         if joined:
             await self._replay_last(shared, listener)
+
+    def _check_table_total(self, client_id: str, sub_id: str, key: str) -> None:
+        """Refuse a table subscribe that would start one live table eval past ``max_total``.
+
+        Joining a running table eval costs nothing and always passes. A
+        re-subscribe whose old table eval has no other listener frees that eval
+        once the new one is attached, so it does not count against the cap.
+
+        Raises
+        ------
+        TableLimit
+            If the server already runs ``max_total`` live table evals.
+        """
+        if key in self._shared_evals:
+            return
+        running = sum(1 for sh in self._shared_evals.values() if sh.spec.kind == "table")
+        replaced = self._find_listener(client_id, sub_id)
+        if replaced is not None:
+            old, listener = replaced
+            if old.spec.kind == "table" and old.listeners == [listener]:
+                running -= 1
+        if running >= self._table.max_total:
+            raise TableLimit(f"the server runs at most {self._table.max_total} live tables; try again later")
 
     def _find_listener(self, client_id: str, sub_id: str) -> tuple[_SharedEval, _Listener] | None:
         """Return the shared evaluation and listener serving a live subscription.

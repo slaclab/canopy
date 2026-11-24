@@ -126,6 +126,10 @@ class TableSettings:
     poll_ms: int = 500
     max_per_client: int = 8
     max_lingering: int = 64
+    # Live table evals the whole server runs at once.
+    max_total: int = 64
+    # Archive samples one input's seed may load (the trigger walk, or one input's cells).
+    seed_max_samples: int = 500_000
 
     @classmethod
     def from_config(cls, cfg: FormulaEngineConfig) -> TableSettings:
@@ -137,6 +141,8 @@ class TableSettings:
             poll_ms=int(cfg.table_poll_ms),
             max_per_client=int(cfg.table_max_per_client),
             max_lingering=int(cfg.table_max_lingering),
+            max_total=int(cfg.table_max_total),
+            seed_max_samples=int(cfg.table_seed_max_samples),
         )
 
 
@@ -793,7 +799,10 @@ class TableStore:
 
     def _apply_history(self, pv: str, fill: _Fill, now: int) -> None:
         st = self.inputs[pv]
-        st.history = fill.history
+        # A capped seed left this input's older cells null. A later fill of other rows
+        # (older ones for a larger N, say) does not fill those, so "truncated" stays.
+        if not (st.history == "truncated" and fill.history == "seeded"):
+            st.history = fill.history
         st.has_sample = st.has_sample or fill.has_sample
         st.retry_at = now + self.settings.retry_ns if fill.history == "live-only" else None
 
@@ -898,7 +907,9 @@ class TableStore:
         """Archive trigger samples in ``[lo, hi]``, newest-first in windows until ``need`` rows.
 
         With an edge rule a row is an edge, not a sample: the walk goes on until the
-        fetched samples hold ``need`` edge rows or it reaches ``lo``.
+        fetched samples hold ``need`` edge rows or it reaches ``lo``. It also stops
+        once ``seed_max_samples`` samples are loaded; the caller then has fewer than
+        ``need`` rows and reports the trigger ``truncated``.
         """
         fetch = self.port.fetch_window_budgeted
         if fetch is None:
@@ -908,11 +919,13 @@ class TableStore:
         width = FIRST_SEED_WINDOW_NS
         cur_hi = hi
         found = 0
+        loaded = 0
         oldest_bucket: int | None = None  # oldest bucket counted so far (faithful walk)
         while cur_hi >= lo:
             a = max(lo, cur_hi - width)
             block = await fetch(pv, a, cur_hi)
             blocks.append(block)
+            loaded += len(block)
             if edge is not None:
                 found = _edge_rows(ArchiveBlock.concat(blocks), edge, lo, hi)
             elif not faithful:
@@ -924,7 +937,7 @@ class TableStore:
                 found += int(buckets.size) - int(bool(buckets.size) and buckets[-1] == oldest_bucket)
                 if buckets.size:
                     oldest_bucket = int(buckets[0])
-            if found >= need or a == lo:
+            if found >= need or a == lo or loaded >= self.settings.seed_max_samples:
                 break
             if edge is not None:
                 # Rows per ns over everything walked so far (edges can be far sparser than samples).
@@ -971,9 +984,12 @@ class TableStore:
         ring_from = first if before is not None else (int(sl.ts_ns[0]) if sl.ts_ns.size else None)
         history: TableHistory = "seeded"
         block: ArchiveBlock | None = None
+        cut: int | None = None
         if ring_from is None or ring_from > first:
             a_rows = row_ts if ring_from is None else row_ts[row_ts < ring_from]
-            block, history = await _from_archive(self._archive_cells(pv, a_rows), "table seed", pv)
+            fetched, history = await _from_archive(self._archive_cells(pv, a_rows), "table seed", pv)
+            if fetched is not None:
+                block, cut = fetched
             # Re-read the ring after the fetch, so a sample (or Hare initial) that
             # landed meanwhile counts -- one O(k) copy, applied on the loop.
             before, sl = await _ring_read(self._ring_view, pv, first)
@@ -988,34 +1004,76 @@ class TableStore:
                 values, has = await asyncio.to_thread(compute)
         else:
             values, has = compute()
+        if cut is not None:
+            # The capped fetch stopped at ``cut``: older rows would otherwise carry its
+            # prior sample forward across samples it never loaded. Leave them null.
+            older = row_ts < cut
+            if older.any():
+                values = np.array(values, dtype=np.float64, copy=True)
+                values[older] = np.nan
+                history = "truncated"
         return _Fill(values, history, has)
 
-    async def _archive_cells(self, pv: str, a_rows: np.ndarray) -> ArchiveBlock | list:
-        """Archive samples covering ``a_rows``: a windowed fetch, or last-before lookups when sparse."""
+    async def _archive_cells(self, pv: str, a_rows: np.ndarray) -> tuple[ArchiveBlock, int | None]:
+        """Archive samples covering ``a_rows``: a windowed fetch, or last-before lookups when sparse.
+
+        Returns the samples and the cut: ``None`` when every row is covered, else
+        the oldest time a windowed fetch reached before ``seed_max_samples``
+        stopped it. Rows older than the cut get no archive value.
+        """
         cached = self._cache.get(pv)
         if cached is not None and len(cached) and int(cached.ts_ns[0]) <= int(a_rows[0]):
-            return cached
+            return cached, None
         fetch = self.port.fetch_window_budgeted
         if fetch is None:
             raise ArchiverNotConfigured("no archiver configured")
         t0, t1 = int(a_rows[0]), int(a_rows[-1])
         rows = len(a_rows)
+        cap = self.settings.seed_max_samples
         if rows > LAST_BEFORE_MAX_TIMESTAMPS or self.port.fetch_last_before is None or t1 - t0 <= FIRST_SEED_WINDOW_NS:
-            return await fetch(pv, t0, t1)
+            return await self._fetch_capped(pv, t0, t1, cap)
         # Probe the newest window, then decide from the observed rate.
         p_lo = max(t0, t1 - FIRST_SEED_WINDOW_NS)
         probe = await fetch(pv, p_lo, t1)
         rate = len(probe) / max(t1 - p_lo, 1)
         requests = math.ceil(rate * (p_lo - t0) / SEED_SAMPLE_BUDGET)
         if requests <= rows / 20:
-            older = await fetch(pv, t0, p_lo - 1)
-            return ArchiveBlock.concat([older, probe])
+            if len(probe) >= cap:
+                return probe, p_lo
+            older, cut = await self._fetch_capped(pv, t0, p_lo - 1, cap - len(probe))
+            return ArchiveBlock.concat([older, probe]), cut
         # Sparse rows over a dense PV: one lookup per row the probe does not cover.
         covered = np.searchsorted(np.asarray(probe.ts_ns), a_rows, side="right") > 0
         lookup = [int(t) for t in a_rows[~covered]]
         samples = await self.port.fetch_last_before(pv, lookup)
         extra = ArchiveBlock.from_samples([s for s in samples if s is not None])
-        return ArchiveBlock.concat([extra, probe])
+        return ArchiveBlock.concat([extra, probe]), None
+
+    async def _fetch_capped(self, pv: str, t0: int, t1: int, cap: int) -> tuple[ArchiveBlock, int | None]:
+        """Archive samples in ``[t0, t1]``, newest first, stopping once ``cap`` are loaded.
+
+        Each request is sized from the previous one's observed rate to about one
+        ``SEED_SAMPLE_BUDGET``, as the trigger walk does, so the cap is overshot by
+        at most one request. Returns the samples and, if the cap stopped the walk
+        before ``t0``, the oldest time it reached (else ``None``).
+        """
+        fetch = self.port.fetch_window_budgeted
+        blocks: list[ArchiveBlock] = []
+        loaded = 0
+        width = FIRST_SEED_WINDOW_NS
+        hi = t1
+        while True:
+            a = max(t0, hi - width)
+            block = await fetch(pv, a, hi)
+            blocks.append(block)
+            loaded += len(block)
+            if a == t0:
+                return ArchiveBlock.concat(blocks), None
+            if loaded >= cap:
+                return ArchiveBlock.concat(blocks), a
+            rate = max(len(block), 1) / max(hi - a, 1)
+            width = int(min(max(SEED_SAMPLE_BUDGET / rate, width), width * 8))
+            hi = a - 1
 
     # --- tick ---------------------------------------------------------------- #
 
