@@ -144,6 +144,23 @@ class TestWiring:
         assert sorted(rig.capacity) == ["X", "Y1"]
         await rig.mgr.shutdown()
 
+    async def test_live_ingest_keeps_each_bindings_protocol(self):
+        """``pva://X`` is subscribed as written (a bare name would open over CA); pins stay canonical."""
+        rig = Rig()
+        spec = FormulaSpec(
+            kind="table",
+            bindings={"x": "pva://SIM:X", "y": "ca://SIM:Y", "z": "SIM:Z", "trig": "pva://SIM:TRIG"},
+            columns={"x": "{x}", "y": "{y}", "z": "{z}"},
+            index="first_input",
+            trigger="trig",
+        )
+        await rig.sub("c", "s", spec, Collector())
+        assert rig.pinned() == {"SIM:X", "SIM:Y", "SIM:Z", "SIM:TRIG"}
+        await wait_for(lambda: rig.subscribed)
+        assert rig.subscribed == [("pva://SIM:X", "ca://SIM:Y", "SIM:Z", "pva://SIM:TRIG")]
+        assert sorted(rig.capacity) == ["SIM:TRIG", "SIM:X", "SIM:Y", "SIM:Z"]
+        await rig.mgr.shutdown()
+
     @pytest.mark.parametrize("client_interval", [0, 50])
     async def test_interval_is_server_derived(self, client_interval):
         rig = Rig(poll_ms=500)

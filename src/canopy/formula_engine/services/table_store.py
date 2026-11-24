@@ -192,6 +192,10 @@ class TableView:
     # Trigger PV mode only: "rising" / "falling" fires rows on that edge;
     # None is Every update, the plain rule.
     trigger_edge: str | None = None
+    # The bindings as written (``pva://X`` keeps its protocol), unique, binding
+    # order: what live ingest subscribes, as for every other formula kind. Pins,
+    # rings and ``pvs`` use the canonical names.
+    subscribe_names: tuple[str, ...] = ()
 
     @property
     def index_key(self) -> str:
@@ -232,6 +236,7 @@ def build_view(spec: FormulaSpec, parsed_columns: dict[str, ParsedFormula | None
         n=int(spec.max_points),
         lookback_ns=int(lookback_ns),
         trigger_edge=trigger_edge,
+        subscribe_names=tuple(dict.fromkeys(spec.bindings.values())),
     )
 
 

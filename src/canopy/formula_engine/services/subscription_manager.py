@@ -842,7 +842,7 @@ class SubscriptionManager:
                 if self._ensure_capacity is not None:
                     for pv in view.pvs:
                         self._ensure_capacity(pv)
-                await self._subscribe_table_inputs(list(view.pvs))
+                await self._subscribe_table_inputs(list(view.subscribe_names or view.pvs))
             except asyncio.CancelledError:
                 raise
             except Exception:
