@@ -229,3 +229,33 @@ class TestBounds:
         test_service.defer_provision("NEW:1", fake_clock.now_ns() + S)  # reaches the mark: prunes
         assert test_service._retry_after == {"NEW:1": fake_clock.now_ns() + S}
         assert test_service.provision_retry_after_ns("OLD:0") == 0
+
+
+class TestReceiveStamps:
+    """Receive stamps only increase, so a ``samples_since`` cursor never skips a sample."""
+
+    async def test_a_backward_clock_step_loses_no_sample_for_a_cursor_reader(self, test_service, fake_clock, channel):
+        cursor, delivered = 0, []
+        for k in range(1, 11):
+            fake_clock.advance(-3 * S if k == 8 else S)  # the wall clock is stepped back 3 s once
+            await channel.send_json({"type": "diff", "data": {"P": _pv(NOW + k * S, float(k))}})
+            new = test_service.samples_since("P", cursor)
+            if new:
+                cursor = max(s.recv_ns for s in new)
+            delivered += [s.value for s in new]
+        assert delivered == [float(k) for k in range(1, 11)]
+
+    async def test_frames_on_the_same_clock_tick_get_distinct_stamps(self, test_service, channel):
+        await channel.send_json({"type": "diff", "data": {"P": _pv(NOW + 1, 1.0)}})
+        first = test_service.samples_since("P", 0)
+        await channel.send_json({"type": "diff", "data": {"P": _pv(NOW + 2, 2.0)}})  # no clock advance
+        second = test_service.samples_since("P", max(s.recv_ns for s in first))
+        assert [s.value for s in second] == [2.0]
+
+    async def test_the_watermark_never_steps_back(self, fake_clock, ingest, channel):
+        fake_clock.advance(10 * S)
+        await channel.send_json({"type": "flush", "timestamp": 0.0})
+        before = ingest.watermark_ns
+        fake_clock.advance(-5 * S)
+        await channel.send_json({"type": "flush", "timestamp": 0.0})
+        assert ingest.watermark_ns > before

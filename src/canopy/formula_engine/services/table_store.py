@@ -542,7 +542,9 @@ class TableStore:
         for pv in view.pvs:
             self.rows.ensure_key(pv)
         now = port.now_ns()
-        self.inputs: dict[str, InputState] = {pv: InputState(last_seen_recv=now) for pv in view.pvs}
+        # See `adopt`: a cursor starts at the newer of the clock and the watermark.
+        start = max(now, int(port.watermark()) if port.watermark is not None else 0)
+        self.inputs: dict[str, InputState] = {pv: InputState(last_seen_recv=start) for pv in view.pvs}
         self.total_final = 0
         # Provisional tail: row times, arrivals and the visible (non-all-null) part's cells.
         self.tail_ts: list[int] = []
@@ -612,9 +614,13 @@ class TableStore:
         inputs' live ingest is subscribed, so the seed's ring reads see it.
         """
         self.view = view
+        # Receive stamps never go back, so after a backward clock step they can run
+        # ahead of the clock: start a new input's cursor at the newer of the two, or
+        # samples already applied (and seeded) would read as new live ones.
+        start = max(self.port.now_ns(), self._watermark())
         for pv in view.pvs:
             if pv not in self.inputs:
-                self.inputs[pv] = InputState(last_seen_recv=self.port.now_ns())
+                self.inputs[pv] = InputState(last_seen_recv=start)
 
         async def _step() -> None:
             if gate is not None:
