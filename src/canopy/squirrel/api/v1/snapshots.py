@@ -169,7 +169,6 @@ async def create_snapshot(
         if facility_id is None:
             raise FacilityNotFound(f"Facility '{data.facility}' not found")
         facility_owner = (await facilities_gateway.owners_by_id({facility_id})).get(facility_id)
-    require_create_owner(facility_owner, owner, f"A snapshot of {data.facility or 'every PV'}")
 
     if key_scope is not None:
         # A facility-restricted key must name a facility it holds. Unlike mutating an
@@ -179,6 +178,8 @@ async def create_snapshot(
             raise InsufficientFacilityAccess("API key is scoped to specific facilities; 'facility' is required")
         if facility_id not in key_scope:
             raise InsufficientFacilityAccess(f"API key is not scoped to facility: {data.facility}")
+    # The facility gate first: a caller who can't reach the facility isn't told its owner.
+    require_create_owner(facility_owner, owner, f"A snapshot of {data.facility or 'every PV'}")
 
     # use_cache goes to the job only when set, so a plain snapshot asks nothing new of the worker.
     extra = {"use_cache": True} if use_cache else {}

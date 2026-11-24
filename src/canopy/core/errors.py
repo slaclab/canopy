@@ -37,6 +37,7 @@ class ErrorCode(StrEnum):
     PRIMARY_UNAVAILABLE = auto()
     SERVICE_KEY_REFUSED = auto()
     MACHINE_READ_ONLY = auto()
+    INVALID_SETTINGS = auto()
 
     # Mole
     ARCHIVER_NOT_CONFIGURED = auto()

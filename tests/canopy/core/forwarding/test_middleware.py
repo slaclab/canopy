@@ -311,7 +311,7 @@ class TestLeftToTheAppHere:
         calls = owner("arm1")
         monkeypatch.delenv("CANOPY_ARMS__ARM1__FORWARD_URL")
         monkeypatch.delenv("CANOPY_ARMS__ARM1__SERVICE_KEY")
-        monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "host=arm1.example.org")
+        monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "postgresql://arm1.example.org/canopy")
 
         client.delete("/squirrel/v1/pvs/p1", headers=_as(WRITER))
 

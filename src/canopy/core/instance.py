@@ -22,7 +22,7 @@ from alembic.script import ScriptDirectory
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.core.db import SessionDep
-from canopy.core.arms import get_arms_config, subscription_name
+from canopy.core.arms import ArmsConfigError, get_arms_config, subscription_name
 from canopy.core.config import get_settings
 from canopy.core.security import require_read_access
 from canopy.contracts.base import CanopyModel
@@ -125,7 +125,12 @@ def shipped_alembic_head() -> str | None:
 @router.get("", dependencies=[Security(require_read_access)])
 async def get_instance(session: SessionDep) -> InstanceDTO:
     settings = get_settings()
-    configured = get_arms_config().arms if settings.role == "mirror" else {}
+    try:
+        configured = get_arms_config().arms if settings.role == "mirror" else {}
+    except ArmsConfigError as exc:
+        # The error handler answers with this message but doesn't log it; the operator needs it here.
+        logger.error("GET /v1/instance: %s", exc)
+        raise
     arms = sorted(configured)
     states = await arm_states(session, arms) if arms else {}
     return InstanceDTO(
