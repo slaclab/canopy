@@ -1,3 +1,6 @@
 # The table fixtures are hashed byte for byte here and in canopy-sdk-js:
 # check them out with LF on every platform, whatever core.autocrlf says.
 tests/canopy/formula_engine/fixtures/table/*.json text eol=lf
+# The packaged color scheme and its schema are hashed (meta.sha256) and compared
+# byte for byte with the copies in PyDMConverter and canopy-spec: LF everywhere too.
+src/canopy/core/data/*.json text eol=lf
