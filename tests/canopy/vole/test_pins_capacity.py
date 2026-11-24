@@ -363,6 +363,48 @@ class TestProvisioning:
         await source.read_aligned(["P"], NOW - 3600 * S, NOW, align="last", index="union")
         assert mole.calls == ["P", "P"]
 
+    async def test_a_pinned_ring_shrunk_by_its_own_seed_is_not_marked_provisioned(self, mole, clock):
+        """Its seed tipped Vole over the ceiling: retried once there is room, not kept cut for good."""
+        config = VoleConfig(max_points=1000, global_bytes_max=BYTES_PER_SAMPLE * 300, settle_depth=10)
+        service = _service(config, clock)
+        service.pin(["P", "OTHER"], holder="t")
+        for i in range(1, 151):
+            await service.append("OTHER", _sample(NOW - 2000 * S + i * S), recv_ns=i)
+        mole.history["P"] = _archive(200, end_ns=NOW - 10 * S)
+        source = _source(service, mole, clock, [])
+
+        window = await source.read_aligned(["P"], NOW - 3600 * S, NOW, align="last", index="union")
+        assert service.ring_max_points("P") == 10  # shrunk inside its own seed
+        assert window.ts_ns.size == 10
+        assert not service.is_provisioned("P")
+        await source.read_aligned(["P"], NOW - 3600 * S, NOW, align="last", index="union")
+        assert mole.calls == ["P"]  # deferred: no fetch on every read
+
+        service.unpin("t")
+        await service.drop("OTHER")  # room again
+        clock.advance(61 * S)
+        window = await source.read_aligned(["P"], NOW - 3600 * S, NOW, align="last", index="union")
+        assert mole.calls == ["P", "P"]
+        assert window.ts_ns.size == 200
+        assert service.is_provisioned("P")
+
+    async def test_a_ring_dropped_during_its_seed_is_not_recreated(self, mole, clock):
+        config = VoleConfig(max_points=1000, global_bytes_max=BYTES_PER_SAMPLE * 300, settle_depth=10)
+        service = _service(config, clock)
+        mole.history["P"] = _archive(200, end_ns=NOW - 10 * S)
+        source = _source(service, mole, clock, [])
+        seed = service.seed
+
+        async def seed_then_drop(pv, samples, **kw):
+            stored = await seed(pv, samples, **kw)
+            await service.drop(pv)  # LRU eviction took the unpinned ring meanwhile
+            return stored
+
+        service.seed = seed_then_drop
+        await source.read_latest("P")
+        assert service.ring_max_points("P") is None
+        assert not service.is_provisioned("P")
+
     async def test_numeric_string_pv_timeseries_is_unchanged(self, test_service):
         """Regression pin: alignment_service._to_float still parses numeric strings."""
         await test_service.append("STR", _sample(S, "3.5"))
