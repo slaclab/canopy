@@ -86,10 +86,10 @@ before deleting a facility on an arm, and re-grant them afterwards.
 The names are the defaults of `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_ROLE`,
 `__APP_ROLE` and `__HEARTBEAT_ROLE`. Each arm's `pg_hba.conf` admits `replicator`,
 `canopy_reader` and, where it prunes, `canopy_heartbeat` over `hostssl` with SCRAM
-from the head's network only. The head reaches each arm with two secrets:
-`CANOPY_ARMS__<arm>__PUBLISHER_DSN` (libpq, as the replication role) and
-`CANOPY_ARMS__<arm>__READER_DSN` (a `postgresql://` URI, as the reader role), plus
-`CANOPY_ARMS__<arm>__HEARTBEAT_DSN` (a URI, as the heartbeat role) for an arm that prunes.
+from the head's network only. The head reaches each arm with two secrets, each a
+`postgresql://` URI: `CANOPY_ARMS__<arm>__PUBLISHER_DSN`, as the replication role, and
+`CANOPY_ARMS__<arm>__READER_DSN`, as the reader role, plus
+`CANOPY_ARMS__<arm>__HEARTBEAT_DSN`, as the heartbeat role, for an arm that prunes.
 
 Each arm's Postgres needs `wal_level = logical`, enough `max_replication_slots`
 and `max_wal_senders`, and `max_slot_wal_keep_size` set **before the first slot
@@ -180,6 +180,12 @@ its snapshot, a PV's tag link without its tag). Each such row is put down to the
 that owns it, through whichever of its parents survives, and is that arm's drift
 (exit 1 for that arm only). A row nobody can be found to own is reported under `head`
 and fails every run until it is fixed. A reference that is NULL is never flagged.
+While the table such a row is in, or the parent table it misses, is still being copied
+(an initial copy or a `refresh`), the row may only be early: it is listed as `pending`
+and makes the run not checked (exit 2), not drift. For an arm's row that's while that
+arm's subscription doesn't hold both tables ready; for a row under `head`, while any
+subscription doesn't. If the head's own check fails, `head` is not checked, with the
+error, and drift found in the arms still makes the run exit 1.
 
 The JSON report gives `status`, then each arm's report under `arms` (drifting tables
 and days) and the head's under `head`. To repair an arm's drift, find its cause, then
@@ -271,7 +277,7 @@ failed check by name:
 | `window_set` | `CANOPY_WINDOW_DAYS` is unset |
 | `no_delete_publication` | Any publication carrying a snapshot table publishes deletes (`canopy_history` still exists) |
 | `slot_active` | The head's slot is missing or no walsender holds it |
-| `streams_split` | The walsender doesn't stream both `canopy_ref` and `canopy_ts`, they don't carry the snapshot tables whole (no row filter or column list), or its command can't be read |
+| `streams_split` | The walsender doesn't stream both `canopy_ref` and `canopy_ts`, they don't carry the snapshot tables whole (inserts and updates, no row filter or column list), or its command can't be read |
 | `no_initial_copy` | A table's initial copy is running (a `pg_<oid>_sync_…` slot exists) |
 | `wal_status_reserved` | The slot's WAL is at risk |
 | `lag` | Flush lag or the head's last reply is older than `CANOPY_PRUNE__MAX_LAG_S` (60 s) |
@@ -335,7 +341,9 @@ creates a new snapshot there.
 
 A forwarded restore runs as a job on the arm. Clients poll it on the head as usual:
 `GET /jobs/v1/{id}` asks that arm about a job the head started there, for a day after
-it started.
+it started. The arm's 404 is answered as 404 `job_not_found`; any other error from the
+arm is a 502, `service_key_refused` when it refused the head's key and
+`primary_unavailable` naming the arm's answer otherwise.
 
 ### Who wrote it
 
@@ -584,7 +592,13 @@ quieter time.
 
 If `reseed` fails part-way, the subscription stays disabled: run it again. Never enable
 the subscription by hand after a failed run, since replication would resume from where
-the old slot left off, not from the copy.
+the old slot left off, not from the copy. Only one `reseed` of an arm runs at a time; a
+second is refused while the first runs.
+
+`reseed`'s report lists under `dangling` any row of that arm (or of nobody known) that
+still references a missing parent once it is done. The usual cause: the arm deleted a
+facility whose snapshots it had pruned or deleted, while the head keeps those
+snapshots. Replication leaves the same reference.
 
 ### Head PITR
 
@@ -647,7 +661,12 @@ A bad write on an arm (a mass edit, a wrong delete) reaches the head within seco
 Never repair an arm's rows on the head; repair them on that arm and let replication
 carry the fix.
 
-1. Restore the head's backup into a scratch database at a time before the bad write.
+1. Restore the head's backup into a scratch server at a time before the bad write,
+   starting it with `max_logical_replication_workers = 0`, as in "Head PITR". Its
+   restored subscriptions still point at the arms' live slots: with workers enabled
+   it would connect, apply new writes and move the slots on. Never drop a subscription
+   there without `SET (slot_name = NONE)` first, which would drop the arm's live slot.
+   Discard the scratch server when done.
 2. Extract the good rows that arm owns from it (`\copy (SELECT ...) TO`, filtered on
    the owner as in "Arm host lost").
 3. Write them back on the arm, in one transaction, parents before children.

@@ -26,7 +26,7 @@ def test_the_shared_settings(monkeypatch):
 def test_an_arm_forwards_with_both_settings(monkeypatch):
     monkeypatch.setenv("CANOPY_ARMS__ARM1__FORWARD_URL", "https://arm1.example.org/")
     monkeypatch.setenv("CANOPY_ARMS__ARM1__SERVICE_KEY", "service-token")
-    monkeypatch.setenv("CANOPY_ARMS__ARM2__PUBLISHER_DSN", "host=arm2.example.org")
+    monkeypatch.setenv("CANOPY_ARMS__ARM2__PUBLISHER_DSN", "postgresql://arm2.example.org/canopy")
 
     arms = ArmsConfig().arms
 
@@ -47,6 +47,6 @@ def test_one_without_the_other_is_refused(monkeypatch, name):
 def test_blank_forward_settings_are_unset(monkeypatch):
     monkeypatch.setenv("CANOPY_ARMS__ARM1__FORWARD_URL", " ")
     monkeypatch.setenv("CANOPY_ARMS__ARM1__SERVICE_KEY", "")
-    monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "host=arm1.example.org")
+    monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "postgresql://arm1.example.org/canopy")
 
     assert not ArmsConfig().arms["arm1"].forwards

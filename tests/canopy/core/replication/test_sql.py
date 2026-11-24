@@ -11,12 +11,12 @@ from canopy.core.replication.sql import (
     quote_ident,
     require_role,
     quote_literal,
-    conninfo_as_uri,
 )
 from canopy.core.replication.registry import (
     REGISTRY,
     OwnerPath,
     TableClass,
+    RegistryError,
     ReplicationRegistry,
 )
 
@@ -108,21 +108,5 @@ def test_owner_join_for_a_root_child_and_grandchild():
 
 
 def test_owner_join_refuses_a_table_without_a_path():
-    with pytest.raises(ValueError, match="s.other has no owner path"):
+    with pytest.raises(RegistryError, match="s.other has no owner path"):
         owner_join(CHAIN, "s.other", alias="t")
-
-
-@pytest.mark.parametrize(
-    ("conninfo", "uri"),
-    [
-        ("postgresql://u:p@h:5432/db?sslmode=require", "postgresql://u:p@h:5432/db?sslmode=require"),
-        (
-            "host=arm1.example.org port=5432 dbname=canopy user=replicator password=s3cret sslmode=verify-full",
-            "postgresql://replicator:s3cret@arm1.example.org:5432/canopy?sslmode=verify-full",
-        ),
-        (r"host=h dbname=db user=u password='it\'s a/secret'", "postgresql://u:it%27s%20a%2Fsecret@h/db"),
-        ("host=h dbname=db", "postgresql://h/db"),
-    ],
-)
-def test_conninfo_as_uri(conninfo, uri):
-    assert conninfo_as_uri(conninfo) == uri

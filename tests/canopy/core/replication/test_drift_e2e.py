@@ -17,14 +17,25 @@ import asyncpg
 from pydantic import SecretStr
 
 from canopy.core.arms import Arm, subscription_name
-from canopy.core.replication.drift import dangling, check_arms, drift_check
+from canopy.core.replication.drift import (
+    dangling,
+    check_arms,
+    drift_check,
+    ready_tables,
+)
 from canopy.core.replication.registry import REGISTRY, TableClass, ReplicationRegistry
 from canopy.core.replication.publisher import publish
 
-from .conftest import Octopus, eventually, _reader_dsn, _subscribed, _arm_connections
+from .conftest import (
+    PRESENT,
+    Octopus,
+    eventually,
+    _reader_dsn,
+    _subscribed,
+    _arm_connections,
+)
 from .test_replication_e2e import _in_step
 
-PRESENT = sorted(REGISTRY.replicated)
 one_arm = pytest.mark.parametrize("octopus", [1], indirect=True)
 
 
@@ -219,7 +230,7 @@ async def test_each_arm_is_compared_on_its_own_rows(octopus: Octopus):
     assert report["status"] == "drift"
     assert list(report["arms"][first]["drift"]) == ["squirrel.tag"]
     assert report["arms"][second]["status"] == "in_step"
-    assert report["head"] == {"status": "in_step", "dangling": []}
+    assert report["head"] == {"status": "in_step", "dangling": [], "pending": []}
 
 
 @one_arm
@@ -261,7 +272,25 @@ async def test_the_head_finds_references_whose_parent_is_gone(octopus: Octopus):
     report = await check_arms(o.head.conn, await _readers(o), [arm], settle_s=5)
     assert report["status"] == "drift" and report["arms"][arm]["status"] == "drift"
     assert len(report["arms"][arm]["dangling"]) == 3
-    assert report["head"] == {"status": "in_step", "dangling": []}
+    assert report["head"] == {"status": "in_step", "dangling": [], "pending": []}
+
+    # The same rows while the arm's copy of core.facility hasn't finished: those that miss a
+    # facility are only early; the link that misses its tag (copied) is still drift.
+    name = subscription_name(arm)
+    await o.head.admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
+    copying = (
+        "UPDATE pg_subscription_rel SET srsubstate = $1::text::\"char\" WHERE srrelid = 'core.facility'::regclass "
+        "AND srsubid = (SELECT oid FROM pg_subscription WHERE subname = $2)"
+    )
+    await o.head.admin.execute(copying, "d", name)
+    try:
+        assert "core.facility" not in (await ready_tables(o.head.conn))[arm]
+        report = await check_arms(o.head.conn, await _readers(o), [arm], settle_s=5)
+        assert report["arms"][arm]["status"] == "drift"
+        assert [d["table"] for d in report["arms"][arm]["pending"]] == ["squirrel.pv_facility", "squirrel.snapshot"]
+        assert [d["table"] for d in report["arms"][arm]["dangling"]] == ["squirrel.pv_tag"]
+    finally:
+        await o.head.admin.execute(copying, "r", name)
 
 
 @one_arm
