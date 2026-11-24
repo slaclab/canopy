@@ -203,10 +203,14 @@ class HareIngestService:
                 after_connect = (
                     frame_type == "initial" or canonical_pv in self._disconnected or canonical_pv not in self._seen
                 )
+                # Store the reconnect's sample before closing the outage: closing tells the
+                # PV's subscribers to re-evaluate, and while the append waits (a contended
+                # lock, eviction) they would read the pre-outage sample as current. A
+                # refused append (BufferAtCapacity) leaves the outage open for the next one.
+                await self._buffer.append(canonical_pv, sample, recv_ns=recv_ns, after_connect=after_connect)
                 if canonical_pv in self._disconnected:
                     self._disconnected.discard(canonical_pv)
                     self._buffer.close_outage(canonical_pv, recv_ns)
-                await self._buffer.append(canonical_pv, sample, recv_ns=recv_ns, after_connect=after_connect)
                 self._seen.add(canonical_pv)
             except Exception:
                 logger.warning("Failed to ingest live sample for %s", pv_name, exc_info=True)

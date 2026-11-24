@@ -7,9 +7,11 @@ with a FakeClock standing in for the server's receive clock.
 from __future__ import annotations
 
 import time
+import asyncio
 
 import pytest
 
+from canopy.vole.errors import BufferAtCapacity
 from canopy.contracts.sample import AlarmSeverity
 from canopy.vole.buffer.ring import MAX_CLOSED_OUTAGES, PerPVRing, StoredSample
 from canopy.vole.services.hare_ingest import HareIngestService
@@ -229,6 +231,44 @@ class TestBounds:
         test_service.defer_provision("NEW:1", fake_clock.now_ns() + S)  # reaches the mark: prunes
         assert test_service._retry_after == {"NEW:1": fake_clock.now_ns() + S}
         assert test_service.provision_retry_after_ns("OLD:0") == 0
+
+
+class TestReconnectOrder:
+    """An outage closes only once the reconnect's sample is stored."""
+
+    async def _disconnect(self, channel):
+        await channel.send_json({"type": "initial", "data": {"P": _pv(NOW, 1.0)}})
+        await channel.send_json({"type": "diff", "data": {"P": _pv(NOW, None, connected=False)}})
+
+    async def test_while_the_append_waits_the_outage_is_still_open(self, test_service, channel):
+        await self._disconnect(channel)
+        lock = test_service._store.lock_for("P")
+        await lock.acquire()  # the reconnect's append is contended
+        try:
+            task = asyncio.create_task(channel.send_json({"type": "diff", "data": {"P": _pv(NOW + S, 2.0)}}))
+            await asyncio.sleep(0.01)
+            # A subscriber woken now must not read the pre-outage 1.0 as current.
+            assert test_service.in_open_outage("P")
+        finally:
+            lock.release()
+        await task
+        assert not test_service.in_open_outage("P")
+        assert test_service.read_latest_sync("P").value == 2.0
+
+    async def test_a_refused_append_leaves_the_outage_open(self, test_service, channel, monkeypatch):
+        await self._disconnect(channel)
+        append = test_service.append
+
+        async def refuse(pv, sample, **kwargs):
+            raise BufferAtCapacity("over the memory ceiling")
+
+        monkeypatch.setattr(test_service, "append", refuse)
+        await channel.send_json({"type": "diff", "data": {"P": _pv(NOW + S, 2.0)}})
+        assert test_service.in_open_outage("P")  # 1.0 is not the PV's value now
+        monkeypatch.setattr(test_service, "append", append)
+        await channel.send_json({"type": "diff", "data": {"P": _pv(NOW + 2 * S, 3.0)}})
+        assert not test_service.in_open_outage("P")
+        assert test_service.read_latest_sync("P").value == 3.0
 
 
 class TestReceiveStamps:
