@@ -1028,8 +1028,13 @@ class TableStore:
             values, has = compute()
         if cut is not None:
             # The capped fetch stopped at ``cut``: older rows would otherwise carry its
-            # prior sample forward across samples it never loaded. Leave them null.
+            # prior sample forward across samples it never loaded. Leave them null --
+            # unless the re-read ring covers them (a sample, or a history seed, that
+            # landed during the fetch), where the ring's value stands.
+            ring_covers = first if before is not None else (int(sl.ts_ns[0]) if sl.ts_ns.size else None)
             older = row_ts < cut
+            if ring_covers is not None:
+                older &= row_ts < ring_covers
             if older.any():
                 values = np.array(values, dtype=np.float64, copy=True)
                 values[older] = np.nan

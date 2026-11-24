@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import numpy as np
 import pytest
 
+from canopy.contracts.sample import Sample, AlarmSeverity
 from canopy.contracts.formula import FormulaSpec
 from canopy.formula_engine.errors import TableLimit
 from tests.canopy.formula_engine.table_harness import MS, HOUR, S, Harness, timer_spec
@@ -111,6 +114,31 @@ class TestSeedSampleCap:
         first_known = int(np.argmax(known))
         assert known[first_known:].all() and not known[:first_known].any()
         assert np.array_equal(z, _last_at_or_before(sparse_ts, -np.arange(sparse_ts.size, dtype=np.float64), ts))
+
+    async def test_rows_past_the_cut_that_the_ring_covers_by_then_keep_their_values(self):
+        """A history seed lands in the ring during the capped fetch: its rows are not blanked."""
+        h = Harness()
+        h.wm = h.now
+        dense = np.arange(h.now - 700 * S + 3 * MS, h.now, 10 * MS, dtype=np.int64)  # 100 Hz
+        h.archived("Y", [(int(t), float(i)) for i, t in enumerate(dense)])
+        spec = FormulaSpec(
+            kind="table", bindings={"y": "Y"}, columns={"y": "{y}"}, index="grid", grid_dt_ns=S, max_points=600
+        )
+        h.gate = asyncio.Event()
+        store = _store(h, spec, {"y": None})
+        await asyncio.sleep(0.05)  # the seed waits in its archive fetch
+        history = [
+            Sample(ts_ns=int(t), value=float(i), severity=AlarmSeverity.NO_ALARM, source="archive")
+            for i, t in enumerate(dense)
+        ]
+        await h.buffer.seed("Y", history, max_points=200_000)  # another reader provisioned the ring
+        h.gate.set()
+        await store.wait_ready()
+
+        ts, vals = store.rows.ordered()
+        assert ts.size + len(store.tail_ts) == 600
+        assert np.array_equal(vals["Y"], _last_at_or_before(dense, np.arange(dense.size, dtype=np.float64), ts))
+        assert store.inputs["Y"].history == "seeded"
 
     async def test_the_cells_fetch_hands_the_cap_to_one_archive_walk(self):
         """One capped walk, not windows of whole walks (which loaded a dense older stretch whole).
