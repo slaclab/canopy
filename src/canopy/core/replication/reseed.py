@@ -41,9 +41,23 @@ The origin's progress isn't transactional, so it moves only after the copy is sa
 in. If a run fails, the arm's subscription stays disabled: run ``reseed`` again, and
 never enable the subscription by hand.
 
+One run per arm at a time: a run holds a session advisory lock on the head, keyed on
+the arm's subscription, from before the subscription is looked up until it is
+enabled, and a second run of the same arm is refused at once. Other arms' runs aren't
+held up.
+
 A key, or a value unique across owners (a facility or Magpie slug), that another
 owner's row already holds here is refused, naming that owner: never overwritten, set
 aside or deleted. So is deleting a row another owner's row still references.
+
+A child row whose owner-path parent is already gone here (a PV's tag link without its
+PV) can't be found through that path. When another parent it references still names
+the arm as owner (``drift.owner_of``) and the arm lacks the row, it is deleted too, as
+replication would have deleted it. Rows the head still holds afterwards whose
+reference finds no parent, owned by the arm or by nobody known, are listed in the
+result (``dangling``) and logged; ``drift-check`` reports them too. One cause the
+copy can't remove: the arm deleted a facility its snapshots still referenced on the
+head (snapshots the arm pruned stay on the head), which replication leaves the same.
 
 ``--since`` must not be later than the newest snapshot the head holds from that arm. Missing
 parents are found by id whatever their time, but children of a parent both sides hold
@@ -84,6 +98,8 @@ from canopy.core.replication.drift import (
     SESSION,
     TIME_SERIES_BUCKETS,
     Bucketing,
+    dangling,
+    owner_of,
     references,
     primary_key,
     table_columns,
@@ -102,6 +118,9 @@ from canopy.core.replication.subscriber import (
 logger = logging.getLogger(__name__)
 
 RESEED_SESSION = {**SESSION, "application_name": "canopy-reseed"}
+
+LOCK_NAMESPACE = "canopy-reseed"
+"""With the subscription's name, the key of the advisory lock one run of an arm holds."""
 
 CUT_WAIT_S = 60.0
 """Default for ``--cut-wait``: how long to keep trying for an exact cut before refusing."""
@@ -330,6 +349,53 @@ async def _delete_missing(
         *args,
     )
     return int(status.split()[-1])
+
+
+async def _delete_orphans(
+    mirror: asyncpg.Connection, copy: Copy, temp: str, owner: str, refs: list[tuple], registry: ReplicationRegistry
+) -> int:
+    """Delete the arm's rows of a child reference table whose owner-path parent is gone here.
+
+    ``_owned`` can't see them, since it follows that parent. They are the arm's when
+    another parent they reference says so (``owner_of``), and the arm lacks them: on
+    the arm a row can't outlive its parent.
+    """
+    path = registry.owner_paths.get(copy.table)
+    if copy.kind is TableClass.TIME_SERIES or path is None or path.parent is None:
+        return 0
+    target = next((pc for t, c, p, pc in refs if t == copy.table and c == path.key and p == path.parent), "id")
+    status = await mirror.execute(
+        f"DELETE FROM {qualified(copy.table)} t WHERE t.{quote_ident(path.key)} IS NOT NULL "
+        f"AND NOT EXISTS (SELECT 1 FROM {qualified(path.parent)} q "
+        f"WHERE q.{quote_ident(target)} = t.{quote_ident(path.key)}) "
+        f"AND {owner_of(registry, refs, copy.table, skip_column=path.key)} = $1 "
+        f"AND NOT EXISTS (SELECT 1 FROM {quote_ident(temp)} y WHERE {_matches('y', 't', copy.key)})",
+        owner,
+    )
+    return int(status.split()[-1])
+
+
+async def _still_dangling(mirror: asyncpg.Connection, arm: str, registry: ReplicationRegistry) -> list[dict]:
+    """The head's dangling rows owned by ``arm`` or by nobody known, logged; a failed scan only warns.
+
+    It runs after the hand-over, so a row apply is part-way through can show here;
+    ``drift-check`` is the authority.
+    """
+    try:
+        found = [row for row in await dangling(mirror, registry) if row["owner"] in (arm, None)]
+    except Exception as exc:  # the hand-over is done: a report must never fail the run
+        logger.warning("Couldn't list rows left dangling after the re-seed (drift-check will): %s", exc)
+        return []
+    for row in found:
+        logger.warning(
+            "After the re-seed, %d rows of %s, owned by %s, still find no %s through %s; see drift-check",
+            row["rows"],
+            row["table"],
+            row["owner"] or "nobody known",
+            row["parent"],
+            row["column"],
+        )
+    return found
 
 
 async def _unique_indexes(conn: asyncpg.Connection, table: str) -> list[list[str]]:
@@ -561,18 +627,18 @@ async def reseed(
     dict
         The subscription and whether it was ``created``; the ``cut_lsn`` replication
         resumed after and the ``cut_attempts`` it took; per table, rows ``read`` from
-        the primary, and ``set_aside``, ``written`` and ``deleted`` on the mirror; and
+        the primary, and ``set_aside``, ``written`` and ``deleted`` on the mirror;
         tables ``skipped`` (not ready: their own initial copy runs once the
-        subscription is enabled).
+        subscription is enabled); and the ``dangling`` rows left on the head that the
+        arm or nobody known owns (see the module docstring).
 
     Raises
     ------
     Refused
-        Wrong role, an arm not configured, missing privileges, an enabled
-        subscription, ``since`` later than the head's newest snapshot from the arm, no exact cut within ``cut_wait_s``, or a unique
+        Wrong role, an arm not configured, missing privileges, another run of the same
+        arm, an enabled subscription, ``since`` later than the head's newest snapshot from the arm, no exact cut within ``cut_wait_s``, or a unique
         value it can't set aside. Nothing was copied.
     """
-    hooks = hooks or {}
     require_role("reseed", "mirror", role)
     _selected_arms(arms, arm, head)
     name = subscription_name(arm)
@@ -580,7 +646,43 @@ async def reseed(
         "SELECT has_function_privilege('pg_replication_origin_advance(text, pg_lsn)', 'EXECUTE')"
     ):
         raise Refused("reseed needs a superuser, or EXECUTE on pg_replication_origin_advance(text, pg_lsn)")
+    if not await mirror.fetchval("SELECT pg_try_advisory_lock(hashtext($1), hashtext($2))", LOCK_NAMESPACE, name):
+        raise Refused(f"another reseed of {arm} is running on this head; nothing was changed. Wait for it")
+    try:
+        return await _reseed_locked(
+            primary,
+            mirror,
+            role=role,
+            arm=arm,
+            arms=arms,
+            head=head,
+            since=since,
+            cut_wait_s=cut_wait_s,
+            registry=registry,
+            hooks=hooks or {},
+        )
+    finally:
+        try:
+            await mirror.execute("SELECT pg_advisory_unlock(hashtext($1), hashtext($2))", LOCK_NAMESPACE, name)
+        except (OSError, asyncpg.PostgresError, asyncpg.InterfaceError):
+            pass  # a lost session has released it already
 
+
+async def _reseed_locked(
+    primary: asyncpg.Connection,
+    mirror: asyncpg.Connection,
+    *,
+    role: str,
+    arm: str,
+    arms: Mapping[str, Arm],
+    head: str | None,
+    since: datetime,
+    cut_wait_s: float,
+    registry: ReplicationRegistry,
+    hooks: Mapping[str, Callable[[], Awaitable[object]]],
+) -> dict:
+    """``reseed`` once this run holds the arm's lock."""
+    name = subscription_name(arm)
     present = set(registry.replicated) & await tables_present(mirror, registry.schemas)
     if (newest := await _newest_parent(mirror, present, arm, registry)) is not None and since > newest:
         raise Refused(
@@ -641,6 +743,10 @@ async def reseed(
                 tables[copy.table]["deleted"] = await _delete_missing(
                     mirror, copy, temps[copy.table], parents, arm, registry
                 )
+            for copy in reversed(copies):  # rows _delete_missing can't see: their path parent is gone
+                tables[copy.table]["deleted"] += await _delete_orphans(
+                    mirror, copy, temps[copy.table], arm, refs, registry
+                )
             if "before_commit" in hooks:
                 await hooks["before_commit"]()
     finally:
@@ -661,6 +767,7 @@ async def reseed(
     await mirror.execute("SELECT pg_replication_origin_advance($1, $2::text::pg_lsn)", f"pg_{sub['oid']}", x0)
     await mirror.execute(f"ALTER SUBSCRIPTION {quote_ident(name)} ENABLE")
     logger.info("Subscription %s enabled; replication from %s resumes after %s", name, arm, x0)
+    left = await _still_dangling(mirror, arm, registry)
     return {
         "arm": arm,
         "subscription": name,
@@ -672,6 +779,7 @@ async def reseed(
         "snapshot_lsn": snapshot_lsn,
         "tables": tables,
         "skipped": skipped,
+        "dangling": left,
     }
 
 

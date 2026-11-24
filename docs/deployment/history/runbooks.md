@@ -3,7 +3,9 @@
 Run SQL on the head as its superuser, from the history cluster's Postgres pod, and on
 an arm as that arm's superuser. The head's subscription to an arm is
 `canopy_history_<arm>`, and its slot on the arm has the same name. Each runbook acts
-on one arm; the other arms keep streaming.
+on one arm; the other arms keep streaming. For an arm that prunes, run each
+`drift-check` below with `--days <the arm's CANOPY_WINDOW_DAYS>`, as its
+[heartbeat](operations.md#heartbeat) does.
 
 ## Slot lost
 
@@ -42,7 +44,12 @@ quieter time.
 
 If `reseed` fails part-way, the subscription stays disabled: run it again. Never enable
 the subscription by hand after a failed run, since replication would resume from where
-the old slot left off, not from the copy.
+the old slot left off, not from the copy. Only one `reseed` of an arm runs at a time; a
+second is refused while the first runs.
+
+`reseed`'s report lists under `dangling` any row of that arm (or of nobody known) that
+still references a missing parent once it is done, for example rows a rebuilt or
+out-of-date arm left behind. `drift-check` reports them too; fix them by hand.
 
 ## Head PITR
 
@@ -105,7 +112,12 @@ A bad write on an arm (a mass edit, a wrong delete) reaches the head within seco
 Never repair an arm's rows on the head; repair them on that arm and let replication
 carry the fix.
 
-1. Restore the head's backup into a scratch database at a time before the bad write.
+1. Restore the head's backup into a scratch server at a time before the bad write,
+   starting it with `max_logical_replication_workers = 0`, as in "Head PITR". Its
+   restored subscriptions still point at the arms' live slots: with workers enabled
+   it would connect, apply new writes and move the slots on. Never drop a subscription
+   there without `SET (slot_name = NONE)` first, which would drop the arm's live slot.
+   Discard the scratch server when done.
 2. Extract the good rows that arm owns from it (`\copy (SELECT ...) TO`, filtered on
    the owner as in "Arm host lost").
 3. Write them back on the arm, in one transaction, parents before children.
@@ -117,18 +129,25 @@ carry the fix.
 apply from that arm keeps failing on the same change and retrying, while the other
 arms stream on. Most likely the arm created a facility slug or a Magpie config slug
 that another owner, another arm or the head, already uses: those slugs are unique
-across owners, and each arm only sees its own rows.
+across owners, and each arm only sees its own rows. Or, after someone re-imported a
+pruned snapshot with `mode=captured`, it's a snapshot id the head already holds.
 
-1. Find it: the head's Postgres log names the unique constraint and the value. Find
-   the row on the head that holds the value, and its `owner_instance`.
-2. Fix it: free the value on the *other* owner, the one whose row is already on the
-   head: on its arm, or on the head itself if the head owns it. The change reaches the
-   head, the slug is free, and the stuck change applies on the next retry. A facility's
-   slug can't be changed through the API (an edit takes its name, description and
-   parent): delete the facility there if nothing uses it, or else change its slug in SQL
-   on its owner. Changing the stuck arm's own row doesn't help: that change queues
-   behind the one that's stuck.
-3. Run `drift-check --arm <arm>` once the apply error count stops rising.
+1. Find it: the head's Postgres log names the unique constraint and the value, and
+   the failing transaction's finish LSN (`finished at …`).
+2. If it's `squirrel.snapshot`'s primary key, the head already holds the original:
+   skip that one transaction on the head with
+   `ALTER SUBSCRIPTION canopy_history_<arm> SKIP (lsn = '<finish LSN from the log>')`,
+   then run `drift-check --arm <arm>`. The arm's second copy is pruned again on its
+   next run. That's all for this case.
+3. Otherwise it's a slug. Find the row on the head that holds the value, and its
+   `owner_instance`, and free the value on that *other* owner, the one whose row is
+   already on the head: on its arm, or on the head itself if the head owns it. The
+   change reaches the head, the slug is free, and the stuck change applies on the next
+   retry. A facility's slug can't be changed through the API (an edit takes its name,
+   description and parent): delete the facility there if nothing uses it, or else
+   change its slug in SQL on its owner. Changing the stuck arm's own row doesn't help:
+   that change queues behind the one that's stuck.
+4. Run `drift-check --arm <arm>` once the apply error count stops rising.
 
-Don't skip the failing transaction: the arm's row would be missing on the head, and
-re-seeding that arm would only meet the same clash.
+Don't skip the failing transaction for a slug: the arm's row would be missing on the
+head, and re-seeding that arm would only meet the same clash.

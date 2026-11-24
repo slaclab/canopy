@@ -19,6 +19,9 @@ from canopy.squirrel.schemas.snapshot import BUNDLE_FORMAT, SnapshotBundleDTO
 from canopy.squirrel.data.repositories import OutboxRepository
 
 from .test_head import (  # noqa: F401 — the head's copy and a client over it
+    LAB,
+    OPS,
+    WRITER,
     HEADERS,
     copy,
     http,
@@ -70,7 +73,7 @@ async def test_a_change_to_a_queued_snapshot_is_answered_here(http, copy, method
     assert "waiting for delivery to arm1" in resp.json()["detail"]
 
 
-async def test_a_capture_for_an_arm_with_a_full_backlog_is_refused_at_once(http, copy, monkeypatch):  # noqa: F811
+async def test_a_capture_for_an_arm_with_a_full_backlog_is_refused_at_once(http, copy, monkeypatch, bind_keys):  # noqa: F811
     enqueued = []
 
     async def fake_enqueue(function, *args, **kwargs):
@@ -94,6 +97,10 @@ async def test_a_capture_for_an_arm_with_a_full_backlog_is_refused_at_once(http,
     assert resp.status_code == 503, resp.text
     assert resp.json()["code"] == "outbox_full"
     assert enqueued == ["create_snapshot_task"]
+    # The facility gate comes first: a key outside arm1's facility learns nothing of its outbox.
+    bind_keys(WRITER, OPS, LAB)
+    resp = await http.post("/squirrel/v1/snapshots", json=capture, headers={"X-API-Key": "lab"})
+    assert (resp.status_code, resp.json()["code"]) == (403, "insufficient_facility_access"), resp.text
     # The head's own facility is never held up by an arm's outbox.
     resp = await http.post(
         "/squirrel/v1/snapshots", json={"title": "t", "facility": copy["head"]["facility"]}, headers=HEADERS

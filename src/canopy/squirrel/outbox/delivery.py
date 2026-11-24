@@ -6,8 +6,11 @@ through ``send``. A row stays pending through any failure that says nothing abou
 the snapshot itself (the arm can't be reached, answered 5xx, or turned down the
 head's own key) and its retry backs off, doubling up to ``retry_max_s``; it never
 gives up. A refusal of the snapshot itself (its facility went, its PVs moved, its id
-clashes) marks it failed with the arm's reason and the next row goes on. Once the
-arm has saved a row, the row stays until the snapshot is on the head, by replication.
+clashes) marks it failed with the arm's reason and the next row goes on. A resend
+the arm refuses for its caller's grant (``resend_refused``) may be of a snapshot an
+earlier send saved, its answer lost: the row ends if the snapshot is on the head,
+else it waits ``resend_wait_s`` for it to replicate, then fails. Once the arm has
+saved a row, the row stays until the snapshot is on the head, by replication.
 A capture the arm saved at once that hasn't replicated back when ``deliver_capture``
 stops waiting is kept the same way, as a row already delivered (``submit``).
 
@@ -60,6 +63,22 @@ _RETRIED_STATUSES = frozenset({408, 429})
 def transient(refusal: ArmRefused) -> bool:
     """Whether a later attempt can succeed with nothing changed about the snapshot."""
     return refusal.status >= 500 or refusal.status in _RETRIED_STATUSES or refusal.code in _CONFIGURATION_CODES
+
+
+# How a resend the arm refused for its caller's grant records the arm's answer: an
+# earlier send may have saved the snapshot and lost the answer.
+_RESENT = "; resent, so it may be saved there already"
+_WAITING = ": waiting for it to replicate here"
+
+
+def resend_refused(refusal: ArmRefused) -> bool:
+    """Whether the arm refused a resend for its caller's facility grant.
+
+    A resend gets a fresh import's facility check before the arm looks up its id, and
+    the same 403 whether or not an earlier send saved the snapshot, so that the arm
+    doesn't tell a caller outside the grant that it exists.
+    """
+    return refusal.status == 403 and refusal.code == "insufficient_facility_access"
 
 
 def refusal_reason(refusal: ArmRefused) -> str:
@@ -353,6 +372,15 @@ async def _record(entry: SnapshotOutbox, **values: Any) -> None:
         await session.commit()
 
 
+async def _swept(entry: SnapshotOutbox) -> bool:
+    """Remove the row if its snapshot is here now; whether it was."""
+    async with session_scope() as session:
+        swept = await OutboxRepository(session).sweep(entry.id)
+        await session.commit()
+    log_swept(swept)
+    return bool(swept)
+
+
 async def _delivered(entry: SnapshotOutbox, attempts: int, now: datetime) -> None:
     """The arm saved it: the row goes now if the snapshot is already here, else it waits for the sweep."""
     async with session_scope() as session:
@@ -376,7 +404,9 @@ async def deliver_arm(
     """Send the arm's due rows in order until one has to wait, the queue is empty, or the budget runs out.
 
     Returns counts by outcome (``delivered``, ``retried``, ``failed``), or
-    ``{"locked": 1}`` when another run holds the arm.
+    ``{"locked": 1}`` when another run holds the arm. A resend the arm refused for its
+    caller's grant counts as delivered when its snapshot is here, else as retried the
+    first time and failed the next.
     """
     counts = {"delivered": 0, "retried": 0, "failed": 0}
     async with arm_lock(arm) as got:
@@ -393,19 +423,24 @@ async def deliver_arm(
                 outcome = await send(arm, document, entry.caller, entry.strict)
             except (PrimaryUnavailable, PrimaryTimeout, ArmRefused) as exc:
                 now = clock()
-                if isinstance(exc, ArmRefused) and not transient(exc):
-                    await _record(
-                        entry,
-                        state="failed",
-                        attempts=attempts,
-                        failed_at=now,
-                        last_error=refusal_reason(exc),
-                    )
-                    logger.error("Snapshot %s refused by %s: %s", entry.id, arm, refusal_reason(exc))
+                # An earlier send may have saved it and lost the answer: the row ends if the
+                # snapshot is here, else waits resend_wait_s for it once, then fails.
+                resent = isinstance(exc, ArmRefused) and entry.attempts > 0 and resend_refused(exc)
+                if resent and await _swept(entry):
+                    counts["delivered"] += 1
+                    continue
+                waited = resent and (entry.last_error or "").endswith(_RESENT + _WAITING)
+                if isinstance(exc, ArmRefused) and not transient(exc) and (not resent or waited):
+                    reason = refusal_reason(exc) + (_RESENT if resent else "")
+                    await _record(entry, state="failed", attempts=attempts, failed_at=now, last_error=reason)
+                    logger.error("Snapshot %s refused by %s: %s", entry.id, arm, reason)
                     counts["failed"] += 1
                     continue
                 reason = refusal_reason(exc) if isinstance(exc, ArmRefused) else exc.detail
                 wait = retry_delay(attempts, config)
+                if resent:
+                    reason += _RESENT + _WAITING
+                    wait = config.resend_wait_s
                 await _record(
                     entry,
                     attempts=attempts,

@@ -318,7 +318,7 @@ class TestLeftToTheAppHere:
         calls = owner("arm1")
         monkeypatch.delenv("CANOPY_ARMS__ARM1__FORWARD_URL")
         monkeypatch.delenv("CANOPY_ARMS__ARM1__SERVICE_KEY")
-        monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "host=arm1.example.org")
+        monkeypatch.setenv("CANOPY_ARMS__ARM1__PUBLISHER_DSN", "postgresql://arm1.example.org/canopy")
 
         client.delete("/squirrel/v1/pvs/p1", headers=_as(WRITER))
 
@@ -618,6 +618,43 @@ class TestJobs:
         httpx_mock.add_response(method="GET", url=f"{ARM1}/jobs/v1/j2", status_code=404, json={})
 
         assert client.get("/jobs/v1/j2", headers=_as(READER)).json()["code"] == "job_not_found"
+
+    def test_an_arm_error_isnt_a_missing_job(self, client, httpx_mock: HTTPXMock, no_local_job, job_on):
+        job_on("arm1")
+        httpx_mock.add_response(
+            method="GET", url=f"{ARM1}/jobs/v1/j4", status_code=500, json={"code": "internal_error", "detail": "boom"}
+        )
+
+        resp = client.get("/jobs/v1/j4", headers=_as(READER))
+
+        assert resp.status_code == 502
+        assert resp.json()["code"] == "primary_unavailable"
+        assert resp.json()["detail"] == "Arm 'arm1' answered 500 internal_error for job 'j4': boom"
+
+    def test_an_arm_not_accepting_forwarded_requests_says_so(self, client, httpx_mock: HTTPXMock, no_local_job, job_on):
+        job_on("arm1")
+        httpx_mock.add_response(
+            method="GET",
+            url=f"{ARM1}/jobs/v1/j5",
+            status_code=403,
+            json={"code": "forwarded_write_refused", "detail": "This instance doesn't accept X-Canopy-On-Behalf-Of"},
+        )
+
+        resp = client.get("/jobs/v1/j5", headers=_as(READER))
+
+        assert resp.status_code == 502
+        assert "403 forwarded_write_refused" in resp.json()["detail"]
+
+    def test_a_refused_service_key_is_the_heads(self, client, httpx_mock: HTTPXMock, no_local_job, job_on):
+        job_on("arm1")
+        httpx_mock.add_response(
+            method="GET", url=f"{ARM1}/jobs/v1/j6", status_code=401, json={"code": "invalid_api_key", "detail": "no"}
+        )
+
+        resp = client.get("/jobs/v1/j6", headers=_as(READER))
+
+        assert resp.status_code == 502
+        assert resp.json()["code"] == "service_key_refused"
 
     @pytest.mark.parametrize("arm", [None, "arm2"])
     def test_a_job_not_forwarded_here_is_a_404(self, client, no_local_job, job_on, arm):

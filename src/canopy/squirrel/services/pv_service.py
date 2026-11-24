@@ -609,11 +609,17 @@ class PvService:
         BadRequest
             If the PV is still a meta-PV; its marker has to be removed first.
         """
-        # Locked, so a meta-PV marker can't be added between the check below and the delete.
-        if (pv := await self.pv_repo.get_by_id(pv_id, for_update=True)) is None:
+        # Judged before it's locked: on a head, row-level security keeps another
+        # instance's row out of SELECT ... FOR UPDATE, so it would look missing.
+        if (pv := await self.pv_repo.get_by_id(pv_id)) is None:
             return False
         await self._require_facility_write(await self.pv_repo.facility_ids_for(pv_id), "this PV")
         require_owned(pv.owner_instance, f"PV {pv_id}")
+        # Now this instance's own row, locked so a meta-PV marker can't be added between
+        # the check below and the delete; re-read, in case it went or moved meanwhile.
+        if await self.pv_repo.get_by_id(pv_id, for_update=True) is None:
+            return False
+        await self._require_facility_write(await self.pv_repo.facility_ids_for(pv_id), "this PV")
         if await self.meta_pv_repo.get_one(pv_id) is not None:
             raise BadRequest(
                 "Cannot delete a PV that is still registered as a meta-PV; remove the meta-PV marker first"

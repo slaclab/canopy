@@ -41,6 +41,10 @@ from dataclasses import field, dataclass
 from collections.abc import Mapping
 
 
+class RegistryError(ValueError):
+    """The registry is incomplete: a replicated table, or a parent on its way, has no owner path."""
+
+
 class TableClass(StrEnum):
     """How a table replicates; see the module docstring."""
 
@@ -127,14 +131,14 @@ class ReplicationRegistry:
 
         Raises
         ------
-        ValueError
+        RegistryError
             When ``table``, or a parent on the way, has no owner path.
         """
         hops: list[tuple[str, str]] = []
         current = table
         while (path := self.owner_paths.get(current)) is None or path.column is None:
             if path is None or len(hops) >= len(self.owner_paths):
-                raise ValueError(f"{current} has no owner path in the replication registry")
+                raise RegistryError(f"{current} has no owner path in the replication registry")
             hops.append((path.parent, path.key))
             current = path.parent
         return hops

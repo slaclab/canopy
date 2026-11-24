@@ -276,8 +276,8 @@ def service_key_refusal(arm: str, answer: httpx.Response, *, manages_facilities:
     service key's only on a route that manages facilities, whose gate the caller
     passed here with every facility. Elsewhere it may be the caller's own grant, and
     ``forwarded_write_refused`` already names forwarding: both go back as they are.
-    Only the router relays this: a caller that acts on the arm's answer (a capture
-    the head delivers) sees it raw.
+    Only the router and the jobs route relay this: a caller that acts on the arm's
+    answer (a capture the head delivers) sees it raw.
     """
     if answer.status_code not in (401, 403):
         return None

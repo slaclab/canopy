@@ -64,6 +64,15 @@ class OutboxConfig(BaseModel):
     retry_initial_s: float = Field(30.0, gt=0, description="Wait before retrying an arm after its first failure.")
     retry_max_s: float = Field(900.0, gt=0, description="Longest wait between retries; the wait doubles up to it.")
     interval_s: int = Field(30, ge=1, le=60, description="How often the worker checks for deliveries due, in seconds.")
+    resend_wait_s: float = Field(
+        60.0,
+        gt=0,
+        le=900,
+        description=(
+            "How long a resend the arm refused for its caller's grant waits for its snapshot to replicate "
+            "here before it fails; the arm's queue waits behind it."
+        ),
+    )
 
     @model_validator(mode="after")
     def _initial_within_max(self) -> Self:

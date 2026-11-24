@@ -239,7 +239,7 @@ async def _sync_publication(conn: asyncpg.Connection, publication: Publication, 
     schemas_removed = sorted(state.schemas)
     if desired and (added or removed or cleared or schemas_removed):
         await conn.execute(f"ALTER PUBLICATION {name} SET TABLE {', '.join(qualified(t) for t in desired)}")
-    elif removed:
+    elif removed or schemas_removed:
         # Nothing left to publish, and SET TABLE needs at least one table.
         if schemas_removed:
             await conn.execute(
@@ -264,9 +264,7 @@ async def _sync_publication(conn: asyncpg.Connection, publication: Publication, 
         )
     if schemas_removed:
         logger.info(
-            "Publication %s: lists its tables instead of publishing schemas %s whole",
-            publication.name,
-            ", ".join(schemas_removed),
+            "Publication %s: no longer publishes schemas %s whole", publication.name, ", ".join(schemas_removed)
         )
     if operations_changed:
         logger.info("Publication %s: now publishes %s", publication.name, ", ".join(publication.operations))
@@ -320,8 +318,8 @@ async def publish(
     hashes), and the heartbeat role may write ``core.history_heartbeat`` only; a
     role that doesn't exist yet is skipped with a notice, and the next run grants
     it. Afterwards each role must be able to do no more than that, counting what it
-    inherits from other roles or PUBLIC; ``publish`` refuses rather than change
-    those shared grants.
+    inherits from other roles or PUBLIC and what it can reach with ``SET ROLE``;
+    ``publish`` refuses rather than change those shared grants.
 
     Keeps whichever layout the database has. ``split`` moves to the split layout:
     the first run creates the split pair beside ``canopy_history``; a later run, once
@@ -344,8 +342,9 @@ async def publish(
     -------
     dict
         The ``layout`` afterwards; per publication, what changed; per role,
-        ``"granted"`` or ``"absent"``; the registered tables that don't exist here;
-        and, when this run dropped ``canopy_history``, the WAL position just after.
+        ``"granted"``, ``"absent"`` (no such role yet) or ``"nothing_published"`` (no
+        registered table here yet); the registered tables that don't exist here; and,
+        when this run dropped ``canopy_history``, the WAL position just after.
 
     Raises
     ------
@@ -412,6 +411,9 @@ async def publish(
                     policy="SELECT on the published tables",
                 )
                 result["roles"][grantee] = "granted"
+            else:
+                logger.info("Nothing is published here yet; no grants made for %s", grantee)
+                result["roles"][grantee] = "nothing_published"
         if not await role_exists(conn, config.heartbeat_role):
             logger.info("Role %s doesn't exist yet; no grants made for it", config.heartbeat_role)
             result["roles"][config.heartbeat_role] = "absent"
@@ -426,6 +428,9 @@ async def publish(
                 policy=f"read-write on {_HEARTBEAT_TABLE}",
             )
             result["roles"][config.heartbeat_role] = "granted"
+        else:
+            logger.info("%s isn't here yet; no grants made for %s", _HEARTBEAT_TABLE, config.heartbeat_role)
+            result["roles"][config.heartbeat_role] = "nothing_published"
     if drop_single:
         result["dropped_at_lsn"] = await conn.fetchval("SELECT pg_current_wal_lsn()::text")
         logger.info(

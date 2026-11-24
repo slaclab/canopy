@@ -132,6 +132,9 @@ class UpdateSnapshotDTO(CanopyModel):
 
 BUNDLE_FORMAT = "canopy.squirrel.snapshot-bundle"
 
+# ``SnapshotValue.status`` and ``.severity`` are Postgres ``integer`` columns.
+_INT32 = {"ge": -(2**31), "le": 2**31 - 1}
+
 
 class BundleValueDTO(CanopyModel):
     """One value in a snapshot bundle, with the addresses its PV had when exported.
@@ -148,8 +151,8 @@ class BundleValueDTO(CanopyModel):
     config_address: str | None = Field(None, max_length=255)
     setpoint_value: dict[str, Any] | None = None
     readback_value: dict[str, Any] | None = None
-    status: int | None = None
-    severity: int | None = None
+    status: int | None = Field(None, **_INT32)
+    severity: int | None = Field(None, **_INT32)
     timestamp: datetime | None = None
 
     @field_validator("setpoint_value", "readback_value")
