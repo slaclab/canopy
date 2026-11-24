@@ -1,7 +1,6 @@
 """The converter's color scheme: config precedence, injection into convert_bytes, and the DTO ``scheme``."""
 
 import io
-import sys
 import json
 import zipfile
 from pathlib import Path
@@ -11,6 +10,7 @@ import fakeredis.aioredis
 from fastapi.testclient import TestClient
 
 import canopy.converter.tasks as tasks_module
+from canopy.core import color_scheme
 from canopy.main import app
 from tests.conftest import READ_HEADERS
 from canopy.converter.app import app as converter_app
@@ -23,6 +23,7 @@ from canopy.core.color_scheme import (
 )
 from canopy.converter.services import conversion_service as service_module
 from canopy.converter.dependencies import get_conversion_service
+from canopy.core.color_scheme_flatten import SchemeResult
 from canopy.converter.services.conversion_service import ConversionService
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -141,6 +142,7 @@ def test_injected_scheme_result_is_passed_through(spy, good_scheme):
     service = ConversionService(scheme=loaded)
     result = service.convert(EDL, kind="edl")
     assert spy[0]["scheme"] is loaded.result
+    assert isinstance(spy[0]["scheme"], SchemeResult)
     assert "color_def_path" not in spy[0]
     assert service.scheme_meta == loaded.meta
     assert result.scheme == loaded.meta
@@ -158,16 +160,14 @@ def test_color_def_path_passed_only_when_set(spy, tmp_path):
 
 
 def test_load_error_loads_once_and_warns_once_per_conversion(monkeypatch, broken_scheme):
-    import pydmconverter.scheme as pydm_scheme
-
     loads = []
-    real = pydm_scheme.load_scheme
+    real = color_scheme.load_scheme
 
     def _counting(*args, **kwargs):
         loads.append(args)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(pydm_scheme, "load_scheme", _counting)
+    monkeypatch.setattr(color_scheme, "load_scheme", _counting)
     service = ConversionService(scheme=get_color_scheme(broken_scheme))
     # A second service on the same path (e.g. the batch worker) reuses the cached load.
     other = ConversionService(scheme=get_color_scheme(broken_scheme))
@@ -181,16 +181,52 @@ def test_load_error_loads_once_and_warns_once_per_conversion(monkeypatch, broken
         assert result.scheme["errors"]
 
 
-def test_without_pydm_scheme_converts_scheme_free_with_degraded_warning(monkeypatch, spy):
-    monkeypatch.setitem(sys.modules, "pydmconverter.scheme", None)  # import now raises ImportError
-    loaded = get_color_scheme(None)
-    assert loaded.result is None and loaded.flat_json is None
-    result = ConversionService(scheme=loaded).convert(EDL, kind="edl")
-    assert spy[0]["scheme"] is None
-    warnings = _scheme_warnings(result.warnings)
-    assert len(warnings) == 1
-    assert "unavailable" in warnings[0]
-    assert result.scheme["served"] == DEFAULT_ID
+# A synthetic .bob panel: a named display background and one named text color, as Phoebus saves them.
+BOB_PANEL = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n<display version="2.0.0"><name>t</name>'
+    b'<background_color><color name="Display_Background" red="255" green="255" blue="255"/></background_color>'
+    b'<widget type="textupdate" version="2.0.0"><name>T</name><pv_name>sim://x</pv_name>'
+    b'<foreground_color><color name="Text" red="0" green="0" blue="0"/></foreground_color></widget>'
+    b"</display>"
+)
+
+
+def _text_color(screen: dict):
+    (widget,) = [c for c in screen["root"]["children"] if c["props"].get("pv") == "sim://x"]
+    return widget["props"]["foregroundColor"]
+
+
+def test_canopy_flattened_default_becomes_roles_in_a_bob_conversion():
+    """canopy's own SchemeResult is what convert_bytes reads (flat, imports, sources): roles come out."""
+    result = ConversionService(scheme=get_color_scheme()).convert(BOB_PANEL, kind="bob")
+    assert result.screen["root"]["props"]["backgroundColor"] == {"$role": "Display_Background", "fallback": "#ffffff"}
+    assert result.screen["schemaVersion"] == "1.1"
+    assert _text_color(result.screen)["$role"] == "Text"
+    assert result.scheme["id"] == DEFAULT_ID
+
+
+def test_facility_import_flattened_by_canopy_reaches_the_converter(tmp_path):
+    """A role and an import only the facility file has: the converter can only know them from canopy's flattening."""
+    doc = {
+        "id": "facility",
+        "format": "canopy-color-scheme/1",
+        "roles": {"Ink": {"light": "#000", "dark": "#f4f4f4"}},
+        "import": {"phoebus": {"Text": "Ink"}},
+    }
+    path = tmp_path / "facility.json"
+    path.write_text(json.dumps(doc))
+    result = ConversionService(scheme=get_color_scheme(path)).convert(BOB_PANEL, kind="bob")
+    assert result.scheme["id"] == "facility"
+    assert result.scheme["errors"] == []
+    color = _text_color(result.screen)
+    assert color["$role"] == "Ink"
+    assert color["fallback"] == "#000000"
+
+
+def test_scheme_free_bob_conversion_has_no_roles():
+    result = ConversionService().convert(BOB_PANEL, kind="bob")
+    assert result.screen["root"]["props"]["backgroundColor"] == "#ffffff"
+    assert result.screen["schemaVersion"] == "1.0"
 
 
 # --- HTTP -----------------------------------------------------------------------------------

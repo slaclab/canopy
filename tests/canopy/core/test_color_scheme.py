@@ -1,19 +1,27 @@
-"""get_color_scheme: one flatten per path, canopy-default on any error, degraded on a missing flattener."""
+"""get_color_scheme: one flatten per path, canopy-default on any error, and no converter needed."""
 
 import sys
 import json
 import hashlib
 import logging
+import subprocess
+import importlib.util
+from pathlib import Path
 
 import pytest
 
 from canopy.core import color_scheme
-from canopy.core.color_scheme import DEFAULT_SCHEME_PATH, get_color_scheme
+from canopy.core.color_scheme import (
+    THEME_FILE_ENV,
+    DEFAULT_SCHEME_PATH,
+    get_color_scheme,
+)
+from canopy.core.color_scheme_flatten import SchemeResult, load_scheme
 
 
 @pytest.fixture(autouse=True)
 def _fresh_cache(monkeypatch):
-    monkeypatch.delenv("CANOPY_THEME_FILE", raising=False)
+    monkeypatch.delenv(THEME_FILE_ENV, raising=False)
     color_scheme.clear_color_scheme_cache()
     yield
     color_scheme.clear_color_scheme_cache()
@@ -27,6 +35,12 @@ def _packaged_sha256() -> str:
     return hashlib.sha256(DEFAULT_SCHEME_PATH.read_bytes()).hexdigest()
 
 
+def _facility(tmp_path: Path, scheme_id: str, name: str = "facility.json") -> Path:
+    path = tmp_path / name
+    path.write_text(json.dumps({"id": scheme_id, "extends": "canopy-default", "roles": {"Beam": "#123456"}}))
+    return path
+
+
 def test_unset_env_serves_canopy_default(caplog):
     scheme = get_color_scheme()
     assert scheme.meta["id"] == "canopy-default"
@@ -34,7 +48,8 @@ def test_unset_env_serves_canopy_default(caplog):
     assert scheme.meta["sha256"] == _packaged_sha256()
     assert scheme.meta["errors"] == []
     assert scheme.degraded == []
-    assert scheme.result is not None
+    assert isinstance(scheme.result, SchemeResult)
+    assert scheme.flat_json == scheme.result.flat_json()
     assert scheme.flat_json["meta"] == scheme.meta
     assert "Text" in scheme.flat_json["roles"]
     assert scheme.imports["phoebus"]
@@ -42,14 +57,12 @@ def test_unset_env_serves_canopy_default(caplog):
 
 
 def test_empty_env_counts_as_unset(monkeypatch):
-    monkeypatch.setenv("CANOPY_THEME_FILE", "")
+    monkeypatch.setenv(THEME_FILE_ENV, "")
     assert get_color_scheme().meta["id"] == "canopy-default"
 
 
 def test_valid_file_gives_facility_id(tmp_path, caplog):
-    path = tmp_path / "facility.json"
-    path.write_text(json.dumps({"id": "facility-x", "extends": "canopy-default", "roles": {"Beam": "#123456"}}))
-    scheme = get_color_scheme(path)
+    scheme = get_color_scheme(_facility(tmp_path, "facility-x"))
     assert scheme.meta["id"] == "facility-x"
     assert scheme.meta["served"] == "facility-x"
     assert scheme.meta["errors"] == []
@@ -59,9 +72,7 @@ def test_valid_file_gives_facility_id(tmp_path, caplog):
 
 
 def test_env_var_names_the_file(tmp_path, monkeypatch):
-    path = tmp_path / "facility.json"
-    path.write_text(json.dumps({"id": "from-env", "extends": "canopy-default", "roles": {}}))
-    monkeypatch.setenv("CANOPY_THEME_FILE", str(path))
+    monkeypatch.setenv(THEME_FILE_ENV, str(_facility(tmp_path, "from-env")))
     assert get_color_scheme().meta["id"] == "from-env"
 
 
@@ -79,11 +90,13 @@ def test_bad_file_logs_once_and_serves_default(tmp_path, caplog, content):
     with caplog.at_level(logging.ERROR, logger=color_scheme.__name__):
         scheme = get_color_scheme(path)
     assert len(_errors(caplog)) == 1
+    assert _errors(caplog)[0].getMessage().startswith("color scheme ")
     assert scheme.degraded == ["color-scheme"]
     assert scheme.meta["served"] == "canopy-default"
     assert scheme.meta["errors"]
     assert scheme.flat_json is not None
     assert "Beam" not in scheme.flat_json["roles"]
+    assert scheme.flat_json["roles"] == load_scheme(None).flat["roles"]
 
 
 def test_missing_file_is_degraded(tmp_path, caplog):
@@ -95,16 +108,14 @@ def test_missing_file_is_degraded(tmp_path, caplog):
 
 
 def test_second_call_same_path_does_not_reflatten(tmp_path, caplog, monkeypatch):
-    from pydmconverter import scheme as pydm_scheme
-
     calls = []
-    real = pydm_scheme.load_scheme
+    real = color_scheme.load_scheme
 
     def spy(*args, **kwargs):
         calls.append(args)
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(pydm_scheme, "load_scheme", spy)
+    monkeypatch.setattr(color_scheme, "load_scheme", spy)
     path = tmp_path / "bad.json"
     path.write_text("{ not json")
     with caplog.at_level(logging.ERROR, logger=color_scheme.__name__):
@@ -122,23 +133,38 @@ def test_default_is_cached_too(monkeypatch):
     assert get_color_scheme(None) is first
 
 
-def test_import_error_degrades_without_flat_json(monkeypatch, caplog):
-    monkeypatch.setitem(sys.modules, "pydmconverter.scheme", None)
-    with caplog.at_level(logging.ERROR, logger=color_scheme.__name__):
-        scheme = get_color_scheme()
-        again = get_color_scheme()
-    assert scheme.result is None
-    assert scheme.flat_json is None
-    assert scheme.degraded == ["color-scheme"]
-    assert scheme.meta["errors"]
-    assert scheme.meta["served"] == "canopy-default"
-    assert again is scheme
-    assert len(_errors(caplog)) == 1
+# -- no converter -----------------------------------------------------------------------------------------------------
+
+_WITHOUT_CONVERTER = """
+import sys
+sys.modules["pydmconverter"] = None  # any import of the converter now raises ImportError
+from canopy.core.color_scheme import get_color_scheme
+from canopy.core.color_scheme_cli import main
+scheme = get_color_scheme()
+assert scheme.degraded == [], scheme.degraded
+assert scheme.flat_json is not None and scheme.flat_json["meta"]["served"] == "canopy-default"
+assert len(scheme.flat_json["roles"]) == len(scheme.flat_json["light"]) == len(scheme.flat_json["dark"]) > 0
+assert main(["check", sys.argv[1]]) == 0
+assert not [name for name in sys.modules if name.startswith("pydmconverter") and sys.modules[name] is not None]
+"""
+
+
+def test_flattens_and_serves_the_default_without_the_converter():
+    """The lean install: no ``convert`` extra, yet the default scheme flattens and serves."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _WITHOUT_CONVERTER, str(DEFAULT_SCHEME_PATH)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_canonical_default_in_sync_with_pydm():
-    from pydmconverter import scheme as pydm_scheme
-
-    assert DEFAULT_SCHEME_PATH.read_bytes() == pydm_scheme.DEFAULT_SCHEME_PATH.read_bytes()
-    result = pydm_scheme.load_scheme(None, base_path=DEFAULT_SCHEME_PATH)
-    assert result.meta["errors"] == []
+    """PyDMConverter vendors a byte copy of canopy-default; found by path, without importing the converter."""
+    spec = importlib.util.find_spec("pydmconverter")
+    if spec is None or spec.origin is None:
+        pytest.skip("PyDMConverter is not installed (no convert extra)")
+    vendored = Path(spec.origin).parent / "ir" / "data" / "schemes" / "canopy-default.json"
+    assert vendored.is_file(), f"PyDMConverter carries no canopy-default copy at {vendored}"
+    assert DEFAULT_SCHEME_PATH.read_bytes() == vendored.read_bytes()

@@ -6,10 +6,12 @@ stock EDM ``colors.list`` names into roles. The PyDM converter vendors a byte
 copy and the SDK ships a flattened copy, so the file must stay schema-valid and
 byte-canonical.
 
-The schema is owned by the SDK (``canopy-color-scheme-1.schema.json``). Its
-checkout only exists on a developer machine, so the schema test reads sibling
-roots from ``CANOPY_SCHEMA_SIBLINGS`` (an ``os.pathsep``-separated list) and is
-skipped when the variable is unset.
+The schema is canopy-spec's ``screen-ir/color-scheme.schema.json``, which canopy
+carries as ``canopy/core/data/color-scheme.schema.json``. The file is validated
+against that copy. Whether the copy still matches canopy-spec (or the SDK's copy
+of the spec) is checked only on a developer machine: that test reads sibling
+checkout roots from ``CANOPY_SCHEMA_SIBLINGS`` (an ``os.pathsep``-separated list)
+and is skipped when the variable is unset.
 """
 
 import os
@@ -21,10 +23,15 @@ import pytest
 import jsonschema
 
 import canopy.converter
-from canopy.core.color_scheme import DEFAULT_SCHEME_PATH as SCHEME_PATH
+from canopy.core.color_scheme_flatten import SCHEMA_PATH as VENDORED_SCHEMA_PATH
+from canopy.core.color_scheme_flatten import DEFAULT_SCHEME_PATH as SCHEME_PATH
 
 SIBLINGS_ENV = "CANOPY_SCHEMA_SIBLINGS"
-SCHEMA_RELATIVE = "packages/screen-ir/schema/canopy-color-scheme-1.schema.json"
+# The schema in a canopy-spec checkout, and in a canopy-sdk-js checkout (its copy of the spec).
+SCHEMA_RELATIVE = (
+    "screen-ir/color-scheme.schema.json",
+    "packages/screen-ir/spec/screen-ir/color-scheme.schema.json",
+)
 
 ROLES = [
     "Transparent",
@@ -135,13 +142,18 @@ def _sibling_roots() -> list[Path]:
 
 
 def test_scheme_is_schema_valid(scheme):
-    roots = _sibling_roots()
-    candidates = [root / SCHEMA_RELATIVE for root in roots if (root / SCHEMA_RELATIVE).is_file()]
-    assert candidates, f"{SCHEMA_RELATIVE} not found under any root in {SIBLINGS_ENV}={roots}"
-    schema = json.loads(candidates[0].read_text(encoding="utf-8"))
+    schema = json.loads(VENDORED_SCHEMA_PATH.read_text(encoding="utf-8"))
     jsonschema.Draft202012Validator.check_schema(schema)
     errors = sorted(jsonschema.Draft202012Validator(schema).iter_errors(scheme), key=str)
     assert not errors, [f"{list(e.absolute_path)}: {e.message}" for e in errors]
+
+
+def test_vendored_schema_matches_sibling_checkout():
+    roots = _sibling_roots()
+    candidates = [root / rel for root in roots for rel in SCHEMA_RELATIVE if (root / rel).is_file()]
+    assert candidates, f"none of {SCHEMA_RELATIVE} found under any root in {SIBLINGS_ENV}={roots}"
+    for candidate in candidates:
+        assert VENDORED_SCHEMA_PATH.read_bytes() == candidate.read_bytes(), f"{candidate} differs from canopy's copy"
 
 
 def test_scheme_is_root(scheme):

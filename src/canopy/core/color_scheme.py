@@ -1,13 +1,14 @@
 """The color scheme served to the viewer and the converter, flattened once per scheme file.
 
 ``get_color_scheme(path)`` flattens a ``canopy-color-scheme/1`` file onto the packaged ``canopy-default`` with
-``pydmconverter.scheme.load_scheme`` and caches the result per resolved absolute path, so each file is read,
-flattened and (when broken) logged once per process. Which file that is, is decided in one place,
-``resolve_scheme_path``: an explicit path wins, else ``CANOPY_THEME_FILE``, else ``canopy-default`` alone.
+canopy's own flattener (:func:`canopy.core.color_scheme_flatten.load_scheme`) and caches the result per resolved
+absolute path, so each file is read, flattened and (when broken) logged once per process. Which file that is, is
+decided in one place, ``resolve_scheme_path``: an explicit path wins, else ``CANOPY_THEME_FILE``, else
+``canopy-default`` alone.
 
-Any error is served as ``canopy-default`` with the errors in ``meta`` and ``degraded == ["color-scheme"]``. When
-``pydmconverter.scheme`` cannot be imported at all there is nothing to flatten with: ``result`` and ``flat_json``
-are ``None`` and consumers fall back to their bundled default.
+Any error is served as ``canopy-default`` with the errors in ``meta`` and ``degraded == ["color-scheme"]``. The
+flattener needs only the standard library and ``jsonschema``, so an install without the ``convert`` extra flattens
+and serves schemes too.
 
 ``canopy/core/data/canopy-default.json`` is the source of truth for the default scheme: pydmconverter vendors a
 byte copy (``pydmconverter/ir/data/schemes/canopy-default.json``) and canopy-sdk-js ships a flattened copy. It
@@ -18,18 +19,31 @@ from __future__ import annotations
 
 import os
 import logging
-import importlib
 import threading
 from typing import Any
 from pathlib import Path
 from dataclasses import dataclass
 
+from canopy.core.color_scheme_flatten import (
+    DEFAULT_ID,
+    DEFAULT_SCHEME_PATH,
+    SchemeResult,
+    load_scheme,
+)
+
+__all__ = [
+    "DEFAULT_ID",
+    "DEFAULT_SCHEME_PATH",
+    "DEGRADED_KEY",
+    "THEME_FILE_ENV",
+    "ColorScheme",
+    "clear_color_scheme_cache",
+    "get_color_scheme",
+    "resolve_scheme_path",
+]
+
 logger = logging.getLogger(__name__)
 
-#: The canonical ``canopy-default`` scheme (pydmconverter's copy must stay byte-identical to it).
-DEFAULT_SCHEME_PATH = Path(__file__).resolve().parent / "data" / "canopy-default.json"
-
-DEFAULT_ID = "canopy-default"
 THEME_FILE_ENV = "CANOPY_THEME_FILE"
 DEGRADED_KEY = "color-scheme"
 
@@ -38,14 +52,15 @@ DEGRADED_KEY = "color-scheme"
 class ColorScheme:
     """One flattened scheme as served.
 
-    ``result`` is the ``SchemeResult`` for ``convert_bytes(scheme=...)`` (``None`` when the flattener is
-    unavailable); ``flat_json`` is the flat scheme plus ``meta`` (``None`` likewise).
+    ``result`` is the :class:`~canopy.core.color_scheme_flatten.SchemeResult` handed to
+    ``convert_bytes(scheme=...)``; ``flat_json`` is the flat scheme plus ``meta``. ``get_color_scheme`` always fills
+    both; ``None`` only appears in a ``ColorScheme`` built by hand (a test stub for "no scheme").
     """
 
-    result: Any
+    result: SchemeResult | None
     flat_json: dict[str, Any] | None
     meta: dict[str, Any]
-    imports: dict[str, dict[str, str]]
+    imports: dict[str, dict[str, Any]]
     degraded: list[str]
 
 
@@ -89,21 +104,7 @@ def get_color_scheme(path: str | os.PathLike[str] | None = None) -> ColorScheme:
 
 def _load(requested: Path | None) -> ColorScheme:
     label = str(requested) if requested is not None else DEFAULT_ID
-    try:
-        pydm_scheme = importlib.import_module("pydmconverter.scheme")
-    except ImportError as exc:
-        message = f"pydmconverter.scheme is unavailable: {exc}"
-        logger.error("color scheme %s not loaded: %s; serving the bundled default", label, message)
-        meta = {
-            "id": None,
-            "sha256": None,
-            "flatHash": None,
-            "served": DEFAULT_ID,
-            "errors": [{"path": "", "message": message}],
-        }
-        return ColorScheme(result=None, flat_json=None, meta=meta, imports={}, degraded=[DEGRADED_KEY])
-
-    result = pydm_scheme.load_scheme(requested, base_path=DEFAULT_SCHEME_PATH)
+    result = load_scheme(requested, base_path=DEFAULT_SCHEME_PATH)
     errors = result.meta.get("errors") or []
     if errors:
         first = errors[0]
