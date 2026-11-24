@@ -104,6 +104,38 @@ class TestPins:
         await _settle()
         assert "ca://P" not in ingest.subscribed_pvs  # the skipped expiry was re-armed
 
+    @pytest.mark.parametrize("order", [["ca://P", "P"], ["P", "ca://P"]])
+    async def test_both_aliases_skipped_while_pinned_are_rearmed_by_the_unpin(self, test_service, order):
+        """Two names feed ring P; both expiries fall while pinned, and both are re-armed."""
+        config = VoleConfig(max_points=1000, global_bytes_max=1_000_000, buffer_grace_seconds=0)
+        ingest = FakeIngestService()
+        grace = GraceManager(ingest, test_service, config, is_pinned=test_service.is_pinned)
+        await ingest.subscribe(["P", "ca://P"])
+        await test_service.append("P", _sample(S))
+        test_service.pin(["P"], holder="t")
+        for name in order:
+            await grace.on_pv_deactivated([name])
+            await _settle()
+        await grace.on_pvs_unpinned(test_service.unpin("t"))
+        await _settle()
+        assert ingest.subscribed_pvs == set()
+        assert test_service.read_latest_sync("P") is None
+
+    async def test_reactivating_one_alias_keeps_the_others_skipped_expiry(self, test_service):
+        config = VoleConfig(max_points=1000, global_bytes_max=1_000_000, buffer_grace_seconds=0)
+        ingest = FakeIngestService()
+        grace = GraceManager(ingest, test_service, config, is_pinned=test_service.is_pinned)
+        await ingest.subscribe(["P", "ca://P"])
+        await test_service.append("P", _sample(S))
+        test_service.pin(["P"], holder="t")
+        await grace.on_pv_deactivated(["ca://P"])
+        await _settle()
+        await grace.on_pv_activated(["P"])  # a browser client is back on the bare name
+        await grace.on_pvs_unpinned(test_service.unpin("t"))
+        await _settle()
+        assert ingest.subscribed_pvs == {"P"}  # ca://P was re-armed and torn down
+        assert test_service.read_latest_sync("P") is not None  # P still feeds the ring
+
     async def test_unpin_never_arms_grace_but_rearms_a_skipped_expiry(self, test_service):
         """A REST-only ring's lifetime is unchanged by pin/unpin."""
         config = VoleConfig(max_points=1000, global_bytes_max=1_000_000, buffer_grace_seconds=0)

@@ -51,8 +51,9 @@ class GraceManager:
         self._pending: dict[str, asyncio.Task] = {}
         # Deactivated PVs whose expiry fired while pinned, re-armed by the last unpin.
         # Keyed by the stripped name (pins are stripped; Hare's deactivation name may
-        # carry ca://), valued by the name the deactivation used, for the re-arm.
-        self._skipped: dict[str, str] = {}
+        # carry ca://), valued by every name the deactivations used (``X`` and
+        # ``ca://X`` can both feed one ring), for the re-arm.
+        self._skipped: dict[str, set[str]] = {}
 
     async def on_pv_deactivated(self, pvs: list[str]) -> None:
         # The property copies, so read it once rather than per PV.
@@ -63,14 +64,20 @@ class GraceManager:
 
     async def on_pv_activated(self, pvs: list[str]) -> None:
         for pv in pvs:
-            self._skipped.pop(strip_protocol_prefix(pv), None)
+            # Only this name is back; another alias's skipped expiry still stands.
+            canonical = strip_protocol_prefix(pv)
+            names = self._skipped.get(canonical)
+            if names is not None:
+                names.discard(pv)
+                if not names:
+                    del self._skipped[canonical]
             task = self._pending.pop(pv, None)
             if task:
                 task.cancel()
 
     async def on_pvs_unpinned(self, pvs: list[str]) -> None:
         """The last pin on these PVs is gone: re-arm the expiries skipped while pinned."""
-        to_rearm = [orig for pv in pvs if (orig := self._skipped.pop(strip_protocol_prefix(pv), None)) is not None]
+        to_rearm = [name for pv in pvs for name in sorted(self._skipped.pop(strip_protocol_prefix(pv), ()))]
         if to_rearm:
             await self.on_pv_deactivated(to_rearm)
 
@@ -85,7 +92,7 @@ class GraceManager:
         try:
             await asyncio.sleep(self._grace_seconds)
             if self._is_pinned(pv):
-                self._skipped[strip_protocol_prefix(pv)] = pv
+                self._skipped.setdefault(strip_protocol_prefix(pv), set()).add(pv)
                 logger.debug("Grace period expired for pinned %s; teardown deferred to its last unpin", pv)
                 return
             await self._ingest.unsubscribe([pv])
