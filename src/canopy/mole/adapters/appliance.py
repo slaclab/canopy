@@ -142,15 +142,18 @@ class EpicsArchiverApplianceAdapter:
         return [s for s in samples if t0_ns <= s.ts_ns <= t1_ns]
 
     async def fetch_window_budgeted(
-        self, pv: str, t0_ns: int, t1_ns: int, *, budget: int = SEED_SAMPLE_BUDGET
+        self, pv: str, t0_ns: int, t1_ns: int, *, budget: int = SEED_SAMPLE_BUDGET, max_samples: int | None = None
     ) -> ArchiveBlock:
         """Seed-path read: rate-sized windows newest-first, each parsed in a worker thread.
 
         ``getData`` has no server-side limit, so the budget is a target the next
         window is sized to. The oldest window also carries the last sample before
-        ``t0_ns`` (a zero-width query), at its true timestamp.
+        ``t0_ns`` (a zero-width query), at its true timestamp. ``max_samples``
+        stops the walk after the response that loads that many.
         """
-        return await fetch_window_budgeted_via(self._fetch_block, pv, t0_ns, t1_ns, budget=budget)
+        return await fetch_window_budgeted_via(
+            self._fetch_block, pv, t0_ns, t1_ns, budget=budget, max_samples=max_samples
+        )
 
     async def _fetch_block(self, pv: str, lo_ns: int, hi_ns: int, include_last_before: bool) -> ArchiveBlock:
         want_prior = include_last_before and lo_ns > 0

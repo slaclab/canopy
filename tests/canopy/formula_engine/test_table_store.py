@@ -470,7 +470,7 @@ class TestSeedOutcomes:
 
         dense_calls = []
 
-        async def dense_y(pv, t0, t1, *, budget=None):
+        async def dense_y(pv, t0, t1, *, budget=None, max_samples=None):
             # A 100 Hz PV: return a thin, representative block (values = ts seconds).
             dense_calls.append((t0, t1))
             h.calls.append(("window", pv, t0, t1))
@@ -480,8 +480,8 @@ class TestSeedOutcomes:
         port = h.port()
         orig = port.fetch_window_budgeted
 
-        async def routed(pv, t0, t1, *, budget=None):
-            return await (dense_y if pv == "Y1" else orig)(pv, t0, t1, budget=budget)
+        async def routed(pv, t0, t1, **kwargs):
+            return await (dense_y if pv == "Y1" else orig)(pv, t0, t1, **kwargs)
 
         port.fetch_window_budgeted = routed
         store = TableStore(make_view(trigger_spec(n=1000), day), TableSettings(), port)
@@ -918,3 +918,43 @@ async def test_a_new_inputs_live_cursor_starts_at_the_watermark_when_it_leads_th
     store.adopt(store.view)
     assert {st.last_seen_recv for st in store.inputs.values()} == {h.wm}
     store.cancel()
+
+
+@pytest.mark.parametrize("ahead_s", [0, 3])
+async def test_receive_stamps_ahead_of_the_clock_never_finalize_a_row_early(ahead_s):
+    """After a backward clock step the stamps (and watermark) lead the clock: a row waits longer, never less."""
+    from tests.canopy.formula_engine.table_harness import (
+        MS,
+        HOUR,
+        S,
+        Harness,
+        trigger_spec,
+    )
+    from canopy.formula_engine.services.table_store import (
+        TableStore,
+        TableSettings,
+        build_view,
+    )
+
+    h = Harness()
+    h.wm = h.now
+    h.archived("X", [(h.now - HOUR, 1.0)])
+    store = TableStore(build_view(trigger_spec(n=50, y={}), {"x": None}, HOUR), TableSettings(), h.port())
+    store.adopt(store.view)
+    await store.wait_ready()
+    h.now += 100 * MS
+    arrived = h.now
+    stamp = h.now + ahead_s * S
+    h.wm = stamp
+    await h.live("X", h.now - 50 * MS, 7.0, recv=stamp)  # X stays before the row: never "moved past"
+    await h.live("TRIG", h.now - 5 * MS, 1.0, recv=stamp)
+    store.tick(h.now)
+    final_after = None
+    for _ in range(200):
+        h.now += 100 * MS
+        h.wm = max(h.wm + 1, h.now)  # stamps advance 1 ns per flush until the clock catches up
+        store.tick(h.now)
+        if store.rows.count:
+            final_after = h.now - arrived
+            break
+    assert final_after == 2 * S + ahead_s * S  # the settle horizon, plus the lead

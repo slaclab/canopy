@@ -81,7 +81,7 @@ EnsureCapacityFn = Callable[..., None]
 LastAtOrBeforeFn = Callable[[str, int], SampleRecord | None]
 SamplesSinceFn = Callable[[str, int], list[SampleRecord]]
 RingSliceFn = Callable[[str, int], RingSlice]
-FetchWindowBudgetedFn = Callable[..., Awaitable[ArchiveBlock]]  # (pv, t0_ns, t1_ns, *, budget=None)
+FetchWindowBudgetedFn = Callable[..., Awaitable[ArchiveBlock]]  # (pv, t0_ns, t1_ns, *, budget=None, max_samples=None)
 FetchLastBeforeFn = Callable[..., Awaitable[list[Sample | None]]]  # (pv, ts_list)
 EventFaithfulFn = Callable[..., Awaitable[bool]]
 

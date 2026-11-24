@@ -365,6 +365,21 @@ def _edge_mask(values: np.ndarray, edge: str, prev: float | None) -> tuple[np.nd
     return fire, float(vv[-1])
 
 
+def _cut_of(block: ArchiveBlock, t0: int, cap: int) -> int | None:
+    """Where a fetch limited to ``cap`` samples stopped, or ``None`` if it covered ``t0``.
+
+    A walk that reaches ``t0`` carries the last sample before it; one stopped
+    by the limit does not, so its first sample is the oldest time it covers.
+    Rows older than that have no archive value from this fetch. (A walk that
+    reached ``t0`` with no older sample in the archive also reads as stopped:
+    its older rows have no value either way.)
+    """
+    if len(block) < cap or not len(block):
+        return None
+    first = int(block.ts_ns[0])
+    return first if first >= t0 else None
+
+
 def _bucket_start(ts_ns: int) -> int:
     """Start of the flush bucket holding ``ts_ns``."""
     return ts_ns // FLUSH_BUCKET_NS * FLUSH_BUCKET_NS
@@ -546,6 +561,10 @@ class TableStore:
         start = max(now, int(port.watermark()) if port.watermark is not None else 0)
         self.inputs: dict[str, InputState] = {pv: InputState(last_seen_recv=start) for pv in view.pvs}
         self.total_final = 0
+        # Oldest row time counted in ``total_final``: a row this old or newer that is
+        # seeded again (a full ring re-searched below its oldest held row) is not
+        # counted twice.
+        self.counted_from: int | None = None
         # Provisional tail: row times, arrivals and the visible (non-all-null) part's cells.
         self.tail_ts: list[int] = []
         self.tail_arrival: list[int] = []
@@ -692,6 +711,7 @@ class TableStore:
         self.rows.vals = {}
         self.rows.rebuild(ts, shared, capacity=view.n)
         self.total_final = source.total_final
+        self.counted_from = source.counted_from
         self.index_hwm = source.index_hwm
         self.searched_from = source.searched_from
         self.tail_ts = list(source.tail_ts)
@@ -720,9 +740,11 @@ class TableStore:
         bound = self.searched_from if self.searched_from is not None else oldest
         if view.trigger_pv is not None:
             hi = (bound - 1) if bound is not None else now
-            if oldest is not None and bound is not None and _bucket_start(bound - 1) == _bucket_start(oldest):
+            # The oldest held row, final or (with no final rows yet) the oldest tail row.
+            held = oldest if oldest is not None else (int(self.tail_ts[0]) if self.tail_ts else None)
+            if held is not None and bound is not None and _bucket_start(bound - 1) == _bucket_start(held):
                 # The oldest held row already stands for its whole bucket.
-                hi = _bucket_start(oldest) - 1
+                hi = _bucket_start(held) - 1
             if hi < lo:
                 return
             row_ts, arrival, trig_history, failed = await self._trigger_rows(view.trigger_pv, lo, hi, need)
@@ -801,7 +823,12 @@ class TableStore:
             for pv in set(vals) | set(held_vals)
         }
         self.rows.rebuild(np.concatenate([ts, held_ts]), new_vals)
-        self.total_final += len(ts)
+        if ts.size:
+            # Rows at or after ``counted_from`` were counted when first finalized.
+            fresh = ts if self.counted_from is None else ts[ts < self.counted_from]
+            self.total_final += int(fresh.size)
+            first = int(ts.min())
+            self.counted_from = first if self.counted_from is None else min(self.counted_from, first)
 
     def _apply_history(self, pv: str, fill: _Fill, now: int) -> None:
         st = self.inputs[pv]
@@ -929,7 +956,8 @@ class TableStore:
         oldest_bucket: int | None = None  # oldest bucket counted so far (faithful walk)
         while cur_hi >= lo:
             a = max(lo, cur_hi - width)
-            block = await fetch(pv, a, cur_hi)
+            # The limit stops Mole's walk inside this window, not just after it.
+            block = await fetch(pv, a, cur_hi, max_samples=self.settings.seed_max_samples - loaded)
             blocks.append(block)
             loaded += len(block)
             if edge is not None:
@@ -1012,8 +1040,13 @@ class TableStore:
             values, has = compute()
         if cut is not None:
             # The capped fetch stopped at ``cut``: older rows would otherwise carry its
-            # prior sample forward across samples it never loaded. Leave them null.
+            # prior sample forward across samples it never loaded. Leave them null --
+            # unless the re-read ring covers them (a sample, or a history seed, that
+            # landed during the fetch), where the ring's value stands.
+            ring_covers = first if before is not None else (int(sl.ts_ns[0]) if sl.ts_ns.size else None)
             older = row_ts < cut
+            if ring_covers is not None:
+                older &= row_ts < ring_covers
             if older.any():
                 values = np.array(values, dtype=np.float64, copy=True)
                 values[older] = np.nan
@@ -1040,7 +1073,10 @@ class TableStore:
             return await self._fetch_capped(pv, t0, t1, cap)
         # Probe the newest window, then decide from the observed rate.
         p_lo = max(t0, t1 - FIRST_SEED_WINDOW_NS)
-        probe = await fetch(pv, p_lo, t1)
+        probe = await fetch(pv, p_lo, t1, max_samples=cap)
+        probe_cut = _cut_of(probe, p_lo, cap)
+        if probe_cut is not None:  # the newest window alone holds the cap
+            return probe, probe_cut
         rate = len(probe) / max(t1 - p_lo, 1)
         requests = math.ceil(rate * (p_lo - t0) / SEED_SAMPLE_BUDGET)
         if requests <= rows / 20:
@@ -1058,28 +1094,14 @@ class TableStore:
     async def _fetch_capped(self, pv: str, t0: int, t1: int, cap: int) -> tuple[ArchiveBlock, int | None]:
         """Archive samples in ``[t0, t1]``, newest first, stopping once ``cap`` are loaded.
 
-        Each request is sized from the previous one's observed rate to about one
-        ``SEED_SAMPLE_BUDGET``, as the trigger walk does, so the cap is overshot by
-        at most one request. Returns the samples and, if the cap stopped the walk
-        before ``t0``, the oldest time it reached (else ``None``).
+        Mole's budgeted walk stops after the response that reaches ``cap``, so
+        the cap is overshot by at most one response (sized to about one budget;
+        more right after a quiet stretch, see `fetch_window_budgeted_via`).
+        Returns the samples and, if
+        the walk stopped short of ``t0``, the oldest time it covers (else ``None``).
         """
-        fetch = self.port.fetch_window_budgeted
-        blocks: list[ArchiveBlock] = []
-        loaded = 0
-        width = FIRST_SEED_WINDOW_NS
-        hi = t1
-        while True:
-            a = max(t0, hi - width)
-            block = await fetch(pv, a, hi)
-            blocks.append(block)
-            loaded += len(block)
-            if a == t0:
-                return ArchiveBlock.concat(blocks), None
-            if loaded >= cap:
-                return ArchiveBlock.concat(blocks), a
-            rate = max(len(block), 1) / max(hi - a, 1)
-            width = int(min(max(SEED_SAMPLE_BUDGET / rate, width), width * 8))
-            hi = a - 1
+        block = await self.port.fetch_window_budgeted(pv, t0, t1, max_samples=cap)
+        return block, _cut_of(block, t0, cap)
 
     # --- tick ---------------------------------------------------------------- #
 
@@ -1120,6 +1142,8 @@ class TableStore:
             row = {pv: float(cells[pv][i]) for pv in view.pvs}
             self.rows.append(p_ts[i], row)
             self.total_final += 1
+            if self.counted_from is None:
+                self.counted_from = int(p_ts[i])
             final_seq.append((p_ts[i], tuple(row[pv] for pv in view.pvs)))
         self.tail_ts = p_ts[n_final:]
         self.tail_arrival = p_arr[n_final:]

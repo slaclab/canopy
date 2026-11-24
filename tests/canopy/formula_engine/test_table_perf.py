@@ -61,13 +61,19 @@ class FastArchive:
             vals[:] = np.arange(trig_n, dtype=float).tolist()
             self.blocks[pv] = ArchiveBlock(tts, vals, np.zeros(trig_n, np.int8))
 
-    async def fetch(self, pv: str, t0: int, t1: int, *, budget: int | None = None) -> ArchiveBlock:
+    async def fetch(
+        self, pv: str, t0: int, t1: int, *, budget: int | None = None, max_samples: int | None = None
+    ) -> ArchiveBlock:
         self.calls += 1
         b = self.blocks.get(pv)
         if b is None:
             return ArchiveBlock.empty()
-        lo = max(int(np.searchsorted(b.ts_ns, t0, side="left")) - 1, 0)
+        first = int(np.searchsorted(b.ts_ns, t0, side="left"))
         hi = int(np.searchsorted(b.ts_ns, t1, side="right"))
+        if max_samples is not None and hi - first > max_samples:  # stopped by the limit: newest, no prior
+            lo = hi - max_samples
+        else:
+            lo = max(first - 1, 0)
         return ArchiveBlock(b.ts_ns[lo:hi], b.values[lo:hi], b.severities[lo:hi])
 
 

@@ -6,6 +6,7 @@ module-level singleton there. Tests can re-bind freely.
 """
 
 import asyncio
+import inspect
 import logging
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
@@ -100,19 +101,28 @@ class ArchiverService:
         *,
         archiver: str | None = None,
         budget: int | None = None,
+        max_samples: int | None = None,
     ) -> tuple[str, ArchiveBlock]:
         """Seed-path read as arrays. Returns ``(archiver_name, block)``; never decimates.
 
         ``ArchiverNotConfigured`` and ``PVNotFoundInArchiver`` propagate unchanged.
         An adapter without ``fetch_window_budgeted`` (see ``SeedCapableAdapter``)
-        is served from ``fetch_window``.
+        is served from ``fetch_window``. With ``max_samples`` the walk stops after
+        the response that loads that many; for an adapter that cannot stop early
+        (no ``max_samples`` parameter, or no budgeted fetch) the result is cut to
+        its newest ``max_samples`` samples, so the contract holds either way.
         """
         adapter = self._resolve(archiver)
         budgeted = getattr(adapter, "fetch_window_budgeted", None)
         if budgeted is not None:
-            return adapter.name, await budgeted(pv, t0_ns, t1_ns, budget=budget or SEED_SAMPLE_BUDGET)
+            kwargs: dict = {"budget": budget or SEED_SAMPLE_BUDGET}
+            stops = max_samples is not None and _takes_max_samples(budgeted)
+            if stops:
+                kwargs["max_samples"] = max_samples
+            block = await budgeted(pv, t0_ns, t1_ns, **kwargs)
+            return adapter.name, block if stops else _newest(block, max_samples)
         samples = await adapter.fetch_window(pv, t0_ns=t0_ns, t1_ns=t1_ns, max_points=None)
-        return adapter.name, ArchiveBlock.from_samples(samples)
+        return adapter.name, _newest(ArchiveBlock.from_samples(samples), max_samples)
 
     async def fetch_last_before(
         self, pv: str, ts_list: list[int], *, archiver: str | None = None
@@ -233,3 +243,20 @@ def _redact_url(url: str) -> str:
         _, _, host = parts.netloc.rpartition("@")
         return urlunsplit(parts._replace(netloc=f"***@{host}"))
     return url
+
+
+def _takes_max_samples(fn) -> bool:
+    """Whether an adapter's ``fetch_window_budgeted`` accepts ``max_samples``."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "max_samples" or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+
+
+def _newest(block: ArchiveBlock, max_samples: int | None) -> ArchiveBlock:
+    """``block`` cut to its newest ``max_samples`` samples (all of it when ``None``)."""
+    if max_samples is None or len(block) <= max_samples:
+        return block
+    k = len(block) - max(max_samples, 0)
+    return ArchiveBlock(block.ts_ns[k:], block.values[k:], block.severities[k:])

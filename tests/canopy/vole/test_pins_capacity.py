@@ -424,7 +424,8 @@ class TestProvisioning:
         config = VoleConfig(max_points=1000, global_bytes_max=BYTES_PER_SAMPLE * 300, settle_depth=10)
         service = _service(config, clock)
         mole.history["P"] = _archive(200, end_ns=NOW - 10 * S)
-        source = _source(service, mole, clock, [])
+        subscribed: list[str] = []
+        source = _source(service, mole, clock, subscribed)
         seed = service.seed
 
         async def seed_then_drop(pv, samples, **kw):
@@ -436,6 +437,7 @@ class TestProvisioning:
         await source.read_latest("P")
         assert service.ring_max_points("P") is None
         assert not service.is_provisioned("P")
+        assert subscribed == []  # eviction released its ingest; provisioning does not undo that
 
     async def test_numeric_string_pv_timeseries_is_unchanged(self, test_service):
         """Regression pin: alignment_service._to_float still parses numeric strings."""

@@ -65,13 +65,17 @@ async def fetch_window_budgeted(
     *,
     archiver: str | None = None,
     budget: int | None = None,
+    max_samples: int | None = None,
 ) -> ArchiveBlock:
     """Seed-path read as arrays, fetched newest-first in rate-sized windows and parsed off-loop.
 
-    See `ArchiverService.fetch_window_budgeted`. Terminal errors
-    (`ArchiverNotConfigured`, `PVNotFoundInArchiver`) propagate unchanged.
+    See `ArchiverService.fetch_window_budgeted` (``max_samples`` stops the walk
+    early). Terminal errors (`ArchiverNotConfigured`, `PVNotFoundInArchiver`)
+    propagate unchanged.
     """
-    _, block = await get_service().fetch_window_budgeted(pv, t0_ns, t1_ns, archiver=archiver, budget=budget)
+    _, block = await get_service().fetch_window_budgeted(
+        pv, t0_ns, t1_ns, archiver=archiver, budget=budget, max_samples=max_samples
+    )
     return block
 
 

@@ -1,6 +1,7 @@
 import os
 import logging
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,7 @@ class FormulaEngineConfig(BaseSettings):
     # walk, or its cells). Rows older than where the cap stopped get no value
     # for that input, which reports ``truncated``. Matches Vole's per-ring
     # ``max_points`` default, the most one PV's history fetch already loads.
-    table_seed_max_samples: int = 500_000
+    table_seed_max_samples: int = Field(default=500_000, ge=1)
 
     # --- live tables --- #
     # A table row is final this long (receive clock) after it arrived, or once

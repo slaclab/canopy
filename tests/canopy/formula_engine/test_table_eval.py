@@ -359,6 +359,26 @@ class TestSharingAndCarryOver:
         await wait_for(lambda: c20.results() and c20.tables()[-1]["tsNs"] == triggers[-20:])
         await rig.mgr.shutdown()
 
+    @pytest.mark.parametrize("path", ["copy", "linger"])
+    async def test_rows_seeded_again_below_a_rolled_ring_are_counted_once(self, path):
+        """totalRows of a larger N over a rolled n=5 store matches a fresh store's."""
+        totals = {}
+        for mode in (path, "fresh"):
+            rig = Rig()
+            await self._rolled_n5(rig, Collector())
+            if mode != "copy":
+                await rig.mgr.remove_subscription("a", "s")  # "linger": the store lingers for the next one
+            if mode == "fresh":
+                for st, _ in list(rig.mgr._lingering.values()):
+                    rig.mgr._drop_store(st)
+                rig.mgr._lingering.clear()
+            c = Collector()
+            await rig.sub("b", "s", trigger_spec(n=20), c, t0=-60 * S)
+            await wait_for(lambda: c.results() and len(c.tables()[-1]["tsNs"]) == 20)
+            totals[mode] = c.tables()[-1]["totalRows"]
+            await rig.mgr.shutdown()
+        assert totals[path] == totals["fresh"] == 20
+
     async def test_a_new_trigger_pv_seeds_from_scratch(self):
         rig = Rig()
         seed_archive(rig.h, ["X", "Y1"])

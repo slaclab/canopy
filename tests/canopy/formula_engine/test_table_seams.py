@@ -108,3 +108,18 @@ async def test_growing_n_extends_older_rows_with_one_row_per_bucket():
     rows = _rows(store)
     assert _one_per_bucket(rows)
     assert np.array_equal(rows, _coalesced(ts)[-600:])
+
+
+async def test_growing_n_over_a_store_with_only_tail_rows_makes_one_row_per_bucket():
+    """Every seeded row is still provisional (within the settle horizon): the stitch counts the tail."""
+    h = Harness()
+    h.wm = h.now
+    ts = _trigger_samples(h.now - HOUR, h.now - 1)
+    h.archived("TRIG", [(int(t), float(i)) for i, t in enumerate(ts)])
+    store = await _seed(h, 5)
+    assert store.rows.count == 0 and len(store.tail_ts) == 5
+    store.adopt(_view(50))
+    await store.wait_ready()
+    rows = _rows(store)
+    assert _one_per_bucket(rows)
+    assert np.array_equal(rows, _coalesced(ts)[-50:])
