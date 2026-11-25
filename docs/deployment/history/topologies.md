@@ -113,8 +113,12 @@ flowchart LR
   Add `-m magpie` if the head's users edit arm1's Magpie configs, and `-m core -a` only
   if the head should create, edit or delete arm1's facilities: an admin key on arm1
   also manages arm1's API keys (see [Who wrote it](operations.md#who-wrote-it)).
+  If arm1 sets `CANOPY_MODULES`, it includes `squirrel` and `jobs`, and `magpie` if
+  the key names it.
 - **head**: as in topology 2, plus `CANOPY_ARMS__ARM1__FORWARD_URL` (https) and
-  `CANOPY_ARMS__ARM1__SERVICE_KEY` from a secret, set together. Optionally
+  `CANOPY_ARMS__ARM1__SERVICE_KEY` from a secret, set together. If the head sets
+  `CANOPY_MODULES`, it includes `squirrel` and `jobs` (and `magpie`, for Magpie
+  configs): a module it leaves out answers 404 on the head and is never forwarded. Optionally
   `CANOPY_FORWARD__WAIT_S`, `__TIMEOUT_S` and `__CA_BUNDLE`. A superuser on the head
   grants its app role `SELECT` on `pg_replication_origin_status` and `EXECUTE` on
   `pg_show_replication_origin_status()`, or every forwarded answer is marked stale

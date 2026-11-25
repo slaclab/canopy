@@ -326,6 +326,39 @@ def pending_detail(entry: SnapshotOutbox, change: str) -> str:
     return f"Snapshot {entry.id} is waiting for delivery to {entry.arm}; {change} it once it's saved there"
 
 
+def require_snapshot_scope(scope: set[str] | None, facility_id: str | None, slug: str | None) -> None:
+    """Gate a *new* snapshot's facility by the key's grant.
+
+    A restricted key (``scope``) must name a facility it holds: minting an unassigned
+    snapshot would create data it couldn't reach again. An out-of-scope facility is a
+    403 naming it, since the caller named it. The capture route checks the owner after
+    this with ``capture_target``, which may save the snapshot on the facility's arm.
+    """
+    if scope is not None:
+        if facility_id is None:
+            raise InsufficientFacilityAccess("API key is scoped to specific facilities; 'facility' is required")
+        if facility_id not in scope:
+            raise InsufficientFacilityAccess(f"API key is not scoped to facility: {slug}")
+
+
+def require_snapshot_create(
+    scope: set[str] | None,
+    facility_id: str | None,
+    slug: str | None,
+    facility_owner: str | None,
+    requested_owner: str | None,
+    what: str,
+) -> None:
+    """Gate a *new* snapshot here: the key's facility grant first, then its owner.
+
+    The grant is ``require_snapshot_scope``'s. Only then the owner
+    (``require_create_owner``), so a caller who can't reach the facility isn't told
+    whose it is. ``import_bundle`` gates here.
+    """
+    require_snapshot_scope(scope, facility_id, slug)
+    require_create_owner(facility_owner, requested_owner, what)
+
+
 class SnapshotService:
     """Snapshot operations with EPICS integration. Owns no transaction — the caller
     (request dep or worker ``session_scope``) commits."""
@@ -386,6 +419,15 @@ class SnapshotService:
                 )
         return meta_pv_values
 
+    async def _require_writable(self, snapshot: Snapshot) -> None:
+        """Gate a write to ``snapshot``: the facility gate first, then the owner.
+
+        A caller who can't reach the row isn't told whose it is. Every write to an
+        existing snapshot goes through here.
+        """
+        await self._require_facility_write(snapshot.facility_id, "this snapshot")
+        require_owned(snapshot.owner_instance, f"Snapshot {snapshot.id}")
+
     async def _require_facility_write(self, facility_id: str | None, what: str) -> None:
         """Gate a write on the calling key's facility grant. Unrestricted keys pass
         unconditionally; a restricted key — including an empty-grant one — needs the
@@ -408,20 +450,6 @@ class SnapshotService:
             )
         if facility_id not in self.facility_scope:
             raise SnapshotNotFound("Snapshot not found")
-
-    def _require_facility_for_create(self, facility_id: str | None, slug: str | None) -> None:
-        """Gate the facility of a *new* snapshot, as the capture route does.
-
-        A restricted key must name a facility it holds: minting an unassigned snapshot
-        would create data it couldn't reach again. Unlike ``_require_facility_write``,
-        an out-of-scope facility is a 403 naming it, since the caller named it.
-        """
-        if self.facility_scope is None:
-            return
-        if facility_id is None:
-            raise InsufficientFacilityAccess("API key is scoped to specific facilities; 'facility' is required")
-        if facility_id not in self.facility_scope:
-            raise InsufficientFacilityAccess(f"API key is not scoped to facility: {slug}")
 
     async def _summary(self, snapshot: Snapshot, *, pv_count: int) -> SnapshotSummaryDTO:
         """``snapshot`` as a summary holding ``pv_count`` values."""
@@ -677,9 +705,7 @@ class SnapshotService:
         if not existing:
             await self._refuse_if_queued(snapshot_id, "change")
             return None
-        # The facility gate first: a caller who can't reach the row isn't told its owner.
-        await self._require_facility_write(existing.facility_id, "this snapshot")
-        require_owned(existing.owner_instance, f"Snapshot {snapshot_id}")
+        await self._require_writable(existing)
         snapshot = await self.snapshot_repo.update_metadata(
             snapshot_id, title=title, description=description, retain=retain
         )
@@ -1024,12 +1050,8 @@ class SnapshotService:
         assigned to that facility or one below it (``capture_scope``), as a capture into
         that facility would take it. Every rule is a condition in the loop below.
         """
-        known = await self.pv_repo.get_existing_ids(pv_ids, include_deleted=True, owner=local_instance())
-        needs_facilities = self.facility_scope is not None or capture_scope is not None
-        assigned = await self.pv_repo.facility_ids_for_many(sorted(known)) if needs_facilities else {}
         importable = set()
-        for pv_id in known:
-            facility_ids = assigned.get(pv_id, set())
+        for pv_id, facility_ids in (await self.pv_repo.facilities_of_owned(pv_ids, owner=local_instance())).items():
             if not self._pv_in_scope(facility_ids):
                 continue
             if capture_scope is not None and not facility_ids & capture_scope:
@@ -1100,22 +1122,23 @@ class SnapshotService:
             When a captured bundle's id is taken by a snapshot with another owner, facility or time.
         FacilityNotFound
             When the bundle names a facility this instance doesn't have.
+        InsufficientFacilityAccess
+            When the key can't write the bundle's facility; checked before the owner.
         NotOwner
             When the bundle's facility is another instance's.
-        InsufficientFacilityAccess
-            When the key can't write the bundle's facility.
         """
         if captured and not created_by:
             raise ValueError("a captured import records its author; pass created_by")
 
-        facility_id = None
+        facility_id = facility_owner = None
         if bundle.facility is not None:
             facility = await facilities_gateway.get_by_slug(bundle.facility)
             if facility is None:
                 raise FacilityNotFound(f"Facility '{bundle.facility}' not found")
-            require_create_owner(facility.owner_instance, None, f"Facility '{bundle.facility}'")
-            facility_id = facility.id
-        self._require_facility_for_create(facility_id, bundle.facility)
+            facility_id, facility_owner = facility.id, facility.owner_instance
+        require_snapshot_create(
+            self.facility_scope, facility_id, bundle.facility, facility_owner, None, f"Facility '{bundle.facility}'"
+        )
 
         if captured and (existing := await self.snapshot_repo.get_by_id(str(bundle.id), include_deleted=True)):
             return await self._already_saved(existing, bundle)
@@ -1606,6 +1629,5 @@ class SnapshotService:
         if not snapshot:
             await self._refuse_if_queued(snapshot_id, "delete")
             return False
-        await self._require_facility_write(snapshot.facility_id, "this snapshot")
-        require_owned(snapshot.owner_instance, f"Snapshot {snapshot_id}")
+        await self._require_writable(snapshot)
         return await self.snapshot_repo.soft_delete(snapshot_id)

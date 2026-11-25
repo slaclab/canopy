@@ -108,6 +108,9 @@ curl -X PUT -H "X-API-Key: dev" -H "Content-Type: application/json" \
 | `value` | number \| bool \| string \| array of scalars | required | The value to write |
 | `wait` | bool | `true` | Block until the IOC processes the write (put-with-callback). With `wait: true`, a `200` means the value landed. `false` submits without waiting for record processing |
 | `timeout` | number \| null | `null` | Per-write timeout in seconds (must be positive); `null` uses the connector default |
+| `binding` | string \| null | `null` | The connector binding the issuing screen was shown (the heartbeat's `binding`). A connector that can switch what it is connected to may refuse a write naming another; the built-in backends ignore it |
+| `origin` | object \| null | `null` | Where the write came from, for the connector's audit record: `{"screen": "<id>", "rev": "<revision or null>"}`; `screen` is required. The built-in backends ignore it |
+| `confirmed` | bool | `false` | `true` when a person confirmed the write in the viewer's dialog. A connector whose heartbeat `writes` state is `asked` refuses a write without it; the built-in backends ignore it |
 
 ### Response
 
@@ -119,6 +122,41 @@ curl -X PUT -H "X-API-Key: dev" -H "Content-Type: application/json" \
 
 A non-2xx status signals failure — a rejected or timed-out write returns
 `502 pv_write_failed`.
+
+## GET /hare/v1/health/summary
+
+The broker's rollup. Requires the `read` scope.
+
+```json
+{
+  "status": "ok",
+  "backend": "epics",
+  "connectorOk": true,
+  "clients": 3,
+  "activeMonitors": 53,
+  "connected": 52,
+  "warmMonitors": 4,
+  "subscriptions": 61,
+  "label": null,
+  "notice": null,
+  "binding": null,
+  "reachable": null,
+  "writes": null
+}
+```
+
+`connected` counts the active monitors whose latest value is connected (a
+monitor with no value yet is not connected); `warmMonitors` counts those kept
+warm with no subscriber left, which `activeMonitors` and `connected` both
+include. `label`, `notice`, `binding`, `reachable` and
+`writes` are the connector's statement, as in the WebSocket `heartbeat`.
+
+`status` is `degraded` when the broker is not running, or when the connector
+says the control system does not answer (`reachable.state` is `no`). Without a
+`reachable` claim it is `degraded` when monitors are active and none of them is
+connected, so during a fresh subscribe's seed window it may read `degraded` until
+a channel connects. A malformed statement counts as no claim; `writes` is
+reported, never judged.
 
 ## Error codes
 
