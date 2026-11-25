@@ -26,7 +26,7 @@ from canopy.squirrel.data.repositories import PvRepository
 from canopy.squirrel.services.pv_service import PvService
 from canopy.squirrel.services.snapshot_service import SnapshotService
 
-from .conftest import WRITE_HEADERS
+from .conftest import READ_HEADERS, WRITE_HEADERS
 from .test_services_snapshot import FakeEpicsIO, _ev, _NoHook
 
 
@@ -151,6 +151,101 @@ async def test_an_import_checks_duplicates_against_its_own_owner(client, as_inst
 
     assert r.status_code == 200, r.text
     assert r.json()[0]["ownerInstance"] == "arm1"
+
+
+# --- PV import with onConflict (POST /v1/pvs/import) --------------------------- #
+
+
+async def _import(client: AsyncClient, rows: list[dict], on_conflict: str, params: str = ""):
+    return await client.post(f"/v1/pvs/import?onConflict={on_conflict}{params}", headers=WRITE_HEADERS, json=rows)
+
+
+async def _stored(client: AsyncClient, pv_id: str) -> dict:
+    """A PV as stored, read back through the listing (there's no single-PV GET)."""
+    r = await client.get("/v1/pvs/paged", headers=READ_HEADERS, params={"pageSize": 1000})
+    assert r.status_code == 200, r.text
+    return next(pv for pv in r.json()["results"] if pv["id"] == pv_id)
+
+
+async def _foreign_tag(client: AsyncClient, as_instance) -> str:
+    with as_instance("arm2"):
+        group = (await client.post("/v1/tags", headers=WRITE_HEADERS, json={"name": "Area"})).json()
+        added = await client.post(f"/v1/tags/{group['id']}/tags", headers=WRITE_HEADERS, json={"name": "north"})
+    return added.json()["group"]["tags"][0]["id"]
+
+
+@pytest.mark.parametrize("on_conflict", ["skip", "update"])
+async def test_an_on_conflict_import_stamps_the_rows_it_creates(client, on_conflict):
+    r = await _import(client, [{"setpointAddress": "NEW:SP"}], on_conflict)
+
+    assert r.status_code == 200, r.text
+    assert [pv["ownerInstance"] for pv in r.json()["created"]] == ["arm1"]
+    _refused(await _import(client, [{"setpointAddress": "OTHER:SP"}], on_conflict, "&owner=arm2"), "not_owner", 403)
+
+
+@pytest.mark.parametrize("on_conflict", ["skip", "update"])
+async def test_an_on_conflict_import_matches_only_this_instances_pvs(client, as_instance, on_conflict):
+    # Identities are unique per owner, so another owner's PV at the address is neither
+    # skipped nor changed: the row is this instance's own new PV, as with /multi.
+    with as_instance("arm2"):
+        theirs = await _pv(client, "SHARED:SP", device="THEIRS")
+
+    r = await _import(client, [{"setpointAddress": "SHARED:SP", "device": "MINE"}], on_conflict)
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert (body["skipped"], body["updated"]) == ([], [])
+    assert [(pv["ownerInstance"], pv["device"]) for pv in body["created"]] == [("arm1", "MINE")]
+    assert (await _stored(client, theirs["id"]))["device"] == "THEIRS"
+
+
+async def test_an_update_row_refuses_another_owners_tag_as_a_pv_update_does(client, as_instance):
+    tag_id = await _foreign_tag(client, as_instance)
+    mine = await _pv(client, "MINE:SP", device="BEFORE")
+
+    _refused(
+        await client.put(f"/v1/pvs/{mine['id']}", headers=WRITE_HEADERS, json={"device": "AFTER", "tags": [tag_id]}),
+        "owner_mismatch",
+        409,
+    )
+    row = {"setpointAddress": "MINE:SP", "device": "AFTER", "tags": [tag_id]}
+    _refused(await _import(client, [row], "update"), "owner_mismatch", 409)
+
+    stored = await _stored(client, mine["id"])
+    assert (stored["device"], stored["tags"]) == ("BEFORE", [])
+
+
+@pytest.mark.parametrize("on_conflict", ["skip", "update"])
+async def test_an_on_conflict_import_has_one_owner(client, db_session, as_instance, on_conflict):
+    # A matched row's facilities only pass the create gate (they're never applied to the
+    # PV), so the create rule judges them, for every row, as in /multi.
+    await _facility(db_session, as_instance, "remote", "arm2")
+    await _facility(db_session, as_instance, "local", "arm1")
+    await _pv(client, "LOCAL:SP", facilities=["local"])
+
+    remote = [{"setpointAddress": "LOCAL:SP", "facilities": ["remote"]}]
+    _refused(await _import(client, remote, on_conflict), "not_owner", 403)
+    mixed = [
+        {"setpointAddress": "LOCAL:SP", "facilities": ["local"]},
+        {"setpointAddress": "NEW:SP", "facilities": ["remote"]},
+    ]
+    _refused(await _import(client, mixed, on_conflict), "owner_mismatch", 409)
+
+
+@pytest.mark.parametrize("on_conflict", ["skip", "update"])
+async def test_on_a_mirror_an_import_cant_write_an_arms_pvs(client, db_session, as_instance, mirror_role, on_conflict):
+    # A head holds its arms' rows through replication and writes none of them, through
+    # this route as through PUT /v1/pvs/{id}.
+    await _facility(db_session, as_instance, "north", "arm2")
+    with as_instance("arm2"):
+        theirs = await _pv(client, "ARM:SP", device="THEIRS", facilities=["north"])
+    rows = [{"setpointAddress": "ARM:SP", "device": "HEAD", "facilities": ["north"]}]
+
+    _refused(await _import(client, rows, on_conflict), "not_owner", 403)
+    _refused(
+        await client.put(f"/v1/pvs/{theirs['id']}", headers=WRITE_HEADERS, json={"device": "HEAD"}), "not_owner", 403
+    )
+    assert (await _stored(client, theirs["id"]))["device"] == "THEIRS"
 
 
 async def test_a_meta_pv_follows_its_pv(client, as_instance):
