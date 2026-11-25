@@ -129,7 +129,11 @@ def _bitwise_apply(operator, left: object, right: object | None = None) -> float
 
     if isinstance(left_int, np.ndarray) or isinstance(right_int, np.ndarray):
         left_values = np.asarray(left_int)
-        left_finite = np.isfinite(left_values) if np.issubdtype(left_values.dtype, np.floating) else np.ones(left_values.shape, dtype=bool)
+        left_finite = (
+            np.isfinite(left_values)
+            if np.issubdtype(left_values.dtype, np.floating)
+            else np.ones(left_values.shape, dtype=bool)
+        )
         left_integer = np.zeros(left_values.shape, dtype=np.int64)
         left_integer[left_finite] = np.trunc(left_values[left_finite]).astype(np.int64)
         left_values = left_integer
@@ -140,7 +144,11 @@ def _bitwise_apply(operator, left: object, right: object | None = None) -> float
             result[left_finite] = np.asarray(finite_result, dtype=np.float64)
         else:
             right_values = np.asarray(right_int)
-            right_finite = np.isfinite(right_values) if np.issubdtype(right_values.dtype, np.floating) else np.ones(right_values.shape, dtype=bool)
+            right_finite = (
+                np.isfinite(right_values)
+                if np.issubdtype(right_values.dtype, np.floating)
+                else np.ones(right_values.shape, dtype=bool)
+            )
             right_integer = np.zeros(right_values.shape, dtype=np.int64)
             right_integer[right_finite] = np.trunc(right_values[right_finite]).astype(np.int64)
             right_values = right_integer

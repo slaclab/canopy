@@ -178,9 +178,7 @@ class TestEvaluateArray:
     async def test_bitwise_array_preserves_nan_values(self, parser):
         """Keep missing samples as NaN instead of failing the whole array."""
         parsed = parser.parse("{a} & 4", {"a": "PV:A"})
-        result = await evaluate_array(
-            parsed, {"__v0": np.array([4.0, np.nan, 0.0])}, timeout_s=1.0
-        )
+        result = await evaluate_array(parsed, {"__v0": np.array([4.0, np.nan, 0.0])}, timeout_s=1.0)
         assert result[0] == 4.0
         assert np.isnan(result[1])
         assert result[2] == 0.0
@@ -196,17 +194,13 @@ class TestEvaluateArray:
     async def test_int_array_preserves_exact_integers_above_2_53(self, parser):
         """int() must not round an existing int64 array through float64."""
         parsed = parser.parse("int(int({a}) + 1) - int({a})", {"a": "PV:A"})
-        result = await evaluate_array(
-            parsed, {"__v0": np.array([2**53], dtype=np.int64)}, timeout_s=1.0
-        )
+        result = await evaluate_array(parsed, {"__v0": np.array([2**53], dtype=np.int64)}, timeout_s=1.0)
         np.testing.assert_array_equal(result, [1.0])
 
     async def test_bitwise_preserves_exact_integers_above_2_53(self, parser):
         """Bitwise coercion must keep the low bits of an exact int64 operand."""
         parsed = parser.parse("(int({a}) + 1) & 1", {"a": "PV:A"})
-        result = await evaluate_array(
-            parsed, {"__v0": np.array([2**53], dtype=np.int64)}, timeout_s=1.0
-        )
+        result = await evaluate_array(parsed, {"__v0": np.array([2**53], dtype=np.int64)}, timeout_s=1.0)
         np.testing.assert_array_equal(result, [1.0])
 
     async def test_str_array_is_rejected(self, parser):
