@@ -68,6 +68,10 @@ class SubscriptionRegistry:
     def client_pvs(self, client_id: str) -> set[str]:
         return set(self._client_pvs.get(client_id, ()))
 
+    def is_subscribed(self, client_id: str, pv: str) -> bool:
+        """Whether ``client_id`` holds ``pv``, without copying its subscriptions as `client_pvs` does."""
+        return pv in self._client_pvs.get(client_id, ())
+
     def active_pvs(self) -> list[str]:
         return list(self._pv_clients.keys())
 

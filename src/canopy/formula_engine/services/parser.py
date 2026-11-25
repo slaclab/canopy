@@ -192,8 +192,14 @@ def _resolve_call_name(node: ast.Call) -> str | None:
     if isinstance(node.func, ast.Name):
         return node.func.id
     if isinstance(node.func, ast.Attribute):
-        if isinstance(node.func.value, ast.Name) and node.func.value.id in ("np", "math"):
-            return node.func.attr
+        if isinstance(node.func.value, ast.Name):
+            prefix = node.func.value.id
+            attr = node.func.attr
+            if prefix == "np":
+                aliases = {"float": "float", "int": "int", "isnan": "isnan"}
+                return aliases.get(attr) if attr in aliases else (attr if attr in SAFE_FUNCS else None)
+            if prefix == "math" and attr in SAFE_FUNCS and attr not in {"float", "int", "str", "isnan"}:
+                return attr
     return None
 
 
@@ -212,5 +218,11 @@ def _check_numexpr_compatible(tree: ast.AST) -> bool:
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
             return False
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.FloorDiv):
+            return False
+        if isinstance(node, ast.BinOp) and isinstance(
+            node.op, ast.BitAnd | ast.BitOr | ast.BitXor | ast.LShift | ast.RShift
+        ):
+            return False
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Invert):
             return False
     return True

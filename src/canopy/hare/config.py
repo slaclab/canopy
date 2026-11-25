@@ -8,6 +8,7 @@ broker/WebSocket knobs. Examples::
     CANOPY_HARE__HEARTBEAT_INTERVAL_S=5
 """
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +22,15 @@ class HareConfig(BaseSettings):
 
     # Diff-stream batching window: buffered updates flush to clients this often.
     ws_batch_interval_ms: int = 100
+    initial_frame_max_pvs: int = Field(1_000, gt=0)
+    """Max PVs in one ``initial`` frame sent by a flush; at least 1.
+
+    PVs that finish seeding between two flushes are sent together; a client
+    with more ready PVs than this gets several frames in that flush, so one
+    large subscribe never produces a single multi-megabyte frame. There is no
+    "no limit" value: 0 or less is refused at startup rather than read as a cap
+    of 1, which would send one frame per PV again.
+    """
     # Heartbeat frames keep clients aware the broker is alive.
     heartbeat_interval_s: float = 5.0
 
