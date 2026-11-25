@@ -806,6 +806,98 @@ async def test_a_failed_delivery_is_logged_and_the_other_clients_still_get_their
     assert "flush delivery to client broken failed" in caplog.text
 
 
+async def test_a_cancelled_delivery_is_logged(fake_connector, caplog):
+    """A delivery that ends in ``CancelledError`` comes back from the gather as a result, and is logged."""
+    broker = PVBroker(fake_connector, HareConfig())
+    broker.add_client("cancelled", FakeWebSocket())
+    await broker.subscribe("cancelled", ["PV:ONE"])
+    await settle(broker)
+    fake_connector.emit("PV:ONE", 5.0, ts=12)
+    await broker._drain_nowait()
+
+    async def send(client_id, message):
+        raise asyncio.CancelledError
+
+    broker._send = send
+    with caplog.at_level("WARNING", logger="canopy.hare.services.broker"):
+        await broker._flush()
+
+    assert "flush delivery to client cancelled was cancelled" in caplog.text
+
+
+class _FailingWebSocket(FakeWebSocket):
+    """A client whose sends, once ``armed``, wait for ``gate`` and then fail, as a dropped socket's would."""
+
+    def __init__(self, gate: asyncio.Event) -> None:
+        super().__init__()
+        self.gate = gate
+        self.armed = False
+        self.waiting = False
+
+    async def send_json(self, data) -> None:
+        if not self.armed:
+            await super().send_json(data)
+            return
+        self.waiting = True
+        await self.gate.wait()
+        raise ConnectionError("socket closed")
+
+
+@pytest.mark.parametrize("grace", [0.0, 0.05])
+async def test_two_clients_failing_in_one_flush_release_their_shared_pv_once(fake_connector, grace):
+    """Two clients whose sends fail in the same flush drop themselves concurrently.
+
+    The PV they share is released once, after its grace period when it has
+    one: its monitor is closed once and the deactivation hook fires once.
+    """
+    broker = PVBroker(fake_connector, HareConfig(monitor_grace_seconds=grace))
+    closes: list[str] = []
+    real_subscribe = fake_connector.subscribe
+
+    async def subscribe(pv, on_event):
+        sub = await real_subscribe(pv, on_event)
+        real_close = sub.close
+
+        async def close():
+            closes.append(pv)
+            await real_close()
+
+        sub.close = close
+        return sub
+
+    fake_connector.subscribe = subscribe
+    deactivated: list[list[str]] = []
+
+    async def on_deactivate(pvs):
+        deactivated.append(pvs)
+
+    broker.add_deactivation_hook(on_deactivate)
+    gate = asyncio.Event()
+    first, second = _FailingWebSocket(gate), _FailingWebSocket(gate)
+    broker.add_client("first", first)
+    broker.add_client("second", second)
+    await broker.subscribe("first", ["PV:SHARED"])
+    await broker.subscribe("second", ["PV:SHARED"])
+    await settle(broker)
+    first.armed = second.armed = True
+    fake_connector.emit("PV:SHARED", 6.0, ts=13)
+    await broker._drain_nowait()
+
+    flush = asyncio.create_task(broker._flush())
+    assert await wait_for(lambda: first.waiting and second.waiting)  # both sends in flight at once
+    gate.set()
+    await asyncio.wait_for(flush, 1.0)
+    if grace:
+        (release,) = broker._grace.values()
+        await asyncio.wait_for(release, 1.0)
+
+    assert closes == ["PV:SHARED"]
+    assert deactivated == [["PV:SHARED"]]
+    assert "PV:SHARED" not in broker._monitors
+    assert "PV:SHARED" not in broker._seed_locks
+    assert "first" not in broker._channels and "second" not in broker._channels
+
+
 async def test_connected_updates_do_not_repeat_a_failed_describe(fake_connector):
     """Only the connect edge starts a describe; further connected updates inside the backoff window do not."""
     broker = PVBroker(fake_connector, HareConfig(seed_retry_backoff_s=3600))

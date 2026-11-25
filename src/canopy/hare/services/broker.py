@@ -1024,7 +1024,11 @@ class PVBroker:
             return_exceptions=True,
         )
         for client_id, result in zip(clients, results):
-            if isinstance(result, Exception):
+            # A delivery cancelled on its own comes back as a result, and
+            # CancelledError is a BaseException, not an Exception.
+            if isinstance(result, asyncio.CancelledError):
+                logger.warning("flush delivery to client %s was cancelled", client_id)
+            elif isinstance(result, BaseException):
                 logger.error("flush delivery to client %s failed", client_id, exc_info=result)
 
     async def _deliver_flush(
