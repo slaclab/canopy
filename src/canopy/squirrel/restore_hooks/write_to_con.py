@@ -32,11 +32,6 @@ class WriteToConHook(RestoreHook):
         -------
         list[tuple[str, Any]]
             ``[(<BCON address>, value)]`` for a magnet BDES setpoint, empty otherwise.
-
-        Raises
-        ------
-        RestoreHookError
-            When ``address`` is a magnet PV without a trailing ``BDES`` segment.
         """
         con_addr = derive_magnet_address(address, BCON_SEGMENT)
         if con_addr is None:

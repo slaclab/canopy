@@ -28,7 +28,7 @@ essentials:
 | Variable | Purpose |
 |----------|---------|
 | `CANOPY_API_KEYS` | API-key registry — see below. Unset means every gated endpoint returns 401 |
-| `CANOPY_EPICS__BACKEND` | `simulation` (default) or `epics`. **Production must set `epics`** |
+| `CANOPY_EPICS__BACKEND` | `simulation` (default) or `epics`, or a `module:Class` path to an [out-of-tree backend](../how_to/custom_epics_backend.md). **Production must not use `simulation`** |
 | `EPICS_CA_ADDR_LIST`, `EPICS_PVA_ADDR_LIST`, ... | Standard EPICS network discovery variables (only with the `epics` backend) |
 | `CANOPY_DATABASE_URL` | Postgres, asyncpg driver: `postgresql+asyncpg://user:pass@host:port/db` |
 | `CANOPY_REDIS_URL` | Redis: `redis://[:password@]host:port/0`. One per instance: a primary and its mirror must not share a queue (give them separate Redis servers or database numbers), since a mirror's worker has no snapshot tasks and fails any primary job it takes |
@@ -85,5 +85,5 @@ its first migration.
 | `GET /health` | Process liveness — used by the container healthchecks and post-deploy checks |
 | `GET /<module>/v1/health/watchdog` | Per-module liveness heartbeat (version, uptime) |
 | `GET /<module>/v1/health/summary` | Per-module status rollup (requires read access) — e.g. Hare's reports backend, client and monitor counts |
-| `GET /v1/instance` | `{role, instance, historyUrl, windowDays, alembicHead}` (requires read access on `core`). `alembicHead` is the migrations head shipped in the image, not the database's, read once at startup. It is `null` where the process finds no migrations tree, as in the dev image, or the tree has more than one head |
-| `GET /metrics` | Prometheus exposition (unauthenticated, like `/health`): request counts and latency per module route, plus module gauges — see [Metrics](../observability/metrics.md) |
+| `GET /v1/instance` | `{role, instance, historyUrl, windowDays, alembicHead}` (requires read access on `core`). `alembicHead` is the migrations head shipped in the image, not the database's, read once at startup. It is `null` where the process finds no migrations tree, as in the dev image, or no Alembic, as on an install without the `data` extra, or the tree has more than one head |
+| `GET /metrics` | Prometheus exposition (unauthenticated, like `/health`, unless [`CANOPY_CLOSED_META`](api-keys.md#closed-meta-routes) is on): request counts and latency per module route, plus module gauges — see [Metrics](../observability/metrics.md) |

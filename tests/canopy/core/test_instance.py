@@ -129,6 +129,12 @@ class TestShippedAlembicHead:
         assert shipped_alembic_head() == "aaaa00000001"
         assert sys.path == before
 
+    def test_no_alembic_is_none_not_an_error(self, monkeypatch):
+        # An install without the ``data`` extra; the repo's alembic.ini is in the working directory.
+        monkeypatch.setitem(sys.modules, "alembic.config", None)
+
+        assert shipped_alembic_head() is None
+
     def test_missing_tree_is_none_not_an_error(self, monkeypatch, tmp_path):
         monkeypatch.setenv("ALEMBIC_CONFIG", str(tmp_path / "absent.ini"))
 
