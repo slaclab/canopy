@@ -34,6 +34,7 @@ class ErrorCode(StrEnum):
     OWNER_MISMATCH = auto()
     MACHINE_READ_ONLY = auto()
     MODULE_UNAVAILABLE = auto()
+    INVALID_SETTINGS = auto()
 
     # Mole
     ARCHIVER_NOT_CONFIGURED = auto()

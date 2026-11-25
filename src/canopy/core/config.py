@@ -2,8 +2,8 @@ from typing import Any, Literal
 from functools import lru_cache
 from collections.abc import Mapping, Iterable
 
-from pydantic import Field, BaseModel, ValidationInfo, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, BaseModel, ValidationInfo, ValidationError, field_validator
+from pydantic_settings import BaseSettings, SettingsError, SettingsConfigDict
 
 INSTANCE_NAME_PATTERN = r"^[a-z0-9_]{1,48}$"
 """An instance name: ``CANOPY_INSTANCE``, an arm's name and every owner stamp."""
@@ -203,3 +203,18 @@ def blank_keeps_default(model: type[BaseModel], value: object, info: ValidationI
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def describe_settings_error(exc: ValidationError | SettingsError) -> str:
+    """Which settings are wrong and why, never their values.
+
+    A ``ValidationError``'s own text (``str`` and ``repr``) echoes its input, which
+    may hold a password, so only each error's variable and message are kept. A
+    ``SettingsError`` names only the field and its source (a value that isn't JSON).
+    """
+    if isinstance(exc, SettingsError):
+        return str(exc)
+    return "; ".join(
+        f"CANOPY_{'__'.join(str(part) for part in error['loc']).upper()}: {error['msg']}"
+        for error in exc.errors(include_input=False, include_url=False, include_context=False)
+    )
