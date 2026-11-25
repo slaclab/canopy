@@ -270,6 +270,30 @@ def _decode_cursor(token: str | None) -> tuple[datetime, str] | None:
     return created_at, snapshot_id
 
 
+def require_snapshot_create(
+    scope: set[str] | None,
+    facility_id: str | None,
+    slug: str | None,
+    facility_owner: str | None,
+    requested_owner: str | None,
+    what: str,
+) -> None:
+    """Gate a *new* snapshot: the key's facility grant first, then its owner.
+
+    A restricted key (``scope``) must name a facility it holds: minting an unassigned
+    snapshot would create data it couldn't reach again. An out-of-scope facility is a
+    403 naming it, since the caller named it. Only then the owner
+    (``require_create_owner``), so a caller who can't reach the facility isn't told
+    whose it is. The capture route and ``import_bundle`` both gate here.
+    """
+    if scope is not None:
+        if facility_id is None:
+            raise InsufficientFacilityAccess("API key is scoped to specific facilities; 'facility' is required")
+        if facility_id not in scope:
+            raise InsufficientFacilityAccess(f"API key is not scoped to facility: {slug}")
+    require_create_owner(facility_owner, requested_owner, what)
+
+
 class SnapshotService:
     """Snapshot operations with EPICS integration. Owns no transaction — the caller
     (request dep or worker ``session_scope``) commits."""
@@ -352,20 +376,6 @@ class SnapshotService:
             )
         if facility_id not in self.facility_scope:
             raise SnapshotNotFound("Snapshot not found")
-
-    def _require_facility_for_create(self, facility_id: str | None, slug: str | None) -> None:
-        """Gate the facility of a *new* snapshot, as the capture route does.
-
-        A restricted key must name a facility it holds: minting an unassigned snapshot
-        would create data it couldn't reach again. Unlike ``_require_facility_write``,
-        an out-of-scope facility is a 403 naming it, since the caller named it.
-        """
-        if self.facility_scope is None:
-            return
-        if facility_id is None:
-            raise InsufficientFacilityAccess("API key is scoped to specific facilities; 'facility' is required")
-        if facility_id not in self.facility_scope:
-            raise InsufficientFacilityAccess(f"API key is not scoped to facility: {slug}")
 
     async def _summary(self, snapshot: Snapshot, *, pv_count: int) -> SnapshotSummaryDTO:
         """``snapshot`` as a summary holding ``pv_count`` values."""
@@ -936,22 +946,23 @@ class SnapshotService:
             When a captured bundle's id is taken by a snapshot with another owner, facility or time.
         FacilityNotFound
             When the bundle names a facility this instance doesn't have.
+        InsufficientFacilityAccess
+            When the key can't write the bundle's facility; checked before the owner.
         NotOwner
             When the bundle's facility is another instance's.
-        InsufficientFacilityAccess
-            When the key can't write the bundle's facility.
         """
         if captured and not created_by:
             raise ValueError("a captured import records its author; pass created_by")
 
-        facility_id = None
+        facility_id = facility_owner = None
         if bundle.facility is not None:
             facility = await facilities_gateway.get_by_slug(bundle.facility)
             if facility is None:
                 raise FacilityNotFound(f"Facility '{bundle.facility}' not found")
-            require_create_owner(facility.owner_instance, None, f"Facility '{bundle.facility}'")
-            facility_id = facility.id
-        self._require_facility_for_create(facility_id, bundle.facility)
+            facility_id, facility_owner = facility.id, facility.owner_instance
+        require_snapshot_create(
+            self.facility_scope, facility_id, bundle.facility, facility_owner, None, f"Facility '{bundle.facility}'"
+        )
 
         if captured and (existing := await self.snapshot_repo.get_by_id(str(bundle.id), include_deleted=True)):
             return await self._already_saved(existing, bundle)
