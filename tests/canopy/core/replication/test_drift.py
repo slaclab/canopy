@@ -1,6 +1,7 @@
 """``drift-check`` without a database: declarations, comparison, and the command's exit status per arm."""
 
 import json
+import asyncio
 import pkgutil
 import importlib
 from argparse import Namespace
@@ -490,3 +491,33 @@ async def test_a_failed_head_check_keeps_the_arms_reports(
     assert report["head"]["status"] == "not_checked"
     assert "statement timeout" in report["head"]["error"]
     assert secret not in out and secret not in caplog.text
+
+
+async def test_arms_are_checked_at_the_same_time_each_on_a_head_connection_of_its_own(
+    head_only, env, monkeypatch, capsys
+):
+    env(
+        CANOPY_ARMS__ARM1__READER_DSN="postgresql://r:pw@arm1-db/db",
+        CANOPY_ARMS__ARM2__READER_DSN="postgresql://r:pw@arm2-db/db",
+    )
+    heads = []
+
+    async def connect(dsn, **_kwargs):
+        conn = _Head()
+        if "head-db" in dsn:
+            heads.append(conn)
+        return conn
+
+    both = asyncio.Barrier(2)
+    read_on = {}
+
+    async def drift_check(_primary, mirror, *, arm, **_kwargs):
+        read_on[arm] = mirror
+        await asyncio.wait_for(both.wait(), 2)  # passes only while the other arm is in flight too
+        return _arm_report("in_step")
+
+    monkeypatch.setattr(drift.asyncpg, "connect", connect)
+    monkeypatch.setattr(drift, "drift_check", drift_check)
+    assert await drift.run(ARGS) == 0
+    assert len({id(conn) for conn in read_on.values()}) == 2
+    assert all(conn in heads[1:] for conn in read_on.values())  # not the run's own head connection

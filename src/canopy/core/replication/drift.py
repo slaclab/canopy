@@ -663,23 +663,31 @@ def overall(statuses: list[str]) -> str:
     return "not_checked" if "not_checked" in statuses else "in_step"
 
 
-async def _check_arm(mirror: asyncpg.Connection, name: str, arm: Arm, *, days, settle_s, secrets) -> dict:
-    """One arm's report; a failure to reach or read it makes that arm not checked, not the run."""
+async def _check_arm(
+    mirror: asyncpg.Connection, name: str, arm: Arm, *, days, settle_s, secrets, connect_head=None
+) -> dict:
+    """One arm's report; a failure to reach or read it makes that arm not checked, not the run.
+
+    With ``connect_head``, the head is read on a connection of its own instead of ``mirror``.
+    """
     if arm.reader_dsn is None or not arm.reader_dsn.get_secret_value():
         return _not_checked(f"set CANOPY_ARMS__{name.upper()}__READER_DSN to this arm's read-only URI (from a secret)")
-    primary = None
+    primary = head = None
     try:
         primary = await asyncpg.connect(
             arm.reader_dsn.get_secret_value(), server_settings={**SESSION, "default_transaction_read_only": "on"}
         )
-        return await drift_check(primary, mirror, arm=name, days=days, settle_s=settle_s)
+        if connect_head is not None:
+            head = await connect_head()
+        return await drift_check(primary, head or mirror, arm=name, days=days, settle_s=settle_s)
     except Refused as exc:
         return _not_checked(str(exc))
     except Exception as exc:  # still "couldn't check", never 1 ("drift")
         return _not_checked(redact(str(exc) or repr(exc), secrets))
     finally:
-        if primary is not None:
-            await primary.close()
+        for conn in (primary, head):
+            if conn is not None:
+                await conn.close()
 
 
 def _copying(row: dict, ready: frozenset) -> bool:
@@ -695,8 +703,13 @@ async def check_arms(
     days: int | None = None,
     settle_s: float = 30.0,
     registry: ReplicationRegistry = REGISTRY,
+    connect_head: Callable[[], Awaitable[asyncpg.Connection]] | None = None,
 ) -> dict:
     """Each of ``names`` compared with its arm, plus one integrity check of the head.
+
+    With ``connect_head``, the arms are checked at the same time, each reading the head
+    on a connection of its own (one connection runs one query at a time). Without it,
+    one after another on ``mirror``. The head's own check always uses ``mirror``.
 
     Returns
     -------
@@ -708,10 +721,17 @@ async def check_arms(
         owns, its ``status``, and an ``error`` when its check couldn't finish.
     """
     secrets = [arm.reader_dsn.get_secret_value() for arm in arms.values() if arm.reader_dsn]
-    reports = {
-        name: await _check_arm(mirror, name, arms[name], days=days, settle_s=settle_s, secrets=secrets)
-        for name in names
-    }
+
+    def check(name: str) -> Awaitable[dict]:
+        return _check_arm(
+            mirror, name, arms[name], days=days, settle_s=settle_s, secrets=secrets, connect_head=connect_head
+        )
+
+    if connect_head is None:
+        results = [await check(name) for name in names]
+    else:
+        results = await asyncio.gather(*(check(name) for name in names))
+    reports = dict(zip(names, results, strict=True))
     for report in reports.values():
         report.setdefault("dangling", [])
         report.setdefault("pending", [])
@@ -759,8 +779,20 @@ async def run(args: argparse.Namespace) -> int:
     try:
         require_role("drift-check", "mirror", settings.role)
         names = _selected_arms(arms, args.arm, settings.instance)
-        mirror = await asyncpg.connect(asyncpg_dsn(settings.database_url), server_settings=SESSION)
-        report = await check_arms(mirror, arms, names, days=args.days, settle_s=args.settle)
+        head_dsn = asyncpg_dsn(settings.database_url)
+        mirror = await asyncpg.connect(head_dsn, server_settings=SESSION)
+
+        def connect_head() -> Awaitable[asyncpg.Connection]:
+            return asyncpg.connect(head_dsn, server_settings=SESSION)
+
+        report = await check_arms(
+            mirror,
+            arms,
+            names,
+            days=args.days,
+            settle_s=args.settle,
+            connect_head=connect_head if len(names) > 1 else None,
+        )
     except Refused as exc:
         logger.error("refused: %s", exc)
         return 2
