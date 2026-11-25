@@ -102,18 +102,36 @@ def test_parser_options():
         build_parser().parse_args(["drift-check", "--days", "0"])
 
 
+# Uuid columns that name a row which needn't exist here, so the head never checks them.
+NOT_REFERENCES = frozenset(
+    {
+        # Provenance: the snapshot its bundle was exported from, maybe on another instance or gone.
+        ("squirrel.snapshot", "imported_from"),
+    }
+)
+
+
 # Ids are uuids across the schema, so every uuid column of a replicated table other
-# than its own id holds another row's id: each one is a foreign key, or declared in
-# REFERENCES, so the head check can't miss one, whatever the column is called.
+# than its own id holds another row's id: each one is a foreign key, declared in
+# REFERENCES, or listed in NOT_REFERENCES, so the head check can't miss one, whatever
+# the column is called.
 @pytest.mark.parametrize("table", [t for t in REGISTRY.replicated if t in Base.metadata.tables])
 def test_every_reference_is_a_foreign_key_or_declared(table):
     for column in Base.metadata.tables[table].columns:
         if column.name == "id" or not isinstance(column.type, sqltypes.Uuid):
             continue
-        assert column.foreign_keys or (table, column.name) in REFERENCES, (
+        key = (table, column.name)
+        assert column.foreign_keys or key in REFERENCES or key in NOT_REFERENCES, (
             f"{table}.{column.name}: make it a foreign key, declare it in drift.REFERENCES, "
-            "or, if it holds no other row's id, list it here"
+            "or, if it needn't name a row here, list it in NOT_REFERENCES"
         )
+
+
+@pytest.mark.parametrize(("table", "column"), sorted(NOT_REFERENCES))
+def test_unchecked_ids_name_real_uuid_columns(table, column):
+    found = Base.metadata.tables[table].columns[column]
+    assert isinstance(found.type, sqltypes.Uuid)
+    assert not found.foreign_keys and (table, column) not in REFERENCES
 
 
 # references() reads single-column foreign keys only.
