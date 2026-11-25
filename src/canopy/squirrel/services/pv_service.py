@@ -169,6 +169,18 @@ class PvService:
         slugs = sorted((await facilities_gateway.slugs_by_id(row_facility_ids)).values())
         raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility(s): {', '.join(slugs)}")
 
+    async def _unrevivable(self, deleted: list[Pv]) -> set[str]:
+        """The ids of the deleted PVs in ``deleted`` that this key may not bring back.
+
+        A deleted PV comes back only for a key that could write it: bringing back
+        another facility's PV would move its past values into this key's facility.
+        ``create`` and ``create_many`` both ask here.
+        """
+        if self.facility_scope is None or not deleted:
+            return set()
+        old_ids = await self.pv_repo.facility_ids_for_many([pv.id for pv in deleted])
+        return {pv.id for pv in deleted if not self._can_write(old_ids.get(pv.id, set()))}
+
     async def _require_facility_for_create(self, facility_ids: set[str], what: str) -> None:
         """Gate the facilities a *new* row is being created with.
 
@@ -355,12 +367,8 @@ class PvService:
             one_owner(facility_owners.values(), "The PV's facilities"), owner, f"PV '{identity_address}'"
         )
 
-        # A deleted PV comes back only for a key that could write it: bringing back
-        # another facility's PV would move its past values into this key's facility.
         existing = await self._find_by_identity(kind, identity_address)
-        if existing is not None and (
-            existing.deleted_at is None or not self._can_write(await self.pv_repo.facility_ids_for(existing.id))
-        ):
+        if existing is not None and (existing.deleted_at is None or await self._unrevivable([existing])):
             raise PvAlreadyExists(f"PV with {kind} address '{identity_address}' already exists")
 
         tags = []
@@ -506,13 +514,9 @@ class PvService:
                     deleted[(kind, address)] = pv
         if revived:
             raise PvAlreadyExists(f"Addresses already exist: {sorted(revived)[:10]}")
-        # As in `create`, a deleted PV comes back only for a key that could write it.
-        if deleted and self.facility_scope is not None:
-            old_ids = await self.pv_repo.facility_ids_for_many([pv.id for pv in deleted.values()])
-            if held := sorted(
-                address for (_, address), pv in deleted.items() if not self._can_write(old_ids.get(pv.id, set()))
-            ):
-                raise PvAlreadyExists(f"Addresses already exist: {held[:10]}")
+        unrevivable = await self._unrevivable(list(deleted.values()))
+        if held := sorted(address for (_, address), pv in deleted.items() if pv.id in unrevivable):
+            raise PvAlreadyExists(f"Addresses already exist: {held[:10]}")
 
         all_tag_ids: set[str] = set()
         for *_, data in normalized_records:
