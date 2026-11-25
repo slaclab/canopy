@@ -169,6 +169,17 @@ class PvService:
         slugs = sorted((await facilities_gateway.slugs_by_id(row_facility_ids)).values())
         raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility(s): {', '.join(slugs)}")
 
+    async def _require_writable(self, pv: Pv) -> set[str]:
+        """Gate a write to ``pv``, and return its facility ids.
+
+        The facility gate comes first, then the owner: a caller who can't reach the row
+        isn't told whose it is. Every write to an existing PV goes through here.
+        """
+        facility_ids = await self.pv_repo.facility_ids_for(pv.id)
+        await self._require_facility_write(facility_ids, "this PV")
+        require_owned(pv.owner_instance, f"PV {pv.id}")
+        return facility_ids
+
     async def _unrevivable(self, deleted: list[Pv]) -> set[str]:
         """The ids of the deleted PVs in ``deleted`` that this key may not bring back.
 
@@ -559,10 +570,7 @@ class PvService:
         pv = await self.pv_repo.get_by_id(pv_id)
         if not pv:
             return None
-        # The facility gate first: a caller who can't reach the row isn't told its owner.
-        facility_ids = await self.pv_repo.facility_ids_for(pv_id)
-        await self._require_facility_write(facility_ids, "this PV")
-        require_owned(pv.owner_instance, f"PV {pv_id}")
+        facility_ids = await self._require_writable(pv)
         if data.facilities is not None:
             new_ids = set((await self._resolve_slugs(data.facilities)).values())
             # A restricted key may not strip a PV down to unassigned: that would hide it
@@ -617,8 +625,7 @@ class PvService:
         # instance's row out of SELECT ... FOR UPDATE, so it would look missing.
         if (pv := await self.pv_repo.get_by_id(pv_id)) is None:
             return False
-        await self._require_facility_write(await self.pv_repo.facility_ids_for(pv_id), "this PV")
-        require_owned(pv.owner_instance, f"PV {pv_id}")
+        await self._require_writable(pv)
         # Now this instance's own row, locked so a meta-PV marker can't be added between
         # the check below and the delete; re-read, in case it went or moved meanwhile.
         if await self.pv_repo.get_by_id(pv_id, for_update=True) is None:
