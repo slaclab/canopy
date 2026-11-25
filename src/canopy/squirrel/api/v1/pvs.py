@@ -15,9 +15,11 @@ from canopy.core.security import require_read_access, require_write_access
 from canopy.core.validation import require_uuid, parse_continuation_token
 from canopy.squirrel.errors import PvNotFound
 from canopy.squirrel.schemas.pv import (
+    OnConflict,
     PVElementDTO,
     NewPVElementDTO,
     PVSearchResponse,
+    PVImportResultDTO,
     UpdatePVElementDTO,
 )
 from canopy.contracts.pagination import PagedResult
@@ -126,6 +128,25 @@ async def create_pv(data: NewPVElementDTO, service: PvServiceDep) -> PVElementDT
 async def create_multiple_pvs(data: list[NewPVElementDTO], service: PvServiceDep) -> list[PVElementDTO]:
     """Bulk-create PVs (CSV import)."""
     return await service.create_many(data)
+
+
+@router.post("/import", dependencies=[Security(require_write_access)])
+async def import_pvs(
+    data: list[NewPVElementDTO],
+    service: PvServiceDep,
+    onConflict: OnConflict = Query(
+        description=(
+            "What to do with a row whose identifying address is already registered: "
+            "'skip' leaves the registered PV alone, 'update' applies the row's provided fields to it"
+        ),
+    ),
+) -> PVImportResultDTO:
+    """Bulk-import PVs (CSV import), skipping or updating rows already registered.
+
+    The counterpart of ``/multi``, which refuses the whole import if any row is
+    registered. One transaction; see ``PvService.import_many``.
+    """
+    return await service.import_many(data, onConflict)
 
 
 @router.put("/{pv_id}", dependencies=[Security(require_write_access)])
