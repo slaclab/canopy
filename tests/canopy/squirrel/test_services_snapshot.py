@@ -362,27 +362,23 @@ async def test_restore_attributes_primary_failure_to_setpoints(db_session: Async
     assert result.failures[0]["phase"] == "Setpoints"
 
 
-async def test_restore_derivation_error_skips_the_pv_and_blames_setpoints(db_session: AsyncSession):
-    """A PV a hook cannot derive from is never written, so nothing is left half-restored."""
-    await _seed_pv(db_session, "QUAD:SIM:01:RBV")
-    io = FakeEpicsIO({"QUAD:SIM:01:RBV": _ev(3.0)})
-    svc = SnapshotService(db_session, io, restore_hooks=[MagnetTrimHook()])
+async def test_restore_writes_non_bdes_magnet_pvs_without_trimming(db_session: AsyncSession):
+    """An EDES magnet PV needs no trim: it is restored as-is, without a failure."""
+    await _seed_pv(db_session, "QUAD:SIM:01:BDES")
+    await _seed_pv(db_session, "QUAD:SIM:01:EDES")
+    io = FakeEpicsIO({"QUAD:SIM:01:BDES": _ev(3.0), "QUAD:SIM:01:EDES": _ev(0.5)})
+    svc = SnapshotService(db_session, io, restore_hooks=[WriteToConHook(), MagnetTrimHook()])
     summary = await svc.create_snapshot(NewSnapshotDTO(title="m"))
 
     io.writes.clear()
-    result, emitted = await _restore_recording_phases(svc, summary.id)
-    assert io.writes == {}
-    assert result.failure_count == 1
-    assert result.failures[0]["phase"] == "Setpoints"
-    assert "not a BDES setpoint" in result.failures[0]["error"]
-
-    # The failure lands in Setpoints when that phase starts, not before.
-    _assert_phases_only_move_forward(emitted)
-    assert emitted[0][0] == {"name": "Setpoints", "current": 0, "total": 1, "status": "pending", "failures": 0}
-    assert emitted[-1] == [
-        {"name": "Setpoints", "current": 1, "total": 1, "status": "completed", "failures": 1},
-        {"name": "MagnetTrimHook", "current": 0, "total": 0, "status": "skipped", "failures": 0},
-    ]
+    result = await svc.restore_snapshot(summary.id)
+    assert io.writes == {
+        "QUAD:SIM:01:BDES": 3.0,
+        "QUAD:SIM:01:EDES": 0.5,
+        "QUAD:SIM:01:BCON": 3.0,
+        "QUAD:SIM:01:CTRL": "TRIM",
+    }
+    assert result.success_count == 2 and result.failure_count == 0
 
 
 class _MirrorHook(RestoreHook):
@@ -397,6 +393,29 @@ class _RefusingHook(RestoreHook):
 
     def derive_extra_writes(self, address: str, value: Any) -> list[tuple[str, Any]]:
         raise RestoreHookError(f"cannot derive from {address}")
+
+
+async def test_restore_derivation_error_skips_the_pv_and_blames_setpoints(db_session: AsyncSession):
+    """A PV a hook cannot derive from is never written, so nothing is left half-restored."""
+    await _seed_pv(db_session, "A:SP")
+    io = FakeEpicsIO({"A:SP": _ev(3.0)})
+    svc = SnapshotService(db_session, io, restore_hooks=[_RefusingHook()])
+    summary = await svc.create_snapshot(NewSnapshotDTO(title="s"))
+
+    io.writes.clear()
+    result, emitted = await _restore_recording_phases(svc, summary.id)
+    assert io.writes == {}
+    assert result.failure_count == 1
+    assert result.failures[0]["phase"] == "Setpoints"
+    assert "cannot derive from A:SP" in result.failures[0]["error"]
+
+    # The failure lands in Setpoints when that phase starts, not before.
+    _assert_phases_only_move_forward(emitted)
+    assert emitted[0][0] == {"name": "Setpoints", "current": 0, "total": 1, "status": "pending", "failures": 0}
+    assert emitted[-1] == [
+        {"name": "Setpoints", "current": 1, "total": 1, "status": "completed", "failures": 1},
+        {"name": "_RefusingHook", "current": 0, "total": 0, "status": "skipped", "failures": 0},
+    ]
 
 
 async def test_restore_skips_an_earlier_hooks_writes_when_a_later_hook_refuses(db_session: AsyncSession):

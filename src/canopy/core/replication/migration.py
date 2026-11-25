@@ -31,8 +31,6 @@ from __future__ import annotations
 
 from typing import Literal
 
-from alembic import op
-
 Side = Literal["publisher", "subscriber"]
 
 OPTION = "canopy_replication_side"
@@ -56,6 +54,10 @@ def migration_side() -> Side:
         When the migration environment didn't record a side (it wasn't run through
         ``migrations/env.py``), so a side-specific step can't guess.
     """
+    # Imported here: the API imports ``side_for_role`` for its replication gauges, and
+    # importing ``canopy.main`` must not load Alembic (``test_module_selection.py``).
+    from alembic import op
+
     side = op.get_context().opts.get(OPTION)
     if side not in ("publisher", "subscriber"):
         raise RuntimeError(

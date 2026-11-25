@@ -1,13 +1,14 @@
-"""``heartbeat`` on a head: what it records on one arm, with both sides stubbed."""
+"""``heartbeat`` (and ``switch``) on a head: what they do with one arm, with both sides stubbed."""
 
 from datetime import UTC, datetime
 
 import pytest
+import asyncpg
 from pydantic import SecretStr
 
 from canopy.core.arms import Arm
 from canopy.core.replication import subscriber
-from canopy.core.replication.sql import Refused
+from canopy.core.replication.sql import Refused, ReplicationError
 
 ARMS = {
     "arm1": Arm(heartbeat_dsn=SecretStr("postgresql://beat:secret@arm1.example.org/canopy")),
@@ -115,3 +116,52 @@ async def test_an_unknown_arm_is_refused_before_connecting(reached):
     with pytest.raises(Refused, match="no arm named 'arm9'"):
         await _beat("arm9")
     assert reached.connected == []
+
+
+class _LostArm:
+    """An arm connection that drops mid-statement, naming its DSN, and can't be closed cleanly either."""
+
+    def __init__(self, error: Exception):
+        self.error = error
+
+    async def fetchval(self, *_args):
+        raise self.error
+
+    async def close(self):
+        raise ConnectionResetError("already gone")
+
+
+_DROPS = [
+    ConnectionResetError("reset by peer: postgresql://beat:secret@arm1.example.org/canopy"),
+    asyncpg.InterfaceError("connection is closed: postgresql://beat:secret@arm1.example.org/canopy"),
+]
+
+
+@pytest.mark.parametrize("error", _DROPS, ids=["os-error", "interface-error"])
+async def test_a_connection_dropped_mid_heartbeat_is_a_redacted_replication_error(monkeypatch, error):
+    _status(monkeypatch)
+
+    async def connect(_name, arm, _command):
+        return _LostArm(error), arm.heartbeat_dsn.get_secret_value()
+
+    monkeypatch.setattr(subscriber, "_connect_arm", connect)
+    with pytest.raises(ReplicationError, match="writing the heartbeat to arm arm1 failed") as failed:
+        await _beat("arm1")
+
+    assert "secret" not in str(failed.value)
+
+
+@pytest.mark.parametrize("error", _DROPS, ids=["os-error", "interface-error"])
+async def test_a_connection_dropped_mid_switch_is_a_redacted_replication_error(monkeypatch, error):
+    async def subscription(_conn, name):
+        return {"subname": name, "subpublications": ["canopy_history"], "subenabled": True, "subslotname": name}
+
+    async def connect(_name, arm, _command):
+        return _LostArm(error), arm.heartbeat_dsn.get_secret_value()
+
+    monkeypatch.setattr(subscriber, "_subscription", subscription)
+    monkeypatch.setattr(subscriber, "_connect_arm", connect)
+    with pytest.raises(ReplicationError, match="reading arm arm1 failed") as failed:
+        await subscriber.switch(None, role="mirror", arm="arm1", arms=ARMS)
+
+    assert "secret" not in str(failed.value)

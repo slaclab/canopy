@@ -37,6 +37,7 @@ class ErrorCode(StrEnum):
     PRIMARY_UNAVAILABLE = auto()
     SERVICE_KEY_REFUSED = auto()
     MACHINE_READ_ONLY = auto()
+    MODULE_UNAVAILABLE = auto()
     INVALID_SETTINGS = auto()
 
     # Mole
@@ -72,6 +73,9 @@ class ErrorCode(StrEnum):
     INVALID_MESSAGE = auto()
     INVALID_SPEC = auto()
     SUBSCRIPTION_LIMIT_EXCEEDED = auto()
+    TABLE_LIVE_ONLY = auto()
+    TABLE_UPDATE_UNSUPPORTED = auto()
+    TABLE_LIMIT = auto()
 
     # Vole
     PV_NOT_BUFFERED = auto()
@@ -347,6 +351,13 @@ class MachineReadOnly(CanopyError):
 
     status_code = 403
     error_code = ErrorCode.MACHINE_READ_ONLY
+
+
+class ModuleUnavailable(CanopyError):
+    """The request needs a module this deployment did not select (``CANOPY_MODULES``)."""
+
+    status_code = 503
+    error_code = ErrorCode.MODULE_UNAVAILABLE
 
 
 def register_canopy_error_handler(app: FastAPI) -> None:

@@ -131,6 +131,16 @@ def _not_switched(walsenders: list[dict], registry: ReplicationRegistry) -> list
     return reasons
 
 
+async def _require_switched(conn: asyncpg.Connection, registry: ReplicationRegistry) -> None:
+    """Refuse to drop ``canopy_history`` while any history slot isn't streaming the split pair."""
+    if reasons := _not_switched(await _subscription_walsenders(conn), registry):
+        names = ", ".join(p.name for p in registry.publications)
+        raise Refused(
+            f"{names} is still needed: {'; '.join(reasons)}. Run `switch --arm <this arm>` on the "
+            "head, then `publish --split` here again"
+        )
+
+
 @dataclass(frozen=True)
 class PublicationState:
     """A publication as this database has it.
@@ -372,12 +382,8 @@ async def publish(
 
     layout = await publication_layout(conn, registry)
     drop_single = split and layout == "switching"
-    if drop_single and (reasons := _not_switched(await _subscription_walsenders(conn), registry)):
-        names = ", ".join(p.name for p in registry.publications)
-        raise Refused(
-            f"{names} is still needed: {'; '.join(reasons)}. Run `switch --arm <this arm>` on the "
-            "head, then `publish --split` here again"
-        )
+    if drop_single:
+        await _require_switched(conn, registry)
     if split or layout in ("switching", "split"):
         publications = registry.split_publications + (
             () if layout in ("none", "split") or drop_single else registry.publications
@@ -393,6 +399,9 @@ async def publish(
             published.update(desired)
             result["publications"][publication.name] = await _sync_publication(conn, publication, desired)
         if drop_single:
+            # Again, just before the drop: the head may have connected anew since the
+            # check above. A refusal here rolls back this whole run.
+            await _require_switched(conn, registry)
             for publication in registry.publications:
                 await conn.execute(f"DROP PUBLICATION {quote_ident(publication.name)}")
                 result["publications"][publication.name] = {"dropped": True}

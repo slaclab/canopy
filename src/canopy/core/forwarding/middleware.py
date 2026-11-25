@@ -23,7 +23,7 @@ from prometheus_client import Counter
 from starlette.responses import Response, JSONResponse
 from starlette.datastructures import Headers, QueryParams
 
-from canopy.core.config import get_settings
+from canopy.core.config import get_settings, module_selected
 from canopy.core.errors import CanopyError, ArchivedImmutable
 from canopy.core.security import APIKey, get_registry
 from canopy.core.ownership import local_instance
@@ -96,7 +96,9 @@ class ForwardingMiddleware:
             return
         settings = get_settings()
         if settings.role == "mirror" and scope["method"] in _WRITE_METHODS:
-            if found := routes.match(scope["method"], _route_path(scope)):
+            # A module this deployment doesn't mount isn't forwarded either: the app answers 404.
+            found = routes.match(scope["method"], _route_path(scope))
+            if found and (found[0].module == "core" or module_selected(scope, found[0].module)):
                 await self._route(scope, receive, send, *found)
                 return
         elif settings.role == "primary" and settings.accept_forwarded_writes:
