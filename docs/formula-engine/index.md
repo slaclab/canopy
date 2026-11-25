@@ -39,8 +39,8 @@ PV names in bindings may optionally include `ca://` or `pva://` protocol prefixe
 C-style boolean operators (`&&`, `||`, `!`) are normalized to Python equivalents before evaluation.
 Bitwise expressions use Python operator precedence; use parentheses to make grouping explicit. Bitwise operands
 are truncated toward zero before conversion to signed 64-bit integers. Scalar results are floating-point values;
-array results are float64 arrays. Missing array elements remain NaN, out-of-range finite values and shift counts
-outside 0-63 are rejected.
+array results are float64 arrays. Intermediate bitwise results retain their integer precision until evaluation
+finishes. Missing array elements remain NaN, out-of-range finite values and shift counts outside 0-63 are rejected.
 
 ## Available functions
 

@@ -13,6 +13,8 @@ import numpy as np
 def _float(value: object) -> float | np.ndarray:
     """Convert a scalar or array value to floating point."""
     if isinstance(value, np.ndarray):
+        if np.ma.isMaskedArray(value):
+            return value.astype(np.float64).filled(np.nan)
         return np.asarray(value, dtype=np.float64)
     return float(value)
 
@@ -27,9 +29,14 @@ def _int(value: object) -> int | np.ndarray:
         return int(value)
 
     if np.issubdtype(value.dtype, np.integer) or np.issubdtype(value.dtype, np.bool_):
-        if np.any(value.astype(object) < -(2**63)) or np.any(value.astype(object) >= 2**63):
+        data = np.ma.getdata(value)
+        integers = data[~np.ma.getmaskarray(value)].astype(object)
+        if np.any(integers < -(2**63)) or np.any(integers >= 2**63):
             raise OverflowError("int() array values must fit in signed 64-bit integers")
         return value.astype(np.int64)
+
+    if np.ma.isMaskedArray(value):
+        value = value.astype(np.float64).filled(np.nan)
 
     values = np.asarray(value, dtype=np.float64)
     finite = np.isfinite(values)
@@ -51,6 +58,8 @@ def _str(value: object) -> str:
 def _isnan(value: object) -> bool | np.ndarray:
     """Test scalar or array values for NaN."""
     if isinstance(value, np.ndarray):
+        if np.ma.isMaskedArray(value):
+            return np.ma.filled(np.isnan(value), True)
         return np.isnan(value)
     return bool(np.isnan(value))
 

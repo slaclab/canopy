@@ -6,6 +6,7 @@ the event loop. Timeout is enforced via ``asyncio.wait_for``.
 
 import ast
 import asyncio
+from functools import wraps
 from collections.abc import Iterable
 
 import numpy as np
@@ -40,6 +41,7 @@ _ARRAY_BITWISE_OPERATORS = {
     int.__rshift__: np.right_shift,
     int.__invert__: np.invert,
 }
+_NAN_REDUCTIONS = {"mean", "sum", "min", "max", "std", "var", "ptp", "count_nonzero"}
 
 
 class _BitwiseTransformer(ast.NodeTransformer):
@@ -51,14 +53,26 @@ class _BitwiseTransformer(ast.NodeTransformer):
             isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id == "np"
-            and node.func.attr in {"float", "int", "isnan"}
+            and node.func.attr in {"float", "int", "str", "isnan", "where", *_NAN_REDUCTIONS}
         ):
-            name = "isnan" if node.func.attr == "isnan" else node.func.attr
             return ast.copy_location(
-                ast.Call(func=ast.Name(id=name, ctx=ast.Load()), args=node.args, keywords=node.keywords),
+                ast.Call(func=ast.Name(id=node.func.attr, ctx=ast.Load()), args=node.args, keywords=node.keywords),
                 node,
             )
         return node
+
+    def visit_Compare(self, node: ast.Compare) -> ast.AST:
+        self.generic_visit(node)
+        if len(node.ops) != 1:
+            return node
+        return ast.copy_location(
+            ast.Call(
+                func=ast.Name(id="_bitwise_comparison", ctx=ast.Load()),
+                args=[node, ast.Constant(value=isinstance(node.ops[0], ast.NotEq))],
+                keywords=[],
+            ),
+            node,
+        )
 
     def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
         self.generic_visit(node)
@@ -92,16 +106,21 @@ def _bitwise_integer(value: object) -> int | np.ndarray:
     scalar integer.
     """
     if isinstance(value, np.ndarray):
-        if np.issubdtype(value.dtype, np.integer) or np.issubdtype(value.dtype, np.bool_):
-            if np.any(value.astype(object) < -(2**63)) or np.any(value.astype(object) >= 2**63):
+        data = np.ma.getdata(value)
+        present = ~np.ma.getmaskarray(value)
+        if np.issubdtype(data.dtype, np.integer) or np.issubdtype(data.dtype, np.bool_):
+            integers = data[present].astype(object)
+            if np.any(integers < -(2**63)) or np.any(integers >= 2**63):
                 raise OverflowError("Bitwise array operands must fit in signed 64-bit integers")
             return value.astype(np.int64)
 
-        values = np.asarray(value, dtype=np.float64)
-        finite = np.isfinite(values)
+        values = np.asarray(data, dtype=np.float64)
+        finite = np.isfinite(values) & present
         truncated = np.trunc(values[finite])
         if np.any(truncated < -(2**63)) or np.any(truncated >= 2**63):
             raise OverflowError("Bitwise array operands must fit in signed 64-bit integers")
+        if np.ma.isMaskedArray(value):
+            return np.ma.array(values, mask=~present)
         return values
 
     if isinstance(value, np.generic):
@@ -122,47 +141,77 @@ def _wrap_int64(value: int) -> int:
     return value
 
 
-def _bitwise_apply(operator, left: object, right: object | None = None) -> float | np.ndarray:
+def _nan_reduction(function):
+    """Keep missing values as NaN rather than ignoring them in reductions."""
+
+    @wraps(function)
+    def reduce(*args, **kwargs):
+        args = tuple(arg.astype(np.float64).filled(np.nan) if np.ma.isMaskedArray(arg) else arg for arg in args)
+        kwargs = {
+            key: value.astype(np.float64).filled(np.nan) if np.ma.isMaskedArray(value) else value
+            for key, value in kwargs.items()
+        }
+        return function(*args, **kwargs)
+
+    return reduce
+
+
+def _where(condition, *choices):
+    """Preserve missing elements when selecting from masked bitwise results."""
+    if len(choices) == 2 and any(np.ma.isMaskedArray(value) for value in (condition, *choices)):
+        condition = np.ma.filled(condition, True)
+        return np.ma.where(condition, *choices)
+    if np.ma.isMaskedArray(condition):
+        condition = condition.astype(np.float64).filled(np.nan)
+    return np.where(condition, *choices)
+
+
+def _bitwise_apply(operator, left: object, right: object | None = None) -> int | np.ndarray:
     """Apply a bitwise operator to scalar or array operands."""
     left_int = _bitwise_integer(left)
     right_int = None if right is None else _bitwise_integer(right)
 
     if isinstance(left_int, np.ndarray) or isinstance(right_int, np.ndarray):
-        left_values = np.asarray(left_int)
+        left_values = np.ma.getdata(left_int)
         left_finite = (
             np.isfinite(left_values)
             if np.issubdtype(left_values.dtype, np.floating)
             else np.ones(left_values.shape, dtype=bool)
         )
+        left_finite &= ~np.ma.getmaskarray(left_int)
         left_integer = np.zeros(left_values.shape, dtype=np.int64)
-        left_integer[left_finite] = np.trunc(left_values[left_finite]).astype(np.int64)
+        left_integer[left_finite] = left_values[left_finite].astype(np.int64)
         left_values = left_integer
 
         if right_int is None:
             finite_result = _ARRAY_BITWISE_OPERATORS[operator](left_values[left_finite])
-            result = np.full(left_values.shape, np.nan, dtype=np.float64)
-            result[left_finite] = np.asarray(finite_result, dtype=np.float64)
+            result = np.zeros(left_values.shape, dtype=np.int64)
+            result[left_finite] = finite_result
+            finite = left_finite
         else:
-            right_values = np.asarray(right_int)
+            right_values = np.ma.getdata(right_int)
             right_finite = (
                 np.isfinite(right_values)
                 if np.issubdtype(right_values.dtype, np.floating)
                 else np.ones(right_values.shape, dtype=bool)
             )
+            right_finite &= ~np.ma.getmaskarray(right_int)
             right_integer = np.zeros(right_values.shape, dtype=np.int64)
-            right_integer[right_finite] = np.trunc(right_values[right_finite]).astype(np.int64)
+            right_integer[right_finite] = right_values[right_finite].astype(np.int64)
             right_values = right_integer
             left_values, left_finite, right_values, right_finite = np.broadcast_arrays(
                 left_values, left_finite, right_values, right_finite
             )
             finite = left_finite & right_finite
-            result = np.full(left_values.shape, np.nan, dtype=np.float64)
+            result = np.zeros(left_values.shape, dtype=np.int64)
             if operator in (int.__lshift__, int.__rshift__):
                 if np.any(right_values[finite] < 0) or np.any(right_values[finite] >= 64):
                     raise ValueError("Bitwise shift counts must be between 0 and 63")
             finite_result = _ARRAY_BITWISE_OPERATORS[operator](left_values[finite], right_values[finite])
-            result[finite] = np.asarray(finite_result, dtype=np.float64)
-        return result
+            result[finite] = finite_result
+        if np.all(finite):
+            return result
+        return np.ma.array(result, mask=~finite)
 
     if right_int is None:
         result = _wrap_int64(operator(left_int))
@@ -170,20 +219,26 @@ def _bitwise_apply(operator, left: object, right: object | None = None) -> float
         if operator in (int.__lshift__, int.__rshift__) and (right_int < 0 or right_int >= 64):
             raise ValueError("Bitwise shift counts must be between 0 and 63")
         result = _wrap_int64(operator(left_int, right_int))
-    return float(result)
+    return result
 
 
 def _bitwise_eval_namespace() -> dict[str, object]:
     """Build the asteval namespace with bitwise helper functions."""
     namespace = build_eval_namespace()
+    for name in _NAN_REDUCTIONS:
+        namespace[name] = _nan_reduction(namespace[name])
     namespace.update(
         {
+            "where": _where,
             "_bitwise_bitand": lambda left, right: _bitwise_apply(int.__and__, left, right),
             "_bitwise_bitor": lambda left, right: _bitwise_apply(int.__or__, left, right),
             "_bitwise_bitxor": lambda left, right: _bitwise_apply(int.__xor__, left, right),
             "_bitwise_lshift": lambda left, right: _bitwise_apply(int.__lshift__, left, right),
             "_bitwise_rshift": lambda left, right: _bitwise_apply(int.__rshift__, left, right),
             "_bitwise_invert": lambda value: _bitwise_apply(int.__invert__, value),
+            "_bitwise_comparison": lambda value, missing: np.ma.filled(value, missing)
+            if np.ma.isMaskedArray(value)
+            else value,
         }
     )
     return namespace
@@ -240,6 +295,8 @@ def _evaluate_array_asteval(parsed: ParsedFormula, variables: dict[str, np.ndarr
         raise FormulaTypeError(f"Evaluation error: {'; '.join(msgs)}")
     if result is None:
         raise FormulaTypeError("Expression returned None")
+    if np.ma.isMaskedArray(result):
+        result = result.astype(np.float64).filled(np.nan)
     return np.asarray(result, dtype=np.float64)
 
 
@@ -260,6 +317,12 @@ def _evaluate_scalar_asteval(
         raise FormulaTypeError("Expression returned None")
     if isinstance(result, np.generic):
         result = result.item()
+    if (
+        isinstance(tree.body, ast.Call)
+        and isinstance(tree.body.func, ast.Name)
+        and tree.body.func.id in {*_BITWISE_HELPERS.values(), "_bitwise_invert"}
+    ):
+        return float(result)
     return result
 
 

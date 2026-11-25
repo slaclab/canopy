@@ -91,10 +91,24 @@ class TestEvaluateScalar:
             ("np.isnan({a})", float("nan"), True),
             ("np.float({a})", 3, 3.0),
             ("np.int({a})", 3.9, 3),
+            ("np.str({a})", 3.5, "3.5"),
         ],
     )
     async def test_conversion_and_nan_functions(self, parser, expression, value, expected):
         """Evaluate scalar conversion functions and both supported isnan spellings."""
+        parsed = parser.parse(expression, {"a": "PV:A"})
+        result = await evaluate_scalar(parsed, {"__v0": value}, timeout_s=1.0)
+        assert result == expected
+
+    @pytest.mark.parametrize(
+        ("expression", "value", "expected"),
+        [
+            ("({a} | 1) & 1", 2**53, 1.0),
+            ("~(~{a}) & 1", 2**53 + 1, 1.0),
+            ("({a} | 1) == 9007199254740993", 2**53, True),
+        ],
+    )
+    async def test_bitwise_intermediates_remain_exact(self, parser, expression, value, expected):
         parsed = parser.parse(expression, {"a": "PV:A"})
         result = await evaluate_scalar(parsed, {"__v0": value}, timeout_s=1.0)
         assert result == expected
@@ -203,11 +217,64 @@ class TestEvaluateArray:
         result = await evaluate_array(parsed, {"__v0": np.array([2**53], dtype=np.int64)}, timeout_s=1.0)
         np.testing.assert_array_equal(result, [1.0])
 
-    async def test_str_array_is_rejected(self, parser):
+    @pytest.mark.parametrize(("expression", "value"), [("({a} | 1) & 1", 2**53), ("~(~{a}) & 1", 2**53 + 1)])
+    async def test_bitwise_intermediates_remain_exact(self, parser, expression, value):
+        parsed = parser.parse(expression, {"a": "PV:A"})
+        result = await evaluate_array(parsed, {"__v0": np.array([value], dtype=np.int64)}, timeout_s=1.0)
+        np.testing.assert_array_equal(result, [1.0])
+
+    async def test_bitwise_intermediate_with_missing_and_large_value(self, parser):
+        parsed = parser.parse("({a} | 1) & 1", {"a": "PV:A"})
+        result = await evaluate_array(parsed, {"__v0": np.array([2**53, np.nan])}, timeout_s=1.0)
+        np.testing.assert_array_equal(result, [1.0, np.nan])
+
+    async def test_comparison_preserves_large_integer_with_missing_sample(self, parser):
+        parsed = parser.parse("({a} | 1) == 9007199254740993", {"a": "PV:A"})
+        result = await evaluate_array(parsed, {"__v0": np.array([2**53, np.nan])}, timeout_s=1.0)
+        np.testing.assert_array_equal(result, [1.0, 0.0])
+
+    async def test_bitwise_intermediates_broadcast_missing_operands(self, parser):
+        parsed = parser.parse("({a} | 1) & ({b} | 1)", {"a": "PV:A", "b": "PV:B"})
+        result = await evaluate_array(
+            parsed,
+            {"__v0": np.array([[2**53], [np.nan]]), "__v1": np.array([[0.0, np.nan]])},
+            timeout_s=1.0,
+        )
+        np.testing.assert_array_equal(result, [[1.0, np.nan], [np.nan, np.nan]])
+
+    @pytest.mark.parametrize(
+        ("expression", "expected"),
+        [
+            ("({a} | 1) & 1", [1.0, np.nan, 1.0]),
+            ("int({a} | 1) & 1", [1.0, np.nan, 1.0]),
+            ("isnan({a} | 1)", [0.0, 1.0, 0.0]),
+            ("({a} | 1) == 1", [1.0, 0.0, 1.0]),
+            ("({a} | 1) != 1", [0.0, 1.0, 0.0]),
+        ],
+    )
+    async def test_bitwise_intermediates_preserve_missing_samples(self, parser, expression, expected):
+        parsed = parser.parse(expression, {"a": "PV:A"})
+        result = await evaluate_array(parsed, {"__v0": np.array([0.0, np.nan, 1.0])}, timeout_s=1.0)
+        np.testing.assert_array_equal(result, expected)
+
+    @pytest.mark.parametrize("function", ["mean", "np.mean", "sum", "np.sum"])
+    async def test_reductions_do_not_ignore_missing_bitwise_results(self, parser, function):
+        parsed = parser.parse(f"{function}({{a}} & 1)", {"a": "PV:A"})
+        result = await evaluate_array(parsed, {"__v0": np.array([1.0, np.nan])}, timeout_s=1.0)
+        assert np.isnan(result)
+
+    @pytest.mark.parametrize("function", ["where", "np.where"])
+    async def test_where_preserves_missing_bitwise_results(self, parser, function):
+        parsed = parser.parse(f"{function}({{a}} > 0, {{a}} | 1, {{a}} & 1) & 1", {"a": "PV:A"})
+        result = await evaluate_array(parsed, {"__v0": np.array([2**53, np.nan, 0.0])}, timeout_s=1.0)
+        np.testing.assert_array_equal(result, [1.0, np.nan, 0.0])
+
+    @pytest.mark.parametrize("expression", ["str({a})", "np.str({a})"])
+    async def test_str_array_is_rejected(self, parser, expression):
         """Reject string conversion on arrays because string results are scalar-only."""
         from canopy.formula_engine.errors import FormulaTypeError
 
-        parsed = parser.parse("str({a})", {"a": "PV:A"})
+        parsed = parser.parse(expression, {"a": "PV:A"})
         with pytest.raises(FormulaTypeError, match="scalar"):
             await evaluate_array(parsed, {"__v0": np.array([1.0, 2.0])}, timeout_s=1.0)
 
