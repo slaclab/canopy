@@ -6,6 +6,7 @@ import importlib
 from argparse import Namespace
 
 import pytest
+from sqlalchemy import ForeignKeyConstraint
 from sqlalchemy.sql import sqltypes
 
 import canopy
@@ -100,14 +101,29 @@ def test_parser_options():
         build_parser().parse_args(["drift-check", "--days", "0"])
 
 
-# Every uuid column of a replicated table that holds another row's id: each one is a
-# foreign key, or declared in REFERENCES, so the head check can't miss one.
+# Ids are uuids across the schema, so every uuid column of a replicated table other
+# than its own id holds another row's id: each one is a foreign key, or declared in
+# REFERENCES, so the head check can't miss one, whatever the column is called.
 @pytest.mark.parametrize("table", [t for t in REGISTRY.replicated if t in Base.metadata.tables])
 def test_every_reference_is_a_foreign_key_or_declared(table):
     for column in Base.metadata.tables[table].columns:
-        if not column.name.endswith("_id") or not isinstance(column.type, sqltypes.Uuid):
+        if column.name == "id" or not isinstance(column.type, sqltypes.Uuid):
             continue
-        assert column.foreign_keys or (table, column.name) in REFERENCES, f"{table}.{column.name} references what?"
+        assert column.foreign_keys or (table, column.name) in REFERENCES, (
+            f"{table}.{column.name}: make it a foreign key, declare it in drift.REFERENCES, "
+            "or, if it holds no other row's id, list it here"
+        )
+
+
+# references() reads single-column foreign keys only.
+@pytest.mark.parametrize("table", [t for t in REGISTRY.replicated if t in Base.metadata.tables])
+def test_no_replicated_table_has_a_composite_foreign_key(table):
+    composite = [
+        k.name or ", ".join(c.name for c in k.columns)
+        for k in Base.metadata.tables[table].constraints
+        if isinstance(k, ForeignKeyConstraint) and len(k.columns) > 1
+    ]
+    assert not composite, f"{table}: drift.references() checks single-column foreign keys only; teach it {composite}"
 
 
 @pytest.mark.parametrize(("child", "parent"), sorted(REFERENCES.items()))
