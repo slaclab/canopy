@@ -783,7 +783,8 @@ async def _arm_status(conn: asyncpg.Connection, arm: str, registry: ReplicationR
         "owner": sub["owner"],
         "publications": list(sub["subpublications"]),
         "layout": (layout := _layout(sub["subpublications"], registry)),
-        "expected_publications": [p.name for p in registry.layout(layout == "split")],
+        # Unknown when the publications match neither layout: someone set them by hand.
+        "expected_publications": None if layout is None else [p.name for p in registry.layout(layout == "split")],
         "streaming": sub["substream"],
         "slot_name": sub["subslotname"],
         "worker": jsonable(worker) if worker else None,
