@@ -181,8 +181,8 @@ EXCLUDED = frozenset({"public.alembic_version"})
 # Tables a migration has dropped but a deployed database may still hold: a mirror drops a
 # column or table a release after its primary, and the migration-order test walks old
 # revisions. Each keeps its entry in the registry, so `publish` and `grants` classify it
-# wherever it still exists, while its model is gone. Remove both once no deployed
-# database can still hold the table.
+# wherever it still exists, while its model is gone. Keep both for good: the
+# migration-order test still walks the revisions that hold the table.
 RETIRED: frozenset[str] = frozenset()
 
 _ALL_OPERATIONS = ("insert", "update", "delete")
