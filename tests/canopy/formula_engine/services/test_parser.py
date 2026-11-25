@@ -173,6 +173,15 @@ class TestBooleanOperators:
         result = parser.parse("{a} != {b}", {"a": "PV:A", "b": "PV:B"})
         assert "!=" in result.placeholder_expr
 
+    @pytest.mark.parametrize("expression", ["np.float({a})", "np.int({a})", "np.isnan({a})"])
+    def test_numpy_conversion_aliases_allowed(self, parser, expression):
+        result = parser.parse(expression, {"a": "PV:A"})
+        assert result.tokens == ["a"]
+
+    def test_unsupported_math_conversion_rejected(self, parser):
+        with pytest.raises(FormulaUnsafeError):
+            parser.parse("math.str({a})", {"a": "PV:A"})
+
 
 class TestBitwiseOperators:
     @pytest.mark.parametrize(

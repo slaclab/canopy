@@ -198,7 +198,7 @@ def _resolve_call_name(node: ast.Call) -> str | None:
             if prefix == "np":
                 aliases = {"float": "float", "int": "int", "isnan": "isnan"}
                 return aliases.get(attr) if attr in aliases else (attr if attr in SAFE_FUNCS else None)
-            if prefix == "math" and attr in SAFE_FUNCS:
+            if prefix == "math" and attr in SAFE_FUNCS and attr not in {"float", "int", "str", "isnan"}:
                 return attr
     return None
 

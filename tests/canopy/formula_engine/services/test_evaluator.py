@@ -89,6 +89,8 @@ class TestEvaluateScalar:
             ("str({a})", 3.5, "3.5"),
             ("isnan({a})", float("nan"), True),
             ("np.isnan({a})", float("nan"), True),
+            ("np.float({a})", 3, 3.0),
+            ("np.int({a})", 3.9, 3),
         ],
     )
     async def test_conversion_and_nan_functions(self, parser, expression, value, expected):
