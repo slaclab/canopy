@@ -379,3 +379,32 @@ async def test_command_exit_status(octopus: Octopus):
     assert failed.returncode == 2
     assert "password authentication failed" in json.loads(failed.stdout)["arms"][o.arm.name]["error"]
     assert wrong not in failed.stderr + failed.stdout
+
+
+@one_arm
+async def test_a_missing_slot_is_reported_at_once(octopus: Octopus):
+    """A differing table can't wait out --settle for a slot that isn't there to confirm."""
+    o = octopus
+    arm = o.arm.name
+    name = subscription_name(arm)
+    ids = await _subscribed(o)
+    await o.head.admin.execute(f'ALTER SUBSCRIPTION "{name}" DISABLE')
+
+    async def slot_released():
+        return not await o.arm.admin.fetchval("SELECT active FROM pg_replication_slots WHERE slot_name = $1", name)
+
+    await eventually(slot_released)
+    await o.arm.admin.execute("SELECT pg_drop_replication_slot($1)", name)
+    await _as_apply(o.head.admin, "DELETE FROM squirrel.meta_pv WHERE pv_id = $1", ids["pv"])
+    primary, mirror = await _arm_connections(o, arm)
+    try:
+        for reason in ("isn't on the primary", "has no slot"):
+            started = asyncio.get_running_loop().time()
+            report = await drift_check(primary, mirror, arm=arm, settle_s=30)
+            assert report["status"] == "not_checked" and not report["drift"]
+            assert reason in report["inconclusive"]["squirrel.meta_pv"]
+            assert asyncio.get_running_loop().time() - started < 10
+            await o.head.admin.execute(f'ALTER SUBSCRIPTION "{name}" SET (slot_name = NONE)')
+    finally:
+        await primary.close()
+        await mirror.close()

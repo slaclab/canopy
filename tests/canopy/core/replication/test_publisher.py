@@ -1,6 +1,7 @@
 """``publish`` and the primary's ``status`` against a real Postgres."""
 
 import logging
+from dataclasses import replace
 
 import pytest
 
@@ -14,22 +15,15 @@ from canopy.core.replication.publisher import (
     publication_layout,
 )
 
-from .conftest import PRESENT, privileges, direct_grants, present_tables
-
-
-async def _published(conn) -> list[str]:
-    rows = await conn.fetch(
-        "SELECT schemaname || '.' || tablename AS name FROM pg_publication_tables WHERE pubname = 'canopy_history'"
-    )
-    return sorted(row["name"] for row in rows)
+from .conftest import PRESENT, privileges, direct_grants, published_tables
 
 
 async def test_publish_creates_the_publication_from_the_registry(db, config, caplog):
     caplog.set_level(logging.INFO, logger="canopy.core.replication")
     result = await publish(db, role="primary", config=config)
 
-    assert await _published(db) == PRESENT
-    assert "core.api_key" not in await _published(db)
+    assert await published_tables(db) == PRESENT
+    assert "core.api_key" not in await published_tables(db)
     row = await db.fetchrow("SELECT pubinsert, pubupdate, pubdelete, pubtruncate FROM pg_publication")
     assert tuple(row.values()) == (True, True, True, False)
     assert result["publications"]["canopy_history"]["created"] is True
@@ -67,7 +61,7 @@ async def test_publish_converges_a_stale_publication(db, config):
 
     result = await publish(db, role="primary", config=config)
 
-    assert await _published(db) == PRESENT
+    assert await published_tables(db) == PRESENT
     sync = result["publications"]["canopy_history"]
     assert sync["removed"] == ["core.api_key"]
     assert "squirrel.pv" not in sync["added"] and "squirrel.snapshot" in sync["added"]
@@ -76,17 +70,16 @@ async def test_publish_converges_a_stale_publication(db, config):
     assert tuple(row.values()) == (True, True, True, False)
 
 
-async def test_a_retired_table_already_dropped_is_not_reported_missing(db, config, caplog, monkeypatch):
+async def test_a_retired_table_already_dropped_is_not_reported_missing(db, config, caplog):
     # Retired tables stay registered for databases that still hold them; one that has
     # dropped the table shouldn't log it as "not here yet" on every deploy.
-    retired = frozenset({"squirrel.pv_facility"})
-    monkeypatch.setattr("canopy.core.replication.publisher.RETIRED", retired)
+    registry = replace(REGISTRY, retired=frozenset({"squirrel.pv_facility"}))
     await db.execute("DROP TABLE squirrel.pv_facility")
     caplog.set_level(logging.INFO, logger="canopy.core.replication")
-    result = await publish(db, role="primary", config=config)
+    result = await publish(db, role="primary", config=config, registry=registry)
     assert result["missing"] == []
     assert "Not in this database yet" not in caplog.text
-    assert await _published(db) == present_tables(retired)  # what PRESENT becomes once it's retired
+    assert await published_tables(db) == registry.current  # what PRESENT becomes once it's retired
 
 
 async def test_publish_picks_up_a_registered_table_once_it_exists(db, config, caplog):
@@ -104,7 +97,7 @@ async def test_publish_picks_up_a_registered_table_once_it_exists(db, config, ca
     result = await publish(db, role="primary", config=config)
 
     assert result["publications"]["canopy_history"]["added"] == ["squirrel.pv_facility"]
-    assert "squirrel.pv_facility" in await _published(db)
+    assert "squirrel.pv_facility" in await published_tables(db)
 
 
 async def test_publish_grants_existing_roles_select_on_published_tables_only(db, config):
@@ -169,7 +162,7 @@ async def test_publish_drops_a_whole_schema_even_with_no_table_to_publish(db, co
     assert result["publications"]["canopy_history"]["schemas_removed"] == ["core"]
     assert (await publication_state(db, "canopy_history")).schemas == frozenset()
     await db.execute("CREATE TABLE core.api_key_like (id int PRIMARY KEY)")
-    assert await _published(db) == []
+    assert await published_tables(db) == []
 
 
 async def test_publish_refuses_an_unclassified_table_and_changes_nothing(db, config):
@@ -350,7 +343,7 @@ async def test_publish_clears_row_filters_and_column_lists(db, config, caplog):
 
     assert result["publications"]["canopy_history"]["cleared"] == ["squirrel.pv", "squirrel.snapshot"]
     assert "re-seed those tables" in caplog.text
-    assert await _published(db) == PRESENT
+    assert await published_tables(db) == PRESENT
     assert (await publisher_status(db, config=config))["publications"][0]["restricted"] == {}
     assert (await publish(db, role="primary", config=config))["publications"]["canopy_history"]["cleared"] == []
 
@@ -363,7 +356,7 @@ async def test_publish_lists_tables_instead_of_publishing_schemas_whole(db, conf
 
     assert result["publications"]["canopy_history"]["schemas_removed"] == ["magpie"]
     assert (await publication_state(db, "canopy_history")).schemas == frozenset()
-    assert await _published(db) == PRESENT
+    assert await published_tables(db) == PRESENT
 
 
 async def test_publish_refuses_a_for_all_tables_publication(db, config):

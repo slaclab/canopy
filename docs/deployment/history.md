@@ -136,8 +136,9 @@ On the head, hourly, for each arm: `refresh --arm <arm>`, then `drift-check --ar
 when every table the arm publishes was compared and is in step, 1 when the copy has
 drifted, and 2 when it couldn't check every table, so anything but 0 fails the Job.
 One Job per arm keeps one arm's failure from hiding another's result; without
-`--arm`, one run checks every arm and exits with the worst. For an arm that prunes,
-its Job also runs `heartbeat --arm <arm>` last, as described under [Prune](#prune).
+`--arm`, one run checks every arm at the same time and exits with the worst. For an
+arm that prunes, its Job also runs `heartbeat --arm <arm>` last, as described under
+[Prune](#prune).
 
 ### Backups
 
@@ -596,9 +597,10 @@ the old slot left off, not from the copy. Only one `reseed` of an arm runs at a 
 second is refused while the first runs.
 
 `reseed`'s report lists under `dangling` any row of that arm (or of nobody known) that
-still references a missing parent once it is done. The usual cause: the arm deleted a
-facility whose snapshots it had pruned or deleted, while the head keeps those
-snapshots. Replication leaves the same reference.
+still references a missing parent once it is done: for example, a snapshot the arm
+deleted before deleting its facility, which the head keeps (it never deletes
+time-series rows), as replication would, or rows a rebuilt or out-of-date arm left
+behind. `drift-check` reports them too; fix them by hand.
 
 ### Head PITR
 
