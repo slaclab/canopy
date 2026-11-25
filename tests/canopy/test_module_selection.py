@@ -198,6 +198,29 @@ def test_with_sqlalchemy_installed_only_the_key_store_is_added(tmp_path):
     assert [m for m in loaded if m.split(".")[0] in ("arq", "alembic")] == []
 
 
+# Started, not just imported: the lifespan reads the shipped Alembic head.
+_SERVE_INSTANCE_LEAN = """
+import sys, json
+sys.modules["sqlalchemy"] = None
+sys.modules["alembic"] = None
+from fastapi.testclient import TestClient
+import canopy.main
+with TestClient(canopy.main.app) as client:
+    r = client.get("/v1/instance", headers={"X-API-Key": "test-read"})
+print(json.dumps({"status": r.status_code, "body": r.json()}))
+"""
+
+
+def test_a_lean_install_serves_the_instance_route_with_no_alembic_head(tmp_path):
+    proc = _run_python(_SERVE_INSTANCE_LEAN, tmp_path, CANOPY_MODULES=",".join(FIVE))
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert report["status"] == 200
+    assert report["body"]["instance"] == os.environ["CANOPY_INSTANCE"]
+    assert report["body"]["alembicHead"] is None
+
+
 def test_an_unknown_name_in_canopy_modules_fails_startup(tmp_path):
     proc = _run_python("import canopy.main", tmp_path, CANOPY_MODULES="hare,badger")
     assert proc.returncode != 0

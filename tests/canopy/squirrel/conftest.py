@@ -23,7 +23,12 @@ import canopy.squirrel.data.models  # noqa: F401 — register squirrel tables on
 import canopy.core.facilities.models  # noqa: F401 — register core.facility on Base.metadata
 from canopy.core import db
 from canopy.core.db import Base, get_session
+from canopy.core.modules import tag_module
 from canopy.squirrel.app import app as squirrel_app
+
+# canopy.main tags each app with its module as it mounts it. These tests serve the app
+# unmounted, so the app is tagged here, for every test file that uses it.
+tag_module(squirrel_app, "squirrel")
 
 # Overridable so CI (or a non-default Postgres) can point these elsewhere.
 TEST_DATABASE_URL = os.environ.get(

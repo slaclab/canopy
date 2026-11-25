@@ -7,6 +7,8 @@ etc.) is configured via the EPICS library's own environment variables, not here.
 from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from canopy.core.config import blank_keeps_default
+
 
 class EpicsConfig(BaseSettings):
     """Settings for the EPICS connector package.
@@ -56,23 +58,8 @@ class EpicsConfig(BaseSettings):
     @field_validator("sim_put_error_rate", "sim_seed", mode="before")
     @classmethod
     def _blank_keeps_default(cls, value: object, info: ValidationInfo) -> object:
-        """Read a blank failure-injection value as unset.
-
-        Parameters
-        ----------
-        value : object
-            The raw value, a string when it comes from the environment.
-        info : ValidationInfo
-            Names the field being validated.
-
-        Returns
-        -------
-        object
-            The field's default when `value` is a blank string, otherwise `value`.
-        """
-        if isinstance(value, str) and not value.strip():
-            return cls.model_fields[info.field_name].default
-        return value
+        """Read a blank failure-injection value as unset (see ``blank_keeps_default``)."""
+        return blank_keeps_default(cls, value, info)
 
     # --- real (epics) backend ---
     ca_timeout_s: float = 5.0

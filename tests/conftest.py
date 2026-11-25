@@ -4,6 +4,8 @@ import os
 import asyncio
 from unittest.mock import patch
 
+import pytest
+
 # Prevent pydantic-settings from reading the developer's local .env file.
 # Tests must be deterministic regardless of .env contents. Env-var-based tests
 # (monkeypatch.setenv) still work because EnvSettingsSource is a separate path.
@@ -11,6 +13,8 @@ patch("pydantic_settings.sources.providers.dotenv.dotenv_values", return_value={
 
 # Seed an API-key registry before canopy.main imports cache settings.
 os.environ["CANOPY_API_KEYS"] = "test-read:read@*,test-write:read+write@*,test-admin:admin@*"
+# CANOPY_INSTANCE is required; the suite runs as an arm named arm1 unless a test says otherwise.
+os.environ.setdefault("CANOPY_INSTANCE", "arm1")
 
 
 READ_HEADERS = {"X-API-Key": "test-read"}
@@ -30,3 +34,19 @@ async def wait_for(predicate, timeout: float = 5.0, interval: float = 0.01) -> b
             return True
         await asyncio.sleep(interval)
     return False
+
+
+@pytest.fixture
+def mirror_role(monkeypatch):
+    """Run the test as a read-only mirror (``CANOPY_ROLE=mirror``).
+
+    Clears the cached ``Settings`` on both sides: ``monkeypatch`` puts the env var
+    back but not the object ``get_settings`` already built from it, and a leaked
+    mirror role would refuse every write in whatever test runs next.
+    """
+    from canopy.core.config import get_settings
+
+    monkeypatch.setenv("CANOPY_ROLE", "mirror")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()

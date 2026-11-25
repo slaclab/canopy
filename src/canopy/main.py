@@ -31,6 +31,8 @@ from canopy.core.errors import (
 from canopy.core.logging import configure_logging
 from canopy.core.metrics import HTTPMetricsMiddleware, render_latest
 from canopy.core.modules import tag_module, module_for_app
+from canopy.core.instance import router as instance_router
+from canopy.core.instance import shipped_alembic_head
 from canopy.core.security import (
     get_registry,
     token_from_scope,
@@ -227,7 +229,7 @@ def build_app(modules: Iterable[str] | str, *, closed_meta: bool | None = None) 
     ``GET /health``; ``None`` takes the ``CANOPY_CLOSED_META`` setting. The key
     registry is bound by the lifespan, before anything is served.
     ``/v1/api-keys`` and ``/v1/facilities`` are mounted only on an install with
-    the database key tier (``has_database_tier``).
+    the database key tier (``has_database_tier``); ``/v1/instance`` on every install.
     """
     database_tier = has_database_tier()
     if closed_meta is None:
@@ -249,6 +251,8 @@ def build_app(modules: Iterable[str] | str, *, closed_meta: bool | None = None) 
         # Built before anything can serve, so a bad CANOPY_API_KEYS or keys file
         # surfaces in the startup log instead of as an unexplained 401.
         bind_key_registry(build_key_registry(get_settings()))
+        # Read the shipped migrations head now, off the request path; /v1/instance serves the cached value.
+        shipped_alembic_head()
         if database_tier:
             from canopy.core.facilities import gateway as facilities_gateway
 
@@ -298,6 +302,7 @@ def build_app(modules: Iterable[str] | str, *, closed_meta: bool | None = None) 
 
         app.include_router(api_keys_router)
         app.include_router(facilities_router)
+    app.include_router(instance_router)
 
     for name, module in sub_apps.items():
         tag_module(module.app, name)
