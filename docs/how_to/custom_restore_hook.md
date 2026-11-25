@@ -56,11 +56,16 @@ addresses you return, so the extra writes go over the same protocol.
 ### Rejecting a setpoint
 
 Raise `canopy.squirrel.restore_hooks.base.RestoreHookError` when the hook
-recognises a setpoint but can't work out its writes. The built-in hooks do
-this for a magnet PV that doesn't end in `BDES`. Squirrel then writes
+recognises a setpoint but can't work out its writes. Squirrel then writes
 **nothing** for that PV, neither the setpoint nor any hook's extra writes,
 and reports it as a failure with the error message. That avoids leaving a
 device half-restored.
+
+Reject only setpoints that need extra writes the hook can't produce. A
+setpoint that simply needs none, even one that looks like the PVs the hook
+handles, should get an empty list. The built-in hooks never reject: a magnet
+PV that doesn't end in `BDES`, such as `QUAD:LI21:201:EDES`, needs no trim,
+so they return `[]` for it and it is restored normally.
 
 Any other exception is not caught and fails the whole restore job, so raise
 `RestoreHookError` for anything about a single PV.
@@ -133,13 +138,14 @@ def test_non_magnet_pv_yields_no_extra_writes():
     assert trim_hook.derive_extra_writes("KLYS:SIM:01:KVAC", 3.0) == []
 
 
-def test_magnet_without_trailing_bdes_raises():
-    with pytest.raises(RestoreHookError):
-        trim_hook.derive_extra_writes("QUAD:SIM:01:BCON", 3.0)
+@pytest.mark.parametrize("address", ["QUAD:SIM:01:EDES", "QUAD:SIM:01:BCON", "pva://XCOR:SIM:01:BCTRL"])
+def test_magnet_without_trailing_bdes_yields_no_extra_writes(address):
+    """Only BDES setpoints need a trim; any other magnet PV is restored as-is."""
+    assert trim_hook.derive_extra_writes(address, 3.0) == []
 ```
 
-Cover the setpoints the hook acts on, the ones it ignores, the ones it
-rejects, and a `ca://` or `pva://` prefix.
+Cover the setpoints the hook acts on, the ones it ignores, any it rejects,
+and a `ca://` or `pva://` prefix.
 
 To check how the hook behaves inside a whole restore, pass it straight to
 `SnapshotService(..., restore_hooks=[YourHook()])`, as the restore tests in
