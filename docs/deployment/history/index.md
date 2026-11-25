@@ -24,6 +24,13 @@ from the Canopy image with the instance's `CANOPY_DATABASE_URL`, `CANOPY_ROLE` a
 commands act on every arm configured in `CANOPY_ARMS__<arm>__…`, or on one with
 `--arm <arm>`; `reseed`, `switch` and `heartbeat` always name their arm.
 
+Every instance here has a database, so it is an install with the `data` extra.
+Replication, forwarding, `/health/ready` and the replication gauges come with that
+extra, whatever `CANOPY_MODULES` selects, and the worker, which delivers the outbox
+and prunes, has no module selection. `CANOPY_MODULES` still picks the modules each
+side's API mounts (unset, every module), and a head forwards writes only for the
+modules it mounts.
+
 ## Topology
 
 ```mermaid

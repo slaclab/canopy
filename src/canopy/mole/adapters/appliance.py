@@ -9,16 +9,21 @@ This commit implements raw `fetch_window`, `health`, and `close`. Binned mode,
 metadata, and search land in subsequent commits.
 """
 
+import json
 import time
+import asyncio
 from typing import Literal
 from datetime import UTC, datetime
 
 import httpx
+import numpy as np
 
 from canopy.mole.config import ArchiverInstanceConfig
 from canopy.mole.schemas.pv import PVMetadata
-from canopy.contracts.sample import Sample, BinnedPoint, AlarmSeverity
+from canopy.contracts.sample import SEVERITY_ORDINAL, Sample, BinnedPoint, AlarmSeverity
 from canopy.mole.adapters.base import (
+    SEED_SAMPLE_BUDGET,
+    ArchiveBlock,
     AdapterHealth,
     ArchiverTimeout,
     ArchiverBadResponse,
@@ -27,7 +32,35 @@ from canopy.mole.adapters.base import (
     PVNotFoundInArchiver,
     normalize_severity,
     register_archiver_type,
+    fetch_window_budgeted_via,
 )
+
+
+def _parse_raw_arrays(content: bytes, archiver: str) -> ArchiveBlock:
+    """The whole seed-path parse -- JSON decode plus the numpy build -- meant for a worker thread."""
+    try:
+        payload = json.loads(content)
+    except ValueError as exc:
+        raise ArchiverBadResponse(f"Appliance '{archiver}' returned invalid JSON: {exc}") from exc
+    if not isinstance(payload, list) or not payload:
+        return ArchiveBlock.empty()
+    rows = payload[0].get("data") if isinstance(payload[0], dict) else None
+    if not isinstance(rows, list):
+        raise ArchiverBadResponse(f"Appliance '{archiver}': missing 'data' array in response")
+    ts = np.empty(len(rows), dtype=np.int64)
+    values = np.empty(len(rows), dtype=object)
+    severities = np.empty(len(rows), dtype=np.int8)
+    for i, row in enumerate(rows):
+        try:
+            ts[i] = int(row["secs"]) * 1_000_000_000 + int(row.get("nanos", 0))
+            values[i] = row["val"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ArchiverBadResponse(f"Appliance '{archiver}': malformed sample row: {exc}") from exc
+        severities[i] = SEVERITY_ORDINAL[normalize_severity(row.get("severity"))]
+    return ArchiveBlock(ts, values, severities)
+
+
+_NS_PER_MS = 1_000_000
 
 
 def _ns_to_iso(ts_ns: int) -> str:
@@ -41,6 +74,8 @@ class EpicsArchiverApplianceAdapter:
     """Adapter for one EPICS Archiver Appliance instance."""
 
     type_name: str = "epics_archiver_appliance"
+    # The Appliance stores every change event with its severity.
+    event_faithful: bool = True
 
     def __init__(self, name: str, url: str, timeout_s: float = 30.0) -> None:
         self.name = name
@@ -106,28 +141,85 @@ class EpicsArchiverApplianceAdapter:
         samples = self._parse_raw_block(payload[0])
         return [s for s in samples if t0_ns <= s.ts_ns <= t1_ns]
 
+    async def fetch_window_budgeted(
+        self, pv: str, t0_ns: int, t1_ns: int, *, budget: int = SEED_SAMPLE_BUDGET, max_samples: int | None = None
+    ) -> ArchiveBlock:
+        """Seed-path read: rate-sized windows newest-first, each parsed in a worker thread.
+
+        ``getData`` has no server-side limit, so the budget is a target the next
+        window is sized to. The oldest window also carries the last sample before
+        ``t0_ns`` (a zero-width query), at its true timestamp. ``max_samples``
+        stops the walk after the response that loads that many.
+        """
+        return await fetch_window_budgeted_via(
+            self._fetch_block, pv, t0_ns, t1_ns, budget=budget, max_samples=max_samples
+        )
+
+    async def _fetch_block(self, pv: str, lo_ns: int, hi_ns: int, include_last_before: bool) -> ArchiveBlock:
+        want_prior = include_last_before and lo_ns > 0
+        # The prior sample is the newest at or before lo - 1, and the wire is
+        # ms-precise: a zero-width query at the whole ms below lo - 1 finds it up
+        # to that ms, and starting this window's own request there finds it after.
+        prior_at = (lo_ns - 1) // _NS_PER_MS * _NS_PER_MS
+        raw = await self._get_block(pv, prior_at if want_prior else lo_ns, hi_ns)
+        mask = (raw.ts_ns >= lo_ns) & (raw.ts_ns <= hi_ns)
+        block = ArchiveBlock(raw.ts_ns[mask], raw.values[mask], raw.severities[mask])
+        if want_prior:
+            candidates = ArchiveBlock.concat([await self._get_block(pv, prior_at, prior_at), raw])
+            before = np.flatnonzero(candidates.ts_ns <= lo_ns - 1)
+            if len(before):
+                i = before[-1]
+                prior = ArchiveBlock(
+                    candidates.ts_ns[i : i + 1], candidates.values[i : i + 1], candidates.severities[i : i + 1]
+                )
+                block = ArchiveBlock.concat([prior, block])
+        return block
+
+    async def _get_block(self, pv: str, from_ns: int, to_ns: int) -> ArchiveBlock:
+        # Widen to whole ms (floor `from`, ceil `to`, in integers): the next
+        # window ends at lo - 1 ns, so a floored `to` would drop the samples in
+        # the last sub-ms before every seam. Callers mask back to ns.
+        from_ms = from_ns // _NS_PER_MS * _NS_PER_MS
+        to_ms = -(-to_ns // _NS_PER_MS) * _NS_PER_MS
+        params = {"pv": pv, "from": _ns_to_iso(from_ms), "to": _ns_to_iso(to_ms), "donotchunk": "true"}
+        response = await self._safe_get("/retrieval/data/getData.json", params=params, pv=pv)
+        return await asyncio.to_thread(_parse_raw_arrays, response.content, self.name)
+
     async def fetch_last_before(self, pv: str, ts_ns: int) -> Sample | None:
         """Most recent stored sample at or before `ts_ns`, or `None`.
 
         A zero-width `getData.json` query (`from == to`) makes the Appliance
-        return the last known sample at or before that instant. `_ns_to_iso`
-        floors to millisecond precision, so a sample landing within the final
-        millisecond before `ts_ns` may be missed — negligible for archive
-        lookback.
+        return the last known sample at or before that instant, but the wire is
+        ms-precise. So the lookup asks at the whole ms at or after `ts_ns`: one
+        request, and exact unless the answer lands after `ts_ns` inside that ms.
+        Only then does it read that ms itself (`[floor, ceil]`), and when nothing
+        there is at or before `ts_ns`, ask at the whole ms below. A sample in the
+        last sub-millisecond before `ts_ns` -- an input stamped by the same event
+        as a table row, say -- is never missed.
         """
-        at = _ns_to_iso(ts_ns)
-        params = {
-            "pv": pv,
-            "from": at,
-            "to": at,
-            "donotchunk": "true",
-        }
+        ceil_ms = -(-ts_ns // _NS_PER_MS) * _NS_PER_MS
+        latest = await self._last_at_or_before(pv, ceil_ms)
+        if latest is None or latest.ts_ns <= ts_ns:
+            return latest
+        floor_ms = ts_ns // _NS_PER_MS * _NS_PER_MS
+        inside = [s for s in await self._query_samples(pv, floor_ms, ceil_ms) if s.ts_ns <= ts_ns]
+        if inside:
+            return inside[-1]
+        return await self._last_at_or_before(pv, floor_ms)
+
+    async def _last_at_or_before(self, pv: str, at_ms: int) -> Sample | None:
+        """The zero-width query at the whole ms `at_ms`: the last sample at or before it."""
+        candidates = [s for s in await self._query_samples(pv, at_ms, at_ms) if s.ts_ns <= at_ms]
+        return candidates[-1] if candidates else None
+
+    async def _query_samples(self, pv: str, from_ms: int, to_ms: int) -> list[Sample]:
+        """One `getData.json` request between two whole-ms bounds, parsed to samples."""
+        params = {"pv": pv, "from": _ns_to_iso(from_ms), "to": _ns_to_iso(to_ms), "donotchunk": "true"}
         response = await self._safe_get("/retrieval/data/getData.json", params=params, pv=pv)
         payload = self._parse_json(response)
         if not isinstance(payload, list) or not payload:
-            return None
-        candidates = [s for s in self._parse_raw_block(payload[0]) if s.ts_ns <= ts_ns]
-        return candidates[-1] if candidates else None
+            return []
+        return self._parse_raw_block(payload[0])
 
     async def fetch_binned(
         self,

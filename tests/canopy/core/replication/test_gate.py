@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from canopy.squirrel.prune import PRUNED_TABLES
-from canopy.core.replication.gate import GateResult, evaluate_gate
+from canopy.core.replication.gate import _CARRIED_OPERATIONS, GateResult, evaluate_gate
 from canopy.core.replication.config import PruneConfig
 from canopy.core.replication.registry import REGISTRY, TableClass
 from canopy.core.replication.publisher import walsender_publications
@@ -195,9 +195,19 @@ def test_walsender_publications_are_read_from_its_command(command, publications)
     assert walsender_publications(command) == publications
 
 
-def test_the_pruned_tables_are_time_series():
-    # Their split-layout publication carries no deletes; a reference table's deletes would reach history.
-    assert all(REGISTRY.tables[table] is TableClass.TIME_SERIES for table in PRUNED_TABLES)
+def test_the_pruned_tables_are_the_time_series_tables():
+    # Their split-layout publication carries no deletes; a reference table's deletes would
+    # reach history. And every time-series table is one prune removes from: a new one needs
+    # its own pruning decided, then a place in PRUNED_TABLES, so the gate checks it too.
+    time_series = sorted(t for t in REGISTRY.current if REGISTRY.tables[t] is TableClass.TIME_SERIES)
+    assert sorted(PRUNED_TABLES) == time_series
+
+
+def test_the_time_series_publication_carries_what_the_gate_requires():
+    # The gate states what the head needs of a pruned table on its own; the registry's
+    # publication for time-series tables must send at least that, and never a delete.
+    [carrier] = [p for p in REGISTRY.split_publications if TableClass.TIME_SERIES in p.classes]
+    assert _CARRIED_OPERATIONS <= set(carrier.operations) and "delete" not in carrier.operations
 
 
 def test_the_reasons_name_the_new_checks():

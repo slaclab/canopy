@@ -56,6 +56,8 @@ gauges, and the alert rules shipped in `docker/observability`, are listed under
 arm's `canopy_replication_slot_lag_bytes`; the head can't measure its own. A head
 that forwards to arms also reports its snapshot outbox per arm, under
 [Snapshot outbox](../../observability/metrics.md#snapshot-outbox).
+With `CANOPY_CLOSED_META` on, each side's scrape of `/metrics` needs a key scoped to
+`core` (see [Closed meta routes](../api-keys.md#closed-meta-routes)).
 
 ## Drift check
 
@@ -137,6 +139,10 @@ parent is answered by the head, with `not_owner` or 409 `owner_mismatch`. A faci
 create sent to an arm whose slug the head already holds, under any owner, is refused
 with 409 `facility_slug_conflict` before it is sent: slugs are unique across every
 instance, and the arm's new row would otherwise stop replication from that arm.
+
+A head forwards only the writes of the modules it mounts: with a module left out of
+`CANOPY_MODULES`, its writes are answered 404 on the head, as any route it doesn't
+serve, and never reach an arm.
 
 A row or facility the head doesn't hold is answered by the head (404). A captured
 import (`?mode=captured`) is never forwarded: it is how a head saves a snapshot it took
@@ -315,7 +321,10 @@ one too.
 Once the snapshot replicates back, its outbox row goes and it is an ordinary snapshot.
 
 **Delivery.** The head's worker sends each arm's queue oldest first, every
-`CANOPY_SQUIRREL__OUTBOX__INTERVAL_S` seconds and whenever a capture queues. Each
+`CANOPY_SQUIRREL__OUTBOX__INTERVAL_S` seconds and whenever a capture queues. The
+worker has no module selection, so it runs these deliveries, and the sweep of
+snapshots that came back, whatever `CANOPY_MODULES` says. With `squirrel` left out of
+the API's modules nothing captures, so the outbox stays empty and a run does nothing. Each
 attempt uses the user's name and facility grant as they were at capture time, and is
 strict: an arm that would save it without some values (a PV moved out of the facility
 meanwhile) refuses it with 409 `import_would_skip`, naming the PVs. A failure that says

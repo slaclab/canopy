@@ -21,7 +21,9 @@ with `prometheus_client.start_http_server` on its own port, under the same
 naming and label rules. That is a follow-up; nothing here changes for it.
 
 The endpoint is unauthenticated, like `/health`, `/docs` and every
-module's `/openapi.json`. This follows Prometheus's own security model, which
+module's `/openapi.json`, unless `CANOPY_CLOSED_META` is on; then a scrape
+must send a key scoped to `core` (see
+[Closed meta routes](../deployment/api-keys.md#closed-meta-routes)). This follows Prometheus's own security model, which
 assumes exposition endpoints are reachable only from trusted networks and
 leaves access control to the network rather than the application.
 [Production deployments](../deployment/production.md) must restrict access
@@ -216,7 +218,8 @@ A history head that delivers captures to arms reports its snapshot outbox
 from the database, so the `/metrics` handler awaits its refresh before rendering:
 its own short-lived connection, a two-second budget, and only
 `canopy_squirrel_outbox_status_up 0` if the read fails. An instance that delivers
-to no arm reports none of these series. Every arm it delivers to is listed, with
+to no arm reports none of these series, and neither does an API that leaves `squirrel`
+out of `CANOPY_MODULES`. Every arm it delivers to is listed, with
 zeros while its queue is empty. `arm` is the arm's name in `CANOPY_ARMS`, as on the
 per-arm replication series. Ages are measured on the database's clock.
 

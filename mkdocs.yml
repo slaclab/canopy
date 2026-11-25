@@ -122,6 +122,7 @@ nav:
   - How To:
     - Custom archiver adapter: how_to/custom_archiver_adapter.md
     - Custom directory adapter: how_to/custom_directory_adapter.md
+    - Custom EPICS backend: how_to/custom_epics_backend.md
     - Custom restore hook: how_to/custom_restore_hook.md
   - Observability:
     - observability/index.md

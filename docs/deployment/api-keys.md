@@ -483,6 +483,57 @@ A key with the wrong scope returns `403` with code `insufficient_read_access`,
 distinguishing "unknown token" (`401`) from "known token, not allowed here"
 (`403`).
 
+## Keys file and closed meta routes
+
+Both are off by default.
+
+### A keys file instead of `CANOPY_API_KEYS`
+
+`CANOPY_API_KEYS_FILE` names a file that replaces `CANOPY_API_KEYS` as the
+static tier. The database tier still chains behind it, and, like an env key, a
+file key grants every facility.
+
+- Entries use the `CANOPY_API_KEYS` grammar, one per line or comma-separated.
+- The file is read strictly. Every entry carries `read` and an `@<module>`
+  suffix, and the file has no comments.
+- A file that cannot be read, holds no key or holds one bad entry stops
+  startup. The error names the entry's position, never its content.
+- When both settings are set, the file wins and the startup log warns that
+  `CANOPY_API_KEYS` is ignored.
+- The file is read once, at startup. After rotating it (a Kubernetes Secret
+  mounted as a file, say), restart the API: a removed key stays valid until then.
+- Canopy does not check the file's permissions. Make it readable only by the
+  user the API runs as.
+
+### Closed meta routes
+
+With `CANOPY_CLOSED_META=true`, every route except the probes, `GET /health` and
+(on an install with the `data` extra) `GET /health/ready`, needs a key scoped to
+the module it targets. That includes `/`, `/docs`, `/openapi.json`, `/metrics`,
+and each module's docs, OpenAPI and `/v1/health/watchdog`.
+
+- The gate checks only that the key is known and scoped to the module. Each
+  route still checks `read`, `write` or `admin` itself, so write-only and
+  admin-only keys work as they do without the gate.
+- Refusals are `401 invalid_api_key`, `403 insufficient_module_access` or
+  `503 key_store_unavailable`, with CORS headers, so a browser client can read them.
+- A CORS preflight needs no key. The probes stay open behind a path prefix
+  (`uvicorn --root-path`) too.
+
+Before turning it on:
+
+- **Probes.** Point liveness probes at `GET /health` and readiness probes at
+  `GET /health/ready`. Neither needs a key; the per-module watchdogs do. The
+  readiness check takes a connection from the app's pool, so it is the one keyless
+  route that reaches the database. An install without the `data` extra has no
+  `/health/ready`, so probe readiness at `/health` there.
+- **Prometheus.** A scrape of `/metrics` must send a key scoped to `core` in the
+  `X-API-Key` header. The bundled `docker/observability/prometheus.yml` sends
+  none, so its scrape fails with `401`.
+- **Analytics.** Anonymous `POST /analytics/v1/events` is refused; clients send
+  a key scoped to `analytics`.
+- **Browser clients.** Send the key on every request, docs included.
+
 ## Known limitations
 
 - Keys have no expiration (`expires_at`) — nothing enforces one today.
