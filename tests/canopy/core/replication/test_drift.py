@@ -1,11 +1,13 @@
 """``drift-check`` without a database: declarations, comparison, and the command's exit status per arm."""
 
 import json
+import asyncio
 import pkgutil
 import importlib
 from argparse import Namespace
 
 import pytest
+from sqlalchemy import ForeignKeyConstraint
 from sqlalchemy.sql import sqltypes
 
 import canopy
@@ -100,14 +102,47 @@ def test_parser_options():
         build_parser().parse_args(["drift-check", "--days", "0"])
 
 
-# Every uuid column of a replicated table that holds another row's id: each one is a
-# foreign key, or declared in REFERENCES, so the head check can't miss one.
+# Uuid columns that name a row which needn't exist here, so the head never checks them.
+NOT_REFERENCES = frozenset(
+    {
+        # Provenance: the snapshot its bundle was exported from, maybe on another instance or gone.
+        ("squirrel.snapshot", "imported_from"),
+    }
+)
+
+
+# Ids are uuids across the schema, so every uuid column of a replicated table other
+# than its own id holds another row's id: each one is a foreign key, declared in
+# REFERENCES, or listed in NOT_REFERENCES, so the head check can't miss one, whatever
+# the column is called.
 @pytest.mark.parametrize("table", [t for t in REGISTRY.replicated if t in Base.metadata.tables])
 def test_every_reference_is_a_foreign_key_or_declared(table):
     for column in Base.metadata.tables[table].columns:
-        if not column.name.endswith("_id") or not isinstance(column.type, sqltypes.Uuid):
+        if column.name == "id" or not isinstance(column.type, sqltypes.Uuid):
             continue
-        assert column.foreign_keys or (table, column.name) in REFERENCES, f"{table}.{column.name} references what?"
+        key = (table, column.name)
+        assert column.foreign_keys or key in REFERENCES or key in NOT_REFERENCES, (
+            f"{table}.{column.name}: make it a foreign key, declare it in drift.REFERENCES, "
+            "or, if it needn't name a row here, list it in NOT_REFERENCES"
+        )
+
+
+@pytest.mark.parametrize(("table", "column"), sorted(NOT_REFERENCES))
+def test_unchecked_ids_name_real_uuid_columns(table, column):
+    found = Base.metadata.tables[table].columns[column]
+    assert isinstance(found.type, sqltypes.Uuid)
+    assert not found.foreign_keys and (table, column) not in REFERENCES
+
+
+# references() reads single-column foreign keys only.
+@pytest.mark.parametrize("table", [t for t in REGISTRY.replicated if t in Base.metadata.tables])
+def test_no_replicated_table_has_a_composite_foreign_key(table):
+    composite = [
+        k.name or ", ".join(c.name for c in k.columns)
+        for k in Base.metadata.tables[table].constraints
+        if isinstance(k, ForeignKeyConstraint) and len(k.columns) > 1
+    ]
+    assert not composite, f"{table}: drift.references() checks single-column foreign keys only; teach it {composite}"
 
 
 @pytest.mark.parametrize(("child", "parent"), sorted(REFERENCES.items()))
@@ -474,3 +509,66 @@ async def test_a_failed_head_check_keeps_the_arms_reports(
     assert report["head"]["status"] == "not_checked"
     assert "statement timeout" in report["head"]["error"]
     assert secret not in out and secret not in caplog.text
+
+
+async def test_arms_are_checked_at_the_same_time_each_on_a_head_connection_of_its_own(
+    head_only, env, monkeypatch, capsys
+):
+    env(
+        CANOPY_ARMS__ARM1__READER_DSN="postgresql://r:pw@arm1-db/db",
+        CANOPY_ARMS__ARM2__READER_DSN="postgresql://r:pw@arm2-db/db",
+    )
+    heads = []
+
+    async def connect(dsn, **_kwargs):
+        conn = _Head()
+        if "head-db" in dsn:
+            heads.append(conn)
+        return conn
+
+    both = asyncio.Barrier(2)
+    read_on = {}
+
+    async def drift_check(_primary, mirror, *, arm, **_kwargs):
+        read_on[arm] = mirror
+        await asyncio.wait_for(both.wait(), 2)  # passes only while the other arm is in flight too
+        return _arm_report("in_step")
+
+    monkeypatch.setattr(drift.asyncpg, "connect", connect)
+    monkeypatch.setattr(drift, "drift_check", drift_check)
+    assert await drift.run(ARGS) == 0
+    assert len({id(conn) for conn in read_on.values()}) == 2
+    assert all(conn in heads[1:] for conn in read_on.values())  # not the run's own head connection
+
+
+class _Arm:
+    """An arm whose ``pg_replication_slots`` holds ``slots``: name -> confirmed or not."""
+
+    def __init__(self, slots: dict[str, bool]):
+        self.slots, self.reads = slots, 0
+
+    async def fetchrow(self, _query, slot, _lsn):
+        self.reads += 1
+        return None if slot not in self.slots else {"confirmed": self.slots[slot]}
+
+
+@pytest.mark.parametrize(
+    ("slot", "slots", "reason"),
+    [
+        (None, {}, "has no slot"),
+        ("canopy_history_arm1", {}, "isn't on the primary"),
+    ],
+)
+async def test_no_slot_to_wait_for_is_reported_at_once(slot, slots, reason):
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    assert reason in await drift._unconfirmed(_Arm(slots), slot, "0/1", started + 30)
+    assert loop.time() - started < 1
+
+
+async def test_a_slot_is_waited_for_until_the_deadline():
+    arm = _Arm({"canopy_history_arm1": False})
+    loop = asyncio.get_running_loop()
+    assert "in time" in await drift._unconfirmed(arm, "canopy_history_arm1", "0/1", loop.time() + 0.6)
+    assert arm.reads > 1
+    assert await drift._unconfirmed(_Arm({"canopy_history_arm1": True}), "canopy_history_arm1", "0/1", 0) is None
