@@ -18,17 +18,21 @@ from canopy.squirrel.outbox.delivery import (
     Submitted,
     submit,
     enqueue,
+    transient,
     bundle_json,
     deliver_all,
     deliver_arm,
     outbox_full,
     retry_delay,
+    refusal_reason,
 )
 from canopy.squirrel.data.repositories import OutboxRepository
 
 from .conftest import CALLER, CAPTURED, Seeded, queue, make_bundle
 
 CONFIG = OutboxConfig(retry_initial_s=30, retry_max_s=900)
+# What an arm whose CANOPY_MODULES leaves out squirrel answers the captured import.
+ROUTE_MISSING = ArmRefused("arm2", 404, None, '{"detail":"Not Found"}')
 
 
 async def _rows(session: AsyncSession) -> dict[str, SnapshotOutbox]:
@@ -159,6 +163,7 @@ async def test_delivers_one_arms_queue_in_capture_order(db_session, seeded: Seed
         ArmRefused("arm2", 401, "invalid_api_key", "Invalid API key"),
         ArmRefused("arm2", 403, "insufficient_write_access", "API key does not have write access"),
         ArmRefused("arm2", 429, "too_many_requests", "slow down"),
+        ROUTE_MISSING,
     ],
 )
 async def test_a_transient_failure_backs_off_and_holds_the_arms_queue(db_session, seeded: Seeded, error):
@@ -503,6 +508,7 @@ async def test_a_saved_snapshot_past_a_cap_isnt_kept_and_the_capture_succeeds(
         PrimaryUnavailable("arm2 could not be reached; nothing was sent to it"),
         PrimaryTimeout("arm2 did not answer"),
         ArmRefused("arm2", 503, None, "Service Unavailable"),
+        ROUTE_MISSING,
     ],
 )
 async def test_submit_queues_what_the_arm_couldnt_take_with_the_attempt(db_session, seeded: Seeded, arm_answers, error):
@@ -599,3 +605,23 @@ async def test_the_worker_task_runs_one_delivery_for_every_arm(monkeypatch):
     monkeypatch.setattr(tasks.outbox, "deliver_all", deliver_all)
 
     assert await tasks.deliver_outbox_task({}) == {"arm1": {"delivered": 1, "retried": 0, "failed": 0}}
+
+
+def test_an_arm_without_squirrel_holds_its_queue_and_says_why():
+    from fastapi.testclient import TestClient
+
+    from canopy.main import build_app
+
+    answer = TestClient(build_app(("hare",), closed_meta=False)).post(
+        "/squirrel/v1/snapshots/import", params={"mode": "captured", "strict": "true"}, json={}
+    )
+    refusal = ArmRefused.from_answer("arm2", answer)
+
+    assert (refusal.status, refusal.code) == (ROUTE_MISSING.status, ROUTE_MISSING.code)
+    assert transient(refusal)
+    assert refusal_reason(refusal) == (
+        "404: arm2 serves no captured import, most likely because its CANOPY_MODULES leaves out squirrel; "
+        "or the head's forward URL for it is wrong"
+    )
+    # A 404 the arm sends about the snapshot itself still fails it.
+    assert not transient(ArmRefused("arm2", 404, "facility_not_found", "Facility 'lab-b' not found"))

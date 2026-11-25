@@ -3,9 +3,9 @@
 A capture that can't reach its arm is queued with ``enqueue``, which holds the arm's
 caps. ``deliver_arm`` then sends that arm's rows oldest first, one at a time, each
 through ``send``. A row stays pending through any failure that says nothing about
-the snapshot itself (the arm can't be reached, answered 5xx, or turned down the
-head's own key) and its retry backs off, doubling up to ``retry_max_s``; it never
-gives up. A refusal of the snapshot itself (its facility went, its PVs moved, its id
+the snapshot itself (the arm can't be reached, answered 5xx, turned down the head's
+own key, or serves no route for the send: ``route_missing``) and its retry backs off,
+doubling up to ``retry_max_s``; it never gives up. A refusal of the snapshot itself (its facility went, its PVs moved, its id
 clashes) marks it failed with the arm's reason and the next row goes on. A resend
 the arm refuses for its caller's grant (``resend_refused``) may be of a snapshot an
 earlier send saved, its answer lost: the row ends if the snapshot is on the head,
@@ -60,9 +60,24 @@ _CONFIGURATION_CODES = frozenset(
 _RETRIED_STATUSES = frozenset({408, 429})
 
 
+def route_missing(refusal: ArmRefused) -> bool:
+    """Whether the arm answered 404 without a Canopy error code: nothing there serves the send.
+
+    An arm whose ``CANOPY_MODULES`` leaves out squirrel answers so, as do a wrong forward
+    URL and a proxy in front of the arm, and every row for the arm would get the same. A
+    404 with a code (``facility_not_found``) is the arm's answer about the snapshot.
+    """
+    return refusal.status == 404 and refusal.code is None
+
+
 def transient(refusal: ArmRefused) -> bool:
     """Whether a later attempt can succeed with nothing changed about the snapshot."""
-    return refusal.status >= 500 or refusal.status in _RETRIED_STATUSES or refusal.code in _CONFIGURATION_CODES
+    return (
+        refusal.status >= 500
+        or refusal.status in _RETRIED_STATUSES
+        or refusal.code in _CONFIGURATION_CODES
+        or route_missing(refusal)
+    )
 
 
 # How a resend the arm refused for its caller's grant records the arm's answer: an
@@ -83,6 +98,11 @@ def resend_refused(refusal: ArmRefused) -> bool:
 
 def refusal_reason(refusal: ArmRefused) -> str:
     """How a row records the arm's answer: ``<code>: <detail>``, or the status when the arm sent no code."""
+    if route_missing(refusal):
+        return (
+            f"404: {refusal.arm} serves no captured import, most likely because its CANOPY_MODULES "
+            "leaves out squirrel; or the head's forward URL for it is wrong"
+        )
     return f"{refusal.code or refusal.status}: {refusal.detail}"
 
 

@@ -25,9 +25,10 @@ groups:
         annotations:
           summary: "{{ $labels.arm }}'s oldest queued snapshot on {{ $labels.instance }} has waited over 15 minutes."
           description: >-
-            The head can't deliver to the arm: the arm is unreachable, answers 5xx, or turns down the
-            head's service key. Captures for that arm keep queueing until its cap. `python -m
-            canopy.squirrel.outbox status` on the head shows the last error.
+            The head can't deliver to the arm: the arm is unreachable, answers 5xx, turns down the head's
+            service key, or serves no captured import (a 404 reason naming CANOPY_MODULES: the arm leaves
+            out squirrel, or the head's forward URL for it is wrong). Captures for that arm keep queueing
+            until its cap. `python -m canopy.squirrel.outbox status` on the head shows the last error.
         data:
           - refId: A
             relativeTimeRange: {from: 600, to: 0}

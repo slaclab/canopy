@@ -492,8 +492,9 @@ later. Every other write to that arm is refused as above.
 
 **The outbox.** The bundle waits in `squirrel.snapshot_outbox`, a local table on the
 head that never replicates. A capture queues when the arm can't be reached, gives no
-answer, answers 5xx, or turns down the head's service key; and also when the arm
-already has snapshots waiting, so the arm gets them in the order they were taken. The
+answer, answers 5xx, turns down the head's service key, or serves no captured import
+(see Delivery, below); and also when the arm already has snapshots waiting, so the arm
+gets them in the order they were taken. The
 capture job then completes with the snapshot's id and `delivery`
 (`{"state": "pending", ...}`), and the message "Captured; waiting for *arm*".
 
@@ -517,7 +518,10 @@ strict: an arm that would save it without some values (a PV moved out of the fac
 meanwhile) refuses it with 409 `import_would_skip`, naming the PVs. A failure that says
 nothing about the snapshot (unreachable, 5xx, the head's key refused) keeps it pending
 and backs off, from `RETRY_INITIAL_S` doubling to `RETRY_MAX_S`; a queued snapshot
-never gives up. A refusal of the snapshot itself (facility gone, PVs moved, id clash)
+never gives up. So does a 404 without a Canopy error code: nothing on the arm serves the
+captured import, most likely because the arm's `CANOPY_MODULES` leaves out `squirrel`,
+or the head's forward URL for it is wrong, and the snapshot's reason says so. A 404 with
+a code, such as `facility_not_found`, is about the snapshot and fails it. A refusal of the snapshot itself (facility gone, PVs moved, id clash)
 marks it failed, and the arm's queue goes on without it. A resend the arm refuses with
 403 `insufficient_facility_access` (the user's grant no longer reaches the facility) may
 be of a snapshot an earlier attempt saved, its answer lost: the arm answers the same
