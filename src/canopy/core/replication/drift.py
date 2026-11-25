@@ -320,18 +320,28 @@ def compare(check: Check, primary: dict, mirror: dict) -> dict | None:
     }
 
 
-async def _confirmed(primary: asyncpg.Connection, slot: str | None, lsn: str, deadline: float) -> bool:
-    """Wait until the mirror's slot on the primary confirms ``lsn``, until ``deadline``."""
+async def _unconfirmed(primary: asyncpg.Connection, slot: str | None, lsn: str, deadline: float) -> str | None:
+    """Wait until the mirror's slot on the primary confirms ``lsn``: ``None`` then, else why not.
+
+    No slot to wait for is reported at once: none on the subscription, or none of that
+    name on the primary. Otherwise it waits until ``deadline``.
+    """
+    if slot is None:
+        return "the subscription has no slot, so the primary's position can't be confirmed"
     loop = asyncio.get_running_loop()
     while True:
-        if slot is not None and await primary.fetchval(
-            "SELECT confirmed_flush_lsn >= $2::text::pg_lsn FROM pg_replication_slots WHERE slot_name = $1",
+        row = await primary.fetchrow(
+            "SELECT confirmed_flush_lsn >= $2::text::pg_lsn AS confirmed FROM pg_replication_slots "
+            "WHERE slot_name = $1",
             slot,
             lsn,
-        ):
-            return True
+        )
+        if row is None:
+            return f"the subscription's slot {slot} isn't on the primary (dropped or lost; see Slot lost)"
+        if row["confirmed"]:
+            return None
         if loop.time() >= deadline:
-            return False
+            return "the mirror didn't confirm the primary's position in time"
         await asyncio.sleep(min(0.5, max(deadline - loop.time(), 0)))
 
 
@@ -351,7 +361,7 @@ async def _compare(
     differing = [c for c in checks if compare(c, before[c.table], on_mirror[c.table]) is not None]
     if not differing:
         return {}, {}
-    confirmed = await _confirmed(primary, slot, lsn, deadline)
+    unconfirmed = await _unconfirmed(primary, slot, lsn, deadline)
     on_mirror = await observe(mirror, differing, since, owner)
     if after_mirror_read is not None:
         await after_mirror_read()
@@ -360,8 +370,8 @@ async def _compare(
     for check in differing:
         if (difference := compare(check, before[check.table], on_mirror[check.table])) is None:
             continue  # it was lag
-        if not confirmed:
-            inconclusive[check.table] = "the mirror didn't confirm the primary's position in time"
+        if unconfirmed:
+            inconclusive[check.table] = unconfirmed
         elif after[check.table] != before[check.table]:
             inconclusive[check.table] = "the primary changed while it was being compared"
         else:
@@ -506,26 +516,17 @@ def _log_arm(arm: str, report: dict) -> None:
         logger.warning("drift-check %s: couldn't check every table; see above", arm, extra=summary)
 
 
-def _log_dangling(found: dict, arm: str | None) -> None:
+def _log_reference(found: dict, arm: str | None, *, pending: bool = False) -> None:
+    """One dangling (or, while a table is still being copied, ``pending``) group of rows."""
     logger.warning(
-        "Dangling on the head: %d rows of %s, owned by %s, whose %s finds no %s",
+        "%s: %d rows of %s, owned by %s, whose %s finds no %s%s",
+        "Not checked yet" if pending else "Dangling on the head",
         found["rows"],
         found["table"],
         found["owner"] or "nobody known",
         found["column"],
         found["parent"],
-        extra={"arm": arm} if arm else {},
-    )
-
-
-def _log_pending(found: dict, arm: str | None) -> None:
-    logger.warning(
-        "Not checked yet: %d rows of %s, owned by %s, whose %s finds no %s while a table is still being copied",
-        found["rows"],
-        found["table"],
-        found["owner"] or "nobody known",
-        found["column"],
-        found["parent"],
+        " while a table is still being copied" if pending else "",
         extra={"arm": arm} if arm else {},
     )
 
@@ -533,14 +534,14 @@ def _log_pending(found: dict, arm: str | None) -> None:
 def _log_report(report: dict) -> None:
     for arm, arm_report in report["arms"].items():
         for found in arm_report["dangling"]:
-            _log_dangling(found, arm)
+            _log_reference(found, arm)
         for found in arm_report["pending"]:
-            _log_pending(found, arm)
+            _log_reference(found, arm, pending=True)
         _log_arm(arm, arm_report)
     for found in report["head"]["dangling"]:
-        _log_dangling(found, None)
+        _log_reference(found, None)
     for found in report["head"]["pending"]:
-        _log_pending(found, None)
+        _log_reference(found, None, pending=True)
     if "error" in report["head"]:
         logger.warning("The head's own reference check couldn't finish: %s", report["head"]["error"])
 

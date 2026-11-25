@@ -521,3 +521,36 @@ async def test_arms_are_checked_at_the_same_time_each_on_a_head_connection_of_it
     assert await drift.run(ARGS) == 0
     assert len({id(conn) for conn in read_on.values()}) == 2
     assert all(conn in heads[1:] for conn in read_on.values())  # not the run's own head connection
+
+
+class _Arm:
+    """An arm whose ``pg_replication_slots`` holds ``slots``: name -> confirmed or not."""
+
+    def __init__(self, slots: dict[str, bool]):
+        self.slots, self.reads = slots, 0
+
+    async def fetchrow(self, _query, slot, _lsn):
+        self.reads += 1
+        return None if slot not in self.slots else {"confirmed": self.slots[slot]}
+
+
+@pytest.mark.parametrize(
+    ("slot", "slots", "reason"),
+    [
+        (None, {}, "has no slot"),
+        ("canopy_history_arm1", {}, "isn't on the primary"),
+    ],
+)
+async def test_no_slot_to_wait_for_is_reported_at_once(slot, slots, reason):
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    assert reason in await drift._unconfirmed(_Arm(slots), slot, "0/1", started + 30)
+    assert loop.time() - started < 1
+
+
+async def test_a_slot_is_waited_for_until_the_deadline():
+    arm = _Arm({"canopy_history_arm1": False})
+    loop = asyncio.get_running_loop()
+    assert "in time" in await drift._unconfirmed(arm, "canopy_history_arm1", "0/1", loop.time() + 0.6)
+    assert arm.reads > 1
+    assert await drift._unconfirmed(_Arm({"canopy_history_arm1": True}), "canopy_history_arm1", "0/1", 0) is None
