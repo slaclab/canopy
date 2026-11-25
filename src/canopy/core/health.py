@@ -13,10 +13,8 @@ import logging
 from collections.abc import Callable
 
 from fastapi import APIRouter
-from sqlalchemy import text
 
 from canopy import __version__
-from canopy.core.db import get_engine
 from canopy.contracts.health import HeartbeatDTO
 
 logger = logging.getLogger(__name__)
@@ -52,6 +50,12 @@ async def database_ready(timeout_s: float = 2.0) -> bool:
     requests hold all of them this process can't serve another one either.
     """
     global _database_down
+    # Imported here: every module's health router imports this file, and SQLAlchemy is
+    # the ``data`` extra, which an install serving only lean modules may lack.
+    from sqlalchemy import text
+
+    from canopy.core.db import get_engine
+
     try:
         async with asyncio.timeout(timeout_s):
             async with get_engine().connect() as conn:

@@ -21,7 +21,9 @@ with `prometheus_client.start_http_server` on its own port, under the same
 naming and label rules. That is a follow-up; nothing here changes for it.
 
 The endpoint is unauthenticated, like `/health`, `/docs` and every
-module's `/openapi.json`. This follows Prometheus's own security model, which
+module's `/openapi.json`, unless `CANOPY_CLOSED_META` is on; then a scrape
+must send a key scoped to `core` (see
+[Closed meta routes](../deployment/api-keys.md#closed-meta-routes)). This follows Prometheus's own security model, which
 assumes exposition endpoints are reachable only from trusted networks and
 leaves access control to the network rather than the application.
 [Production deployments](../deployment/production.md) must restrict access

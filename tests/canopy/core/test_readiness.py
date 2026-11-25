@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import canopy.main
+import canopy.core.db
 import canopy.core.health
 from canopy.main import app
 from canopy.core.health import database_ready
@@ -42,7 +43,7 @@ async def engine_at(monkeypatch):
     def use(url: str) -> None:
         engine = create_async_engine(url, poolclass=NullPool)
         engines.append(engine)
-        monkeypatch.setattr(canopy.core.health, "get_engine", lambda: engine)
+        monkeypatch.setattr(canopy.core.db, "get_engine", lambda: engine)
 
     yield use
     for engine in engines:
