@@ -172,3 +172,44 @@ class TestBooleanOperators:
     def test_not_equals_preserved(self, parser):
         result = parser.parse("{a} != {b}", {"a": "PV:A", "b": "PV:B"})
         assert "!=" in result.placeholder_expr
+
+    @pytest.mark.parametrize("expression", ["np.float({a})", "np.int({a})", "np.isnan({a})"])
+    def test_numpy_conversion_aliases_allowed(self, parser, expression):
+        result = parser.parse(expression, {"a": "PV:A"})
+        assert result.tokens == ["a"]
+
+    def test_unsupported_math_conversion_rejected(self, parser):
+        with pytest.raises(FormulaUnsafeError):
+            parser.parse("math.str({a})", {"a": "PV:A"})
+
+
+class TestBitwiseOperators:
+    @pytest.mark.parametrize(
+        "operator",
+        ["&", "|", "^", "~", "<<", ">>"],
+    )
+    def test_bitwise_operators_allowed(self, parser, operator):
+        """Allow each requested bitwise operator and force the evaluator fallback."""
+        expression = "~{a}" if operator == "~" else f"{{a}} {operator} 2"
+        result = parser.parse(expression, {"a": "PV:A"})
+        assert not result.is_numexpr_compatible
+
+    def test_comparisons_bind_more_tightly_than_bitwise_operators(self, parser):
+        """Preserve Python precedence for unparenthesized bitwise expressions."""
+        result = parser.parse("{a} & 4 == 4", {"a": "PV:A"})
+        assert result.placeholder_expr == "__v0 & 4 == 4"
+
+    def test_explicit_parentheses_are_preserved(self, parser):
+        """Preserve explicit parentheses."""
+        result = parser.parse("({a} & 4) == 4", {"a": "PV:A"})
+        assert result.placeholder_expr == "(__v0 & 4) == 4"
+
+    def test_trailing_comment_is_preserved(self, parser):
+        """Keep comments as part of the original expression."""
+        result = parser.parse("{a} & 4 == 4 # status test", {"a": "PV:A"})
+        assert result.placeholder_expr == "__v0 & 4 == 4 # status test"
+
+    def test_python_not_precedence_is_preserved(self, parser):
+        """Keep Python ``not`` precedence in the placeholder expression."""
+        result = parser.parse("not {a} == 0 & 2", {"a": "PV:A"})
+        assert result.placeholder_expr == "not __v0 == 0 & 2"
