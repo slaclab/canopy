@@ -5,6 +5,7 @@
 import logging
 from uuid import uuid4
 from contextlib import asynccontextmanager
+from dataclasses import replace
 
 import pytest
 import asyncpg
@@ -31,14 +32,7 @@ from canopy.core.replication.subscriber import (
     subscriber_status,
 )
 
-from .conftest import (
-    DB_DSN,
-    PRESENT,
-    privileges,
-    build_schema,
-    direct_grants,
-    present_tables,
-)
+from .conftest import DB_DSN, PRESENT, privileges, build_schema, direct_grants
 
 DSN = "postgresql://replicator:s3cret-pw@arm1.example.org/canopy"
 ARMS = {"arm1": Arm(publisher_dsn=SecretStr(DSN))}
@@ -98,14 +92,14 @@ async def test_grants_reads_every_row_and_writes_only_the_heads(db, config):
 async def test_grants_leaves_out_a_retired_table_once_it_is_dropped(db, config):
     # What PRESENT and ROOTS become once a table is retired: its model is gone, so a
     # database built from the models doesn't hold it, and grants covers the rest.
-    retired = frozenset({"magpie.config"})
+    registry = replace(REGISTRY, retired=frozenset({"magpie.config"}))
     await db.execute(f'CREATE ROLE "{config.app_role}"')
     await db.execute("DROP TABLE magpie.config")
 
     result = await grants(db, role="mirror", head=HEAD, config=config)
 
-    assert result["replicated"] == present_tables(retired)
-    assert result["row_security"] == sorted(set(ROOTS) - retired)
+    assert result["replicated"] == registry.current
+    assert result["row_security"] == sorted(set(ROOTS) - registry.retired)
 
 
 async def test_a_permissive_policy_added_by_hand_doesnt_widen_writes(db, config):
@@ -595,14 +589,14 @@ async def test_subscribe_failure_is_redacted_and_unchained(caplog):
 
 
 @pytest.mark.parametrize("retired", [False, True], ids=["registered", "retired"])
-async def test_subscribe_reports_a_missing_table_unless_it_is_retired(caplog, monkeypatch, retired):
+async def test_subscribe_reports_a_missing_table_unless_it_is_retired(caplog, retired):
     # Like publish: a retired table a database has dropped isn't "not here yet".
     table = "squirrel.pv_facility"
-    monkeypatch.setattr("canopy.core.replication.subscriber.RETIRED", frozenset({table} if retired else ()))
+    registry = replace(REGISTRY, retired=frozenset({table} if retired else ()))
     conn = ScriptedConnection(superuser=True, present=[t for t in PRESENT if t != table])
     caplog.set_level(logging.INFO, logger="canopy.core.replication")
 
-    await subscribe(conn, role="mirror", head="head", arms=ARMS, connect_arm=_same(conn))
+    await subscribe(conn, role="mirror", head="head", arms=ARMS, connect_arm=_same(conn), registry=registry)
 
     reported = f"Not in this database yet, not copied: {table}" in caplog.text
     assert reported == (not retired)

@@ -36,7 +36,7 @@ import canopy.core.facilities.models  # noqa: F401
 from canopy.core.db import Base
 from canopy.core.arms import Arm, ArmsConfig, subscription_name
 from canopy.core.replication.config import ReplicationConfig
-from canopy.core.replication.registry import RETIRED, REGISTRY
+from canopy.core.replication.registry import REGISTRY
 from canopy.core.replication.subscriber import subscriber_status
 
 _ADMIN_DSN = os.environ.get("CANOPY_TEST_ADMIN_DSN", "postgresql://canopy:canopy@localhost:5432/postgres")
@@ -44,15 +44,9 @@ _DB_NAME = "canopy_replication_test"
 DB_DSN = make_url(_ADMIN_DSN).set(database=_DB_NAME).render_as_string(hide_password=False)
 
 
-def present_tables(retired: frozenset[str] = RETIRED) -> list[str]:
-    """The replicated tables ``build_schema`` makes: every registered one but the retired.
-
-    A retired table keeps its registry entry but has no model, so no test database holds it.
-    """
-    return sorted(set(REGISTRY.replicated) - retired)
-
-
-PRESENT = present_tables()
+# The replicated tables ``build_schema`` makes. A retired table keeps its registry
+# entry but has no model, so no test database holds it.
+PRESENT = REGISTRY.current
 
 
 async def build_schema(dsn: str) -> None:

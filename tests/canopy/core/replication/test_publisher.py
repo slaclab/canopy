@@ -1,6 +1,7 @@
 """``publish`` and the primary's ``status`` against a real Postgres."""
 
 import logging
+from dataclasses import replace
 
 import pytest
 
@@ -12,7 +13,7 @@ from canopy.core.replication.publisher import (
     publication_state,
 )
 
-from .conftest import PRESENT, privileges, direct_grants, present_tables
+from .conftest import PRESENT, privileges, direct_grants
 
 
 async def _published(conn) -> list[str]:
@@ -70,17 +71,16 @@ async def test_publish_converges_a_stale_publication(db, config):
     assert tuple(row.values()) == (True, True, True, False)
 
 
-async def test_a_retired_table_already_dropped_is_not_reported_missing(db, config, caplog, monkeypatch):
+async def test_a_retired_table_already_dropped_is_not_reported_missing(db, config, caplog):
     # Retired tables stay registered for databases that still hold them; one that has
     # dropped the table shouldn't log it as "not here yet" on every deploy.
-    retired = frozenset({"squirrel.pv_facility"})
-    monkeypatch.setattr("canopy.core.replication.publisher.RETIRED", retired)
+    registry = replace(REGISTRY, retired=frozenset({"squirrel.pv_facility"}))
     await db.execute("DROP TABLE squirrel.pv_facility")
     caplog.set_level(logging.INFO, logger="canopy.core.replication")
-    result = await publish(db, role="primary", config=config)
+    result = await publish(db, role="primary", config=config, registry=registry)
     assert result["missing"] == []
     assert "Not in this database yet" not in caplog.text
-    assert await _published(db) == present_tables(retired)  # what PRESENT becomes once it's retired
+    assert await _published(db) == registry.current  # what PRESENT becomes once it's retired
 
 
 async def test_publish_picks_up_a_registered_table_once_it_exists(db, config, caplog):

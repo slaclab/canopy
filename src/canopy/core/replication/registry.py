@@ -104,6 +104,9 @@ class ReplicationRegistry:
     tables: Mapping[str, TableClass]
     publications: tuple[Publication, ...]
     owner_paths: Mapping[str, OwnerPath] = field(default_factory=dict)
+    # Registered tables a migration has dropped (``RETIRED`` for ``REGISTRY``): still
+    # classified wherever a database holds one, never missing where it doesn't.
+    retired: frozenset[str] = frozenset()
     # Columns unique across every owner, by table: two owners' rows can't share a
     # value, so a clash stops replication from the arm whose row arrives second.
     shared_keys: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
@@ -140,6 +143,19 @@ class ReplicationRegistry:
     def replicated(self) -> list[str]:
         """Tables carried by any publication, sorted."""
         return sorted({name for publication in self.publications for name in self.published(publication)})
+
+    @property
+    def current(self) -> list[str]:
+        """Replicated tables this release's models define, sorted: all but the retired.
+
+        ``replicated`` keeps a retired table, since a database that still holds one
+        still publishes and copies it; only a table here can be missing.
+        """
+        return sorted(set(self.replicated) - self.retired)
+
+    def missing_from(self, present: set[str]) -> list[str]:
+        """Current tables a database holding ``present`` lacks yet, sorted. A dropped retired table isn't one."""
+        return sorted(set(self.current) - present)
 
     @property
     def local(self) -> list[str]:
@@ -187,6 +203,7 @@ REGISTRY = ReplicationRegistry(
             "core.api_key": TableClass.LOCAL,
         }
     ),
+    retired=RETIRED,
     owner_paths=MappingProxyType(
         {
             "core.facility": _root(),
