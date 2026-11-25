@@ -46,7 +46,21 @@ target_metadata = Base.metadata
 settings = get_settings()
 database_url = settings.database_url
 replication_side = side_for_role(settings.role)
-logging.getLogger("alembic.env").info("CANOPY_ROLE=%s: migrating the replication %s", settings.role, replication_side)
+_side_named = False
+
+
+def _name_the_side(**_step) -> None:
+    """Log the side once, after the first step applies (Alembic's ``on_version_apply``).
+
+    Not at import: ``alembic check``, ``current`` and an upgrade with nothing to apply
+    run this file too, and the side only matters to a step that runs.
+    """
+    global _side_named
+    if not _side_named:
+        _side_named = True
+        logging.getLogger("alembic.env").info(
+            "CANOPY_ROLE=%s: migrated as the replication %s", settings.role, replication_side
+        )
 
 
 def _include_object(obj, name, type_, reflected, compare_to) -> bool:
@@ -72,6 +86,7 @@ def run_migrations_offline() -> None:
         version_table_schema="public",
         include_object=_include_object,
         canopy_replication_side=replication_side,
+        on_version_apply=_name_the_side,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -122,6 +137,7 @@ def do_run_migrations(connection: Connection) -> None:
         version_table_schema="public",
         include_object=_include_object,
         canopy_replication_side=replication_side,
+        on_version_apply=_name_the_side,
     )
     with context.begin_transaction():
         # Inside the migration transaction: a query run before it would open one
