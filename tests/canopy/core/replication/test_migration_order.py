@@ -77,10 +77,9 @@ from canopy.core.replication.registry import REGISTRY
 from canopy.core.replication.migration import REQUIRES_PRIMARY_AT
 from canopy.core.replication.subscriber import refresh, subscribe
 
-from .conftest import Octopus, eventually
+from .conftest import Octopus, eventually, published_tables
 
 ROOT = Path(__file__).resolve().parents[4]
-PUBLICATIONS = [publication.name for publication in REGISTRY.publications]
 
 REPLICATION_BASE = "89e21441c63c"
 """The oldest revision a database with a subscription can run: the ownership revision."""
@@ -208,14 +207,6 @@ async def walk(bare_octopus: Octopus) -> Walk:
 # --------------------------------------------------------------------------- #
 # The catalog
 # --------------------------------------------------------------------------- #
-
-
-async def _published(conn: asyncpg.Connection) -> list[str]:
-    rows = await conn.fetch(
-        "SELECT DISTINCT schemaname || '.' || tablename AS name FROM pg_publication_tables WHERE pubname = ANY($1)",
-        PUBLICATIONS,
-    )
-    return sorted(row["name"] for row in rows)
 
 
 async def _present(conn: asyncpg.Connection, tables: list[str]) -> list[str]:
@@ -462,7 +453,7 @@ async def _write(w: Walk, *, arms: list[Side] | None = None, head: bool = True) 
     replicated = await _present(w.head.conn, REGISTRY.replicated)
     shared = {table: await _unique_per_owner(w.head.conn, table) for table in replicated}
     for arm in w.arms if arms is None else arms:
-        published = await _published(arm.conn)
+        published = await published_tables(arm.conn)
         await _insert_rows(arm.conn, published, owner=arm.name, shared=shared, round_=w.rounds)
         await _rewrite(arm.conn, published)
         await _insert_rows(arm.conn, await _present(arm.conn, REGISTRY.local))
@@ -527,7 +518,7 @@ async def _differing(w: Walk, *, arms: list[Side] | None = None) -> list[str]:
     held: dict[str, set[tuple]] = {}
     for arm in w.arms if arms is None else arms:
         ready = set(await _subscribed(w.head.conn, arm.name))
-        for table in await _published(arm.conn):
+        for table in await published_tables(arm.conn):
             if table not in ready:
                 continue
             key = await _primary_key(arm.conn, table)
@@ -563,7 +554,7 @@ async def _caught_up(w: Walk, when: str, *, timeout: float = 60.0) -> None:
     """Wait until the head holds every arm's rows; fail at once on an apply or copy error."""
     await _forget_schemas(w)
     for arm in w.arms:
-        if leaked := sorted(set(await _published(arm.conn)) & set(REGISTRY.local)):
+        if leaked := sorted(set(await published_tables(arm.conn)) & set(REGISTRY.local)):
             pytest.fail(f"{when}: {arm.name} publishes local tables: {', '.join(leaked)}")
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -704,7 +695,7 @@ async def test_every_revision_in_release_order(walk: Walk):
     for arm, sub in zip(w.arms, status["subscriptions"]):
         assert sub["exists"] and not sub["tables_not_ready"]
         assert sub["apply_error_count"] == 0 and sub["sync_error_count"] == 0
-        assert sub["tables_ready"] == len(await _published(arm.conn))
+        assert sub["tables_ready"] == len(await published_tables(arm.conn))
     for side in (w.head, *w.arms):
         assert await side.conn.fetchval("SELECT version_num FROM public.alembic_version") == ordered[-1]
 

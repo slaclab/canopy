@@ -47,6 +47,7 @@ DB_DSN = make_url(_ADMIN_DSN).set(database=_DB_NAME).render_as_string(hide_passw
 # The replicated tables ``build_schema`` makes. A retired table keeps its registry
 # entry but has no model, so no test database holds it.
 PRESENT = REGISTRY.current
+PUBLICATIONS = [publication.name for publication in REGISTRY.publications]
 
 
 async def build_schema(dsn: str) -> None:
@@ -130,6 +131,15 @@ async def direct_grants(conn: asyncpg.Connection, role: str, table: str) -> set[
         table,
     )
     return {row["privilege_type"] for row in rows}
+
+
+async def published_tables(conn: asyncpg.Connection, publications: list[str] = PUBLICATIONS) -> list[str]:
+    """The tables any of ``publications`` (by default the registry's) carries, sorted."""
+    rows = await conn.fetch(
+        "SELECT DISTINCT schemaname || '.' || tablename AS name FROM pg_publication_tables WHERE pubname = ANY($1)",
+        publications,
+    )
+    return sorted(row["name"] for row in rows)
 
 
 # --------------------------------------------------------------------------- #
