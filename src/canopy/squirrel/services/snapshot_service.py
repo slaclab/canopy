@@ -870,12 +870,8 @@ class SnapshotService:
         assigned to that facility or one below it (``capture_scope``), as a capture into
         that facility would take it. Every rule is a condition in the loop below.
         """
-        known = await self.pv_repo.get_existing_ids(pv_ids, include_deleted=True, owner=local_instance())
-        needs_facilities = self.facility_scope is not None or capture_scope is not None
-        assigned = await self.pv_repo.facility_ids_for_many(sorted(known)) if needs_facilities else {}
         importable = set()
-        for pv_id in known:
-            facility_ids = assigned.get(pv_id, set())
+        for pv_id, facility_ids in (await self.pv_repo.facilities_of_owned(pv_ids, owner=local_instance())).items():
             if not self._pv_in_scope(facility_ids):
                 continue
             if capture_scope is not None and not facility_ids & capture_scope:
