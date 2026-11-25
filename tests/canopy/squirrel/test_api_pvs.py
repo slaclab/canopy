@@ -1,5 +1,8 @@
 """API tests for the PV registry + meta-PV endpoints."""
 
+from uuid import uuid4
+
+import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -114,9 +117,84 @@ async def test_paged_and_filtered_search(client: AsyncClient, sample_pv: dict):
     assert body["totalCount"] >= 1 and body["limit"] == 10
 
 
-async def test_paged_bad_tagfilters_is_400(client: AsyncClient):
-    r = await client.get("/v1/pvs/paged?tagFilters=NOT_JSON", headers=READ_HEADERS)
-    assert r.status_code == 400
+async def test_paged_follows_continuation_token(client: AsyncClient, sample_pv: dict):
+    await client.post("/v1/pvs", headers=WRITE_HEADERS, json={"setpointAddress": "SECOND:SP"})
+
+    first = await client.get("/v1/pvs/paged?pageSize=1", headers=READ_HEADERS)
+    assert first.status_code == 200, first.text
+    token = first.json()["continuationToken"]
+    assert token is not None
+
+    second = await client.get(f"/v1/pvs/paged?pageSize=1&continuationToken={token}", headers=READ_HEADERS)
+    assert second.status_code == 200, second.text
+    assert second.json()["results"][0]["id"] != first.json()["results"][0]["id"]
+    assert second.json()["continuationToken"] is None
+
+
+async def test_paged_normalises_token_forms_and_empty_token(client: AsyncClient, sample_pv: dict):
+    """Forms uuid.UUID() accepts must be normalised, not handed raw to asyncpg (500)."""
+    await client.post("/v1/pvs", headers=WRITE_HEADERS, json={"setpointAddress": "SECOND:SP"})
+    first = await client.get("/v1/pvs/paged?pageSize=1", headers=READ_HEADERS)
+    assert first.status_code == 200, first.text
+    token = first.json()["continuationToken"]
+    plain = await client.get(f"/v1/pvs/paged?pageSize=1&continuationToken={token}", headers=READ_HEADERS)
+    assert plain.status_code == 200, plain.text
+
+    for form in ("{" + token + "}", f"urn:uuid:{token}", token.upper()):
+        r = await client.get("/v1/pvs/paged", params={"pageSize": 1, "continuationToken": form}, headers=READ_HEADERS)
+        assert r.status_code == 200, f"{form!r} -> {r.status_code} {r.text}"
+        assert r.json() == plain.json()
+
+    # An empty token means the first page, as it did before the guard existed.
+    r = await client.get("/v1/pvs/paged?pageSize=1&continuationToken=", headers=READ_HEADERS)
+    assert r.status_code == 200 and r.json() == first.json()
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "garbage",
+        "0" * 40,
+        "not-a-uuid-but-36-chars-long-aaaaaaaa",
+        "+" + "0" * 31,  # uuid.UUID() would read these three as the nil UUID via int(hex, 16)
+        "0_" + "0" * 30,
+        " " + "0" * 31,
+    ],
+)
+async def test_paged_malformed_continuation_token_400(client: AsyncClient, token: str):
+    """A bad token must not reach asyncpg as an invalid UUID comparison (500), nor pass as a UUID."""
+    r = await client.get("/v1/pvs/paged", params={"continuationToken": token}, headers=READ_HEADERS)
+    assert r.status_code == 400, f"{token!r} -> {r.status_code} {r.text}"
+    assert r.json()["code"] == "bad_request"
+
+
+@pytest.mark.parametrize(
+    "tag_filters",
+    [
+        "NOT_JSON",
+        '{"g": ["garbage"]}',  # tag id is not a UUID
+        '{"g": [1, 2]}',  # tag ids are not strings
+        '{"g": "notalist"}',  # group value is not a list
+        "[1, 2]",  # not an object
+        '{"not-a-group": ["00000000-0000-0000-0000-000000000000"]}',  # key is not a group id
+        '{"": ["00000000-0000-0000-0000-000000000000"]}',
+    ],
+)
+async def test_paged_bad_tagfilters_is_400(client: AsyncClient, tag_filters: str):
+    """Malformed tagFilters must be rejected before the query is built (not a 500 from the DB)."""
+    r = await client.get("/v1/pvs/paged", params={"tagFilters": tag_filters}, headers=READ_HEADERS)
+    assert r.status_code == 400, f"{tag_filters!r} -> {r.status_code} {r.text}"
+    assert r.json()["code"] == "bad_request"
+
+
+@pytest.mark.parametrize("tag_filters", ["null", "[]", "false", "0", "{}"])
+async def test_paged_falsy_tagfilters_mean_no_filter(client: AsyncClient, sample_pv: dict, tag_filters: str):
+    """A client that serialises an empty selection as null or [] gets the unfiltered list, not a 400."""
+    unfiltered = await client.get("/v1/pvs/paged", headers=READ_HEADERS)
+    assert unfiltered.status_code == 200, unfiltered.text
+    r = await client.get("/v1/pvs/paged", params={"tagFilters": tag_filters}, headers=READ_HEADERS)
+    assert r.status_code == 200, f"{tag_filters!r} -> {r.status_code} {r.text}"
+    assert r.json() == unfiltered.json()
 
 
 async def test_paged_tag_filter(client: AsyncClient, sample_tag_group: dict):
@@ -157,6 +235,17 @@ async def test_update_bad_uuid_is_404(client: AsyncClient):
     r = await client.put("/v1/pvs/not-a-uuid", headers=WRITE_HEADERS, json={"description": "x"})
     assert r.status_code == 404
     assert r.json()["code"] == "pv_not_found"
+
+
+async def test_path_id_forms_are_normalised_not_500(client: AsyncClient, sample_pv: dict):
+    """Braced and urn ids parse as UUIDs but asyncpg rejects them raw; they used to 500."""
+    pv_id = sample_pv["id"]
+    r = await client.put(f"/v1/pvs/{{{pv_id}}}", headers=WRITE_HEADERS, json={"description": "braced"})
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == pv_id and r.json()["description"] == "braced"
+
+    r = await client.put(f"/v1/pvs/urn:uuid:{uuid4()}", headers=WRITE_HEADERS, json={"description": "x"})
+    assert r.status_code == 404 and r.json()["code"] == "pv_not_found"
 
 
 # --- meta PVs --------------------------------------------------------------- #

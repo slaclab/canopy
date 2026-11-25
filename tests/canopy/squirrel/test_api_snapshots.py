@@ -321,6 +321,9 @@ async def test_get_snapshot_bad_and_missing_uuid(client: AsyncClient):
     assert (await client.get("/v1/snapshots/not-a-uuid", headers=READ_HEADERS)).status_code == 404
     r = await client.get("/v1/snapshots/00000000-0000-0000-0000-000000000000", headers=READ_HEADERS)
     assert r.status_code == 404 and r.json()["code"] == "snapshot_not_found"
+    # Braced form: a UUID to the parser, not to asyncpg; must be the same 404, not a 500.
+    r = await client.get("/v1/snapshots/{00000000-0000-0000-0000-000000000000}", headers=READ_HEADERS)
+    assert r.status_code == 404 and r.json()["code"] == "snapshot_not_found"
 
 
 async def test_update_metadata(client: AsyncClient, db_session: AsyncSession):
