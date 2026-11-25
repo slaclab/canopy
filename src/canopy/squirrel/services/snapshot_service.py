@@ -321,6 +321,15 @@ class SnapshotService:
                 )
         return meta_pv_values
 
+    async def _require_writable(self, snapshot: Snapshot) -> None:
+        """Gate a write to ``snapshot``: the facility gate first, then the owner.
+
+        A caller who can't reach the row isn't told whose it is. Every write to an
+        existing snapshot goes through here.
+        """
+        await self._require_facility_write(snapshot.facility_id, "this snapshot")
+        require_owned(snapshot.owner_instance, f"Snapshot {snapshot.id}")
+
     async def _require_facility_write(self, facility_id: str | None, what: str) -> None:
         """Gate a write on the calling key's facility grant. Unrestricted keys pass
         unconditionally; a restricted key — including an empty-grant one — needs the
@@ -573,9 +582,7 @@ class SnapshotService:
         existing = await self.snapshot_repo.get_by_id(snapshot_id)
         if not existing:
             return None
-        # The facility gate first: a caller who can't reach the row isn't told its owner.
-        await self._require_facility_write(existing.facility_id, "this snapshot")
-        require_owned(existing.owner_instance, f"Snapshot {snapshot_id}")
+        await self._require_writable(existing)
         snapshot = await self.snapshot_repo.update_metadata(
             snapshot_id, title=title, description=description, retain=retain
         )
@@ -1406,6 +1413,5 @@ class SnapshotService:
         snapshot = await self.snapshot_repo.get_by_id(snapshot_id)
         if not snapshot:
             return False
-        await self._require_facility_write(snapshot.facility_id, "this snapshot")
-        require_owned(snapshot.owner_instance, f"Snapshot {snapshot_id}")
+        await self._require_writable(snapshot)
         return await self.snapshot_repo.soft_delete(snapshot_id)
