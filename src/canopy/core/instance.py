@@ -12,20 +12,18 @@ an arm without forwarding is read-only here.
 import os
 import sys
 import logging
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from functools import lru_cache
 
 from fastapi import Security, APIRouter
-from sqlalchemy import text
-from alembic.config import Config
-from alembic.script import ScriptDirectory
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from canopy.core.db import SessionDep
 from canopy.core.arms import ArmsConfigError, get_arms_config, subscription_name
 from canopy.core.config import get_settings
 from canopy.core.security import require_read_access
 from canopy.contracts.base import CanopyModel
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +50,7 @@ class InstanceDTO(CanopyModel):
     arms: list[ArmDTO]
 
 
-async def arm_states(session: AsyncSession, arms: list[str]) -> dict[str, SubscriptionState]:
+async def arm_states(session: "AsyncSession", arms: list[str]) -> dict[str, SubscriptionState]:
     """The state of this head's subscription to each of ``arms``.
 
     ``missing`` before ``subscribe``; ``disabled``; ``stopped`` when no apply worker
@@ -60,6 +58,8 @@ async def arm_states(session: AsyncSession, arms: list[str]) -> dict[str, Subscr
     had its initial copy; otherwise ``streaming``. Read from the subscription
     catalogs, whose columns other than the connection string any role may read.
     """
+    from sqlalchemy import text
+
     rows = await session.execute(
         text(
             """
@@ -92,6 +92,19 @@ async def arm_states(session: AsyncSession, arms: list[str]) -> dict[str, Subscr
     return states
 
 
+async def _head_arm_states(arms: list[str]) -> dict[str, SubscriptionState]:
+    """``arm_states`` in a session of its own.
+
+    The database is imported here, not at the top: ``/v1/instance`` is served on
+    every install, including one without the ``data`` extra, and only a head,
+    which has the database, has arms to read.
+    """
+    from canopy.core.db import session_scope
+
+    async with session_scope() as session:
+        return await arm_states(session, arms)
+
+
 @lru_cache
 def shipped_alembic_head() -> str | None:
     """The head revision of the migrations tree shipped with this process, not the database's.
@@ -99,8 +112,9 @@ def shipped_alembic_head() -> str | None:
     Found the way the ``alembic`` CLI finds it — ``$ALEMBIC_CONFIG``, else
     ``alembic.ini`` in the working directory (``/app`` in the prod image) — so
     it names exactly what ``alembic upgrade head`` would migrate to from here.
-    ``None`` when the tree isn't there (the dev image has none), can't be read,
-    or has more than one head; this endpoint must never fail over it.
+    ``None`` when the tree isn't there (the dev image has none), Alembic isn't
+    installed (an install without the ``data`` extra), the tree can't be read, or
+    it has more than one head; this endpoint must never fail over it.
 
     Reading the tree imports every version file, so the API calls this once at
     startup and the cache answers every request: the tree can't change under a
@@ -108,6 +122,13 @@ def shipped_alembic_head() -> str | None:
     the ini's ``prepend_sys_path`` to it.
     """
     config_path = os.environ.get("ALEMBIC_CONFIG", "alembic.ini")
+    try:
+        # Imported here: Alembic comes with the ``data`` extra, which a lean install lacks.
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+    except ImportError:
+        logger.info("Alembic is not installed; reporting no Alembic head")
+        return None
     saved_path = sys.path[:]
     try:
         heads = ScriptDirectory.from_config(Config(config_path)).get_heads()
@@ -123,7 +144,7 @@ def shipped_alembic_head() -> str | None:
 
 
 @router.get("", dependencies=[Security(require_read_access)])
-async def get_instance(session: SessionDep) -> InstanceDTO:
+async def get_instance() -> InstanceDTO:
     settings = get_settings()
     try:
         configured = get_arms_config().arms if settings.role == "mirror" else {}
@@ -132,7 +153,7 @@ async def get_instance(session: SessionDep) -> InstanceDTO:
         logger.error("GET /v1/instance: %s", exc)
         raise
     arms = sorted(configured)
-    states = await arm_states(session, arms) if arms else {}
+    states = await _head_arm_states(arms) if arms else {}
     return InstanceDTO(
         role=settings.role,
         instance=settings.instance,

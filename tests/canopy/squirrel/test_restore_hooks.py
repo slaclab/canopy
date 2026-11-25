@@ -6,7 +6,6 @@ import pytest
 
 from canopy.squirrel.config import SquirrelConfig
 from canopy.squirrel.restore_hooks import registry
-from canopy.squirrel.restore_hooks.base import RestoreHookError
 from canopy.squirrel.restore_hooks.magnet_trim import MAGNET_PREFIXES, MagnetTrimHook
 from canopy.squirrel.restore_hooks.write_to_con import WriteToConHook
 
@@ -30,9 +29,10 @@ def test_non_magnet_pv_yields_no_extra_writes():
     assert trim_hook.derive_extra_writes("KLYS:SIM:01:KVAC", 3.0) == []
 
 
-def test_magnet_without_trailing_bdes_raises():
-    with pytest.raises(RestoreHookError):
-        trim_hook.derive_extra_writes("QUAD:SIM:01:BCON", 3.0)
+@pytest.mark.parametrize("address", ["QUAD:SIM:01:EDES", "QUAD:SIM:01:BCON", "pva://XCOR:SIM:01:BCTRL"])
+def test_magnet_without_trailing_bdes_yields_no_extra_writes(address):
+    """Only BDES setpoints need a trim; any other magnet PV is restored as-is."""
+    assert trim_hook.derive_extra_writes(address, 3.0) == []
 
 
 def test_protocol_prefix_is_preserved():
@@ -69,14 +69,9 @@ def test_con_non_magnet_pv_yields_no_extra_writes():
     assert con_hook.derive_extra_writes("KLYS:SIM:01:KVAC", 1.0) == []
 
 
-def test_con_magnet_without_trailing_bdes_raises():
-    with pytest.raises(RestoreHookError, match="not a BDES setpoint"):
-        con_hook.derive_extra_writes("QUAD:SIM:01:CTRL", 1.0)
-
-
-def test_con_error_names_the_original_address():
-    with pytest.raises(RestoreHookError, match="pva://QUAD:SIM:01:RBV"):
-        con_hook.derive_extra_writes("pva://QUAD:SIM:01:RBV", 1.0)
+@pytest.mark.parametrize("address", ["QUAD:SIM:01:EDES", "QUAD:SIM:01:CTRL", "pva://QUAD:SIM:01:RBV"])
+def test_con_magnet_without_trailing_bdes_yields_no_extra_writes(address):
+    assert con_hook.derive_extra_writes(address, 1.0) == []
 
 
 def test_con_protocol_prefix_is_preserved():

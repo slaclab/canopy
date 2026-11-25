@@ -798,18 +798,25 @@ class PvRepository(BaseRepository[Pv]):
         if rows:
             await self.session.execute(insert(pv_facility), rows)
 
-    async def get_existing_ids(
-        self, ids: list[str], *, include_deleted: bool = False, owner: str | None = None
-    ) -> set[str]:
-        """The subset of ``ids`` that are PVs here, without loading the rows; ``owner``'s only, if given."""
+    async def facilities_of_owned(self, ids: list[str], *, owner: str) -> dict[str, set[str]]:
+        """``owner``'s PVs among ``ids``, deleted ones included, each with its facility ids.
+
+        One query, with the ids as one ``uuid[]`` parameter, whatever their number. A PV
+        with no facility maps to an empty set; an id that isn't ``owner``'s PV is absent.
+        """
         if not ids:
-            return set()
-        query = select(Pv.id).where(Pv.id == any_(_uuid_array(ids)))
-        if not include_deleted:
-            query = query.where(Pv.deleted_at.is_(None))
-        if owner is not None:
-            query = query.where(Pv.owner_instance == owner)
-        return set((await self.session.execute(query)).scalars())
+            return {}
+        rows = await self.session.execute(
+            select(Pv.id, pv_facility.c.facility_id)
+            .outerjoin(pv_facility, pv_facility.c.pv_id == Pv.id)
+            .where(Pv.id == any_(_uuid_array(ids)), Pv.owner_instance == owner)
+        )
+        found: dict[str, set[str]] = {}
+        for pv_id, facility_id in rows.all():
+            facility_ids = found.setdefault(pv_id, set())
+            if facility_id is not None:
+                facility_ids.add(facility_id)
+        return found
 
     async def get_by_ids(
         self, ids: list[str], *, include_deleted: bool = False, populate_existing: bool = False

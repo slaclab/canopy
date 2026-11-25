@@ -93,9 +93,9 @@ So every revision must work with a head any number of revisions ahead of each ar
 - **Retire a table** like a drop, and keep its entry in the replication registry with
   its name added to `RETIRED` in `canopy/core/replication/registry.py`, and its owner
   path: a database that hasn't dropped it yet still needs it classified. Keep them
-  after every deployed database has dropped it, too: the migration-order test walks
-  every revision from the ownership one, those before the drop still hold the table,
-  and `publish` refuses a table the registry doesn't classify.
+  after every deployed database has dropped it, too: the migration-order test replays
+  every revision from the ownership one with today's registry, those before the drop
+  still hold the table, and `publish` refuses a table the registry doesn't classify.
 
 Local tables, which never replicate (`core.api_key`), need none of this.
 

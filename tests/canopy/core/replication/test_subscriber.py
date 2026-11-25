@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from canopy.core.arms import Arm
 from canopy.core.instance import arm_states
+from canopy.core.replication import subscriber
 from canopy.core.replication.sql import (
     Refused,
     ReplicationError,
@@ -600,3 +601,46 @@ async def test_subscribe_reports_a_missing_table_unless_it_is_retired(caplog, re
 
     reported = f"Not in this database yet, not copied: {table}" in caplog.text
     assert reported == (not retired)
+
+
+@pytest.mark.parametrize(
+    ("publications", "layout", "expected"),
+    [
+        (["canopy_history"], "single", ["canopy_history"]),
+        (["canopy_ts", "canopy_ref"], "split", ["canopy_ref", "canopy_ts"]),
+        (["canopy_ref"], None, None),
+    ],
+    ids=["single", "split", "set-by-hand"],
+)
+async def test_status_expects_no_layout_for_publications_set_by_hand(monkeypatch, publications, layout, expected):
+    # A subscription altered out of band to canopy_ref alone matches neither layout, so
+    # status can't say which it should read; defaulting to the single layout would point
+    # an operator at a publication the arm may have dropped.
+    async def subscription(_conn, name):
+        return {
+            "oid": 1,
+            "subname": name,
+            "owner": "canopy",
+            "subenabled": True,
+            "subpublications": publications,
+            "substream": "p",
+            "subslotname": name,
+        }
+
+    class _Head:
+        async def fetchrow(self, *_args):
+            return None
+
+    async def nothing(*_args):
+        return None
+
+    async def no_tables(*_args):
+        return {}
+
+    monkeypatch.setattr(subscriber, "_subscription", subscription)
+    monkeypatch.setattr(subscriber, "applied_lsn", nothing)
+    monkeypatch.setattr(subscriber, "_subscribed_tables", no_tables)
+
+    status = await subscriber._arm_status(_Head(), "arm1", REGISTRY)
+
+    assert (status["layout"], status["expected_publications"]) == (layout, expected)

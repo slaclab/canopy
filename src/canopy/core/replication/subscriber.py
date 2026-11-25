@@ -783,7 +783,8 @@ async def _arm_status(conn: asyncpg.Connection, arm: str, registry: ReplicationR
         "owner": sub["owner"],
         "publications": list(sub["subpublications"]),
         "layout": (layout := _layout(sub["subpublications"], registry)),
-        "expected_publications": [p.name for p in registry.layout(layout == "split")],
+        # Unknown when the publications match neither layout: someone set them by hand.
+        "expected_publications": None if layout is None else [p.name for p in registry.layout(layout == "split")],
         "streaming": sub["substream"],
         "slot_name": sub["subslotname"],
         "worker": jsonable(worker) if worker else None,
@@ -832,6 +833,18 @@ async def subscriber_status(
         "subscriptions": [await _arm_status(conn, arm, registry) for arm in selected],
         "unexpected": _unexpected(await _history_subscriptions(conn), arms),
     }
+
+
+# What a failed statement or a dropped connection to an arm raises, as reseed catches it.
+_LOST = (OSError, asyncpg.PostgresError, asyncpg.InterfaceError)
+
+
+async def _close_quietly(conn: asyncpg.Connection) -> None:
+    """Close ``conn``; one already lost can't be closed cleanly, and that changes nothing."""
+    try:
+        await conn.close()
+    except _LOST:
+        pass
 
 
 async def _connect_arm(name: str, arm: Arm, command: str) -> tuple[asyncpg.Connection, str]:
@@ -929,10 +942,10 @@ async def switch(
                     f"check the subscription is streaming (`status --arm {arm}`) and try again"
                 )
             await asyncio.sleep(1)
-    except asyncpg.PostgresError as exc:
+    except _LOST as exc:
         raise ReplicationError(f"reading arm {arm} failed: {redact(str(exc), [dsn])}") from None
     finally:
-        await primary.close()
+        await _close_quietly(primary)
 
     publications = ", ".join(quote_ident(p) for p in target)
     await conn.execute(
@@ -1013,10 +1026,10 @@ async def heartbeat(
             """,
             *row.values(),
         )
-    except asyncpg.PostgresError as exc:
+    except _LOST as exc:
         raise ReplicationError(f"writing the heartbeat to arm {arm} failed: {redact(str(exc), [dsn])}") from None
     finally:
-        await primary.close()
+        await _close_quietly(primary)
     level = logging.INFO if backup_ok and wal_archive_ok and drift_ok else logging.WARNING
     logger.log(
         level,
