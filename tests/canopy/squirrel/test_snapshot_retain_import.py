@@ -146,7 +146,7 @@ async def test_export_of_a_missing_or_deleted_snapshot_is_404(client: AsyncClien
 
 
 async def test_import_creates_a_new_snapshot_from_an_export(client: AsyncClient, db_session: AsyncSession):
-    sid, _, _ = await _seed(db_session)
+    sid, sp, rb = await _seed(db_session)
     bundle = await _export(client, sid)
 
     r = await client.post("/v1/snapshots/import", headers=WRITE_HEADERS, json=bundle)
@@ -167,12 +167,26 @@ async def test_import_creates_a_new_snapshot_from_an_export(client: AsyncClient,
     listing = (await client.get("/v1/snapshots", headers=READ_HEADERS)).json()["results"]
     assert [row["id"] for row in listing] == [new["id"], sid]
 
-    original = (await client.get(f"/v1/snapshots/{sid}", headers=READ_HEADERS)).json()["pvValues"]
+    # Against what _seed stored, written out, so a fault that changed a value on both the
+    # original and the copy alike would still show.
     copied = (await client.get(f"/v1/snapshots/{new['id']}", headers=READ_HEADERS)).json()["pvValues"]
-    fields = ("pvId", "pvName", "setpointValue", "readbackValue", "status", "severity", "timestamp")
-    assert [{k: v[k] for k in fields} for v in copied] == [{k: v[k] for k in fields} for v in original]
-    # The new snapshot exports the same values again.
-    assert (await _export(client, new["id"]))["values"] == bundle["values"]
+    assert {
+        v["pvName"]: (
+            v["pvId"],
+            v["setpointValue"] and (v["setpointValue"]["value"], v["setpointValue"]["units"]),
+            v["readbackValue"]["value"],
+            v["status"],
+            v["severity"],
+        )
+        for v in copied
+    } == {"EXP:SP": (sp.id, (1.25, "A"), 1.2, 0, 0), "EXP:ONLY:RB": (rb.id, None, [1, 2, 3], 3, 1)}
+    # Exported again, each blob comes out as stored.
+    exported = (await _export(client, new["id"]))["values"]
+    assert {v["pvName"]: (v["pvId"], v["setpointValue"], v["readbackValue"]) for v in exported} == {
+        "EXP:SP": (sp.id, {"value": 1.25, "units": "A", "precision": 3, "extra": "kept"}, {"value": 1.2}),
+        "EXP:ONLY:RB": (rb.id, None, {"value": [1, 2, 3]}),
+    }
+    assert all(datetime.fromisoformat(v["timestamp"]) == CAPTURED for v in copied + exported)
 
 
 async def test_import_keeps_a_deleted_pvs_value_but_restore_still_skips_it(
