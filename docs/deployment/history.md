@@ -502,7 +502,10 @@ one too.
 Once the snapshot replicates back, its outbox row goes and it is an ordinary snapshot.
 
 **Delivery.** The head's worker sends each arm's queue oldest first, every
-`CANOPY_SQUIRREL__OUTBOX__INTERVAL_S` seconds and whenever a capture queues. Each
+`CANOPY_SQUIRREL__OUTBOX__INTERVAL_S` seconds and whenever a capture queues. The
+worker has no module selection, so it runs these deliveries, and the sweep of
+snapshots that came back, whatever `CANOPY_MODULES` says. With `squirrel` left out of
+the API's modules nothing captures, so the outbox stays empty and a run does nothing. Each
 attempt uses the user's name and facility grant as they were at capture time, and is
 strict: an arm that would save it without some values (a PV moved out of the facility
 meanwhile) refuses it with 409 `import_would_skip`, naming the PVs. A failure that says
