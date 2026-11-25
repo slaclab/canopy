@@ -28,8 +28,8 @@ Every instance here has a database, so it is an install with the `data` extra.
 Replication, forwarding, `/health/ready` and the replication gauges come with that
 extra, whatever `CANOPY_MODULES` selects, and the worker, which delivers the outbox
 and prunes, has no module selection. `CANOPY_MODULES` still picks the modules each
-side's API mounts (unset, every module): a head forwards writes only for the modules
-it mounts, and an arm answers a forwarded write for a module it leaves out with 404.
+side's API mounts (unset, every module), and a head forwards writes only for the
+modules it mounts.
 
 ## Topology
 
