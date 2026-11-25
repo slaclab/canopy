@@ -255,6 +255,31 @@ async def test_split_keeps_canopy_history_until_a_mirror_is_seen_streaming_the_p
     assert await publication_layout(db) == "switching"
 
 
+async def test_split_checks_the_head_again_just_before_dropping_canopy_history(db, config, monkeypatch):
+    # Streaming the pair at the first check, then (a new connection) canopy_history alone
+    # by the drop: the run refuses, and nothing it did before the drop stays.
+    await publish(db, role="primary", config=config)
+    await publish(db, role="primary", config=config, split=True)
+    before = await _publications(db)
+    answers = iter(
+        [
+            [{"slot": "canopy_history_head", "active": True, "publications": ["canopy_ref", "canopy_ts"]}],
+            [{"slot": "canopy_history_head", "active": True, "publications": ["canopy_history"]}],
+        ]
+    )
+
+    async def walsenders(_conn):
+        return next(answers)
+
+    monkeypatch.setattr("canopy.core.replication.publisher._subscription_walsenders", walsenders)
+    with pytest.raises(Refused, match="slot canopy_history_head streams canopy_history"):
+        await publish(db, role="primary", config=config, split=True)
+
+    assert next(answers, None) is None, "both checks ran"
+    assert await publication_layout(db) == "switching"
+    assert await _publications(db) == before
+
+
 async def test_split_on_a_new_primary_creates_only_the_pair(db, config):
     result = await publish(db, role="primary", config=config, split=True)
 

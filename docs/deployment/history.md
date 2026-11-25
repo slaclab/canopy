@@ -153,6 +153,8 @@ subscription to each arm (labelled `arm`). `/health/ready` checks the database. 
 gauges, and the alert rules shipped in `docker/observability`, are listed under
 [Replication](../observability/metrics.md#replication). The lag to watch is each
 arm's `canopy_replication_slot_lag_bytes`; the head can't measure its own.
+With `CANOPY_CLOSED_META` on, each side's scrape of `/metrics` needs a key scoped to
+`core` (see [Closed meta routes](api-keys.md#closed-meta-routes)).
 
 ### Drift check
 
@@ -327,6 +329,10 @@ parent is answered by the head, with `not_owner` or 409 `owner_mismatch`. A faci
 create sent to an arm whose slug the head already holds, under any owner, is refused
 with 409 `facility_slug_conflict` before it is sent: slugs are unique across every
 instance, and the arm's new row would otherwise stop replication from that arm.
+
+A head forwards only the writes of the modules it mounts: with a module left out of
+`CANOPY_MODULES`, its writes are answered 404 on the head, as any route it doesn't
+serve, and never reach an arm.
 
 A row or facility the head doesn't hold is answered by the head (404). A captured
 import (`?mode=captured`) is never forwarded: it is how a head saves a snapshot it took

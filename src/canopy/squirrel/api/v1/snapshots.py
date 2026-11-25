@@ -49,6 +49,7 @@ from canopy.squirrel.schemas.snapshot import (
     ComparisonResultDTO,
     SnapshotImportResultDTO,
 )
+from canopy.squirrel.services.snapshot_service import require_snapshot_scope
 
 logger = logging.getLogger(__name__)
 
@@ -180,14 +181,7 @@ async def create_snapshot(
             raise FacilityNotFound(f"Facility '{data.facility}' not found")
         facility_owner = (await facilities_gateway.owners_by_id({facility_id})).get(facility_id)
 
-    if key_scope is not None:
-        # A facility-restricted key must name a facility it holds. Unlike mutating an
-        # existing unassigned row, minting a *new* unscoped snapshot is refused — it
-        # would create data the key could not otherwise have reached.
-        if facility_id is None:
-            raise InsufficientFacilityAccess("API key is scoped to specific facilities; 'facility' is required")
-        if facility_id not in key_scope:
-            raise InsufficientFacilityAccess(f"API key is not scoped to facility: {data.facility}")
+    require_snapshot_scope(key_scope, facility_id, data.facility)
     # The facility gate first: a caller who can't reach the facility isn't told its owner.
     target = capture_target(facility_owner, owner, f"A snapshot of {data.facility or 'every PV'}")
 

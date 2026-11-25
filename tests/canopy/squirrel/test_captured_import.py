@@ -250,6 +250,27 @@ async def test_a_bundle_for_another_instances_facility_is_refused(client, db_ses
 
 
 @pytest.mark.parametrize("captured", [False, True], ids=["history", "captured"])
+async def test_a_key_outside_another_instances_facility_isnt_told_its_owner(client, db_session, as_instance, captured):
+    # The facility gate runs first, as for a capture: the key learns only that it can't
+    # reach the facility, not which instance owns it.
+    bundle = await _captured_bundle(client, db_session)
+    reachable = Facility(slug="reachable", name="Reachable")
+    db_session.add(reachable)
+    with as_instance("arm2"):
+        db_session.add(Facility(slug="theirs", name="Theirs"))
+        await db_session.commit()
+
+    with pytest.raises(InsufficientFacilityAccess) as refused:
+        await SnapshotService(db_session, facility_scope={reachable.id}).import_bundle(
+            SnapshotBundleDTO.model_validate({**bundle, "facility": "theirs"}),
+            captured=captured,
+            created_by="alice" if captured else None,
+        )
+
+    assert str(refused.value) == "API key is not scoped to facility: theirs"
+
+
+@pytest.mark.parametrize("captured", [False, True], ids=["history", "captured"])
 async def test_values_of_another_instances_pvs_are_skipped(client, db_session, as_instance, captured):
     bundle = await _captured_bundle(client, db_session)
     with as_instance("arm2"):

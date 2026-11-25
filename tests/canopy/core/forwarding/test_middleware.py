@@ -15,7 +15,7 @@ from pytest_httpx import HTTPXMock
 from prometheus_client import REGISTRY
 from fastapi.testclient import TestClient
 
-from canopy.main import app
+from canopy.main import app, build_app
 from canopy.core.config import get_settings
 from canopy.core.modules import WILDCARD
 from canopy.core.security import APIKey
@@ -226,6 +226,17 @@ def test_the_root_path_is_not_sent_to_the_arm(head, bind_keys, owner, httpx_mock
 
 class TestLeftToTheAppHere:
     """Never sent to an arm (``httpx_mock`` fails the test on any request)."""
+
+    def test_a_module_this_head_doesnt_mount(self, head, bind_keys, owner, httpx_mock: HTTPXMock):
+        # CANOPY_MODULES=squirrel: a Magpie write answers 404 here, as the app would, and
+        # a Squirrel write is still forwarded.
+        bind_keys(WRITER)
+        owner("arm1")
+        squirrel_only = TestClient(build_app("squirrel"), raise_server_exceptions=False)
+        httpx_mock.add_response(method="PUT", url=f"{ARM1}/squirrel/v1/pvs/p1", json={"id": "p1"})
+
+        assert squirrel_only.put("/magpie/v1/configs/app/slug", json={}, headers=_as(WRITER)).status_code == 404
+        assert squirrel_only.put("/squirrel/v1/pvs/p1", json={}, headers=_as(WRITER)).json() == {"id": "p1"}
 
     def test_no_key_or_a_bad_one(self, client, owner):
         owner("arm1")
