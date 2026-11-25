@@ -395,7 +395,9 @@ For a forwarded request that committed a write, the arm returns
 subscription to that arm, `canopy_history_<arm>`, to reach that position
 (`pg_replication_origin_status`). If it doesn't, the answer carries
 `X-Canopy-Replica-Stale: true`: the write succeeded, but a read straight after it may
-not show it yet. A capture commits later, in the arm's worker, so it carries no
+not show it yet. An arm that saved the write but couldn't read its position
+afterwards (a lost connection, a failover) answers without `X-Canopy-Commit-LSN`, and
+the head then can't wait for it. A capture commits later, in the arm's worker, so it carries no
 position. Both headers are exposed through CORS, so a browser client on another
 origin can read them. The wait includes getting a database connection, so a busy pool
 marks the answer stale rather than delaying it.
