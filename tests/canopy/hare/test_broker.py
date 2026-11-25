@@ -887,9 +887,8 @@ async def test_two_clients_failing_in_one_flush_release_their_shared_pv_once(fak
     assert await wait_for(lambda: first.waiting and second.waiting)  # both sends in flight at once
     gate.set()
     await asyncio.wait_for(flush, 1.0)
-    if grace:
-        (release,) = broker._grace.values()
-        await asyncio.wait_for(release, 1.0)
+    # With a grace period the release follows it, so wait for the monitor to close.
+    assert await wait_for(lambda: closes, timeout=1.0)
 
     assert closes == ["PV:SHARED"]
     assert deactivated == [["PV:SHARED"]]
