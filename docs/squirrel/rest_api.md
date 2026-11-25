@@ -954,7 +954,9 @@ added, are skipped with a warning instead of failing the import.
 GET /squirrel/v1/health/watchdog
 ```
 
-Liveness heartbeat; needs no API key and touches no database.
+Liveness heartbeat; touches no database. It needs no API key unless
+[`CANOPY_CLOSED_META`](../deployment/api-keys.md#closed-meta-routes) is on; then it needs
+a key scoped to `squirrel`.
 
 ??? example "Response"
     ```json
