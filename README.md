@@ -127,16 +127,16 @@
 | src/canopy/formula\_engine/errors.py                         |       49 |        0 |    100% |           |
 | src/canopy/formula\_engine/gateway.py                        |       28 |        7 |     75% |31-33, 44, 55-57 |
 | src/canopy/formula\_engine/language/\_\_init\_\_.py          |        0 |        0 |    100% |           |
-| src/canopy/formula\_engine/language/grammar.py               |       18 |        4 |     78% |     64-67 |
-| src/canopy/formula\_engine/language/namespace.py             |       13 |        0 |    100% |           |
+| src/canopy/formula\_engine/language/grammar.py               |       18 |        2 |     89% |     72-73 |
+| src/canopy/formula\_engine/language/namespace.py             |       48 |        3 |     94% |17, 35, 39 |
 | src/canopy/formula\_engine/ports.py                          |       41 |        7 |     83% |121, 137-139, 149-151, 154-156 |
 | src/canopy/formula\_engine/runtime.py                        |        4 |        0 |    100% |           |
 | src/canopy/formula\_engine/schemas/\_\_init\_\_.py           |        0 |        0 |    100% |           |
 | src/canopy/formula\_engine/schemas/formula.py                |       21 |        0 |    100% |           |
 | src/canopy/formula\_engine/services/\_\_init\_\_.py          |        0 |        0 |    100% |           |
-| src/canopy/formula\_engine/services/evaluator.py             |       87 |        9 |     90% |53, 112-113, 115, 128-129, 131, 184, 186 |
+| src/canopy/formula\_engine/services/evaluator.py             |      214 |       13 |     94% |74, 121, 130, 134, 139, 171-173, 216, 271, 335, 355, 416 |
 | src/canopy/formula\_engine/services/formula\_service.py      |       98 |        2 |     98% |   87, 170 |
-| src/canopy/formula\_engine/services/parser.py                |      120 |       15 |     88% |105-109, 142, 157-158, 163, 165, 167, 170, 176, 194-197, 206 |
+| src/canopy/formula\_engine/services/parser.py                |      130 |       11 |     92% |105-109, 157-158, 163, 165, 167, 170, 176, 202, 212 |
 | src/canopy/formula\_engine/services/scalar\_evaluator.py     |       34 |        1 |     97% |        43 |
 | src/canopy/formula\_engine/services/subscription\_manager.py |      533 |       28 |     95% |420, 648, 663, 666, 672, 682, 747, 767, 770-776, 833-834, 856, 859-860, 874-877, 897, 916, 922, 1128 |
 | src/canopy/formula\_engine/services/table\_store.py          |      954 |       30 |     97% |269, 272-274, 289-290, 319-320, 330-333, 476, 483, 621, 670, 694-696, 928, 949, 997-998, 1014, 1079, 1084, 1260, 1383, 1426, 1438-1439 |
@@ -316,7 +316,7 @@
 | src/canopy/vole/services/hare\_ingest.py                     |      135 |        9 |     93% |60-61, 68, 97, 127, 191, 236-239 |
 | src/canopy/vole/services/notifier.py                         |       35 |        2 |     94% |     33-34 |
 | src/canopy/worker.py                                         |       47 |        1 |     98% |        34 |
-| **TOTAL**                                                    | **12505** |  **772** | **94%** |           |
+| **TOTAL**                                                    | **12677** |  **773** | **94%** |           |
 
 
 ## Setup coverage badge
