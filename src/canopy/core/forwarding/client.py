@@ -205,13 +205,14 @@ async def wait_until_applied(
 ) -> bool:
     """Wait up to ``timeout_s`` for ``subscription`` to apply ``commit_lsn`` here.
 
-    Polls ``applied_lsn`` (``pg_replication_origin_status.remote_lsn``). ``until``, if
-    given, is asked on the same connection at each poll and ends the wait early when
-    true: for a write that may already be here although the position isn't reached.
-    ``False`` on a timeout, and also when the position can't be read (no such
-    subscription, or no grant on the view): the caller then marks the answer stale,
-    which is true as far as this instance can tell. Never raises; the write already
-    succeeded on the arm.
+    Polls ``applied_lsn`` (``pg_replication_origin_status.remote_lsn``), which reaches
+    the end of the arm's commit record once the write is applied here: the position the
+    arm reports (``core.db``). ``until``, if given, is asked on the same connection at
+    each poll and ends the wait early when true: for a write that may already be here
+    although the position isn't reached. ``False`` on a timeout, and also when the
+    position can't be read (no such subscription, or no grant on the view): the caller
+    then marks the answer stale, which is true as far as this instance can tell. Never
+    raises; the write already succeeded on the arm.
 
     ``timeout_s`` bounds the whole wait, getting a connection from the pool and each
     query included, so a busy pool or a stalled database can't hold the answer.
