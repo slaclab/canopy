@@ -148,6 +148,8 @@ subscription to each arm (labelled `arm`). `/health/ready` checks the database. 
 gauges, and the alert rules shipped in `docker/observability`, are listed under
 [Replication](../observability/metrics.md#replication). The lag to watch is each
 arm's `canopy_replication_slot_lag_bytes`; the head can't measure its own.
+With `CANOPY_CLOSED_META` on, each side's scrape of `/metrics` needs a key scoped to
+`core` (see [Closed meta routes](api-keys.md#closed-meta-routes)).
 
 ### Drift check
 
