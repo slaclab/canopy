@@ -183,8 +183,9 @@ class ForwardingMiddleware:
                 raise refusal
             if answer.status_code == 404 and await _pruned_on_arm(route, params, answer):
                 outcome = "refused"
+                what = route.owner.table.rsplit(".", 1)[-1].replace("_", " ").capitalize()
                 raise ArchivedImmutable(
-                    f"Snapshot {params[route.owner.param]} is no longer on arm '{arm.name}'; it is kept here as "
+                    f"{what} {params[route.owner.param]} is no longer on arm '{arm.name}'; it is kept here as "
                     "history and can't be changed"
                 )
         except CanopyError as exc:
@@ -272,13 +273,13 @@ async def _pruned_on_arm(route: routes.WriteRoute, params: dict[str, str], answe
     404 is the right answer and is relayed as it is.
     """
     rule = route.owner
-    if not isinstance(rule, routes.Row) or rule.table != "squirrel.snapshot":
+    if not isinstance(rule, routes.Row) or rule.retained is None:
         return False
     try:
         code = answer.json().get("code")
     except (ValueError, AttributeError):
         return False
-    return code == "snapshot_not_found" and await owners.snapshot_is_live(params[rule.param])
+    return code == rule.retained and await owners.row_is_live(rule, params[rule.param])
 
 
 def _job_id(answer) -> str | None:

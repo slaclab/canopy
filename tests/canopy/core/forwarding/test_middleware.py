@@ -521,10 +521,11 @@ class TestArchivedImmutable:
     @pytest.fixture
     def live_here(self, monkeypatch):
         def _set(live: bool):
-            async def snapshot_is_live(snapshot_id: str) -> bool:
+            async def row_is_live(rule, value: str) -> bool:
+                assert (rule.table, rule.retained) == ("squirrel.snapshot", "snapshot_not_found")
                 return live
 
-            monkeypatch.setattr(owners, "snapshot_is_live", snapshot_is_live)
+            monkeypatch.setattr(owners, "row_is_live", row_is_live)
 
         return _set
 

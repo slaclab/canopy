@@ -47,12 +47,18 @@ class Row:
     ``facilities`` is set where the app gates the row by the caller's facility grant.
     The head then forwards only for a caller whose grant reaches the row here, and
     leaves any other caller to the app, which answers as it does on every instance.
+
+    ``retained`` is the error code the owner answers for a row it no longer holds that
+    a head keeps as history, in a table that soft deletes (``deleted_at``): the head
+    refuses a change to a row it holds live with ``archived_immutable`` instead of
+    relaying that 404.
     """
 
     table: str
     param: str
     column: str = "id"
     facilities: FacilityOf | None = None
+    retained: str | None = None
 
 
 @dataclass(frozen=True)
@@ -135,7 +141,13 @@ class WriteRoute:
         return "core" if mount == "v1" else mount
 
 
-_SNAPSHOT = Row("squirrel.snapshot", "snapshot_id", facilities=FacilityOf("squirrel.snapshot", "id"))
+# An arm prunes snapshots past its window; the head keeps them.
+_SNAPSHOT = Row(
+    "squirrel.snapshot",
+    "snapshot_id",
+    facilities=FacilityOf("squirrel.snapshot", "id"),
+    retained="snapshot_not_found",
+)
 _PV = Row("squirrel.pv", "pv_id", facilities=FacilityOf("squirrel.pv_facility", "pv_id"))
 _TAG_GROUP = Row("squirrel.tag_group", "group_id")
 _CONFIG = Row("magpie.config", "slug", column="slug")
