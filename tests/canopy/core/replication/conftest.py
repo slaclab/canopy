@@ -44,6 +44,12 @@ _DB_NAME = "canopy_replication_test"
 DB_DSN = make_url(_ADMIN_DSN).set(database=_DB_NAME).render_as_string(hide_password=False)
 
 
+# The replicated tables ``build_schema`` makes. A retired table keeps its registry
+# entry but has no model, so no test database holds it.
+PRESENT = REGISTRY.current
+PUBLICATIONS = [publication.name for publication in REGISTRY.publications]
+
+
 async def build_schema(dsn: str) -> None:
     """Drop and recreate every registered schema with all of ``Base.metadata``'s tables."""
     engine = create_async_engine(
@@ -125,6 +131,15 @@ async def direct_grants(conn: asyncpg.Connection, role: str, table: str) -> set[
         table,
     )
     return {row["privilege_type"] for row in rows}
+
+
+async def published_tables(conn: asyncpg.Connection, publications: list[str] = PUBLICATIONS) -> list[str]:
+    """The tables any of ``publications`` (by default the registry's) carries, sorted."""
+    rows = await conn.fetch(
+        "SELECT DISTINCT schemaname || '.' || tablename AS name FROM pg_publication_tables WHERE pubname = ANY($1)",
+        publications,
+    )
+    return sorted(row["name"] for row in rows)
 
 
 # --------------------------------------------------------------------------- #
@@ -321,7 +336,7 @@ async def copied(octopus: Octopus, arm: str) -> bool:
     """Whether the head's subscription to ``arm`` has finished every table's initial copy."""
     status = await subscriber_status(octopus.head.admin, arms=octopus.arms_config.arms, only=arm)
     sub = status["subscriptions"][0]
-    return sub["exists"] and sub["tables_ready"] == len(REGISTRY.replicated) and not sub["tables_not_ready"]
+    return sub["exists"] and sub["tables_ready"] == len(PRESENT) and not sub["tables_not_ready"]
 
 
 async def seed_rows(conn: asyncpg.Connection, owner: str, *, slug: str | None = None) -> dict[str, str]:

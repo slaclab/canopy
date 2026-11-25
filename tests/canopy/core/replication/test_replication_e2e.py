@@ -31,9 +31,8 @@ from canopy.core.replication.subscriber import (
     subscriber_status,
 )
 
-from .conftest import Octopus, copied, seed_rows, eventually, build_schema
+from .conftest import PRESENT, Octopus, copied, seed_rows, eventually, build_schema
 
-PRESENT = sorted(REGISTRY.replicated)
 one_arm = pytest.mark.parametrize("octopus", [1], indirect=True)
 
 
