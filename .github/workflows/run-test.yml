@@ -37,19 +37,20 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
     - name: Install uv
-      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
       with:
         python-version: "3.12"
 
     - name: Install dependencies
-      run: uv sync --group dev
+      run: uv sync --group dev --all-extras
 
     # Two arms (wal_level=logical) and a head, for the replication end-to-end tests.
     - name: Start the replication test servers
       run: docker compose -f tests/canopy/core/replication/docker-compose.yml up -d --wait
 
+    # The perf bounds are for operator-class hardware, not a shared runner.
     - name: Test with pytest
-      run: uv run coverage run -m pytest tests/ -v
+      run: uv run coverage run -m pytest tests/ -v -m "not perf"
       env:
         COVERAGE_FILE: ".coverage.linux"
         CANOPY_TEST_REPLICATION_ARM1_DSN: postgresql://postgres:postgres@localhost:55442/postgres
@@ -64,6 +65,38 @@ jobs:
         name: coverage-linux
         path: .coverage.linux
         include-hidden-files: true
+
+  # The oldest release of every direct dependency pyproject.toml admits. A floor the
+  # tests do not pass at turns this job red; uv.lock is not what it installs.
+  tests-floors:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: canopy
+          POSTGRES_PASSWORD: canopy
+          POSTGRES_DB: canopy
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      with:
+        python-version: "3.12"
+
+    # The perf bounds are for operator-class hardware, not a shared runner.
+    - name: Test under the dependency floors
+      run: ci/run-under-floors.sh tests/ -m "not perf"
 
   # Windows/macOS runners can't run service containers, so skip those tests (their conftest
   # skips when Postgres is unreachable)
@@ -83,15 +116,16 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
     - name: Install uv
-      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
       with:
         python-version: ${{ matrix.python-version }}
 
     - name: Install dependencies
-      run: uv sync --group dev
+      run: uv sync --group dev --all-extras
 
+    # The perf bounds are for operator-class hardware, not a shared runner.
     - name: Test with pytest
-      run: uv run coverage run -m pytest tests/ -v
+      run: uv run coverage run -m pytest tests/ -v -m "not perf"
       env:
         COVERAGE_FILE: ".coverage.${{ matrix.python-version }}.${{ matrix.os }}"
 
@@ -123,7 +157,7 @@ jobs:
 
     - name: Coverage comment
       id: coverage_comment
-      uses: py-cov-action/python-coverage-comment-action@07249dd712cd2464873eb8a59a24f97fd281e76f # v4.6
+      uses: py-cov-action/python-coverage-comment-action@281cb0dcb5b15d4773037d51873558fddc5a7df8 # v4.7
       with:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         MERGE_COVERAGE_FILES: true
