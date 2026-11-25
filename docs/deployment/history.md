@@ -328,6 +328,10 @@ create sent to an arm whose slug the head already holds, under any owner, is ref
 with 409 `facility_slug_conflict` before it is sent: slugs are unique across every
 instance, and the arm's new row would otherwise stop replication from that arm.
 
+A head forwards only the writes of the modules it mounts: with a module left out of
+`CANOPY_MODULES`, its writes are answered 404 on the head, as any route it doesn't
+serve, and never reach an arm.
+
 A row or facility the head doesn't hold is answered by the head (404). A captured
 import (`?mode=captured`) is never forwarded: it is how a head saves a snapshot it took
 for an arm, and only a service key sends one, to the arm.
