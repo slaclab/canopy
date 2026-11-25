@@ -104,6 +104,9 @@ class ReplicationRegistry:
     tables: Mapping[str, TableClass]
     publications: tuple[Publication, ...]
     owner_paths: Mapping[str, OwnerPath] = field(default_factory=dict)
+    # Registered tables a migration has dropped (``RETIRED`` for ``REGISTRY``): still
+    # classified wherever a database holds one, never missing where it doesn't.
+    retired: frozenset[str] = frozenset()
     # Columns unique across every owner, by table: two owners' rows can't share a
     # value, so a clash stops replication from the arm whose row arrives second.
     shared_keys: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
@@ -142,6 +145,19 @@ class ReplicationRegistry:
         return sorted({name for publication in self.publications for name in self.published(publication)})
 
     @property
+    def current(self) -> list[str]:
+        """Replicated tables this release's models define, sorted: all but the retired.
+
+        ``replicated`` keeps a retired table, since a database that still holds one
+        still publishes and copies it; only a table here can be missing.
+        """
+        return sorted(set(self.replicated) - self.retired)
+
+    def missing_from(self, present: set[str]) -> list[str]:
+        """Current tables a database holding ``present`` lacks yet, sorted. A dropped retired table isn't one."""
+        return sorted(set(self.current) - present)
+
+    @property
     def local(self) -> list[str]:
         """Tables that never replicate, sorted."""
         return sorted(name for name, cls in self.tables.items() if cls is TableClass.LOCAL)
@@ -165,8 +181,8 @@ EXCLUDED = frozenset({"public.alembic_version"})
 # Tables a migration has dropped but a deployed database may still hold: a mirror drops a
 # column or table a release after its primary, and the migration-order test walks old
 # revisions. Each keeps its entry in the registry, so `publish` and `grants` classify it
-# wherever it still exists, while its model is gone. Remove both once no deployed
-# database can still hold the table.
+# wherever it still exists, while its model is gone. Keep both for good: the
+# migration-order test still walks the revisions that hold the table.
 RETIRED: frozenset[str] = frozenset()
 
 _ALL_OPERATIONS = ("insert", "update", "delete")
@@ -187,6 +203,7 @@ REGISTRY = ReplicationRegistry(
             "core.api_key": TableClass.LOCAL,
         }
     ),
+    retired=RETIRED,
     owner_paths=MappingProxyType(
         {
             "core.facility": _root(),
