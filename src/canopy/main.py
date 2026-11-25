@@ -127,13 +127,17 @@ def _route_path(scope: Scope) -> str:
     return path
 
 
-def _is_open(scope: Scope) -> bool:
-    """``GET /health`` passes the closed-meta gate."""
-    return scope["type"] == "http" and scope["method"] == "GET" and _route_path(scope) == "/health"
+def _is_open(scope: Scope, probes: frozenset[str]) -> bool:
+    """A ``GET`` on one of ``probes`` (the health probe paths) passes the closed-meta gate."""
+    return scope["type"] == "http" and scope["method"] == "GET" and _route_path(scope) in probes
 
 
 class _ClosedMeta:
-    """Refuse every request without a registry key for the module it targets, except ``GET /health``.
+    """Refuse every request that lacks a registry key for the module it targets, except a ``GET`` on a probe.
+
+    The probes are ``/health`` and, on the database tier, ``/health/ready``. A probe
+    says only whether the process is up or ready, and a kubelet probe can't easily
+    send a key from a secret. An unmounted probe path is refused like any other.
 
     Per-route dependencies cannot do this: the docs and OpenAPI pages of the
     parent and of each mounted sub-app, the root document and the per-module
@@ -157,9 +161,10 @@ class _ClosedMeta:
 
     _DETAIL = "A valid API key is required"
 
-    def __init__(self, app: ASGIApp, *, router_app: FastAPI) -> None:
+    def __init__(self, app: ASGIApp, *, router_app: FastAPI, probes: frozenset[str]) -> None:
         self.app = app
         self.router_app = router_app
+        self.probes = probes
 
     def _module_for(self, scope: Scope) -> str:
         for route in self.router_app.router.routes:
@@ -188,7 +193,7 @@ class _ClosedMeta:
         if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
-        refused = None if _is_open(scope) else await self._refusal(scope)
+        refused = None if _is_open(scope, self.probes) else await self._refusal(scope)
         if refused is None:
             await self.app(scope, receive, send)
             return
@@ -235,8 +240,9 @@ def build_app(modules: Iterable[str] | str, *, closed_meta: bool | None = None) 
     dependencies are not installed costs nothing as long as it is left out.
 
     ``closed_meta`` puts the whole app behind the key registry except
-    ``GET /health``; ``None`` takes the ``CANOPY_CLOSED_META`` setting. The key
-    registry is bound by the lifespan, before anything is served.
+    ``GET /health`` and ``GET /health/ready``; ``None`` takes the
+    ``CANOPY_CLOSED_META`` setting. The key registry is bound by the lifespan,
+    before anything is served.
     ``/v1/api-keys``, ``/v1/facilities`` and ``/health/ready`` are mounted only on
     an install with the database key tier (``has_database_tier``), whose ``/metrics``
     also reports replication; ``/v1/instance`` on every install.
@@ -289,7 +295,8 @@ def build_app(modules: Iterable[str] | str, *, closed_meta: bool | None = None) 
     if closed_meta:
         # Registered first, so it is the innermost layer: CORS answers a preflight
         # before it, and its refusals get the CORS headers and are counted.
-        app.add_middleware(_ClosedMeta, router_app=app)
+        probes = frozenset({"/health", "/health/ready"} if database_tier else {"/health"})
+        app.add_middleware(_ClosedMeta, router_app=app, probes=probes)
     # Registered before CORSMiddleware so it sits INSIDE it (Starlette wraps in reverse
     # registration order): preflight OPTIONS requests that CORS answers itself never
     # reach the router, and counting them would only inflate the "unmatched" series.

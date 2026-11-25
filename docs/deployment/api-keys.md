@@ -497,22 +497,26 @@ file key grants every facility.
 
 ### Closed meta routes
 
-With `CANOPY_CLOSED_META=true`, every route except `GET /health` needs a key
-scoped to the module it targets. That includes `/`, `/docs`, `/openapi.json`,
-`/metrics`, and each module's docs, OpenAPI and `/v1/health/watchdog`.
+With `CANOPY_CLOSED_META=true`, every route except the probes, `GET /health` and
+(on an install with the `data` extra) `GET /health/ready`, needs a key scoped to
+the module it targets. That includes `/`, `/docs`, `/openapi.json`, `/metrics`,
+and each module's docs, OpenAPI and `/v1/health/watchdog`.
 
 - The gate checks only that the key is known and scoped to the module. Each
   route still checks `read`, `write` or `admin` itself, so write-only and
   admin-only keys work as they do without the gate.
 - Refusals are `401 invalid_api_key`, `403 insufficient_module_access` or
   `503 key_store_unavailable`, with CORS headers, so a browser client can read them.
-- A CORS preflight needs no key. `GET /health` stays open behind a path prefix
+- A CORS preflight needs no key. The probes stay open behind a path prefix
   (`uvicorn --root-path`) too.
 
 Before turning it on:
 
-- **Probes.** Point liveness and readiness probes at `GET /health`; the
-  per-module watchdogs need a key.
+- **Probes.** Point liveness probes at `GET /health` and readiness probes at
+  `GET /health/ready`. Neither needs a key; the per-module watchdogs do. The
+  readiness check takes a connection from the app's pool, so it is the one keyless
+  route that reaches the database. An install without the `data` extra has no
+  `/health/ready`, so probe readiness at `/health` there.
 - **Prometheus.** A scrape of `/metrics` must send a key scoped to `core` in the
   `X-API-Key` header. The bundled `docker/observability/prometheus.yml` sends
   none, so its scrape fails with `401`.

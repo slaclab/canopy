@@ -1,7 +1,8 @@
 """The closed-meta gate on the five modules that need no database or job queue.
 
-With ``CANOPY_CLOSED_META=1`` nothing but ``GET /health`` answers without a
-registry key, and a key opens only the modules it is scoped to; each route
+With ``CANOPY_CLOSED_META=1`` nothing but the probes, ``GET /health`` and (on the
+database tier) ``GET /health/ready``, answers without a registry key, and a key
+opens only the modules it is scoped to; each route
 still checks the scope it needs. Everything here must hold on an install without the ``data``
 extra, so the file imports nothing from the unselected modules; the all-eleven
 cases live in ``test_closed_meta_default.py``.
@@ -24,9 +25,11 @@ from canopy.main import build_app
 from tests.conftest import READ_HEADERS
 from canopy.core.config import Settings
 from canopy.core.errors import KeyStoreUnavailable
+from canopy.core.security import has_database_tier
 
 FIVE = ("hare", "vole", "formula-engine", "mole", "converter")
-OPEN = ("GET", "/health")
+# The probes; /health/ready is mounted only on the database tier.
+OPEN = {("GET", "/health"), ("GET", "/health/ready")}
 REFUSAL = {"code": "invalid_api_key", "detail": "A valid API key is required"}
 
 
@@ -109,14 +112,14 @@ def test_the_walk_reaches_the_parent_the_mounts_and_both_sockets(routes):
         "/hare/v1/ws/pvs",
         "/formula-engine/v1/ws/formulas",
     }
-    assert ("http", *OPEN) in routes
+    assert ("http", "GET", "/health") in routes
 
 
 def test_every_http_route_and_method_is_refused_without_a_key(closed_app, routes):
     client = TestClient(closed_app)
     answered = {}
     for kind, method, path in routes:
-        if kind == "http" and (method, path) != OPEN:
+        if kind == "http" and (method, path) not in OPEN:
             resp = client.request(method, path)
             if resp.status_code != 401 or (method != "HEAD" and resp.json() != REFUSAL):
                 answered[f"{method} {path}"] = resp.status_code
@@ -152,11 +155,60 @@ def test_get_health_answers_without_a_key(closed_app):
 
 @pytest.mark.parametrize(
     ("method", "path"),
-    [("HEAD", "/health"), ("POST", "/health"), ("GET", "/health/"), ("GET", "/hare/health"), ("GET", "/healthz")],
+    [
+        ("HEAD", "/health"),
+        ("POST", "/health"),
+        ("GET", "/health/"),
+        ("GET", "/hare/health"),
+        ("GET", "/healthz"),
+        ("HEAD", "/health/ready"),
+        ("POST", "/health/ready"),
+        ("GET", "/health/ready/"),
+        ("GET", "/hare/health/ready"),
+    ],
 )
-def test_only_get_on_the_exact_health_path_is_open(closed_app, method, path):
+def test_only_get_on_the_exact_probe_paths_is_open(closed_app, method, path):
     resp = TestClient(closed_app).request(method, path, follow_redirects=False)
     assert resp.status_code == 401
+
+
+needs_database_tier = pytest.mark.skipif(not has_database_tier(), reason="/health/ready needs the data extra")
+
+
+@needs_database_tier
+@pytest.mark.parametrize(
+    ("ready", "status", "body"),
+    [(True, 200, {"status": "ready"}), (False, 503, {"status": "unavailable", "database": "unreachable"})],
+)
+def test_get_health_ready_answers_without_a_key(closed_app, monkeypatch, ready, status, body):
+    async def check() -> bool:
+        return ready
+
+    monkeypatch.setattr(canopy.main, "database_ready", check)
+    resp = TestClient(closed_app).get("/health/ready")
+    assert resp.status_code == status
+    assert resp.json() == body
+
+
+@needs_database_tier
+def test_get_health_ready_answers_without_a_key_behind_a_root_path(closed_app, monkeypatch):
+    async def check() -> bool:
+        return True
+
+    monkeypatch.setattr(canopy.main, "database_ready", check)
+    resp = TestClient(closed_app, root_path="/canopy").get("/canopy/health/ready")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ready"}
+
+
+def test_without_the_database_tier_the_unmounted_ready_path_is_refused(monkeypatch):
+    """An unmounted probe stays behind the gate, so the answer doesn't tell which install this is."""
+    monkeypatch.setattr(canopy.main, "has_database_tier", lambda: False)
+    app = build_app(FIVE, closed_meta=True)
+    assert ("http", "GET", "/health/ready") not in set(_walk(app))
+    client = TestClient(app)
+    assert client.get("/health/ready").status_code == 401
+    assert client.get("/health").status_code == 200
 
 
 def test_get_health_answers_without_a_key_behind_a_root_path(closed_app):
