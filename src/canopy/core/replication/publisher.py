@@ -26,7 +26,6 @@ from canopy.core.replication.sql import (
 )
 from canopy.core.replication.config import ReplicationConfig
 from canopy.core.replication.registry import (
-    RETIRED,
     EXCLUDED,
     REGISTRY,
     Publication,
@@ -229,7 +228,7 @@ async def publish(
     dict
         Per publication, what changed; per role, ``"granted"``, ``"absent"`` (no such
         role yet) or ``"nothing_published"`` (no registered table here yet); and the
-        registered tables that don't exist here.
+        registered tables that don't exist here yet (a dropped retired one isn't missing).
 
     Raises
     ------
@@ -248,7 +247,7 @@ async def publish(
             f"unclassified tables: {', '.join(unclassified)}. Add them to "
             "canopy.core.replication.registry before publishing"
         )
-    missing = sorted(set(registry.replicated) - present - RETIRED)
+    missing = registry.missing_from(present)
     if missing:
         logger.info("Not in this database yet, skipped: %s", ", ".join(missing))
     if (wal_level := await conn.fetchval("SHOW wal_level")) != "logical":
