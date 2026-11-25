@@ -448,6 +448,7 @@ To import rows whose PV may already be registered, use
 | Status | Code | Condition |
 |--------|------|-----------|
 | 400 | `bad_request` | Two rows share an identifying address |
+| 403 | `insufficient_facility_access` | See [API keys](../deployment/api-keys.md) |
 | 409 | `pv_already_exists` | A row's identifying address is already registered |
 | 422 | — | A row has no address |
 
@@ -504,6 +505,7 @@ and `row` is the row's 1-based position in the request:
 |--------|------|-----------|
 | 400 | `bad_request` | Two rows share an identifying address, or an `update` row names an unknown tag id |
 | 403 | `insufficient_facility_access` | See [API keys](../deployment/api-keys.md) |
+| 409 | `pv_already_exists` | Another write registered a new row's identifying address while the import ran |
 | 422 | — | A row has no address, or `onConflict` is missing or isn't `skip` or `update` |
 
 ### Update a PV
