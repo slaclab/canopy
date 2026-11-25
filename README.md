@@ -148,9 +148,9 @@
 | src/canopy/hare/api/v1/health.py                             |       44 |        0 |    100% |           |
 | src/canopy/hare/api/v1/pvs.py                                |       18 |        0 |    100% |           |
 | src/canopy/hare/api/v1/router.py                             |        8 |        0 |    100% |           |
-| src/canopy/hare/api/v1/ws.py                                 |       42 |        4 |     90% | 92, 95-97 |
+| src/canopy/hare/api/v1/ws.py                                 |       42 |        4 |     90% |95, 98-100 |
 | src/canopy/hare/app.py                                       |       32 |        0 |    100% |           |
-| src/canopy/hare/config.py                                    |       16 |        0 |    100% |           |
+| src/canopy/hare/config.py                                    |       19 |        0 |    100% |           |
 | src/canopy/hare/dependencies.py                              |        7 |        0 |    100% |           |
 | src/canopy/hare/errors.py                                    |        2 |        2 |      0% |      9-12 |
 | src/canopy/hare/gateway.py                                   |       11 |        1 |     91% |        29 |
@@ -160,8 +160,8 @@
 | src/canopy/hare/schemas/pv.py                                |       12 |        0 |    100% |           |
 | src/canopy/hare/schemas/ws.py                                |       23 |        0 |    100% |           |
 | src/canopy/hare/services/\_\_init\_\_.py                     |        0 |        0 |    100% |           |
-| src/canopy/hare/services/broker.py                           |      542 |       51 |     91% |122, 159, 188-189, 196-197, 260, 325, 445, 467, 479-480, 508, 541, 543, 550-551, 640, 675-676, 705, 708-710, 738-739, 754-755, 765-766, 821, 827, 890-891, 950-953, 958, 961-968, 985, 1069-1070, 1080-1081 |
-| src/canopy/hare/services/subscriptions.py                    |       51 |        2 |     96% |    30, 72 |
+| src/canopy/hare/services/broker.py                           |      587 |       43 |     93% |131, 168, 198-199, 206-207, 270, 336, 467, 489, 501-502, 530, 563, 565, 572-573, 660, 695-696, 725, 728-730, 758-759, 775-776, 786-787, 847, 910-911, 987, 1105-1108, 1113, 1140, 1224-1225, 1235-1236 |
+| src/canopy/hare/services/subscriptions.py                    |       53 |        2 |     96% |    30, 76 |
 | src/canopy/jobs/\_\_init\_\_.py                              |        0 |        0 |    100% |           |
 | src/canopy/jobs/api/\_\_init\_\_.py                          |        0 |        0 |    100% |           |
 | src/canopy/jobs/api/v1/\_\_init\_\_.py                       |        0 |        0 |    100% |           |
@@ -268,7 +268,7 @@
 | src/canopy/squirrel/gateway.py                               |       12 |        0 |    100% |           |
 | src/canopy/squirrel/pv\_cache/\_\_init\_\_.py                |        4 |        0 |    100% |           |
 | src/canopy/squirrel/pv\_cache/keys.py                        |       46 |        0 |    100% |           |
-| src/canopy/squirrel/pv\_cache/monitor.py                     |      260 |       28 |     89% |57-59, 64, 111, 156-157, 220-221, 237, 258-263, 276, 305-306, 325, 349-350, 371-376, 414-415 |
+| src/canopy/squirrel/pv\_cache/monitor.py                     |      260 |       25 |     90% |57-59, 64, 111, 156-157, 220-221, 237, 259-263, 276, 305-306, 325, 349-350, 372, 376, 414-415 |
 | src/canopy/squirrel/pv\_cache/reader.py                      |       64 |        2 |     97% |     81-82 |
 | src/canopy/squirrel/restore\_hooks/\_\_init\_\_.py           |        4 |        0 |    100% |           |
 | src/canopy/squirrel/restore\_hooks/base.py                   |        7 |        0 |    100% |           |
@@ -316,7 +316,7 @@
 | src/canopy/vole/services/hare\_ingest.py                     |      135 |        9 |     93% |60-61, 68, 97, 127, 191, 236-239 |
 | src/canopy/vole/services/notifier.py                         |       35 |        2 |     94% |     33-34 |
 | src/canopy/worker.py                                         |       47 |        1 |     98% |        34 |
-| **TOTAL**                                                    | **12789** |  **769** | **94%** |           |
+| **TOTAL**                                                    | **12839** |  **758** | **94%** |           |
 
 
 ## Setup coverage badge
