@@ -640,6 +640,19 @@ class TestJobs:
         assert resp.status_code == 502
         assert "403 forwarded_write_refused" in resp.json()["detail"]
 
+    @pytest.mark.parametrize("body", [b"not json", b'{"status": "running"}'], ids=["not-json", "missing-fields"])
+    def test_a_status_the_head_cant_read_is_a_gateway_error(
+        self, client, httpx_mock: HTTPXMock, no_local_job, job_on, body
+    ):
+        job_on("arm1")
+        httpx_mock.add_response(method="GET", url=f"{ARM1}/jobs/v1/j7", content=body)
+
+        resp = client.get("/jobs/v1/j7", headers=_as(READER))
+
+        assert resp.status_code == 502
+        assert resp.json()["code"] == "primary_unavailable"
+        assert "can't read" in resp.json()["detail"]
+
     def test_a_refused_service_key_is_the_heads(self, client, httpx_mock: HTTPXMock, no_local_job, job_on):
         job_on("arm1")
         httpx_mock.add_response(
