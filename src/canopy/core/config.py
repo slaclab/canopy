@@ -205,7 +205,7 @@ def get_settings() -> Settings:
     return Settings()
 
 
-def describe_settings_error(exc: ValidationError | SettingsError, prefix: str = "CANOPY_") -> str:
+def describe_settings_error(exc: ValidationError | SettingsError) -> str:
     """Which settings are wrong and why, never their values.
 
     A ``ValidationError``'s own text (``str`` and ``repr``) echoes its input, which
@@ -215,6 +215,6 @@ def describe_settings_error(exc: ValidationError | SettingsError, prefix: str = 
     if isinstance(exc, SettingsError):
         return str(exc)
     return "; ".join(
-        f"{prefix}{'__'.join(str(part) for part in error['loc']).upper()}: {error['msg']}"
+        f"CANOPY_{'__'.join(str(part) for part in error['loc']).upper()}: {error['msg']}"
         for error in exc.errors(include_input=False, include_url=False, include_context=False)
     )
