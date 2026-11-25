@@ -524,9 +524,9 @@ class PvRepository(BaseRepository[Pv]):
         all, and the flush keeps every value it wrote, so ``updated_at`` is the one
         attribute left to read: the database sets it on each ``pv`` row the flush
         updates, and the flush expires it. One query reads ``(id, updated_at)`` for every
-        PV instead of reloading the rows and their tags. A PV whose only changes are its
-        tags or facilities gets no ``pv`` UPDATE, so its ``updated_at`` stays as it was,
-        just as with ``update``.
+        PV instead of reloading the rows and their tags. A PV whose only change is its
+        tags gets no ``pv`` UPDATE, so its ``updated_at`` stays as it was, just as with
+        ``update``.
 
         Parameters
         ----------

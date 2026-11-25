@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import uuid
 import logging
-import functools
 from typing import Literal, NamedTuple
 from collections.abc import Callable, Awaitable
 
@@ -54,7 +53,7 @@ _REGISTERED_PVS: dict[AddressKind, Callable[[PvRepository, list[str]], Awaitable
     "config": PvRepository.get_by_config_only,
 }
 
-# How many refused rows a multi-create's 403 names before summarizing the rest
+# How many refused rows an import error names before summarizing the rest
 _REFUSED_ROWS_SHOWN = 10
 
 
@@ -95,11 +94,8 @@ def _identity(
     raise BadRequest("At least one address (setpoint, readback, or config) is required")
 
 
-@functools.lru_cache(maxsize=4096)
 def _canonical_uuid(value: str) -> str | None:
     """``value`` in the lowercase, hyphenated form Postgres returns a UUID in.
-
-    Cached: an import names the same few tag IDs on many rows.
 
     Parameters
     ----------
@@ -125,13 +121,37 @@ class _ImportRow(NamedTuple):
     kind: AddressKind  # identity kind, as `_identity` returns it
     identity_address: str
     data: NewPVElementDTO
+    # Tag IDs in canonical form, first occurrence kept (see `_canonical_tag_ids`)
+    tag_ids: tuple[str, ...]
 
-    @property
-    def tag_ids(self) -> list[str]:
-        """The row's tag IDs in canonical form, first occurrence kept, so they match the
-        IDs Postgres returns and a repeated ID adds the tag once. An ID that isn't a UUID
-        is kept as sent: no tag has it, so it counts as unknown."""
-        return list(dict.fromkeys(_canonical_uuid(tid) or tid for tid in self.data.tags))
+
+def _canonical_tag_ids(tags: list[str], seen: dict[str, str]) -> tuple[str, ...]:
+    """A row's tag IDs in canonical form, first occurrence kept.
+
+    Canonical IDs match the ones Postgres returns, and a repeated ID adds the tag once.
+    An ID that isn't a UUID is kept as sent: no tag has it, so it counts as unknown.
+
+    Parameters
+    ----------
+    tags : list[str]
+        The tag IDs as the row sent them.
+    seen : dict[str, str]
+        Each ID already canonicalized in this import, mapped to its canonical form.
+        Updated in place, so the few IDs an import repeats on many rows are parsed
+        once, and nothing outlives the import.
+
+    Returns
+    -------
+    tuple[str, ...]
+        The canonical IDs, in the order first sent.
+    """
+    canonical: dict[str, None] = {}
+    for tid in tags:
+        canon = seen.get(tid)
+        if canon is None:
+            canon = seen[tid] = _canonical_uuid(tid) or tid
+        canonical[canon] = None
+    return tuple(canonical)
 
 
 def _list_refused(refused: list[tuple[_ImportRow, str]]) -> str:
@@ -611,6 +631,7 @@ class PvService:
         rows: list[_ImportRow] = []
         identities: dict[str, set[str]] = {kind: set() for kind in IDENTITY_KINDS}
         duplicates: dict[str, set[str]] = {kind: set() for kind in IDENTITY_KINDS}
+        canonical_tags: dict[str, str] = {}
         for number, data in enumerate(data_list, 1):
             addresses = (
                 self._normalize_address(data.setpoint_address),
@@ -621,7 +642,8 @@ class PvService:
             if identity_address in identities[kind]:
                 duplicates[kind].add(identity_address)
             identities[kind].add(identity_address)
-            rows.append(_ImportRow(number, addresses, kind, identity_address, data))
+            tag_ids = _canonical_tag_ids(data.tags, canonical_tags)
+            rows.append(_ImportRow(number, addresses, kind, identity_address, data, tag_ids))
 
         for kind in IDENTITY_KINDS:
             if duplicates[kind]:
@@ -710,7 +732,7 @@ class PvService:
         An id that isn't a UUID is left out of the query, since Postgres would refuse it
         as a ``uuid`` parameter; it can't name a tag, so it is simply unknown.
         """
-        tag_ids = {tid for row in rows for tid in row.tag_ids if _canonical_uuid(tid)}
+        tag_ids = {tid for tid in {tid for row in rows for tid in row.tag_ids} if _canonical_uuid(tid)}
         if not tag_ids:
             return {}
         return {tag.id: tag for tag in await self.tag_repo.get_by_ids(list(tag_ids))}
