@@ -26,11 +26,11 @@ from canopy.formula_engine.language.namespace import (
 
 _SEVERITY_ORDER = [AlarmSeverity.NO_ALARM, AlarmSeverity.MINOR, AlarmSeverity.MAJOR, AlarmSeverity.INVALID]
 _BITWISE_HELPERS = {
-    ast.BitAnd: "_fox_bitand",
-    ast.BitOr: "_fox_bitor",
-    ast.BitXor: "_fox_bitxor",
-    ast.LShift: "_fox_lshift",
-    ast.RShift: "_fox_rshift",
+    ast.BitAnd: "_bitwise_bitand",
+    ast.BitOr: "_bitwise_bitor",
+    ast.BitXor: "_bitwise_bitxor",
+    ast.LShift: "_bitwise_lshift",
+    ast.RShift: "_bitwise_rshift",
 }
 _ARRAY_BITWISE_OPERATORS = {
     int.__and__: np.bitwise_and,
@@ -43,7 +43,22 @@ _ARRAY_BITWISE_OPERATORS = {
 
 
 class _BitwiseTransformer(ast.NodeTransformer):
-    """Route bitwise AST nodes through EPICS-compatible integer coercion."""
+    """Route bitwise and supported NumPy aliases through integer coercion."""
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self.generic_visit(node)
+        if (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "np"
+            and node.func.attr in {"float", "int", "isnan"}
+        ):
+            name = "isnan" if node.func.attr == "isnan" else node.func.attr
+            return ast.copy_location(
+                ast.Call(func=ast.Name(id=name, ctx=ast.Load()), args=node.args, keywords=node.keywords),
+                node,
+            )
+        return node
 
     def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
         self.generic_visit(node)
@@ -62,7 +77,7 @@ class _BitwiseTransformer(ast.NodeTransformer):
         if not isinstance(node.op, ast.Invert):
             return node
         call = ast.Call(
-            func=ast.Name(id="_fox_invert", ctx=ast.Load()),
+            func=ast.Name(id="_bitwise_invert", ctx=ast.Load()),
             args=[node.operand],
             keywords=[],
         )
@@ -70,57 +85,97 @@ class _BitwiseTransformer(ast.NodeTransformer):
 
 
 def _bitwise_integer(value: object) -> int | np.ndarray:
+    """Coerce a scalar or array operand to signed 64-bit integers.
+
+    Array NaN values remain NaN at their original positions. Scalar NaN values
+    are rejected because Python integer conversion does not define a missing
+    scalar integer.
+    """
     if isinstance(value, np.ndarray):
+        if np.issubdtype(value.dtype, np.integer) or np.issubdtype(value.dtype, np.bool_):
+            if np.any(value.astype(object) < -(2**63)) or np.any(value.astype(object) >= 2**63):
+                raise OverflowError("Bitwise array operands must fit in signed 64-bit integers")
+            return value.astype(np.int64)
+
         values = np.asarray(value, dtype=np.float64)
-        if not np.all(np.isfinite(values)):
-            raise ValueError("Bitwise operands must be finite")
-        values = np.trunc(values)
-        if np.any(values < -(2**63)) or np.any(values >= 2**63):
+        finite = np.isfinite(values)
+        truncated = np.trunc(values[finite])
+        if np.any(truncated < -(2**63)) or np.any(truncated >= 2**63):
             raise OverflowError("Bitwise array operands must fit in signed 64-bit integers")
-        return values.astype(np.int64)
+        return values
 
     if isinstance(value, np.generic):
         value = value.item()
     if isinstance(value, float) and not np.isfinite(value):
         raise ValueError("Bitwise operands must be finite")
-    return int(value)
+    integer = int(value)
+    if integer < -(2**63) or integer >= 2**63:
+        raise OverflowError("Bitwise operands must fit in signed 64-bit integers")
+    return integer
+
+
+def _wrap_int64(value: int) -> int:
+    """Wrap scalar integer results to the signed 64-bit range."""
+    value %= 2**64
+    if value >= 2**63:
+        value -= 2**64
+    return value
 
 
 def _bitwise_apply(operator, left: object, right: object | None = None) -> float | np.ndarray:
+    """Apply a bitwise operator to scalar or array operands."""
     left_int = _bitwise_integer(left)
     right_int = None if right is None else _bitwise_integer(right)
 
     if isinstance(left_int, np.ndarray) or isinstance(right_int, np.ndarray):
-        left_values = np.asarray(left_int, dtype=np.int64)
+        left_values = np.asarray(left_int)
+        left_finite = np.isfinite(left_values) if np.issubdtype(left_values.dtype, np.floating) else np.ones(left_values.shape, dtype=bool)
+        left_integer = np.zeros(left_values.shape, dtype=np.int64)
+        left_integer[left_finite] = np.trunc(left_values[left_finite]).astype(np.int64)
+        left_values = left_integer
+
         if right_int is None:
-            result = _ARRAY_BITWISE_OPERATORS[operator](left_values)
+            finite_result = _ARRAY_BITWISE_OPERATORS[operator](left_values[left_finite])
+            result = np.full(left_values.shape, np.nan, dtype=np.float64)
+            result[left_finite] = np.asarray(finite_result, dtype=np.float64)
         else:
-            right_values = np.asarray(right_int, dtype=np.int64)
+            right_values = np.asarray(right_int)
+            right_finite = np.isfinite(right_values) if np.issubdtype(right_values.dtype, np.floating) else np.ones(right_values.shape, dtype=bool)
+            right_integer = np.zeros(right_values.shape, dtype=np.int64)
+            right_integer[right_finite] = np.trunc(right_values[right_finite]).astype(np.int64)
+            right_values = right_integer
+            left_values, left_finite, right_values, right_finite = np.broadcast_arrays(
+                left_values, left_finite, right_values, right_finite
+            )
+            finite = left_finite & right_finite
+            result = np.full(left_values.shape, np.nan, dtype=np.float64)
             if operator in (int.__lshift__, int.__rshift__):
-                if np.any(right_values < 0) or np.any(right_values >= 64):
+                if np.any(right_values[finite] < 0) or np.any(right_values[finite] >= 64):
                     raise ValueError("Bitwise shift counts must be between 0 and 63")
-            result = _ARRAY_BITWISE_OPERATORS[operator](left_values, right_values)
-        return np.asarray(result, dtype=np.float64)
+            finite_result = _ARRAY_BITWISE_OPERATORS[operator](left_values[finite], right_values[finite])
+            result[finite] = np.asarray(finite_result, dtype=np.float64)
+        return result
 
     if right_int is None:
-        result = operator(left_int)
+        result = _wrap_int64(operator(left_int))
     else:
         if operator in (int.__lshift__, int.__rshift__) and (right_int < 0 or right_int >= 64):
             raise ValueError("Bitwise shift counts must be between 0 and 63")
-        result = operator(left_int, right_int)
+        result = _wrap_int64(operator(left_int, right_int))
     return float(result)
 
 
 def _bitwise_eval_namespace() -> dict[str, object]:
+    """Build the asteval namespace with bitwise helper functions."""
     namespace = build_eval_namespace()
     namespace.update(
         {
-            "_fox_bitand": lambda left, right: _bitwise_apply(int.__and__, left, right),
-            "_fox_bitor": lambda left, right: _bitwise_apply(int.__or__, left, right),
-            "_fox_bitxor": lambda left, right: _bitwise_apply(int.__xor__, left, right),
-            "_fox_lshift": lambda left, right: _bitwise_apply(int.__lshift__, left, right),
-            "_fox_rshift": lambda left, right: _bitwise_apply(int.__rshift__, left, right),
-            "_fox_invert": lambda value: _bitwise_apply(int.__invert__, value),
+            "_bitwise_bitand": lambda left, right: _bitwise_apply(int.__and__, left, right),
+            "_bitwise_bitor": lambda left, right: _bitwise_apply(int.__or__, left, right),
+            "_bitwise_bitxor": lambda left, right: _bitwise_apply(int.__xor__, left, right),
+            "_bitwise_lshift": lambda left, right: _bitwise_apply(int.__lshift__, left, right),
+            "_bitwise_rshift": lambda left, right: _bitwise_apply(int.__rshift__, left, right),
+            "_bitwise_invert": lambda value: _bitwise_apply(int.__invert__, value),
         }
     )
     return namespace
@@ -195,6 +250,8 @@ def _evaluate_scalar_asteval(
         raise FormulaTypeError(f"Evaluation error: {'; '.join(msgs)}")
     if result is None:
         raise FormulaTypeError("Expression returned None")
+    if isinstance(result, np.generic):
+        result = result.item()
     return result
 
 

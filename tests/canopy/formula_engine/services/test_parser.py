@@ -186,12 +186,21 @@ class TestBitwiseOperators:
         assert not result.is_numexpr_compatible
 
     def test_comparisons_bind_more_tightly_than_bitwise_operators(self, parser):
-        """Normalize an unparenthesized expression to EPICS comparison precedence."""
+        """Preserve Python precedence for unparenthesized bitwise expressions."""
         result = parser.parse("{a} & 4 == 4", {"a": "PV:A"})
-        assert " & (" in result.placeholder_expr
-        assert "== 4)" in result.placeholder_expr
+        assert result.placeholder_expr == "__v0 & 4 == 4"
 
-    def test_parentheses_override_epics_precedence(self, parser):
-        """Preserve explicit parentheses when normalizing bitwise precedence."""
+    def test_explicit_parentheses_are_preserved(self, parser):
+        """Preserve explicit parentheses."""
         result = parser.parse("({a} & 4) == 4", {"a": "PV:A"})
         assert result.placeholder_expr == "(__v0 & 4) == 4"
+
+    def test_trailing_comment_is_preserved(self, parser):
+        """Keep comments as part of the original expression."""
+        result = parser.parse("{a} & 4 == 4 # status test", {"a": "PV:A"})
+        assert result.placeholder_expr == "__v0 & 4 == 4 # status test"
+
+    def test_python_not_precedence_is_preserved(self, parser):
+        """Keep Python ``not`` precedence in the placeholder expression."""
+        result = parser.parse("not {a} == 0 & 2", {"a": "PV:A"})
+        assert result.placeholder_expr == "not __v0 == 0 & 2"

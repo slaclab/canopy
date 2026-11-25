@@ -51,14 +51,14 @@ class TestEvaluateScalar:
         result = await evaluate_scalar(parsed, {"__v0": value}, timeout_s=1.0)
         assert result == expected
 
-    async def test_epics_comparison_precedence(self, parser):
-        """Ensure comparisons bind before bitwise operations as in EPICS Calc."""
+    async def test_python_comparison_precedence(self, parser):
+        """Python binds bitwise AND more tightly than comparisons."""
         parsed = parser.parse("{a} & 4 == 4", {"a": "PV:A"})
         result = await evaluate_scalar(parsed, {"__v0": 4.0}, timeout_s=1.0)
-        assert result == 0.0
+        assert result is True
 
-    async def test_explicit_parentheses_override_epics_precedence(self, parser):
-        """Ensure explicit grouping can put bitwise evaluation before comparison."""
+    async def test_explicit_parentheses_override_precedence(self, parser):
+        """Ensure explicit grouping controls evaluation order."""
         parsed = parser.parse("({a} & 4) == 4", {"a": "PV:A"})
         result = await evaluate_scalar(parsed, {"__v0": 4.0}, timeout_s=1.0)
         assert result is True
@@ -152,18 +152,16 @@ class TestEvaluateArray:
         result = await evaluate_array(parsed, {"__v0": np.array([0.5, 1.5, 2.5])}, timeout_s=1.0)
         np.testing.assert_array_equal(result, expected)
 
-    async def test_int_array_rejects_nonfinite_values(self, parser):
-        """Reject non-finite elements when converting an array to integers."""
-        from canopy.formula_engine.errors import FormulaTypeError
-
+    async def test_int_array_preserves_nan_values(self, parser):
+        """Keep missing array elements as NaN during integer conversion."""
         parsed = parser.parse("int({a})", {"a": "PV:A"})
-        with pytest.raises(FormulaTypeError, match="NaN or infinity"):
-            await evaluate_array(parsed, {"__v0": np.array([1.0, np.nan])}, timeout_s=1.0)
+        result = await evaluate_array(parsed, {"__v0": np.array([1.0, np.nan])}, timeout_s=1.0)
+        assert result[0] == 1.0
+        assert np.isnan(result[1])
 
     @pytest.mark.parametrize(
         ("values", "message"),
         [
-            ([1.0, np.inf], "finite"),
             ([1.0, float(2**63)], "signed 64-bit"),
         ],
     )
@@ -175,6 +173,16 @@ class TestEvaluateArray:
         with pytest.raises(FormulaTypeError, match=message):
             await evaluate_array(parsed, {"__v0": np.array(values)}, timeout_s=1.0)
 
+    async def test_bitwise_array_preserves_nan_values(self, parser):
+        """Keep missing samples as NaN instead of failing the whole array."""
+        parsed = parser.parse("{a} & 4", {"a": "PV:A"})
+        result = await evaluate_array(
+            parsed, {"__v0": np.array([4.0, np.nan, 0.0])}, timeout_s=1.0
+        )
+        assert result[0] == 4.0
+        assert np.isnan(result[1])
+        assert result[2] == 0.0
+
     async def test_int_array_rejects_values_outside_int64(self, parser):
         """Reject array integer conversions that exceed the signed 64-bit range."""
         from canopy.formula_engine.errors import FormulaTypeError
@@ -182,6 +190,22 @@ class TestEvaluateArray:
         parsed = parser.parse("int({a})", {"a": "PV:A"})
         with pytest.raises(FormulaTypeError, match="signed 64-bit"):
             await evaluate_array(parsed, {"__v0": np.array([float(2**63)])}, timeout_s=1.0)
+
+    async def test_int_array_preserves_exact_integers_above_2_53(self, parser):
+        """int() must not round an existing int64 array through float64."""
+        parsed = parser.parse("int(int({a}) + 1) - int({a})", {"a": "PV:A"})
+        result = await evaluate_array(
+            parsed, {"__v0": np.array([2**53], dtype=np.int64)}, timeout_s=1.0
+        )
+        np.testing.assert_array_equal(result, [1.0])
+
+    async def test_bitwise_preserves_exact_integers_above_2_53(self, parser):
+        """Bitwise coercion must keep the low bits of an exact int64 operand."""
+        parsed = parser.parse("(int({a}) + 1) & 1", {"a": "PV:A"})
+        result = await evaluate_array(
+            parsed, {"__v0": np.array([2**53], dtype=np.int64)}, timeout_s=1.0
+        )
+        np.testing.assert_array_equal(result, [1.0])
 
     async def test_str_array_is_rejected(self, parser):
         """Reject string conversion on arrays because string results are scalar-only."""
