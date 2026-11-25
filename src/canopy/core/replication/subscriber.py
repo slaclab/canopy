@@ -411,7 +411,7 @@ async def subscribe(
         return {"subscriptions": _in_order(results, selected)}
 
     present = await tables_present(conn, registry.schemas)
-    if missing := sorted(set(registry.replicated) - present):
+    if missing := registry.missing_from(present):
         logger.info("Not in this database yet, not copied: %s", ", ".join(missing))
     copied = sorted(set(registry.replicated) & present)
     connect = connect_arm or _arm_connector(arms)

@@ -2,6 +2,7 @@
 
 import io
 import shutil
+import logging
 from pathlib import Path
 
 import pytest
@@ -69,14 +70,20 @@ def test_a_context_without_a_side_refuses_to_guess():
         on_publisher()
 
 
-@pytest.mark.parametrize(("role", "step"), [("primary", "publisher step"), ("mirror", "subscriber step")])
-def test_env_takes_the_side_from_canopy_role(tmp_path, monkeypatch, role, step):
-    """The shipped ``env.py``, run offline over a probe revision, migrates the side ``CANOPY_ROLE`` names."""
+# A second revision on top of the probe.
+PROBE_2 = PROBE.replace('revision = "probe"', 'revision = "probe_2"').replace(
+    "down_revision = None", 'down_revision = "probe"'
+)
+
+
+def _offline_upgrade(tmp_path, monkeypatch, role: str, revisions: dict[str, str]) -> str:
+    """Run the shipped ``env.py`` offline with ``CANOPY_ROLE=role`` over ``revisions``; return its SQL."""
     scripts = tmp_path / "migrations"
     (scripts / "versions").mkdir(parents=True)
     shutil.copy(ROOT / "migrations" / "env.py", scripts / "env.py")
     shutil.copy(ROOT / "migrations" / "script.py.mako", scripts / "script.py.mako")
-    (scripts / "versions" / "probe.py").write_text(PROBE)
+    for name, source in revisions.items():
+        (scripts / "versions" / f"{name}.py").write_text(source)
     monkeypatch.setenv("CANOPY_ROLE", role)
     get_settings.cache_clear()
     sql = io.StringIO()
@@ -86,7 +93,25 @@ def test_env_takes_the_side_from_canopy_role(tmp_path, monkeypatch, role, step):
         command.upgrade(config, "head", sql=True)
     finally:
         get_settings.cache_clear()
-    assert f"SELECT '{step}'" in sql.getvalue()
+    return sql.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("role", "side"), [("primary", "publisher"), ("mirror", "subscriber")], ids=["primary", "mirror"]
+)
+def test_env_takes_the_side_from_canopy_role(tmp_path, monkeypatch, caplog, role, side):
+    """The shipped ``env.py``, run offline over two probe revisions, migrates the side ``CANOPY_ROLE`` names."""
+    caplog.set_level(logging.INFO, logger="alembic.env")
+    sql = _offline_upgrade(tmp_path, monkeypatch, role, {"probe": PROBE, "probe_2": PROBE_2})
+    assert sql.count(f"SELECT '{side} step'") == 2
+    assert caplog.text.count(f"CANOPY_ROLE={role}: migrated as the replication {side}") == 1  # once a run
+
+
+def test_env_names_no_side_when_no_step_applies(tmp_path, monkeypatch, caplog):
+    # As for `alembic check`, or an upgrade with nothing to do: env.py runs, no step does.
+    caplog.set_level(logging.INFO, logger="alembic.env")
+    _offline_upgrade(tmp_path, monkeypatch, "mirror", {})
+    assert "migrated as the replication" not in caplog.text
 
 
 def test_a_required_primary_revision_comes_earlier_in_the_tree():
