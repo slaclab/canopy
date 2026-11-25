@@ -180,12 +180,13 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 async def _commit_forwarded(session: AsyncSession, write: ForwardedWrite) -> None:
     """Commit, and if the transaction wrote anything, record a WAL position at or past its commit.
 
-    The insert position read straight after the commit is never before the commit
-    record's end, which is what the head reports as applied once it has the change
-    (``pg_replication_origin_status.remote_lsn``). Other sessions' WAL can land in
-    between; that only makes the head wait longer, never report a write as applied
-    before it is. A transaction that wrote nothing has no xid and gets no position,
-    so a read or a job enqueue never makes the head wait.
+    The position is the end of the last WAL record when it is read, straight after the
+    commit: the commit record's own end, which is what the head reports as applied once
+    it has the change (``pg_replication_origin_status.remote_lsn``). It is never before
+    that end, so the head never reports a write as applied before it is. Other
+    sessions' WAL can land in between, and then only the arm's next published write
+    takes the head past it. A transaction that wrote nothing has no xid and gets no
+    position, so a read or a job enqueue never makes the head wait.
 
     A route that always answers with a position (``ForwardedWrite.report_position``,
     the captured import) gets the current WAL position when it wrote nothing: a
@@ -193,10 +194,41 @@ async def _commit_forwarded(session: AsyncSession, write: ForwardedWrite) -> Non
     """
     wrote = await session.scalar(text("SELECT pg_current_xact_id_if_assigned() IS NOT NULL"))
     await session.commit()
-    if wrote:
-        write.commit_lsn = await session.scalar(text("SELECT pg_current_wal_insert_lsn()::text"))
-    elif write.report_position:
-        write.commit_lsn = await session.scalar(text("SELECT pg_current_wal_lsn()::text"))
+    if wrote or write.report_position:
+        current = "pg_current_wal_insert_lsn()" if wrote else "pg_current_wal_lsn()"
+        row = (await session.execute(text(_POSITION.format(current=current)))).one()
+        write.commit_lsn = _lsn_text(_record_end(int(row.position), int(row.page), int(row.segment)))
+
+
+_POSITION = """
+SELECT {current} - '0/0'::pg_lsn AS position,
+       (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_block_size') AS page,
+       (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size') AS segment
+"""
+
+# Bytes of a WAL page's header: the long one opens each segment (SizeOfXLogLongPHD), the
+# short one every other page (SizeOfXLogShortPHD), on a 64-bit build.
+_LONG_PAGE_HEADER = 40
+_SHORT_PAGE_HEADER = 24
+
+
+def _record_end(position: int, page: int, segment: int) -> int:
+    """The end of the last WAL record written before ``position``, an insert position.
+
+    The two differ only when that record ended a page: the insert position then points
+    past the next page's header, where the next record would start, while the record's
+    end, which a subscriber reports as applied, is the page boundary.
+    """
+    if position % segment == _LONG_PAGE_HEADER:
+        return position - _LONG_PAGE_HEADER
+    if position % page == _SHORT_PAGE_HEADER:
+        return position - _SHORT_PAGE_HEADER
+    return position
+
+
+def _lsn_text(position: int) -> str:
+    """``position`` as ``pg_lsn`` text (``"16/B374D848"``)."""
+    return f"{position >> 32:X}/{position & 0xFFFFFFFF:X}"
 
 
 SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]
