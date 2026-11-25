@@ -13,9 +13,9 @@ Hooks are site-specific, so none run unless you configure them.
 
 1. **Planning.** Before anything is written, each configured hook looks at
    every setpoint in the restore and lists its extra writes. A hook can also
-   reject a setpoint it recognises but can't handle, such as a magnet PV that
-   doesn't end in `BDES`. A rejected PV is not written at all, by the restore
-   or by any hook, and is reported as a failure in the `Setpoints` phase.
+   reject a setpoint it recognises but can't handle; the built-in hooks never
+   do. A rejected PV is not written at all, by the restore or by any hook, and
+   is reported as a failure in the `Setpoints` phase.
 2. **Setpoints.** All the setpoints are written as one batch.
 3. **Hooks, in order.** Each hook's extra writes go out as their own batch,
    in the order the hooks are configured, and each hook reports its own
@@ -56,21 +56,21 @@ case-sensitive, and a `ca://` or `pva://` prefix is ignored for matching and
 kept on the derived address.
 
 An address with a magnet first segment but a different last segment, such as
-`XCOR:LI21:101:BCTRL`, is rejected during planning: neither it nor its hook
-writes are written, and the restore reports why.
+`QUAD:SIM:01:EDES` or `XCOR:SIM:01:BCTRL`, needs no trim. Both hooks
+ignore it, so it is restored like any other setpoint, with no extra writes.
 
 ### `magnet_trim`
 
 A magnet doesn't act on a new `BDES` setpoint until it is **trimmed**. For
 each magnet setpoint restored, this hook writes `TRIM` to the magnet's `CTRL`
-PV, for example `QUAD:LI21:201:CTRL` for `QUAD:LI21:201:BDES`.
+PV, for example `QUAD:SIM:01:CTRL` for `QUAD:SIM:01:BDES`.
 
 ### `write_to_con`
 
 Operators often tune magnets by hand after a restore, and it helps to compare
 the live setpoint against the value that was restored. For each magnet
 setpoint restored, this hook writes the same value to the magnet's `BCON` PV,
-for example `QUAD:LI21:201:BCON`. `BCON` PVs exist only to hold that value:
+for example `QUAD:SIM:01:BCON`. `BCON` PVs exist only to hold that value:
 Squirrel doesn't track or capture them.
 
 ### Recommended order
