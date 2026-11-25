@@ -46,7 +46,11 @@ _database_down = False
 
 
 async def database_ready(timeout_s: float = 2.0) -> bool:
-    """Whether the app's database answers ``SELECT 1`` through the app's own pool within ``timeout_s``."""
+    """Whether the app's database answers ``SELECT 1`` through the app's own pool within ``timeout_s``.
+
+    Through the pool on purpose: every request needs a pooled connection, so while
+    requests hold all of them this process can't serve another one either.
+    """
     global _database_down
     try:
         async with asyncio.timeout(timeout_s):

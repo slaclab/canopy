@@ -165,8 +165,11 @@ def settings_env(monkeypatch):
     get_settings.cache_clear()
 
 
+UNREACHABLE = "postgresql+asyncpg://canopy:canopy@127.0.0.1:1/canopy"
+
+
 async def test_a_failed_refresh_reports_status_down_and_warns_once(settings_env, caplog):
-    settings_env(CANOPY_DATABASE_URL="postgresql+asyncpg://canopy:canopy@127.0.0.1:1/canopy")
+    settings_env(CANOPY_DATABASE_URL=UNREACHABLE)
     collector = ReplicationCollector()
     collector.status = {"side": "publisher", "slots": []}
 
@@ -186,9 +189,11 @@ async def test_a_head_whose_arms_setting_is_unreadable_reports_status_down(db, s
 
 
 async def test_refresh_reads_the_primary_side(db, settings_env, caplog):
-    settings_env(CANOPY_DATABASE_URL=_app_url(DB_DSN), CANOPY_ROLE="primary")
     collector = ReplicationCollector()
-    collector._failing = True  # as after an outage
+    settings_env(CANOPY_DATABASE_URL=UNREACHABLE, CANOPY_ROLE="primary")
+    await collector.refresh()  # an outage first
+    assert collector.status is None
+    settings_env(CANOPY_DATABASE_URL=_app_url(DB_DSN))
 
     with caplog.at_level(logging.INFO, logger="canopy.core.replication.metrics"):
         await collector.refresh()
