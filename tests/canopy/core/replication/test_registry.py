@@ -6,6 +6,7 @@ adds a table fails here until it says whether the history mirror receives it.
 
 import pkgutil
 import importlib
+from dataclasses import replace
 
 import pytest
 from sqlalchemy import UniqueConstraint
@@ -52,13 +53,25 @@ def test_every_table_is_classified():
 
 
 def test_every_registered_table_has_a_model():
-    assert set(REGISTRY.tables) - RETIRED <= set(METADATA_TABLES)
+    assert set(REGISTRY.tables) - REGISTRY.retired <= set(METADATA_TABLES)
 
 
 def test_retired_tables_keep_their_class_and_lose_their_model():
     """A database that hasn't dropped a retired table yet still needs it classified."""
-    assert RETIRED <= set(REGISTRY.tables)
-    assert not RETIRED & set(METADATA_TABLES)
+    assert REGISTRY.retired <= set(REGISTRY.tables)
+    assert not REGISTRY.retired & set(METADATA_TABLES)
+
+
+def test_the_registry_retires_the_tables_contributing_names():
+    assert REGISTRY.retired == RETIRED
+
+
+def test_a_retired_table_still_replicates_but_is_never_missing():
+    registry = replace(REGISTRY, retired=frozenset({"magpie.config"}))
+    assert "magpie.config" in registry.replicated  # a database that still holds it publishes it
+    assert registry.current == sorted(set(REGISTRY.replicated) - {"magpie.config"})
+    assert registry.missing_from(set()) == registry.current
+    assert registry.missing_from({"squirrel.pv"}) == sorted(set(registry.current) - {"squirrel.pv"})
 
 
 def test_excluded_tables_are_not_classified():
@@ -113,14 +126,14 @@ def test_every_replicated_table_has_an_owner_path_and_no_local_one_does():
 
 def test_root_tables_carry_their_owner_column():
     for name, path in REGISTRY.owner_paths.items():
-        if path.column is not None and name not in RETIRED:
+        if path.column is not None and name not in REGISTRY.retired:
             column = METADATA_TABLES[name].c[path.column]
             assert not column.nullable, f"{name}.{path.column} must be NOT NULL"
 
 
 def test_child_keys_point_at_their_parents_id():
     for name, path in REGISTRY.owner_paths.items():
-        if path.parent is not None and name not in RETIRED:
+        if path.parent is not None and name not in REGISTRY.retired:
             targets = {
                 (fk.column.table.fullname, fk.column.name) for fk in METADATA_TABLES[name].c[path.key].foreign_keys
             }
@@ -150,12 +163,12 @@ def test_shared_keys_are_exactly_the_unique_keys_without_the_owner():
     # retired table has no model to check, but keeps its shared key for databases that
     # still hold it.
     found = {}
-    for name in set(REGISTRY.replicated) - RETIRED:
+    for name in REGISTRY.current:
         table = METADATA_TABLES[name]
         for columns in _unique_column_sets(table):
             if "owner_instance" not in columns and set(columns) != {c.name for c in table.primary_key.columns}:
                 found.setdefault(name, set()).add(columns)
-    assert found == {name: {columns} for name, columns in REGISTRY.shared_keys.items() if name not in RETIRED}
+    assert found == {name: {columns} for name, columns in REGISTRY.shared_keys.items() if name not in REGISTRY.retired}
 
 
 # The checks above that read a table's model. A retired table has no model, so each
@@ -175,6 +188,6 @@ _MODEL_CHECKS = [
 @pytest.mark.parametrize("table", ["magpie.config", "squirrel.pv_facility"])  # a root with a shared key, a child
 def test_the_model_checks_hold_once_a_table_is_retired(monkeypatch, table, check):
     """Retire a table as CONTRIBUTING.md says: its name goes in RETIRED, and its model goes away."""
-    monkeypatch.setitem(globals(), "RETIRED", RETIRED | {table})
+    monkeypatch.setitem(globals(), "REGISTRY", replace(REGISTRY, retired=REGISTRY.retired | {table}))
     monkeypatch.delitem(METADATA_TABLES, table)
     check()
