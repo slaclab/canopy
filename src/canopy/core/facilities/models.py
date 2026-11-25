@@ -7,6 +7,7 @@ from sqlalchemy.orm import Mapped, relationship, mapped_column
 from sqlalchemy.dialects.postgresql import UUID
 
 from canopy.core.db import Base, UUIDMixin, TimestampMixin
+from canopy.core.ownership import OwnedMixin
 
 CORE_SCHEMA = "core"
 
@@ -16,13 +17,14 @@ def _fk(target: str) -> str:
     return f"{CORE_SCHEMA}.{target}"
 
 
-class Facility(UUIDMixin, TimestampMixin, Base):
+class Facility(UUIDMixin, TimestampMixin, OwnedMixin, Base):
     """A facility or sub-facility node (e.g. LCLS, then LCLS-SC/LCLS-NC beneath it).
 
     Self-referential rather than two separate tables — "in facility X" means "X or
     any descendant of X," which falls out of walking ``parent_id`` without a
     facility/sub-facility special case. ``slug`` is immutable once created: it goes
-    into URLs and API key facility grants.
+    into URLs and API key facility grants, and it is unique across every instance.
+    A facility's parent has the same ``owner_instance`` (``canopy.core.ownership``).
     """
 
     __tablename__ = "facility"
