@@ -13,8 +13,6 @@ from typing import Literal
 from functools import lru_cache
 
 from fastapi import Security, APIRouter
-from alembic.config import Config
-from alembic.script import ScriptDirectory
 
 from canopy.core.config import get_settings
 from canopy.core.security import require_read_access
@@ -40,8 +38,9 @@ def shipped_alembic_head() -> str | None:
     Found the way the ``alembic`` CLI finds it — ``$ALEMBIC_CONFIG``, else
     ``alembic.ini`` in the working directory (``/app`` in the prod image) — so
     it names exactly what ``alembic upgrade head`` would migrate to from here.
-    ``None`` when the tree isn't there (the dev image has none), can't be read,
-    or has more than one head; this endpoint must never fail over it.
+    ``None`` when the tree isn't there (the dev image has none), Alembic isn't
+    installed (an install without the ``data`` extra), the tree can't be read, or
+    it has more than one head; this endpoint must never fail over it.
 
     Reading the tree imports every version file, so the API calls this once at
     startup and the cache answers every request: the tree can't change under a
@@ -49,6 +48,13 @@ def shipped_alembic_head() -> str | None:
     the ini's ``prepend_sys_path`` to it.
     """
     config_path = os.environ.get("ALEMBIC_CONFIG", "alembic.ini")
+    try:
+        # Imported here: Alembic comes with the ``data`` extra, which a lean install lacks.
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+    except ImportError:
+        logger.info("Alembic is not installed; reporting no Alembic head")
+        return None
     saved_path = sys.path[:]
     try:
         heads = ScriptDirectory.from_config(Config(config_path)).get_heads()
