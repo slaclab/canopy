@@ -834,6 +834,18 @@ async def subscriber_status(
     }
 
 
+# What a failed statement or a dropped connection to an arm raises, as reseed catches it.
+_LOST = (OSError, asyncpg.PostgresError, asyncpg.InterfaceError)
+
+
+async def _close_quietly(conn: asyncpg.Connection) -> None:
+    """Close ``conn``; one already lost can't be closed cleanly, and that changes nothing."""
+    try:
+        await conn.close()
+    except _LOST:
+        pass
+
+
 async def _connect_arm(name: str, arm: Arm, command: str) -> tuple[asyncpg.Connection, str]:
     """A connection to arm ``name`` over its ``heartbeat_dsn``, and the DSN (for redaction)."""
     if arm.heartbeat_dsn is None or not arm.heartbeat_dsn.get_secret_value():
@@ -929,10 +941,10 @@ async def switch(
                     f"check the subscription is streaming (`status --arm {arm}`) and try again"
                 )
             await asyncio.sleep(1)
-    except asyncpg.PostgresError as exc:
+    except _LOST as exc:
         raise ReplicationError(f"reading arm {arm} failed: {redact(str(exc), [dsn])}") from None
     finally:
-        await primary.close()
+        await _close_quietly(primary)
 
     publications = ", ".join(quote_ident(p) for p in target)
     await conn.execute(
@@ -1013,10 +1025,10 @@ async def heartbeat(
             """,
             *row.values(),
         )
-    except asyncpg.PostgresError as exc:
+    except _LOST as exc:
         raise ReplicationError(f"writing the heartbeat to arm {arm} failed: {redact(str(exc), [dsn])}") from None
     finally:
-        await primary.close()
+        await _close_quietly(primary)
     level = logging.INFO if backup_ok and wal_archive_ok and drift_ok else logging.WARNING
     logger.log(
         level,
