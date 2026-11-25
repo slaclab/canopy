@@ -28,7 +28,7 @@ essentials:
 | Variable | Purpose |
 |----------|---------|
 | `CANOPY_API_KEYS` | API-key registry — see below. Unset means every gated endpoint returns 401 |
-| `CANOPY_EPICS__BACKEND` | `simulation` (default) or `epics`. **Production must set `epics`** |
+| `CANOPY_EPICS__BACKEND` | `simulation` (default) or `epics`, or a `module:Class` path to an [out-of-tree backend](../how_to/custom_epics_backend.md). **Production must not use `simulation`** |
 | `EPICS_CA_ADDR_LIST`, `EPICS_PVA_ADDR_LIST`, ... | Standard EPICS network discovery variables (only with the `epics` backend) |
 | `CANOPY_DATABASE_URL` | Postgres, asyncpg driver: `postgresql+asyncpg://user:pass@host:port/db` |
 | `CANOPY_REDIS_URL` | Redis: `redis://[:password@]host:port/0` |
@@ -82,4 +82,4 @@ its first migration.
 | `GET /health` | Process liveness — used by the container healthchecks and post-deploy checks |
 | `GET /<module>/v1/health/watchdog` | Per-module liveness heartbeat (version, uptime) |
 | `GET /<module>/v1/health/summary` | Per-module status rollup (requires read access) — e.g. Hare's reports backend, client and monitor counts |
-| `GET /metrics` | Prometheus exposition (unauthenticated, like `/health`): request counts and latency per module route, plus module gauges — see [Metrics](../observability/metrics.md) |
+| `GET /metrics` | Prometheus exposition (unauthenticated, like `/health`, unless [`CANOPY_CLOSED_META`](api-keys.md#closed-meta-routes) is on): request counts and latency per module route, plus module gauges — see [Metrics](../observability/metrics.md) |

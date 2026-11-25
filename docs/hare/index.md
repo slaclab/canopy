@@ -10,7 +10,10 @@ metadata, and writes.
 Hare keeps **one EPICS monitor per PV**, no matter how many clients subscribe
 to it. Updates land in a cache of latest values and are fanned out to
 subscribers as batched diffs. New subscribers get the current value
-immediately from the cache — no extra load on the IOC.
+immediately from the cache — no extra load on the IOC. When a PV's last
+subscriber leaves, its monitor and cached value stay warm for a grace period
+before they are released. A warm PV still has its monitor, so it counts in the
+health summary's `activeMonitors` and in `canopy_hare_active_monitors`.
 
 ```mermaid
 graph LR
@@ -58,17 +61,23 @@ interpret it:
 
 ## Backends
 
-The EPICS connector behind Hare has two backends, selected with
-`CANOPY_EPICS__BACKEND`:
+The EPICS connector behind Hare ships two backends, selected with
+`CANOPY_EPICS__BACKEND`, and can load a third from your own package:
 
 - **`simulation`** (default) — every PV name resolves to a synthetic sine
   wave. No IOC or network needed; ideal for frontend development and CI.
   The name's suffix picks the value kind: `:ENUM`, `:WAVEFORM` / `:WF`,
   `:STR_WAVEFORM` / `:STR_WF` (string waveform), `:STR`, `:TABLE`; anything
-  else is a scalar.
+  else is a scalar. A name under `SIM:NEVER:` stands for a PV no IOC serves:
+  it reads back disconnected, its monitor reports `connected: false` once and
+  then stays silent, and writes to it fail.
 - **`epics`** — real Channel Access / PV Access via the facility network.
   Discovery uses the standard EPICS environment variables
-  (`EPICS_CA_ADDR_LIST`, `EPICS_PVA_ADDR_LIST`, ...).
+  (`EPICS_CA_ADDR_LIST`, `EPICS_PVA_ADDR_LIST`, ...). A Channel Access
+  channel lost in an outage is searched for afresh every
+  `CANOPY_EPICS__CA_RECONNECT_S` (default 15 s) until it reconnects.
+- **`module.path:ClassName`** — an out-of-tree backend, imported and built
+  at startup. See [Custom EPICS backend](../how_to/custom_epics_backend.md).
 
 ## Configuration
 
@@ -85,6 +94,7 @@ Environment variables with prefix `CANOPY_HARE__`:
 | `CANOPY_HARE__SEED_CONCURRENCY` | `32` | Max concurrent metadata fetches (describes) across all clients; a describe runs only once a PV's channel has connected, so channels that never connect take no slot |
 | `CANOPY_HARE__SEED_TIMEOUT_S` | `2.0` | How long a newly subscribed PV waits for its monitor's first value before being reported `connected: false`; the monitor still delivers the value when the channel connects |
 | `CANOPY_HARE__SEED_RETRY_BACKOFF_S` | `30.0` | How long before a subscribe retries a describe that failed on a connected channel |
+| `CANOPY_HARE__MONITOR_GRACE_SECONDS` | `60.0` | How long a PV's monitor and cached value stay warm after its last subscriber leaves, so switching back to a screen is served from the cache (0 releases at once) |
 
 The connector's own settings use the `CANOPY_EPICS__` prefix — see
 `.env.example` at the repo root for the full annotated list.

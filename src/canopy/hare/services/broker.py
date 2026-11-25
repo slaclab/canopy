@@ -2,22 +2,26 @@
 
 Owns the connector, the subscription registry, a latest-value cache, and three
 background loops (consume / flush / heartbeat). Monitors are started and stopped
-on demand: the first subscriber to a PV starts an EPICS monitor, the last to
-leave stops it. Updates are buffered and flushed as diffs every
-``ws_batch_interval_ms`` to the clients subscribed to each PV. A newly
-subscribed PV is seeded by its monitor's first update and a background
-describe, so a subscribe never waits on the connector; PVs that become ready
-are queued and sent in the same flush, as ``initial`` frames ahead of the diff.
+on demand: the first subscriber to a PV starts an EPICS monitor; once the last
+one leaves, the monitor and its cached value stay warm for
+``monitor_grace_seconds`` and are then released. Updates are buffered and
+flushed as diffs every ``ws_batch_interval_ms`` to the clients subscribed to
+each PV. A newly subscribed PV is seeded by its monitor's first update and a
+background describe, so a subscribe never waits on the connector; PVs that
+become ready are queued and sent in the same flush, as ``initial`` frames ahead
+of the diff.
 """
 
+import copy
+import json
 import time
 import asyncio
 import logging
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Awaitable
+from collections.abc import Mapping, Callable, Iterable, Awaitable
 
-from canopy.epics.base import PVConnector, Subscription
+from canopy.epics.base import PVConnector, Subscription, ConnectorStatement
 from canopy.core.errors import ErrorCode
 from canopy.hare.config import HareConfig
 from canopy.contracts.pv import PVMeta, PVValue, PVWriteValue
@@ -29,10 +33,21 @@ LifecycleHook = Callable[[list[str]], Awaitable[None]]
 
 logger = logging.getLogger(__name__)
 
+# The fields of a describe that learned nothing: what a connector returns for a
+# channel it could not describe in time (only the name is set).
+_EMPTY_META_FIELDS = PVMeta(pv="").model_dump(exclude={"pv"})
+
 
 @runtime_checkable
 class ClientChannel(Protocol):
-    """What the broker needs from a connected client (FastAPI WebSocket fits)."""
+    """What the broker needs from a connected client (FastAPI WebSocket fits).
+
+    A channel may also set ``wants_flush_marker = True`` to receive a
+    ``{"type": "flush", "timestamp": T}`` frame after every flush, empty ones
+    included, sent after the diff it covers. An in-process client (Vole's
+    ingest) takes its watermark from it; a channel without the attribute, such
+    as a browser socket, never receives it.
+    """
 
     async def send_json(self, data) -> None: ...
     async def close(self) -> None: ...
@@ -74,6 +89,8 @@ class PVBroker:
         # PVs whose running describe task must run again after its current
         # attempt, because the channel reconnected while that attempt was pending.
         self._describe_again: set[str] = set()
+        # PVs with no subscriber left, kept warm until their release task fires.
+        self._grace: dict[str, asyncio.Task] = {}
         self._buffer: dict[str, PVValue] = {}
         self._buffer_lock = asyncio.Lock()
         # PVs whose describe or connect timer has finished since the last flush.
@@ -87,9 +104,21 @@ class PVBroker:
         # QueueFull path in _on_event then applies backpressure by dropping.
         self._queue: asyncio.Queue[tuple[PVValue, asyncio.Lock]] = asyncio.Queue(maxsize=config.event_queue_maxsize)
         self._running = False
+        # Set by stop(), which cancels the grace tasks: a PV released after it is
+        # released at once instead of starting a grace task nothing would cancel.
+        self._stopped = False
         self._tasks: list[asyncio.Task] = []
         self._activation_hooks: list[tuple[LifecycleHook, set[str]]] = []
         self._deactivation_hooks: list[tuple[LifecycleHook, set[str]]] = []
+        # The connector's statement seam, when it implements one.
+        self._statement_source = connector if isinstance(connector, ConnectorStatement) else None
+        # The statement of the last heartbeat the flush loop pushed; unset until
+        # start() records the connector's first statement as given.
+        self._last_statement: tuple | None = None
+        # Statement fields that held a value JSON cannot encode, logged once until they encode again.
+        self._unencodable: set[str] = set()
+        # The background loops' clock; tests replace it to step the loops.
+        self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
     @property
     def registry(self) -> SubscriptionRegistry:
@@ -101,7 +130,9 @@ class PVBroker:
         if self._running:
             return
         await self._connector.start()
+        self._last_statement = self._statement(self.heartbeat_frame())
         self._running = True
+        self._stopped = False
         self._tasks = [self._spawn_loop(name) for name in ("consume", "flush", "heartbeat")]
         logger.info(
             "PVBroker started (backend=%s, batch=%dms)",
@@ -142,6 +173,7 @@ class PVBroker:
 
     async def stop(self) -> None:
         self._running = False
+        self._stopped = True
         for task in self._tasks:
             task.cancel()
         for task in self._tasks:
@@ -150,6 +182,11 @@ class PVBroker:
             except asyncio.CancelledError:
                 pass
         self._tasks = []
+        grace = list(self._grace.values())
+        self._grace.clear()
+        for task in grace:
+            task.cancel()
+        await asyncio.gather(*grace, return_exceptions=True)
         for task in (*self._connect_timers.values(), *self._describe_tasks.values()):
             task.cancel()
         await self.drain_seeds()
@@ -180,7 +217,7 @@ class PVBroker:
     async def remove_client(self, client_id: str) -> None:
         affected_pvs = list(self._registry.client_pvs(client_id))
         deactivated = self._registry.remove_client(client_id)
-        await self._stop_monitors(deactivated)
+        await self._release_monitors(deactivated)
         if affected_pvs:
             await self._fire_deactivation_hooks(affected_pvs, client_id)
         self._channels.pop(client_id, None)
@@ -301,6 +338,7 @@ class PVBroker:
         newly = self._registry.subscribe(client_id, pvs)
         for pv in pvs:
             self._seed_locks.setdefault(pv, asyncio.Lock())
+        self._cancel_release(newly)
         await self._start_monitors(newly)
         new_for_client = [pv for pv in pvs if pv not in previously_subscribed]
         if new_for_client:
@@ -382,10 +420,32 @@ class PVBroker:
             ``True`` when a describe should be started, otherwise ``False``.
         """
         cached = self._latest.get(pv)
-        if cached is None or not cached.connected or pv in self._meta:
+        if cached is None or not cached.connected or not self._meta_is_missing(pv):
             return False
         now = time.monotonic()
         return now >= self._seed_retry_after.get(pv, now)
+
+    def _meta_is_missing(self, pv: str) -> bool:
+        """Report whether a PV has no metadata worth keeping: none cached, or only a bare one.
+
+        A describe that timed out comes back as a `PVMeta` naming only the PV.
+        It is cached and sent like any other, but counts as missing, so the PV
+        is described again after ``seed_retry_backoff_s`` or on its next
+        connect, instead of keeping the empty metadata for as long as it is
+        subscribed.
+
+        Parameters
+        ----------
+        pv : str
+            Validated name of a subscribed PV.
+
+        Returns
+        -------
+        bool
+            ``True`` when the PV still needs a describe, otherwise ``False``.
+        """
+        meta = self._meta.get(pv)
+        return meta is None or meta.model_dump(exclude={"pv"}) == _EMPTY_META_FIELDS
 
     def _ensure_connect_timer(self, pv: str) -> None:
         """Start a PV's connect timer unless one is already running.
@@ -499,7 +559,7 @@ class PVBroker:
                 self._describe_again.discard(pv)
                 async with self._seed_sem, lock:
                     cached = self._latest.get(pv)
-                    if self._seed_locks.get(pv) is not lock or pv in self._meta:
+                    if self._seed_locks.get(pv) is not lock or not self._meta_is_missing(pv):
                         return
                     if cached is None or not cached.connected:
                         return
@@ -517,6 +577,8 @@ class PVBroker:
 
         A failure is logged and sets the deadline ``seed_retry_backoff_s``
         ahead, so a later subscribe does not retry at once; success clears it.
+        A bare result (see `_meta_is_missing`) is cached but sets the deadline
+        like a failure.
         `_stop_monitors` discards the PV's seed lock on release and a later
         subscribe creates a new one, so the result is cached only while ``lock``
         is still the PV's: an attempt that outlives its PV's release leaves
@@ -536,10 +598,11 @@ class PVBroker:
             meta = None
         if self._seed_locks.get(pv) is not lock:
             return
-        if meta is None:
+        if meta is not None:
+            self._meta[pv] = meta
+        if self._meta_is_missing(pv):
             self._seed_retry_after[pv] = time.monotonic() + self._config.seed_retry_backoff_s
         else:
-            self._meta[pv] = meta
             self._seed_retry_after.pop(pv, None)
 
     def _queue_initial(self, pv: str, lock: asyncio.Lock) -> None:
@@ -601,7 +664,7 @@ class PVBroker:
         held = self._registry.client_pvs(client_id)
         released = [pv for pv in pvs if pv in held]
         deactivated = self._registry.unsubscribe(client_id, pvs)
-        await self._stop_monitors(deactivated)
+        await self._release_monitors(deactivated)
         if released:
             await self._fire_deactivation_hooks(released, client_id)
 
@@ -631,6 +694,47 @@ class PVBroker:
                 )
             except Exception as exc:
                 logger.error("failed to start monitor for %s: %s", pv, exc)
+
+    async def _release_monitors(self, pvs: Iterable[str]) -> None:
+        """Release PVs that lost their last subscriber, once ``monitor_grace_seconds`` has passed.
+
+        Until then the monitor keeps running and its updates keep the cache
+        current, so a client that subscribes again within the grace period is
+        answered from cache. With a grace of 0, or once the broker has stopped,
+        the PVs are released at once.
+
+        Parameters
+        ----------
+        pvs : Iterable[str]
+            PVs that have no subscribers left.
+        """
+        grace = self._config.monitor_grace_seconds
+        if grace <= 0 or self._stopped:
+            await self._stop_monitors(pvs)
+            return
+        for pv in pvs:
+            if pv not in self._grace:
+                self._grace[pv] = asyncio.create_task(self._release_after_grace(pv, grace), name=f"grace:{pv}")
+
+    async def _release_after_grace(self, pv: str, grace: float) -> None:
+        """Wait out a PV's grace period, then release it unless it was subscribed again."""
+        await asyncio.sleep(grace)
+        if self._grace.get(pv) is asyncio.current_task():
+            del self._grace[pv]
+        if self._registry.subscribers(pv):
+            return
+        try:
+            await self._stop_monitors([pv])
+        except Exception:
+            # Nothing awaits this task, so an unlogged error would be invisible.
+            logger.exception("releasing %s after its grace period failed", pv)
+
+    def _cancel_release(self, pvs: Iterable[str]) -> None:
+        """Keep PVs in their grace period warm: they have a subscriber again."""
+        for pv in pvs:
+            task = self._grace.pop(pv, None)
+            if task is not None:
+                task.cancel()
 
     async def _stop_monitors(self, pvs: Iterable[str]) -> None:
         """Close the monitors of released PVs and discard their cached state.
@@ -701,8 +805,8 @@ class PVBroker:
         nor buffered.
 
         The first update of a PV cancels its connect timer. A connected update
-        for a PV with no cached metadata, whose previous value was missing or
-        disconnected, starts a background describe through
+        for a PV whose metadata is missing (see `_meta_is_missing`), whose
+        previous value was missing or disconnected, starts a background describe through
         `_ensure_describe_task` regardless of any retry deadline: the channel
         has just connected, so its metadata is available now. If the PV's
         describe task is still running, it describes again afterwards instead. Later connected updates do not repeat a describe
@@ -721,7 +825,8 @@ class PVBroker:
         self._latest[value.pv] = value
         if previous is None:
             self._cancel_task(self._connect_timers, value.pv)
-        if value.connected and value.pv not in self._meta and (previous is None or not previous.connected):
+        # The connect edge first: `_meta_is_missing` dumps the metadata, too dear for every update.
+        if value.connected and (previous is None or not previous.connected) and self._meta_is_missing(value.pv):
             self._ensure_describe_task(value.pv, again_if_running=True)
         async with self._buffer_lock:
             self._buffer[value.pv] = value
@@ -729,13 +834,108 @@ class PVBroker:
     async def _flush_loop(self) -> None:
         interval = self._config.ws_batch_interval_ms / 1000.0
         while self._running:
-            await asyncio.sleep(interval)
+            await self._sleep(interval)
             try:
                 await self._flush()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("broker flush loop iteration failed")
+            try:
+                await self._push_statement()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("broker statement push failed")
+
+    @staticmethod
+    def _statement(frame: dict) -> tuple:
+        """The part of a heartbeat frame whose change is pushed at once.
+
+        A copy, so a connector that updates its ``reachable`` or ``writes``
+        mapping in place still differs from the recorded statement.
+        """
+        return copy.deepcopy((frame["label"], frame["notice"], frame["binding"], frame["reachable"], frame["writes"]))
+
+    async def _push_statement(self) -> None:
+        """Send the heartbeat at once when the connector's statement changed.
+
+        Runs on every flush tick whether or not any client is connected. When
+        (label, notice, binding, reachable, writes) differs from the last
+        pushed statement, the frame goes to every client, then the connector's
+        `ConnectorStatement.statement_sent` is called once. The keep-alive loop
+        neither records a statement nor calls it.
+        """
+        frame = self.heartbeat_frame()
+        statement = self._statement(frame)
+        if self._last_statement is None:
+            self._last_statement = statement
+            return
+        if statement == self._last_statement:
+            return
+        self._last_statement = statement
+        for client_id in list(self._channels):
+            await self._send(client_id, frame)
+        if self._statement_source is not None:
+            self._statement_source.statement_sent()
+
+    def _encodable(self, field: str, value: Any) -> Any:
+        """A statement field as the frame can carry it: a value JSON cannot encode reads ``None``.
+
+        A mapping is copied to a plain dict and only its unencodable entries are
+        nulled, so a ``writes`` state such as ``locked`` survives a bad ``reason``;
+        an unencodable ``state`` itself reads ``unknown``.
+        Never raises; a field that needed this is logged once, until it encodes again.
+        """
+
+        def encodes(item: Any) -> bool:
+            try:
+                json.dumps(item, allow_nan=False)
+            except Exception:
+                return False
+            return True
+
+        try:
+            if isinstance(value, Mapping):
+                value = {str(key): item for key, item in value.items()}
+                bad = [key for key, item in value.items() if not encodes(item)]
+                value.update(dict.fromkeys(bad))
+                if "state" in bad:
+                    # Not null, which a viewer may read as no claim: `unknown` is never writable.
+                    value["state"] = "unknown"
+                clean = not bad
+            else:
+                clean = encodes(value)
+                value = value if clean else None
+        except Exception:
+            value, clean = None, False
+        if clean:
+            self._unencodable.discard(field)
+        elif field not in self._unencodable:
+            self._unencodable.add(field)
+            logger.warning("connector %s holds a value JSON cannot encode; the heartbeat sends it as null", field)
+        return value
+
+    def heartbeat_frame(self) -> dict:
+        """The heartbeat frame: the backend, plus the connector's identity and statement.
+
+        ``label``, ``notice``, ``binding``, ``reachable`` and ``writes`` are read
+        from the connector on every call when it implements `ConnectorStatement`,
+        so a change shows on the next frame; they are ``None`` (no claim) for a
+        connector that does not. One builder for the keep-alive loop, the first
+        frame of every ``ws_pvs`` socket, the push on a statement change and
+        ``GET /hare/v1/health/summary``. A value JSON cannot encode is sent as
+        ``None`` (see `_encodable`), so one bad value cannot fail every send.
+        """
+        source = self._statement_source
+        fields = ("label", "notice", "binding", "reachable", "writes")
+        statement = {f: self._encodable(f, getattr(source, f)) if source is not None else None for f in fields}
+        return {
+            "type": "heartbeat",
+            "timestamp": time.time(),
+            "backend": getattr(self._connector, "backend_name", None),
+            **statement,
+        }
 
     async def _flush(self) -> None:
         """Send each client the PVs that became ready and the updates buffered since the last flush.
@@ -747,6 +947,10 @@ class PVBroker:
         frames is left out of that client's diff, since it would carry the same
         value again; clients take values from ``initial`` frames as well as
         diffs, as the protocol already requires.
+
+        A channel that asks for one then gets a ``flush`` marker (see
+        `ClientChannel`). The marker goes out on every flush, empty ones
+        included, after the frames it covers.
 
         Each client's frames go out in order, and the clients are sent to
         concurrently, so a client whose socket is backed up delays only its own
@@ -763,8 +967,6 @@ class PVBroker:
         one.
         """
         async with self._buffer_lock:
-            if not self._buffer and not self._pending_initial:
-                return
             updates = self._buffer
             self._buffer = {}
             pending = self._pending_initial
@@ -804,11 +1006,18 @@ class PVBroker:
                     for pv in pvs:
                         if pv in in_both:
                             diff.pop(pv, None)
-        clients = list(dict.fromkeys([*per_client_initial, *per_client_diff]))
+        marked = {
+            client_id for client_id, channel in self._channels.items() if getattr(channel, "wants_flush_marker", False)
+        }
+        clients = list(dict.fromkeys([*per_client_initial, *per_client_diff, *marked]))
         results = await asyncio.gather(
             *(
                 self._deliver_flush(
-                    client_id, per_client_initial.get(client_id, []), per_client_diff.get(client_id), ready
+                    client_id,
+                    per_client_initial.get(client_id, []),
+                    per_client_diff.get(client_id),
+                    ready,
+                    marker=client_id in marked,
                 )
                 for client_id in clients
             ),
@@ -824,8 +1033,10 @@ class PVBroker:
         initial_pvs: list[str],
         diff: dict[str, dict] | None,
         ready: dict[str, tuple[asyncio.Lock, dict | None, dict | None]],
+        *,
+        marker: bool = False,
     ) -> None:
-        """Send one client its part of a flush: its ``initial`` frames, then its ``diff``.
+        """Send one client its part of a flush: its ``initial`` frames, its ``diff``, then its ``flush`` marker.
 
         Parameters
         ----------
@@ -837,12 +1048,18 @@ class PVBroker:
             The client's diff payloads, by PV, or ``None`` when it has none.
         ready : dict[str, tuple[asyncio.Lock, dict | None, dict | None]]
             The flush's snapshot of ready PVs, as `_send_ready` takes it.
+        marker : bool, optional
+            Whether the client's channel asks for a ``flush`` marker (see
+            `ClientChannel`), which is then sent after its other frames, even
+            when it has none.
         """
         cap = self._config.initial_frame_max_pvs
         for offset in range(0, len(initial_pvs), cap):
             await self._send_ready(client_id, initial_pvs[offset : offset + cap], ready)
         if diff:
             await self._send(client_id, {"type": "diff", "data": diff, "count": len(diff), "timestamp": time.time()})
+        if marker:
+            await self._send(client_id, {"type": "flush", "timestamp": time.time()})
 
     async def _send_ready(
         self, client_id: str, pvs: list[str], ready: dict[str, tuple[asyncio.Lock, dict | None, dict | None]]
@@ -876,13 +1093,9 @@ class PVBroker:
 
     async def _heartbeat_loop(self) -> None:
         while self._running:
-            await asyncio.sleep(self._config.heartbeat_interval_s)
+            await self._sleep(self._config.heartbeat_interval_s)
             try:
-                message = {
-                    "type": "heartbeat",
-                    "timestamp": time.time(),
-                    "backend": getattr(self._connector, "backend_name", None),
-                }
+                message = self.heartbeat_frame()
                 for client_id in list(self._channels):
                     await self._send(client_id, message)
             except asyncio.CancelledError:
@@ -901,7 +1114,7 @@ class PVBroker:
             self._channels.pop(client_id, None)
             affected_pvs = list(self._registry.client_pvs(client_id))
             deactivated = self._registry.remove_client(client_id)
-            await self._stop_monitors(deactivated)
+            await self._release_monitors(deactivated)
             if affected_pvs:
                 await self._fire_deactivation_hooks(affected_pvs, client_id)
 
@@ -925,16 +1138,36 @@ class PVBroker:
 
     # --- writes ---------------------------------------------------------- #
 
-    async def put(self, pv: str, value: PVWriteValue, *, wait: bool = True, timeout: float | None = None) -> None:
+    async def put(
+        self,
+        pv: str,
+        value: PVWriteValue,
+        *,
+        wait: bool = True,
+        timeout: float | None = None,
+        binding: str | None = None,
+        origin: Mapping[str, Any] | None = None,
+        confirmed: bool = False,
+    ) -> None:
         """Write a value to a PV (one-shot, independent of any subscription).
 
         Delegates to the connector, which routes by protocol prefix and raises
         `PVWriteFailed` on failure or timeout. On success the cached latest value
         is dropped so an immediate `get_value` reflects the write instead of the
         pre-write cache. The monitor path repopulates the cache on its next tick.
+        ``binding``, ``origin`` and ``confirmed`` are passed on as
+        `PVConnector.put` describes them, ``origin`` as a plain dict.
         """
         validate_pv_name(pv)
-        await self._connector.put(pv, value, wait=wait, timeout=timeout)
+        await self._connector.put(
+            pv,
+            value,
+            wait=wait,
+            timeout=timeout,
+            binding=binding,
+            origin=dict(origin) if origin is not None else None,
+            confirmed=confirmed,
+        )
         self._latest.pop(pv, None)
 
     # --- introspection --------------------------------------------------- #
@@ -944,12 +1177,23 @@ class PVBroker:
             "running": self._running,
             "backend": getattr(self._connector, "backend_name", None),
             "active_monitors": len(self._monitors),
+            "warm_monitors": len(self._grace),
+            "connected": self._connected_count(),
             **self._registry.stats(),
             # After the spread so it wins over the registry's own ``clients``
             # bookkeeping key; the two are kept in step, but this is the count
             # of connected channels the health summary describes.
             "clients": len(self._channels),
         }
+
+    def _connected_count(self) -> int:
+        """Of the active monitors, how many whose latest value is connected.
+
+        A monitor with no value yet counts as not connected: nothing has said
+        the channel is there. ``active_monitors`` is the total it is read
+        against.
+        """
+        return sum(1 for pv in self._monitors if (latest := self._latest.get(pv)) is not None and latest.connected)
 
     # --- lifecycle hooks ------------------------------------------------- #
 

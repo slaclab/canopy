@@ -15,6 +15,7 @@ from canopy.core.config import get_settings
 from canopy.core.errors import ErrorCode, CanopyError
 from canopy.core.security import ws_require_read_access
 from canopy.contracts.formula import FormulaSpec
+from canopy.formula_engine.errors import TABLE_UPDATE_UNSUPPORTED_MESSAGE
 from canopy.formula_engine.dependencies import FormulaServiceDep, SubscriptionManagerDep
 
 logger = logging.getLogger(__name__)
@@ -45,8 +46,10 @@ def _coerce_opt_int(value: object, field: str) -> int | None:
     return None if value is None else _coerce_int(value, field)
 
 
-async def _send_error(send_fn, code: str, message: str, *, sub_id: str | None = None) -> None:
-    frame: dict = {"type": "error", "code": code, "message": message}
+async def _send_error(send_fn, code: str, message: str, *, sub_id: str | None = None, retryable: bool = False) -> None:
+    # Errors sent from here are contract or validation rejects (or a failed
+    # start): nothing retries them server-side, so ``retryable`` is false.
+    frame: dict = {"type": "error", "code": code, "message": message, "retryable": retryable}
     if sub_id is not None:
         frame["id"] = sub_id
     await send_fn(frame)
@@ -75,24 +78,34 @@ async def ws_formulas(
     - ``{"type": "result", "id": "...", "data": {...}}``
     - ``{"type": "updated", "id": "..."}``
     - ``{"type": "completed", "id": "..."}``
-    - ``{"type": "error", "id": "...", "code": "...", "message": "..."}``
-    - ``{"type": "error", "code": "...", "message": "..."}`` (no ``id``)
+    - ``{"type": "error", "id": "...", "code": "...", "message": "...", "retryable": bool}``
+    - ``{"type": "error", "code": "...", "message": "...", "retryable": bool}`` (no ``id``)
     - ``{"type": "pong", "timestamp": T}``
 
     Each subscribe gets one reply, in the order the subscribes arrive:
     ``subscribed``, or an error without an ``id``. A malformed subscribe or a
-    spec that can't be evaluated (a bad binding or expression) gets the
-    id-less error, before anything subscribes and before any id is assigned.
-    A failure after that (the subscription limit, a PV subscribe that fails)
-    gets ``subscribed``, then an error with the id.
+    spec that can't be evaluated (a bad binding or expression, or a live
+    table that fails its whole-table check) gets the id-less error, before
+    anything subscribes and before any id is assigned. A failure after that
+    (the subscription limit, a PV subscribe that fails) gets ``subscribed``,
+    then an error with the id.
+
+    A live ``table`` polls at a server-derived interval (``intervalMs`` is
+    ignored) and its result frames carry ``data = {kind: "table", table: {...}}``
+    with nulls for NaN/±inf. Tables are never updated in place.
     """
     await websocket.accept()
     client_id = uuid.uuid4().hex
     send_lock = asyncio.Lock()
 
-    async def send_fn(msg: dict) -> None:
+    async def send_fn(msg: dict | str) -> None:
+        # Every Formula Engine frame is a WebSocket *text* frame: a dict goes out via
+        # send_json (text mode), a table eval's pre-encoded JSON via send_text.
         async with send_lock:
-            await websocket.send_json(msg)
+            if isinstance(msg, str):
+                await websocket.send_text(msg)
+            else:
+                await websocket.send_json(msg)
 
     try:
         while True:
@@ -131,8 +144,15 @@ async def ws_formulas(
                     await _send_error(send_fn, ErrorCode.INVALID_SPEC.value, f"invalid spec: {exc}")
                     continue
 
+                # Checked before it is acknowledged, pinned or subscribed: a live
+                # table whole (lookback, caps, bindings, every column), any other
+                # kind by check_spec. A table with a fixed t1 has no expression
+                # to check and falls through to the one-shot reject.
                 try:
-                    formula_service.check_spec(spec)
+                    if spec.kind != "table":
+                        formula_service.check_spec(spec)
+                    elif t1_ns == 0:
+                        manager.validate_table(spec, t0_ns)
                 except CanopyError as exc:
                     await _send_error(send_fn, exc.error_code.value, exc.detail)
                     continue
@@ -161,13 +181,22 @@ async def ws_formulas(
 
                 # Errors from here on carry the id: an id-less error is read
                 # as the reply to a pending subscribe.
+                spec_update = message.get("spec")
+                # Tables are never updated in place; reject before any other check.
+                if isinstance(spec_update, dict) and spec_update.get("kind") == "table":
+                    await _send_error(
+                        send_fn,
+                        ErrorCode.TABLE_UPDATE_UNSUPPORTED.value,
+                        TABLE_UPDATE_UNSUPPORTED_MESSAGE,
+                        sub_id=sub_id,
+                    )
+                    continue
                 try:
                     t0_update = _coerce_opt_int(message.get("t0Ns"), "t0Ns")
                     interval_update = _coerce_opt_int(message.get("intervalMs"), "intervalMs")
                 except _WSValidationError as exc:
                     await _send_error(send_fn, ErrorCode.INVALID_MESSAGE.value, str(exc), sub_id=sub_id)
                     continue
-                spec_update = message.get("spec")
 
                 parsed_spec = None
                 if spec_update is not None:

@@ -4,6 +4,11 @@ When a PV loses all Hare subscribers (deactivation), the GraceManager starts a
 timer. If no new subscriber arrives before the timer fires, Vole unsubscribes
 from the PV and drops its buffer. If a subscriber arrives (activation), the
 pending timer is cancelled and the buffer stays warm.
+
+A pinned PV (held by a live table eval) is never torn down: an expiry that fires
+while the PV is pinned is skipped and remembered, and the last unpin re-arms that
+same expiry. Unpin never arms grace on its own -- grace stays driven only by Hare
+deactivation, so a REST-only ring keeps today's lifetime.
 """
 
 from __future__ import annotations
@@ -11,8 +16,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Protocol
+from collections.abc import Callable
 
 from canopy.vole.config import VoleConfig
+from canopy.epics.pv_protocol import strip_protocol_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +36,24 @@ class BufferProtocol(Protocol):
 
 
 class GraceManager:
-    def __init__(self, ingest: IngestProtocol, buffer: BufferProtocol, config: VoleConfig) -> None:
+    def __init__(
+        self,
+        ingest: IngestProtocol,
+        buffer: BufferProtocol,
+        config: VoleConfig,
+        *,
+        is_pinned: Callable[[str], bool] | None = None,
+    ) -> None:
         self._ingest = ingest
         self._buffer = buffer
         self._grace_seconds = config.buffer_grace_seconds
+        self._is_pinned = is_pinned or (lambda pv: False)
         self._pending: dict[str, asyncio.Task] = {}
+        # Deactivated PVs whose expiry fired while pinned, re-armed by the last unpin.
+        # Keyed by the stripped name (pins are stripped; Hare's deactivation name may
+        # carry ca://), valued by every name the deactivations used (``X`` and
+        # ``ca://X`` can both feed one ring), for the re-arm.
+        self._skipped: dict[str, set[str]] = {}
 
     async def on_pv_deactivated(self, pvs: list[str]) -> None:
         # The property copies, so read it once rather than per PV.
@@ -44,9 +64,22 @@ class GraceManager:
 
     async def on_pv_activated(self, pvs: list[str]) -> None:
         for pv in pvs:
+            # Only this name is back; another alias's skipped expiry still stands.
+            canonical = strip_protocol_prefix(pv)
+            names = self._skipped.get(canonical)
+            if names is not None:
+                names.discard(pv)
+                if not names:
+                    del self._skipped[canonical]
             task = self._pending.pop(pv, None)
             if task:
                 task.cancel()
+
+    async def on_pvs_unpinned(self, pvs: list[str]) -> None:
+        """The last pin on these PVs is gone: re-arm the expiries skipped while pinned."""
+        to_rearm = [name for pv in pvs for name in sorted(self._skipped.pop(strip_protocol_prefix(pv), ()))]
+        if to_rearm:
+            await self.on_pv_deactivated(to_rearm)
 
     async def _expire(self, pv: str) -> None:
         """Wait out the grace period, then unsubscribe ingest and drop the ring.
@@ -58,8 +91,17 @@ class GraceManager:
         """
         try:
             await asyncio.sleep(self._grace_seconds)
+            if self._is_pinned(pv):
+                self._skipped.setdefault(strip_protocol_prefix(pv), set()).add(pv)
+                logger.debug("Grace period expired for pinned %s; teardown deferred to its last unpin", pv)
+                return
             await self._ingest.unsubscribe([pv])
-            await self._buffer.drop(pv)
+            # Rings are keyed by the canonical name (a ``ca://X`` deactivation owns ring
+            # ``X``). Keep the ring while another name still feeds it, so a dropped ring
+            # always means an unsubscribed name.
+            canonical = strip_protocol_prefix(pv)
+            if not any(strip_protocol_prefix(name) == canonical for name in self._ingest.subscribed_pvs):
+                await self._buffer.drop(canonical)
             logger.debug("Grace period expired; unsubscribed and dropped buffer for %s", pv)
         except asyncio.CancelledError:
             raise
@@ -74,4 +116,5 @@ class GraceManager:
         for task in tasks:
             task.cancel()
         self._pending.clear()
+        self._skipped.clear()
         await asyncio.gather(*tasks, return_exceptions=True)

@@ -34,9 +34,12 @@ class FakeConnector:
     callbacks: dict[str, EventCallback] = field(default_factory=dict)
     started: bool = False
     closed: bool = False
-    # Recorded `put` calls as (pv, value, wait, timeout); set `put_error` to make
-    # the next put raise (drives the broker/endpoint write-failure paths).
+    # Recorded `put` calls as (pv, value, wait, timeout), and the (binding,
+    # origin) each carried; set `put_error` to make the next put raise (drives
+    # the broker/endpoint write-failure paths).
     puts: list = field(default_factory=list)
+    put_contexts: list = field(default_factory=list)
+    put_confirmed: list = field(default_factory=list)
     put_error: Exception | None = None
     # PVs whose monitor never delivers a value: channels that never connect.
     dead: set[str] = field(default_factory=set)
@@ -55,8 +58,20 @@ class FakeConnector:
     async def get(self, pv: str, *, timeout: float | None = None) -> PVValue:
         return PVValue(pv=pv, value=0.0, severity=AlarmSeverity.NO_ALARM, ts_ns=1, connected=True)
 
-    async def put(self, pv: str, value, *, timeout: float | None = None, wait: bool = True) -> None:
+    async def put(
+        self,
+        pv: str,
+        value,
+        *,
+        timeout: float | None = None,
+        wait: bool = True,
+        binding=None,
+        origin=None,
+        confirmed: bool = False,
+    ) -> None:
         self.puts.append((pv, value, wait, timeout))
+        self.put_contexts.append((binding, origin))
+        self.put_confirmed.append(confirmed)
         if self.put_error is not None:
             raise self.put_error
 
@@ -106,6 +121,14 @@ async def settle(broker: PVBroker) -> None:
     await broker.drain_seeds()
     await broker._drain_nowait()
     await broker._flush()
+
+
+@pytest.fixture(autouse=True)
+def _no_keep_warm_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every ``HareConfig`` built here releases a PV the moment its last subscriber
+    leaves, as upstream's refcount tests expect; test_broker_grace.py sets the
+    grace it tests explicitly."""
+    monkeypatch.setenv("CANOPY_HARE__MONITOR_GRACE_SECONDS", "0")
 
 
 @pytest.fixture
