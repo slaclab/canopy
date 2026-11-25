@@ -49,9 +49,12 @@ async def engine_at(monkeypatch):
         await engine.dispose()
 
 
+UNREACHABLE = "postgresql+asyncpg://canopy:canopy@127.0.0.1:1/canopy"
+
+
 async def test_an_unreachable_database_is_not_ready_and_warns_once(engine_at, monkeypatch, caplog):
     monkeypatch.setattr(canopy.core.health, "_database_down", False)
-    engine_at("postgresql+asyncpg://canopy:canopy@127.0.0.1:1/canopy")
+    engine_at(UNREACHABLE)
     assert await database_ready() is False
     assert await database_ready() is False
     assert caplog.text.count("didn't answer") == 1
@@ -63,7 +66,9 @@ async def test_a_reachable_database_is_ready(engine_at, monkeypatch, caplog):
     except (OSError, asyncpg.PostgresError) as e:
         pytest.skip(f"Postgres unavailable for the readiness test ({_ADMIN_DSN}): {e}")
     await conn.close()
-    monkeypatch.setattr(canopy.core.health, "_database_down", True)  # as after an outage
+    monkeypatch.setattr(canopy.core.health, "_database_down", False)
+    engine_at(UNREACHABLE)
+    assert await database_ready() is False  # an outage first
     engine_at(make_url(_ADMIN_DSN).set(drivername="postgresql+asyncpg").render_as_string(hide_password=False))
     assert await database_ready() is True
     assert "answers again" in caplog.text

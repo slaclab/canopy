@@ -55,9 +55,11 @@ PV) can't be found through that path. When another parent it references still na
 the arm as owner (``drift.owner_of``) and the arm lacks the row, it is deleted too, as
 replication would have deleted it. Rows the head still holds afterwards whose
 reference finds no parent, owned by the arm or by nobody known, are listed in the
-result (``dangling``) and logged; ``drift-check`` reports them too. One cause the
-copy can't remove: the arm deleted a facility its snapshots still referenced on the
-head (snapshots the arm pruned stay on the head), which replication leaves the same.
+result (``dangling``) and logged; ``drift-check`` reports them too. One case the
+copy can't remove: an arm that deleted a snapshot and then its facility leaves the
+head's copy of the snapshot (time-series rows are never deleted on the head) without
+its facility, as replication would. The list also shows rows a rebuilt or out-of-date
+arm left behind.
 
 ``--since`` must not be later than the newest snapshot the head holds from that arm. Missing
 parents are found by id whatever their time, but children of a parent both sides hold
@@ -398,20 +400,34 @@ async def _still_dangling(mirror: asyncpg.Connection, arm: str, registry: Replic
     return found
 
 
-async def _unique_indexes(conn: asyncpg.Connection, table: str) -> list[list[str]]:
-    """The columns of each unique index on ``table`` other than its primary key (expression indexes left out)."""
+async def _unique_indexes(conn: asyncpg.Connection, table: str) -> list[tuple[str, list[str], str | None]]:
+    """Each unique index on ``table`` but its primary key: its name, its columns, and why not plain.
+
+    The reason is ``None`` for an index on plain columns, else that it is an expression
+    or a partial index, which ``_set_aside`` can't read.
+    """
     rows = await conn.fetch(
         """
-        SELECT array_agg(a.attname ORDER BY k.n) AS columns, bool_or(a.attname IS NULL) AS expression
+        SELECT c.relname AS name, array_agg(a.attname ORDER BY k.n) AS columns,
+               bool_or(a.attname IS NULL) AS expression, bool_or(i.indpred IS NOT NULL) AS partial
         FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
         JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, n) ON true
         LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum AND k.attnum > 0
         WHERE i.indrelid = $1::regclass AND i.indisunique AND NOT i.indisprimary
-        GROUP BY i.indexrelid
+        GROUP BY i.indexrelid, c.relname
+        ORDER BY c.relname
         """,
         qualified(table),
     )
-    return [list(row["columns"]) for row in rows if not row["expression"]]
+    return [
+        (
+            row["name"],
+            [column for column in row["columns"] if column is not None],
+            "an expression index" if row["expression"] else "a partial index" if row["partial"] else None,
+        )
+        for row in rows
+    ]
 
 
 async def _placeholder(conn: asyncpg.Connection, copy: Copy, column: str) -> str:
@@ -448,27 +464,40 @@ async def _set_aside(
     never outlives it; a row that would be kept as it is (history the arm no longer
     has) is refused instead. A row of another owner holding the value is never touched:
     that is refused, naming the owner (only values unique across owners can clash so).
+
+    An index it can't read (an expression or partial index, or one on a column the arm
+    doesn't have, as while the head is a release ahead) is logged by name and left to
+    the database: a clash under it fails ``_upsert`` with that index's unique violation,
+    and since the copy is one transaction, nothing is written.
     """
     parked = 0
     join_sql, owner_sql = copy.owners
     owner_column = getattr(registry.owner_paths.get(copy.table), "column", None)
-    for columns in await _unique_indexes(mirror, copy.table):
-        if not set(columns) <= set(copy.columns):
+    for index, columns, unreadable in await _unique_indexes(mirror, copy.table):
+        if unreadable is None and (absent := [c for c in columns if c not in copy.columns]):
+            unreadable = f"{', '.join(absent)} isn't on the arm"
+        if unreadable is not None:
+            logger.warning(
+                "Re-seeding %s: values the arm moved aren't set aside under unique index %s (%s); "
+                "a clash there stops the copy, and nothing is written",
+                copy.table,
+                index,
+                unreadable,
+            )
             continue
         same = " AND ".join(f"x.{quote_ident(c)} = t.{quote_ident(c)}" for c in columns)
         mine = ", ".join(f"t.{quote_ident(k)}" for k in copy.key)
         theirs = ", ".join(f"x.{quote_ident(k)}" for k in copy.key)
         clash = f"EXISTS (SELECT 1 FROM {quote_ident(temp)} x WHERE {same} AND ({theirs}) IS DISTINCT FROM ({mine}))"
-        if not await mirror.fetchval(f"SELECT EXISTS (SELECT 1 FROM {qualified(copy.table)} t WHERE {clash})"):
+        holders = await mirror.fetch(
+            f"SELECT DISTINCT {owner_sql} AS owner FROM {qualified(copy.table)} t {join_sql} WHERE {clash} ORDER BY 1"
+        )
+        if not holders:
             continue
-        if foreign := await mirror.fetch(
-            f"SELECT DISTINCT {owner_sql} AS owner FROM {qualified(copy.table)} t {join_sql} "
-            f"WHERE {owner_sql} <> $1 AND {clash} ORDER BY 1",
-            owner,
-        ):
+        if foreign := [row["owner"] for row in holders if row["owner"] != owner]:
             raise Refused(
                 f"{copy.table}.{', '.join(columns)}: a value the arm gives one of its rows is held here by a row of "
-                f"{', '.join(row['owner'] for row in foreign)}; rename one of them on its owner"
+                f"{', '.join(foreign)}; rename one of them on its owner"
             )
         mine_owned = _owned(copy, "$1", registry)
         kept = f"EXISTS (SELECT 1 FROM {quote_ident(temp)} x WHERE {_matches('x', 't', copy.key)})"

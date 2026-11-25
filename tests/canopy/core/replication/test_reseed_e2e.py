@@ -708,6 +708,39 @@ async def test_one_run_per_arm_at_a_time(octopus: Octopus):
 
 
 @one_arm
+async def test_a_second_reseed_refuses_at_once_while_the_first_copies(octopus: Octopus):
+    """Two reseeds of the same arm at the same time: the second refuses, naming the arm; the first finishes."""
+    o = octopus
+    await _subscribed(o)
+    since = await _newest_on_head(o)
+    await _lose_subscription(o)
+    copying, finish = asyncio.Event(), asyncio.Event()
+
+    async def hold():
+        copying.set()
+        await finish.wait()
+
+    first, second = await _connections(o), await _connections(o)
+    run = None
+    try:
+        run = asyncio.create_task(_reseed(o, *first, since=since, hooks={"before_commit": hold}))
+        await asyncio.wait_for(copying.wait(), 30)
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(Refused, match=f"another reseed of {o.arm.name} is running"):
+            await asyncio.wait_for(_reseed(o, *second, since=since), 10)  # never blocked behind the first
+        assert asyncio.get_running_loop().time() - started < 5
+        finish.set()
+        assert (await asyncio.wait_for(run, 60))["created"]
+        await eventually(lambda: _in_step(o, o.arm.name))
+    finally:
+        finish.set()
+        if run is not None and not run.done():
+            run.cancel()
+        for conn in (*first, *second):
+            await conn.close()
+
+
+@one_arm
 async def test_deletes_links_whose_pv_was_already_gone_here(octopus: Octopus):
     """The head lost a PV but kept its links; the arm deletes the PV in the gap. The links go too."""
     o = octopus
@@ -756,6 +789,45 @@ async def test_lists_a_snapshot_whose_facility_the_arm_deleted(octopus: Octopus)
         assert report["dangling"] == [
             {"table": "squirrel.snapshot", "column": "facility_id", "parent": "core.facility", "owner": arm, "rows": 1}
         ]
+    finally:
+        await primary.close()
+        await mirror.close()
+
+
+@one_arm
+async def test_a_unique_index_it_cant_read_is_named_and_a_clash_there_writes_nothing(octopus: Octopus, caplog):
+    """A partial index, or one on a column the arm lacks, is logged and left to the database."""
+    o = octopus
+    arm = o.arm.name
+    await _subscribed(o)
+    first, second = str(uuid4()), str(uuid4())
+    await o.arm.admin.execute(
+        "INSERT INTO squirrel.pv (id, setpoint_address, device, owner_instance) "
+        "VALUES ($1, 'SIM:PV:7:SETPOINT', 'SIM:DEV:7', $3), ($2, 'SIM:PV:8:SETPOINT', NULL, $3)",
+        first,
+        second,
+        arm,
+    )
+    await eventually(lambda: _in_step(o, arm))
+    since = await _newest_on_head(o)
+    await _lose_subscription(o)
+    # Only on the head: a partial unique index, and one on a column the arm doesn't have.
+    await o.head.admin.execute("CREATE UNIQUE INDEX zz_device ON squirrel.pv (device) WHERE device IS NOT NULL")
+    await o.head.admin.execute("ALTER TABLE squirrel.pv ADD COLUMN zz_extra text")
+    await o.head.admin.execute("CREATE UNIQUE INDEX zz_extra ON squirrel.pv (zz_extra)")
+    # The arm gives the second PV the device the first still has, which the head's index refuses.
+    await o.arm.admin.execute("UPDATE squirrel.pv SET device = 'SIM:DEV:7' WHERE id = $1", second)
+    before = await _rows(o.head.conn, "squirrel.pv", arm)
+
+    primary, mirror = await _connections(o)
+    try:
+        with pytest.raises(asyncpg.UniqueViolationError, match="zz_device"):
+            await _reseed(o, primary, mirror, since=since)
+        assert "unique index zz_device (a partial index)" in caplog.text
+        assert "unique index zz_extra (zz_extra isn't on the arm)" in caplog.text
+        assert await _rows(o.head.conn, "squirrel.pv", arm) == before
+        name = subscription_name(arm)
+        assert not await o.head.admin.fetchval("SELECT subenabled FROM pg_subscription WHERE subname = $1", name)
     finally:
         await primary.close()
         await mirror.close()
