@@ -32,6 +32,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import noload, raiseload, selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -467,9 +468,29 @@ class PvRepository(BaseRepository[Pv]):
         result = await self.session.execute(self._locked(query) if for_update else query)
         return result.scalar_one_or_none()
 
-    async def _find_by_identity(
-        self, kind: str, address: str, owner: str, include_deleted: bool, for_update: bool
+    async def find_by_identity(
+        self, kind: str, address: str, *, owner: str, include_deleted: bool = False, for_update: bool = False
     ) -> Pv | None:
+        """``owner``'s PV holding the identity ``kind`` at ``address``, tags loaded.
+
+        Parameters
+        ----------
+        kind : str
+            Identity kind: ``"setpoint"``, ``"readback"`` or ``"config"``.
+        address : str
+            Address carrying the identity.
+        owner : str
+            The owner whose PVs to search; identities are unique per owner.
+        include_deleted : bool
+            Also match a deleted PV. A live one comes first when both exist.
+        for_update : bool
+            Lock the row until the transaction ends.
+
+        Returns
+        -------
+        Pv | None
+            The PV, or ``None`` when none of ``owner``'s PVs holds that identity.
+        """
         query = (
             select(Pv)
             .options(selectinload(Pv.tags).selectinload(Tag.group))
@@ -477,64 +498,9 @@ class PvRepository(BaseRepository[Pv]):
         )
         if not include_deleted:
             query = query.where(Pv.deleted_at.is_(None))
-        # One of an owner's PVs at most holds an identity, deleted or not; a live one would come first.
         query = query.order_by(Pv.deleted_at.is_not(None)).limit(1)
         result = await self.session.execute(self._locked(query) if for_update else query)
         return result.scalars().first()
-
-    async def find_by_setpoint(
-        self, setpoint_address: str, *, owner: str, include_deleted: bool = False, for_update: bool = False
-    ) -> Pv | None:
-        """``owner``'s PV with this setpoint address: setpoint addresses are unique per owner."""
-        return await self._find_by_identity("setpoint", setpoint_address, owner, include_deleted, for_update)
-
-    async def find_by_readback_without_setpoint(
-        self, readback_address: str, *, owner: str, include_deleted: bool = False, for_update: bool = False
-    ) -> Pv | None:
-        """Find ``owner``'s setpoint-less PV by its readback address.
-
-        Parameters
-        ----------
-        readback_address : str
-            Readback address to match.
-        owner : str
-            The owner whose PVs to search.
-        include_deleted : bool
-            Also match a deleted PV.
-        for_update : bool
-            Lock the row until the transaction ends.
-
-        Returns
-        -------
-        Pv | None
-            A PV whose ``setpoint_address`` is NULL and whose ``readback_address`` equals
-            ``readback_address``, or ``None`` when no such PV exists.
-        """
-        return await self._find_by_identity("readback", readback_address, owner, include_deleted, for_update)
-
-    async def find_by_config_only(
-        self, config_address: str, *, owner: str, include_deleted: bool = False, for_update: bool = False
-    ) -> Pv | None:
-        """Find ``owner``'s config-only PV by its config address.
-
-        Parameters
-        ----------
-        config_address : str
-            Config address to match.
-        owner : str
-            The owner whose PVs to search.
-        include_deleted : bool
-            Also match a deleted PV.
-        for_update : bool
-            Lock the row until the transaction ends.
-
-        Returns
-        -------
-        Pv | None
-            A PV whose ``setpoint_address`` and ``readback_address`` are both NULL and whose
-            ``config_address`` equals ``config_address``, or ``None`` when no such PV exists.
-        """
-        return await self._find_by_identity("config", config_address, owner, include_deleted, for_update)
 
     async def _existing_identities(self, kind: str, addresses: list[str], owner: str) -> set[str]:
         """The subset of ``addresses`` already identifying one of ``owner``'s live PVs as ``kind``."""
@@ -621,7 +587,8 @@ class PvRepository(BaseRepository[Pv]):
         Returns
         -------
         dict[str, Pv]
-            Each PV, with its tags loaded, keyed by the address that identifies it.
+            Each PV, with its tags loaded, keyed by the address that identifies it; a live
+            PV over a deleted one where both hold an address.
         """
         if not addresses:
             return {}
@@ -631,9 +598,13 @@ class PvRepository(BaseRepository[Pv]):
             .where(self._identity_filter(kind, addresses), Pv.owner_instance == owner)
             .order_by(Pv.id)
         )
-        return {
-            getattr(pv, f"{kind}_address"): pv for pv in (await self.session.execute(self._locked(query))).scalars()
-        }
+        found: dict[str, Pv] = {}
+        for pv in (await self.session.execute(self._locked(query))).scalars():
+            # Readback and config identities aren't unique in the database: a live PV wins.
+            address = getattr(pv, f"{kind}_address")
+            if address not in found or (found[address].deleted_at is not None and pv.deleted_at is None):
+                found[address] = pv
+        return found
 
     async def soft_delete(self, pv_id: str) -> bool:
         """Mark a live PV deleted, keeping its tags and values; ``False`` when there is none."""
@@ -753,6 +724,130 @@ class PvRepository(BaseRepository[Pv]):
         if len(reloaded) != len(pvs):
             raise RuntimeError(f"Reloaded {len(reloaded)} of {len(pvs)} created PVs")
         return pvs
+
+    async def update_many(self, pvs: list[Pv]) -> list[Pv]:
+        """Flush changes made to loaded PVs and read back the ``updated_at`` it set.
+
+        The many-row counterpart of ``update``. The PVs come in fully loaded, tags and
+        all, and the flush keeps every value it wrote, so ``updated_at`` is the one
+        attribute left to read: the database sets it on each ``pv`` row the flush
+        updates, and the flush expires it. One query reads ``(id, updated_at)`` for every
+        PV instead of reloading the rows and their tags. A PV whose only change is its
+        tags gets no ``pv`` UPDATE, so its ``updated_at`` stays as it was, just as with
+        ``update``.
+
+        Parameters
+        ----------
+        pvs : list[Pv]
+            PVs already in the session, loaded, with their changes applied.
+
+        Returns
+        -------
+        list[Pv]
+            ``pvs`` itself, in the order given, with ``updated_at`` loaded.
+
+        Raises
+        ------
+        RuntimeError
+            If the read-back doesn't return every PV, which would leave the missing ones
+            with an unloaded ``updated_at``.
+        """
+        if not pvs:
+            return []
+        await self.session.flush()
+        result = await self.session.execute(
+            select(Pv.id, Pv.updated_at).where(Pv.id == any_(_uuid_array([pv.id for pv in pvs])))
+        )
+        updated_at = dict(result.tuples().all())
+        if len(updated_at) != len(pvs):
+            raise RuntimeError(f"Reloaded {len(updated_at)} of {len(pvs)} updated PVs")
+        for pv in pvs:
+            # Loads the value without marking the PV changed, as a refresh would.
+            set_committed_value(pv, "updated_at", updated_at[pv.id])
+        return pvs
+
+    async def _get_by_identity(self, address_column, addresses: list[str], *conditions, owner: str) -> dict[str, Pv]:
+        """``{address: Pv}`` for ``owner``'s PVs whose ``address_column`` is one of ``addresses``.
+
+        Batched under the Postgres parameter limit, with tags eager-loaded. Only setpoint
+        addresses are unique in the database, and only per owner; when several of
+        ``owner``'s PVs share another identifying address, the one with the lowest id is
+        returned.
+        """
+        found: dict[str, Pv] = {}
+        for i in range(0, len(addresses), PARAM_BATCH_SIZE):
+            batch = addresses[i : i + PARAM_BATCH_SIZE]
+            result = await self.session.execute(
+                select(Pv)
+                .options(selectinload(Pv.tags).selectinload(Tag.group))
+                .where(*conditions, address_column.in_(batch), Pv.owner_instance == owner, Pv.deleted_at.is_(None))
+                .order_by(Pv.id)
+            )
+            for pv in result.scalars().all():
+                found.setdefault(getattr(pv, address_column.key), pv)
+        return found
+
+    async def get_by_setpoints(self, setpoint_addresses: list[str], *, owner: str) -> dict[str, Pv]:
+        """``owner``'s PVs holding these setpoint addresses.
+
+        Parameters
+        ----------
+        setpoint_addresses : list[str]
+            Setpoint addresses to look up.
+        owner : str
+            The owner whose PVs to search.
+
+        Returns
+        -------
+        dict[str, Pv]
+            Each found address mapped to its PV, tags loaded. Absent addresses are left out.
+        """
+        return await self._get_by_identity(Pv.setpoint_address, setpoint_addresses, owner=owner)
+
+    async def get_by_readbacks_without_setpoint(self, readback_addresses: list[str], *, owner: str) -> dict[str, Pv]:
+        """``owner``'s setpoint-less PVs holding these readback addresses.
+
+        Parameters
+        ----------
+        readback_addresses : list[str]
+            Readback addresses to look up.
+        owner : str
+            The owner whose PVs to search.
+
+        Returns
+        -------
+        dict[str, Pv]
+            Each found address mapped to a PV whose ``setpoint_address`` is NULL, tags
+            loaded. If several such PVs share an address, the one with the lowest id.
+        """
+        return await self._get_by_identity(
+            Pv.readback_address, readback_addresses, Pv.setpoint_address.is_(None), owner=owner
+        )
+
+    async def get_by_config_only(self, config_addresses: list[str], *, owner: str) -> dict[str, Pv]:
+        """``owner``'s config-only PVs holding these config addresses.
+
+        Parameters
+        ----------
+        config_addresses : list[str]
+            Config addresses to look up.
+        owner : str
+            The owner whose PVs to search.
+
+        Returns
+        -------
+        dict[str, Pv]
+            Each found address mapped to a PV whose ``setpoint_address`` and
+            ``readback_address`` are both NULL, tags loaded. If several such PVs share an
+            address, the one with the lowest id.
+        """
+        return await self._get_by_identity(
+            Pv.config_address,
+            config_addresses,
+            Pv.setpoint_address.is_(None),
+            Pv.readback_address.is_(None),
+            owner=owner,
+        )
 
     async def facility_ids_for(self, pv_id: str) -> set[str]:
         """The facility ids a PV is assigned to — empty if it's unassigned.
