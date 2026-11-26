@@ -1,10 +1,10 @@
-"""Repository tests for ``PvRepository.bulk_create`` and ``get_by_ids`` against the test Postgres."""
+"""Repository tests for ``PvRepository.bulk_create``, ``update_many`` and ``get_by_ids`` against the test Postgres."""
 
 import random
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import event, inspect
+from sqlalchemy import text, event, inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.squirrel.data import repositories
@@ -95,6 +95,43 @@ async def test_bulk_create_fails_clearly_if_the_reload_misses_a_row(db_session: 
     monkeypatch.setattr(repo, "get_by_ids", short_get_by_ids)
     with pytest.raises(RuntimeError, match="Reloaded 2 of 3 created PVs"):
         await repo.bulk_create(_new_pvs(3, tags))
+
+
+async def test_update_many_reads_back_updated_at_and_leaves_every_attribute_loaded(db_session: AsyncSession):
+    """The flush expires only ``updated_at``; the read-back loads it, so the DTO can read
+    every attribute without a lazy load. A tags-only change issues no ``pv`` UPDATE."""
+    tags = await _seed_tags(db_session, 3)
+    repo = PvRepository(db_session)
+    column, tags_only, untouched = await repo.bulk_create(_new_pvs(3, tags))
+    stamps = {pv.id: pv.updated_at for pv in (column, tags_only, untouched)}
+    # A new transaction, so the UPDATE's now() differs from the INSERT's.
+    await db_session.commit()
+
+    column.description = "changed"
+    tags_only.tags = [tags[0]]
+    updated = await repo.update_many([column, tags_only, untouched])
+
+    assert updated == [column, tags_only, untouched]
+    for pv in updated:
+        _assert_loaded(pv)
+        assert not inspect(pv).modified
+    assert column.updated_at > stamps[column.id]
+    assert tags_only.updated_at == stamps[tags_only.id]
+    assert untouched.updated_at == stamps[untouched.id]
+    assert [t.name for t in tags_only.tags] == ["sim-tag-0"]
+
+
+async def test_update_many_fails_clearly_if_the_read_back_misses_a_row(db_session: AsyncSession):
+    """As with ``bulk_create``: a row missing from the read-back is a clear error."""
+    repo = PvRepository(db_session)
+    pvs = await repo.bulk_create([Pv(setpoint_address=f"SIM:DEV:{n:05d}:SET") for n in range(1, 4)])
+    # Gone from the database behind the session's back, and unchanged, so the flush
+    # doesn't touch it.
+    await db_session.execute(text("DELETE FROM squirrel.pv WHERE id = :id"), {"id": pvs[1].id})
+    pvs[0].description = "changed"
+
+    with pytest.raises(RuntimeError, match="Reloaded 2 of 3 updated PVs"):
+        await repo.update_many(pvs)
 
 
 async def test_get_by_ids_sends_any_number_of_ids_as_one_parameter(db_session: AsyncSession):
