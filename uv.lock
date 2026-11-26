@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 
 [[package]]
@@ -203,7 +203,7 @@ requires-dist = [
     { name = "prometheus-client", specifier = ">=0.20" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pydantic-settings", specifier = ">=2.11" },
-    { name = "pydmconverter", marker = "extra == 'convert'", specifier = ">=1.0.8" },
+    { name = "pydmconverter", marker = "extra == 'convert'", specifier = ">=1.1.1" },
     { name = "python-multipart", specifier = ">=0.0.32" },
     { name = "redis", marker = "extra == 'data'", specifier = ">=5.0" },
     { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'data'", specifier = ">=2.0" },
@@ -1441,13 +1441,13 @@ wheels = [
 
 [[package]]
 name = "pydmconverter"
-version = "1.0.8"
+version = "1.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jsonschema" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/15/6f/538c25fcce4267f12ab5fcd60149ddcd026f3911ab96e70a492a46aa15b8/pydmconverter-1.0.8.tar.gz", hash = "sha256:05f5d7171fd624856fccb693074a8623a35ccc1dd04931d8d189d3c5a297e06a", size = 501941, upload-time = "2026-10-28T18:26:59.554Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/59/56/6a09ad5783fdeddb5da45476a75f5440680980d3b82bd1de8e310e8b5495/pydmconverter-1.1.1.tar.gz", hash = "sha256:4e8c9ae228da4f4f1da1e50e807d541d8c88b6bf3216216bd8f1cabe9467b658", size = 835783, upload-time = "2026-11-26T06:23:15.804Z" }
 
 [[package]]
 name = "pygments"

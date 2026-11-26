@@ -57,6 +57,8 @@ async def _start_worker(monkeypatch) -> dict:
     """Run ``worker.on_startup`` against fakeredis, with the hook registry's cache isolated."""
     monkeypatch.setattr(registry, "_hooks", [])
     monkeypatch.setattr(registry, "_hook_providers", None)
+    # on_startup also builds the converter's batch service; keep it from outliving the test.
+    monkeypatch.setattr("canopy.converter.tasks._service", None)
     ctx = {"redis": fakeredis.aioredis.FakeRedis()}
     await worker.on_startup(ctx)
     return ctx

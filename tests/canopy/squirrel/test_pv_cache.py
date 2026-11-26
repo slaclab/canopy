@@ -629,6 +629,8 @@ async def test_worker_runs_the_monitor_only_when_enabled(monkeypatch, enabled):
         return set()
 
     monkeypatch.setattr("canopy.squirrel.pv_cache.monitor.load_pv_addresses", no_pvs)
+    # on_startup also builds the converter's batch service; keep it from outliving the test.
+    monkeypatch.setattr("canopy.converter.tasks._service", None)
     ctx = {"redis": fakeredis.aioredis.FakeRedis()}
     await worker.on_startup(ctx)
     try:
