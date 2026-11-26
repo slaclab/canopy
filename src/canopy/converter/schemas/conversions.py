@@ -31,7 +31,11 @@ class DroppedPropsDTO(CanopyModel):
 
 
 class SchemeErrorDTO(CanopyModel):
-    """One problem found while loading the color scheme (``path`` is a JSON pointer, ``""`` for the root)."""
+    """One problem found while loading the color scheme.
+
+    ``path`` is the keys from the file's root to the problem joined with ``/``, such as ``roles/OK/dark``, with no
+    escaping (a role name may itself contain ``/``); ``""`` is the file as a whole.
+    """
 
     path: str
     message: str

@@ -49,6 +49,15 @@ def test_check_reports_role_without_dark(tmp_path, capsys):
     assert "no dark value: Brand" in out
 
 
+def test_check_names_a_role_with_a_slash_whole(tmp_path, capsys):
+    path = tmp_path / "s.json"
+    path.write_text(json.dumps({"id": "x", "roles": {"Beam/On": {"light": "#123456"}}}))
+    code, out = _run(capsys, "check", str(path))
+    assert code == 1
+    # Parsing the error path printed "On" here (the second-to-last segment of roles/Beam/On/dark).
+    assert [line for line in out.splitlines() if line.startswith("no dark value:")] == ["no dark value: Beam/On"]
+
+
 def test_check_unreadable_file_fails(tmp_path, capsys):
     code, out = _run(capsys, "check", str(tmp_path / "missing.json"))
     assert code == 1

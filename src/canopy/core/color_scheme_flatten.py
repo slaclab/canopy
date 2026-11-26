@@ -10,7 +10,9 @@ resolves ``@alias`` references, canonicalises every hex, and returns a :class:`S
 - ``sources``: ``{role: hex}``, each role's declared ``phoebus`` source color (canonical hex), merged per role like a
   mode; roles without one are absent. Like ``imports`` it is a converter input, not a column of ``flat``, so it does
   not enter :meth:`SchemeResult.flat_json` or ``flatHash``;
-- ``meta``: ``{"id", "sha256", "flatHash", "served", "errors": [{"path", "message"}]}``.
+- ``meta``: ``{"id", "sha256", "flatHash", "served", "errors": [{"path", "message"}]}``;
+- ``holes``: ``((role, mode), ...)``, every role the file left without a light or dark value after inheritance (each
+  also an error), as data, so a reader need not parse an error's path or message. A role name may contain ``/``.
 
 The converter takes a :class:`SchemeResult` as ``convert_bytes(scheme=...)`` and reads its ``flat``, ``imports`` and
 ``sources``; this module is the only flattener canopy runs, and it needs nothing outside the standard library and
@@ -61,12 +63,17 @@ _INVALID = object()
 
 @dataclass(frozen=True)
 class SchemeResult:
-    """A flattened scheme: the flat role table, the merged import maps, the role sources and the meta block."""
+    """A flattened scheme: the flat role table, the merged import maps, the role sources and the meta block.
+
+    ``holes`` describes the requested file, like ``meta["errors"]``: the ``(role, mode)`` pairs it left without a
+    value, in the order the errors report them. It is not part of :meth:`flat_json`.
+    """
 
     flat: dict[str, list[str]]
     imports: dict[str, dict[str, str | dict[str, str]]]
     meta: dict[str, Any]
     sources: dict[str, str] = field(default_factory=dict)
+    holes: tuple[tuple[str, str], ...] = ()
 
     def flat_json(self) -> dict[str, Any]:
         """The flat scheme plus ``meta``, as a fresh JSON-serialisable dict. ``imports`` and ``sources`` are not in it."""
@@ -100,12 +107,16 @@ def load_scheme(path: str | Path | None, *, base_path: str | Path | None = None)
     base_path = Path(base_path) if base_path is not None else DEFAULT_SCHEME_PATH
     base_bytes = base_path.read_bytes()
     base_doc = json.loads(base_bytes.decode("utf-8"))
-    base_roles, base_imports, base_sources, base_errors = _flatten({}, {}, {}, base_doc, prefix="base:", sort_new=False)
+    base_roles, base_imports, base_sources, base_errors, base_holes = _flatten(
+        {}, {}, {}, base_doc, prefix="base:", sort_new=False
+    )
     base_flat = _to_flat(base_roles)
     base = (base_flat, base_imports, base_sources)
 
     if path is None:
-        return _result(*base, DEFAULT_ID, hashlib.sha256(base_bytes).hexdigest(), DEFAULT_ID, base_errors)
+        return _result(
+            *base, DEFAULT_ID, hashlib.sha256(base_bytes).hexdigest(), DEFAULT_ID, base_errors, holes=base_holes
+        )
 
     path = Path(path)
     try:
@@ -128,12 +139,12 @@ def load_scheme(path: str | Path | None, *, base_path: str | Path | None = None)
         name: {mode: (value, f"base:roles/{name}/{mode}") for mode, value in modes.items()}
         for name, modes in base_roles.items()
     }
-    roles, imports, sources, flatten_errors = _flatten(
+    roles, imports, sources, flatten_errors, holes = _flatten(
         base_values, base_imports, base_sources, doc, prefix="", sort_new=True
     )
     errors.extend(flatten_errors)
     if errors:
-        return _fallback(base, scheme_id, digest, errors)
+        return _fallback(base, scheme_id, digest, errors, holes=holes)
     return _result(_to_flat(roles), imports, sources, scheme_id, digest, scheme_id or DEFAULT_ID, [])
 
 
@@ -144,14 +155,16 @@ def _err(path: str, message: str) -> dict[str, str]:
     return {"path": path, "message": message}
 
 
-def _result(flat, imports, sources, scheme_id, digest, served, errors) -> SchemeResult:
+def _result(flat, imports, sources, scheme_id, digest, served, errors, *, holes=()) -> SchemeResult:
     meta = {"id": scheme_id, "sha256": digest, "flatHash": flat_hash(flat), "served": served, "errors": errors}
-    return SchemeResult(flat=copy.deepcopy(flat), imports=copy.deepcopy(imports), meta=meta, sources=dict(sources))
+    return SchemeResult(
+        flat=copy.deepcopy(flat), imports=copy.deepcopy(imports), meta=meta, sources=dict(sources), holes=tuple(holes)
+    )
 
 
-def _fallback(base, scheme_id, digest, errors) -> SchemeResult:
-    """Serve the base: ``base`` is its ``(flat, imports, sources)``."""
-    return _result(*base, scheme_id, digest, DEFAULT_ID, errors)
+def _fallback(base, scheme_id, digest, errors, *, holes=()) -> SchemeResult:
+    """Serve the base: ``base`` is its ``(flat, imports, sources)``; ``holes`` are the rejected file's."""
+    return _result(*base, scheme_id, digest, DEFAULT_ID, errors, holes=holes)
 
 
 def _to_flat(roles: dict[str, dict[str, str]]) -> dict[str, list[str]]:
@@ -214,11 +227,13 @@ def _flatten(base_values, base_imports, base_sources, doc, *, prefix: str, sort_
     """Merge ``doc`` onto the base, resolve aliases and check imports.
 
     ``base_values`` maps role -> mode -> (value, origin path); ``base_sources`` maps role -> phoebus hex. Returns
-    (roles, imports, sources, errors) where roles maps each fully resolved role to ``{"light": hex, "dark": hex}``;
-    roles that failed to resolve are left out, and so are their sources. New roles keep file order for the base
-    itself and are sorted by name for a facility file (so key order cannot matter).
+    (roles, imports, sources, errors, holes) where roles maps each fully resolved role to
+    ``{"light": hex, "dark": hex}``; roles that failed to resolve are left out, and so are their sources. ``holes``
+    lists the ``(role, mode)`` pairs with no value after inheritance. New roles keep file order for the base itself
+    and are sorted by name for a facility file (so key order cannot matter).
     """
     errors: list[dict[str, str]] = []
+    holes: list[tuple[str, str]] = []
     merged: dict[str, dict[str, tuple[Any, str]]] = {name: dict(modes) for name, modes in base_values.items()}
     merged_sources: dict[str, str] = dict(base_sources)
 
@@ -252,6 +267,7 @@ def _flatten(base_values, base_imports, base_sources, doc, *, prefix: str, sort_
     for name, modes in merged.items():
         for mode in MODES:
             if mode not in modes:
+                holes.append((name, mode))
                 errors.append(
                     _err(f"{prefix}roles/{name}/{mode}", f"role {name!r} has no {mode} value after inheritance")
                 )
@@ -290,7 +306,7 @@ def _flatten(base_values, base_imports, base_sources, doc, *, prefix: str, sort_
                         )
             elif target not in merged:
                 errors.append(_err(f"{prefix}import/{kind}/{key}", f"import target {target!r} is not a role"))
-    return roles, imports, sources, errors
+    return roles, imports, sources, errors, holes
 
 
 def _resolve(name, mode, merged, errors, reported_cycles) -> str | None:

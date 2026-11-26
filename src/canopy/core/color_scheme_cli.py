@@ -23,9 +23,7 @@ def check(path: Path, out: TextIO) -> int:
     """Print the problems of the scheme file at ``path`` to ``out``; 1 when there is any, else 0."""
     result = load_scheme(path)
     errors = result.meta["errors"]
-    no_dark = sorted(
-        {e["path"].split("/")[-2] for e in errors if e["path"].endswith("/dark") and "no dark value" in e["message"]}
-    )
+    no_dark = sorted({role for role, mode in result.holes if mode == "dark"})
     for err in errors:
         print(f"error: {err['path'] or '<file>'}: {err['message']}", file=out)
     for name in no_dark:

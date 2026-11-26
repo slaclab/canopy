@@ -590,3 +590,29 @@ def test_canonical_hex_and_flat_hash_are_public():
     assert canonical_hex("#ABC") == "#aabbcc"
     assert canonical_hex("#AABBCCFF") == "#aabbcc"
     assert flat_hash(load_scheme(None).flat) == DEFAULT_FLAT_HASH
+
+
+# -- holes: the roles left without a mode, as data ------------------------------------------------------------------
+
+
+def test_holes_list_each_missing_mode_and_are_not_in_flat_json(tmp_path):
+    result = load_scheme(write(tmp_path, {"id": "fac", "roles": {"Half": {"light": "#fff"}, "Empty": {}}}))
+    assert set(result.holes) == {("Half", "dark"), ("Empty", "light"), ("Empty", "dark")}
+    assert len(result.holes) == len(result.meta["errors"])
+    assert "holes" not in result.flat_json()
+    assert_serves_default(result)
+
+
+def test_a_role_name_with_a_slash_keeps_its_name_in_holes(tmp_path):
+    result = load_scheme(write(tmp_path, {"id": "fac", "roles": {"Beam/On": {"light": "#123456"}}}))
+    assert result.holes == (("Beam/On", "dark"),)
+    # The error path format is unchanged (keys joined with "/", unescaped), as in the converter's flattener.
+    assert error_paths(result) == ["roles/Beam/On/dark"]
+
+
+def test_clean_files_and_other_errors_have_no_holes(tmp_path):
+    assert load_scheme(None).holes == ()
+    assert load_scheme(write(tmp_path, {"id": "fac", "roles": {"Beam/On": "#123456"}}, "a.json")).holes == ()
+    dangling = load_scheme(write(tmp_path, {"id": "fac", "roles": {"A": "@Nope"}}, "b.json"))
+    assert dangling.meta["errors"] and dangling.holes == ()
+    assert load_scheme(write(tmp_path, "{ not json", "c.json")).holes == ()
