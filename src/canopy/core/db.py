@@ -12,6 +12,7 @@ Routes and services take their request session through ``SessionDep``;
 
 from __future__ import annotations
 
+import logging
 from uuid import uuid4
 from typing import Annotated
 from datetime import datetime
@@ -19,7 +20,8 @@ from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
 
 from fastapi import Depends
-from sqlalchemy import DateTime, func, select
+from sqlalchemy import DateTime, func, text, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Mapped, DeclarativeBase, mapped_column
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -30,6 +32,9 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.dialects.postgresql import UUID
 
 from canopy.core.config import get_settings
+from canopy.core.forwarding.context import ForwardedWrite, forwarded_write
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -164,10 +169,80 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
     Every dependency in a request that takes ``SessionDep`` shares one session and one
     transaction, because FastAPI only reuses a dependency declared the same way, scope
     included. A module that needs a different policy can still declare its own.
+
+    For a write a history head forwarded on someone's behalf, the commit's WAL position
+    is recorded for ``X-Canopy-Commit-LSN`` (see ``_commit_forwarded``).
     """
     async with session_scope() as session:
         yield session
-        await session.commit()
+        if (write := forwarded_write.get()) is not None and write.on_behalf_of is not None:
+            await _commit_forwarded(session, write)
+        else:
+            await session.commit()
+
+
+async def _commit_forwarded(session: AsyncSession, write: ForwardedWrite) -> None:
+    """Commit, and if the transaction wrote anything, record a WAL position at or past its commit.
+
+    The position is the end of the last WAL record when it is read, straight after the
+    commit: the commit record's own end, which is what the head reports as applied once
+    it has the change (``pg_replication_origin_status.remote_lsn``). It is never before
+    that end, so the head never reports a write as applied before it is. Other
+    sessions' WAL can land in between, and then only the arm's next published write
+    takes the head past it. A transaction that wrote nothing has no xid and gets no
+    position, so a read or a job enqueue never makes the head wait.
+
+    A route that always answers with a position (``ForwardedWrite.report_position``,
+    the captured import) gets the current WAL position when it wrote nothing: a
+    replay of a write already committed, which is at or before it.
+
+    The write is committed before the position is read, so a failure to read it
+    (a lost connection, a failover) leaves the answer without a position rather than
+    turning a saved write into an error. The head then can't wait for it.
+    """
+    wrote = await session.scalar(text("SELECT pg_current_xact_id_if_assigned() IS NOT NULL"))
+    await session.commit()
+    if wrote or write.report_position:
+        current = "pg_current_wal_insert_lsn()" if wrote else "pg_current_wal_lsn()"
+        try:
+            row = (await session.execute(text(_POSITION.format(current=current)))).one()
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "A forwarded write for %s is committed but its WAL position can't be read: %s", write.on_behalf_of, exc
+            )
+            return
+        write.commit_lsn = _lsn_text(_record_end(int(row.position), int(row.page), int(row.segment)))
+
+
+_POSITION = """
+SELECT {current} - '0/0'::pg_lsn AS position,
+       (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_block_size') AS page,
+       (SELECT setting::bigint FROM pg_settings WHERE name = 'wal_segment_size') AS segment
+"""
+
+# Bytes of a WAL page's header: the long one opens each segment (SizeOfXLogLongPHD), the
+# short one every other page (SizeOfXLogShortPHD), on a 64-bit build.
+_LONG_PAGE_HEADER = 40
+_SHORT_PAGE_HEADER = 24
+
+
+def _record_end(position: int, page: int, segment: int) -> int:
+    """The end of the last WAL record written before ``position``, an insert position.
+
+    The two differ only when that record ended a page: the insert position then points
+    past the next page's header, where the next record would start, while the record's
+    end, which a subscriber reports as applied, is the page boundary.
+    """
+    if position % segment == _LONG_PAGE_HEADER:
+        return position - _LONG_PAGE_HEADER
+    if position % page == _SHORT_PAGE_HEADER:
+        return position - _SHORT_PAGE_HEADER
+    return position
+
+
+def _lsn_text(position: int) -> str:
+    """``position`` as ``pg_lsn`` text (``"16/B374D848"``)."""
+    return f"{position >> 32:X}/{position & 0xFFFFFFFF:X}"
 
 
 SessionDep = Annotated[AsyncSession, Depends(get_session, scope="function")]

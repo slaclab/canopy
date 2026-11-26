@@ -232,3 +232,28 @@ async def test_get_session_declared_without_session_dep_scope_makes_a_second_ses
     """
     assert not await _route_and_service_share_a_session(Annotated[AsyncSession, Depends(db.get_session)])
     assert len(made_sessions) == 2
+
+
+PAGE, SEGMENT = 8192, 16 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    ("position", "end"),
+    [
+        (3 * SEGMENT + 5 * PAGE + 24, 3 * SEGMENT + 5 * PAGE),
+        (3 * SEGMENT + 40, 3 * SEGMENT),
+        (3 * SEGMENT + 5 * PAGE + 4096, 3 * SEGMENT + 5 * PAGE + 4096),
+        (3 * SEGMENT + 5 * PAGE + 32, 3 * SEGMENT + 5 * PAGE + 32),
+        (3 * SEGMENT + PAGE + 24, 3 * SEGMENT + PAGE),
+    ],
+    ids=["after-a-page-header", "after-a-segment-header", "mid-page", "past-a-record-on-the-page", "second-page"],
+)
+def test_a_commit_position_is_the_end_of_the_last_record(position, end):
+    # A commit that ends a page leaves the insert position past the next page's
+    # header; the head's subscription reports the page boundary for it.
+    assert db._record_end(position, PAGE, SEGMENT) == end
+
+
+def test_a_position_reads_as_pg_lsn_text():
+    assert db._lsn_text(0x16_B374D848) == "16/B374D848"
+    assert db._lsn_text(0x7BBE000) == "0/7BBE000"

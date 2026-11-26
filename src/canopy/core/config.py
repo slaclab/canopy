@@ -102,6 +102,10 @@ class Settings(BaseSettings):
         Days of history this instance keeps, at least 1; ``None`` means it keeps
         everything. A blank value, as Helm and compose render an unset one, is ``None``
         here and for ``history_url``.
+    accept_forwarded_writes : bool
+        On a primary (an arm), trust ``X-Canopy-On-Behalf-Of`` from service keys, so
+        writes a history head forwards are recorded under the user it sent them for.
+        Off by default: the header is then refused from every key.
     """
 
     model_config = SettingsConfigDict(
@@ -163,11 +167,14 @@ class Settings(BaseSettings):
     history_url: str | None = None
     window_days: int | None = Field(None, ge=1)
 
-    @field_validator("history_url", "window_days", mode="before")
+    @field_validator("history_url", "window_days", "accept_forwarded_writes", mode="before")
     @classmethod
     def _blank_is_unset(cls, value: object, info: ValidationInfo) -> object:
-        """Read a blank value as unset rather than as ``""`` or an unparseable int."""
+        """Read a blank value as unset rather than as ``""``, an unparseable int or bool."""
         return blank_keeps_default(cls, value, info)
+
+    # Primary (arm) only: accept writes a history head forwards on a user's behalf.
+    accept_forwarded_writes: bool = False
 
     @property
     def machine_writes(self) -> bool:

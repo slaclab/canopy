@@ -522,7 +522,8 @@ and each module's docs, OpenAPI and `/v1/health/watchdog`.
 - Refusals are `401 invalid_api_key`, `403 insufficient_module_access` or
   `503 key_store_unavailable`, with CORS headers, so a browser client can read them.
 - A CORS preflight needs no key. The probes stay open behind a path prefix
-  (`uvicorn --root-path`) too.
+  (`uvicorn --root-path /canopy`) too. Give the prefix without a trailing slash:
+  the router, and so the gate, strips it only at a path boundary.
 
 Before turning it on:
 

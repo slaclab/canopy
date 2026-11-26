@@ -15,6 +15,7 @@ from starlette.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from canopy import __version__
+from canopy.core.asgi import route_path
 from canopy.core.config import (
     MODULES_SCOPE_KEY,
     get_settings,
@@ -42,6 +43,7 @@ from canopy.core.security import (
     build_key_registry,
 )
 from canopy.contracts.health import HealthDTO
+from canopy.core.forwarding.context import COMMIT_LSN_HEADER, REPLICA_STALE_HEADER
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -115,21 +117,9 @@ class _SelectedModules:
         await self.app(scope, receive, send)
 
 
-def _route_path(scope: Scope) -> str:
-    """The path the router matches: ``scope["path"]`` without the ``root_path`` prefix.
-
-    Behind a path-prefixed ingress (``uvicorn --root-path /canopy``) the server
-    puts the prefix in front of ``path``; the router strips it, and so must the gate.
-    """
-    path, root_path = scope["path"], scope.get("root_path", "")
-    if root_path and path.startswith(root_path) and path[len(root_path) : len(root_path) + 1] in ("", "/"):
-        return path[len(root_path) :] or "/"
-    return path
-
-
 def _is_open(scope: Scope, probes: frozenset[str]) -> bool:
     """A ``GET`` on one of ``probes`` (the health probe paths) passes the closed-meta gate."""
-    return scope["type"] == "http" and scope["method"] == "GET" and _route_path(scope) in probes
+    return scope["type"] == "http" and scope["method"] == "GET" and route_path(scope) in probes
 
 
 class _ClosedMeta:
@@ -266,6 +256,12 @@ def build_app(modules: Iterable[str] | str, *, closed_meta: bool | None = None) 
         # including on a cold start when the cache has nothing stale to serve.
         # Built before anything can serve, so a bad CANOPY_API_KEYS or keys file
         # surfaces in the startup log instead of as an unexplained 401.
+        if database_tier and get_settings().role == "mirror":
+            # A head forwards writes to its arms: a bad forward setting stops it here,
+            # not at the first write.
+            from canopy.core.forwarding.client import check_forward_urls
+
+            check_forward_urls()
         bind_key_registry(build_key_registry(get_settings()))
         # Read the shipped migrations head now, off the request path; /v1/instance serves the cached value.
         shipped_alembic_head()
@@ -301,12 +297,27 @@ def build_app(modules: Iterable[str] | str, *, closed_meta: bool | None = None) 
     # registration order): preflight OPTIONS requests that CORS answers itself never
     # reach the router, and counting them would only inflate the "unmatched" series.
     app.add_middleware(HTTPMetricsMiddleware)
+    if database_tier:
+        # Between the two: on a history head it answers writes it forwards to an arm itself
+        # (they have their own counter, since no route here matched them), and CORS still
+        # wraps them. On an arm it adds a forwarded write's commit position.
+        from canopy.core.forwarding.middleware import ForwardingMiddleware
+
+        remember_job = None
+        if "jobs" in selected:
+            from canopy.jobs import gateway as jobs_gateway
+
+            remember_job = jobs_gateway.remember_forwarded_job
+        app.add_middleware(ForwardingMiddleware, remember_job=remember_job)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        # Not CORS-safelisted, so a browser client on another origin couldn't otherwise read
+        # whether its forwarded write is visible here yet.
+        expose_headers=[COMMIT_LSN_HEADER, REPLICA_STALE_HEADER],
     )
     app.add_middleware(_SelectedModules, modules=frozenset(selected))
 

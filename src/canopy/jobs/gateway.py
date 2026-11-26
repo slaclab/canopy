@@ -15,15 +15,19 @@ from __future__ import annotations
 
 import json
 import asyncio
+import logging
 from typing import Any
 
 from arq import create_pool
 from arq.jobs import Job, JobStatus
 from arq.connections import ArqRedis, RedisSettings
+from redis.exceptions import RedisError
 
 from canopy.core.config import get_settings
 from canopy.jobs.errors import JobAlreadyExists
 from canopy.jobs.schemas.job import JobPhaseDTO, JobStatusDTO
+
+logger = logging.getLogger(__name__)
 
 _pool: ArqRedis | None = None
 _redis_url: str | None = None
@@ -61,6 +65,35 @@ async def enqueue(function: str, *args: Any, **kwargs: Any) -> str:
     if job is None:
         raise JobAlreadyExists(f"Cannot enqueue {function!r}: a job with the same id already exists")
     return job.job_id
+
+
+# --- forwarded jobs: which arm runs a job a head forwarded ------------------- #
+
+_FORWARDED_PREFIX = "canopy:forwarded-job:"
+# The arm keeps a job's result for its worker's keep_result (an hour) after the job
+# ends; a day covers a job queued or running there for a long while first.
+_FORWARDED_TTL = 86400
+
+
+async def remember_forwarded_job(job_id: str, arm: str) -> None:
+    """Record that job ``job_id`` runs on arm ``arm``: a head forwarded the write that started it.
+
+    ``get_forwarded_job_arm`` reads it back for ``GET /jobs/v1/{id}``, which asks that
+    arm. The ``ForwardingMiddleware`` calls this, so it must never fail the answer:
+    a Redis error is logged and the job is then unknown here.
+    """
+    try:
+        pool = await get_pool()
+        await pool.set(_FORWARDED_PREFIX + job_id, arm, ex=_FORWARDED_TTL)
+    except (OSError, RedisError) as exc:
+        logger.warning("Cannot record that job %s runs on arm %s: %s", job_id, arm, exc)
+
+
+async def get_forwarded_job_arm(job_id: str) -> str | None:
+    """The arm a forwarded job runs on, or ``None`` when this head didn't forward it."""
+    pool = await get_pool()
+    arm = await pool.get(_FORWARDED_PREFIX + job_id)
+    return arm.decode() if isinstance(arm, bytes) else arm
 
 
 # --- progress: a per-job Redis key written from inside running tasks -------- #
