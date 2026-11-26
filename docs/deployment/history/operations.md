@@ -1,100 +1,9 @@
-# History mirror
+# Operations
 
-A history head is a copy of one or more Canopy instances' databases, its arms, kept
-in step by Postgres logical replication. Remote users browse the full history there
-while each arm goes on controlling its machine, and the head is the off-site copy of
-the arms' data. Every row has one owner, the instance that wrote it, so the head keeps
-each arm's rows apart, beside any rows it owns itself. An arm runs with
-`CANOPY_ROLE=primary`, the head with `CANOPY_ROLE=mirror`.
-
-The commands below are `python -m canopy.core.replication <command>`, run from the
-Canopy image with the instance's `CANOPY_DATABASE_URL`, `CANOPY_ROLE` and
-`CANOPY_INSTANCE`. Every command refuses to run on the wrong side. On the head, the
-commands act on every arm configured in `CANOPY_ARMS__<arm>__…`, or on one with
-`--arm <arm>`; `reseed` always names its arm.
-
-## Topology
-
-```mermaid
-flowchart LR
-    subgraph A1["arm1 (CANOPY_ROLE=primary)"]
-        A1A["api + worker"] --> A1D[("Postgres<br/>publication canopy_history")]
-    end
-    subgraph A2["arm2 (CANOPY_ROLE=primary)"]
-        A2A["api + worker"] --> A2D[("Postgres<br/>publication canopy_history")]
-    end
-    subgraph H["head (CANOPY_ROLE=mirror)"]
-        HD[("Postgres<br/>canopy_history_arm1<br/>canopy_history_arm2")] --> HA["api + worker"]
-        CJ["CronJob: refresh, drift-check"]
-    end
-    HD -- "logical replication (TLS)" --> A1D
-    HD -- "logical replication (TLS)" --> A2D
-    CJ -- "read-only queries (TLS)" --> A1D
-    CJ -- "read-only queries (TLS)" --> A2D
-```
-
-- **One connection direction.** Every connection opens from the head's side to an
-  arm's Postgres: the head's subscription to that arm, `canopy_history_<arm>` (as the
-  arm's replication role), and the drift check and re-seed (as its reader role). An
-  arm never connects to the head.
-- **Owners.** The arm that writes a row owns it (`owner_instance` on facilities, PVs,
-  snapshots, tag groups and Magpie configs; other rows follow their parent). An arm
-  holds only its own rows. The head holds every arm's rows plus its own, and the drift
-  check and re-seed work on one arm's rows at a time.
-- **What replicates.** `canopy.core.replication.registry` classifies every table.
-  Reference tables (PVs, tags, configs) and time-series tables (snapshots and their
-  values) replicate with inserts, updates and deletes. Local tables never replicate:
-  each side mints and checks its own API keys. `TRUNCATE` isn't published, so one
-  typed on an arm by hand doesn't empty history.
-- **Schema.** Both sides run the same Alembic tree. A few migration steps run on one
-  side only (see "Database Migrations" in `CONTRIBUTING.md`).
-
-## Roles
-
-### Instance roles
-
-| `CANOPY_ROLE` | Holds | Writes |
-|---|---|---|
-| `primary` (default) | Only its own rows; publishes them, and may prune | Its own rows |
-| `mirror` | Its arms' rows, beside its own; never prunes | Its own rows; an arm's rows on that arm, when the head forwards to it ([Writes on a head](#writes-on-a-head)) |
-
-Every instance writes only the rows it owns (see [Row owners](index.md#row-owners)),
-and a head meant to stay read-only gives its users read keys only. `GET /v1/instance`
-reports the role and the instance's name, so clients can tell which rows they can
-write, and the Alembic head shipped in the image, which the deploy check below
-compares.
-
-**API keys and facilities.** Each instance's API keys are its own, and a key's
-facility grants are slugs. An arm refuses to delete a facility its own rows or keys
-still use, and no other instance's rows can use it (a facility's rows share its
-owner). What it can't see is the head's keys. A facility deleted on its arm is deleted
-on the head too, and a head key that granted it silently stops reaching that
-facility's data (a slug that no longer exists grants nothing). Check the head's keys
-before deleting a facility on an arm, and re-grant them afterwards.
-
-### Database roles
-
-| Role | Database | Used by | Rights |
-|---|---|---|---|
-| `replicator` | each arm | The head's subscription to that arm | `REPLICATION LOGIN`; `publish` grants `SELECT` on the published tables only |
-| `canopy_reader` | each arm | The head's `drift-check` and `reseed` for that arm | `LOGIN`; `publish` grants the same `SELECT`. It can't read API-key hashes |
-| table owner (e.g. `canopy_owner`) | head | Migrations, `grants`, `refresh`, `subscribe` | Owns the tables; member of `pg_create_subscription` |
-| `canopy_app` | head | The head's API and worker | `grants` lets it read every row and write only the head's own (row-level security on the root tables), and read-write its API keys |
-| superuser | head | `reseed` | Or the table owner with `EXECUTE` on `pg_replication_origin_advance(text, pg_lsn)` |
-| `canopy_heartbeat` | each arm that prunes | The head's `heartbeat` and `switch` for that arm | `LOGIN`; `publish` lets it read and write `core.history_heartbeat` and nothing else, and refuses if it can reach more through other roles or PUBLIC. Only needed for [pruning](#prune) |
-
-The names are the defaults of `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_ROLE`,
-`__APP_ROLE` and `__HEARTBEAT_ROLE`. Each arm's `pg_hba.conf` admits `replicator`,
-`canopy_reader` and, where it prunes, `canopy_heartbeat` over `hostssl` with SCRAM
-from the head's network only. The head reaches each arm with two secrets, each a
-`postgresql://` URI: `CANOPY_ARMS__<arm>__PUBLISHER_DSN`, as the replication role, and
-`CANOPY_ARMS__<arm>__READER_DSN`, as the reader role, plus
-`CANOPY_ARMS__<arm>__HEARTBEAT_DSN`, as the heartbeat role, for an arm that prunes.
-
-Each arm's Postgres needs `wal_level = logical`, enough `max_replication_slots`
-and `max_wal_senders`, and `max_slot_wal_keep_size` set **before the first slot
-exists**: without a cap, a head that stops consuming makes the arm keep WAL until
-its disk is full.
+How to run a head and its arms: the order of a release, the hourly jobs, what to watch,
+how the head handles writes and snapshots for its arms, prune on an arm, and every
+setting. What each database holds is on the [overview](index.md); how to set up each
+shape is under [Topologies](topologies.md); repairs are under [Runbooks](runbooks.md).
 
 ## Release order
 
@@ -127,9 +36,7 @@ publishes, then streams changes. `status` shows the copy's progress on either si
 before a second arm is connected: a re-seed that reconciled whole tables would delete
 the other arms' rows.
 
-## Operations
-
-### CronJobs
+## Hourly jobs
 
 On the head, hourly, for each arm: `refresh --arm <arm>`, then `drift-check --arm
 <arm>` (with that arm's `CANOPY_ARMS__<arm>__READER_DSN`). `drift-check` exits 0 only
@@ -140,25 +47,19 @@ One Job per arm keeps one arm's failure from hiding another's result; without
 arm that prunes, its Job also runs `heartbeat --arm <arm>` last, as described under
 [Prune](#prune).
 
-### Backups
-
-Back up the head like a primary, with base backups and WAL archiving. Each arm's rows
-can be copied again from that arm, but the head's own rows exist only in its database
-and its backups, and so do snapshots waiting in its outbox for an arm.
-
-### Metrics and alerts
+## Metrics and alerts
 
 Each side's `/metrics` reports its half of replication: an arm's slot, and the head's
 subscription to each arm (labelled `arm`). `/health/ready` checks the database. The
 gauges, and the alert rules shipped in `docker/observability`, are listed under
-[Replication](../observability/metrics.md#replication). The lag to watch is each
+[Replication](../../observability/metrics.md#replication). The lag to watch is each
 arm's `canopy_replication_slot_lag_bytes`; the head can't measure its own. A head
 that forwards to arms also reports its snapshot outbox per arm, under
-[Snapshot outbox](../observability/metrics.md#snapshot-outbox).
+[Snapshot outbox](../../observability/metrics.md#snapshot-outbox).
 With `CANOPY_CLOSED_META` on, each side's scrape of `/metrics` needs a key scoped to
-`core` (see [Closed meta routes](api-keys.md#closed-meta-routes)).
+`core` (see [Closed meta routes](../api-keys.md#closed-meta-routes)).
 
-### Drift check
+## Drift check
 
 Replication skips an update or delete whose row the head doesn't have, without an
 error, so the copy can drift with every gauge green. `drift-check` compares, for each
@@ -192,110 +93,17 @@ error, and drift found in the arms still makes the run exit 1.
 
 The JSON report gives `status`, then each arm's report under `arms` (drifting tables
 and days) and the head's under `head`. To repair an arm's drift, find its cause, then
-run `reseed --arm <arm>` with `--since` no later than the oldest drifting day
-(reference tables and snapshots are always reconciled in full).
+disable that arm's subscription (`ALTER SUBSCRIPTION canopy_history_<arm> DISABLE`;
+`reseed` refuses while it's enabled) and run `reseed --arm <arm>` with `--since` no
+later than the oldest drifting day (reference tables and snapshots are always
+reconciled in full). Run `reseed` as a superuser, or as the table owner with `EXECUTE`
+on `pg_replication_origin_advance(text, pg_lsn)`; it enables the subscription again
+from an exact cut (see [Slot lost](runbooks.md#slot-lost)).
 
 If `publish` on an arm ever reported tables it `cleared`, or `status` showed
 `restricted` ones (a row filter or column list on the publication), a head that
 subscribed while the restriction was in place holds only part of that arm's rows in
 those tables, and `refresh` won't copy them again. Re-seed that arm.
-
-## Prune
-
-An arm whose disk can't hold all of its history keeps the last `CANOPY_WINDOW_DAYS`
-days of snapshots and leaves older ones to the head. Turn this on only for an arm whose
-sizing forecast says it's needed; arms may differ, one pruning on the split layout and
-another on `canopy_history`. The head never prunes, its own rows included. Pruning takes
-the three steps below, once per arm, then a worker setting on that arm. Prune deletes
-must never reach the head, so the arm first moves to a second publication layout:
-`canopy_ref` carries the reference tables with every operation, and `canopy_ts` carries
-the time-series tables with inserts and updates only. User deletes still reach the head,
-because deleting a snapshot or a PV only marks it deleted.
-
-### Switch to the split layout
-
-1. On the arm: `publish --split`. It creates `canopy_ref` and `canopy_ts` beside
-   `canopy_history`. Deploys keep running plain `publish`, which keeps all three in
-   step and never switches layouts.
-2. On the head: `switch --arm <arm>`, with `CANOPY_ARMS__<arm>__HEARTBEAT_DSN` set to a
-   URI to the arm as `canopy_heartbeat`. It waits (up to `--timeout`, 120 s) until the
-   slot has confirmed a position taken after the pair existed, then moves that arm's
-   subscription to the pair without copying. A subscription moved while its slot is
-   still behind the pair's creation can't find the publications and retries forever.
-   `switch` refuses if the subscription is disabled or the arm has no pair yet. Other
-   arms' subscriptions are untouched.
-3. On the arm: `publish --split` again. It drops `canopy_history` once the head's
-   walsender is seen streaming exactly the pair, and exits 2 with the reason until
-   then. Retry after a few seconds: the walsender restarts after the switch. Reading
-   what a walsender streams needs a superuser or `pg_read_all_stats`.
-
-From then on the head's subscription to that arm reads the pair. `reseed --arm <arm>`
-creates it on the pair whenever the arm has it. To copy everything again instead, run
-`subscribe --split --arm <arm>`.
-
-### Heartbeat
-
-The head reports its checks to each arm that prunes, hourly, last in that arm's Job:
-
-```text
-refresh --arm <arm>
-drift-check --arm <arm> --days <the arm's CANOPY_WINDOW_DAYS>
-heartbeat --arm <arm> [--backup-ok] [--wal-archive-ok] [--drift-ok]
-```
-
-Pass each flag only when that check passed: `--drift-ok` when that arm's `drift-check`
-exited 0 (1, drift, and 2, couldn't check, both leave it out), and `--backup-ok` and
-`--wal-archive-ok` from the backup system's own status. The backup and WAL archive are
-the head's, so every arm's heartbeat gets the same two; only `--drift-ok` differs by
-arm. A dangling row `drift-check` attributes to one arm fails only that arm's check; one
-it can't attribute fails every arm's. Once an arm prunes, its `drift-check` needs
-`--days`: days the arm has pruned would otherwise count as drift. `heartbeat` writes the
-arm's `core.history_heartbeat` through `CANOPY_ARMS__<arm>__HEARTBEAT_DSN`, in a row named
-after the head's slot there, timed by the arm's clock.
-
-While that arm's subscription is disabled or any of its tables is still copying,
-`heartbeat` records the drift check as failed whatever `--drift-ok` says: those tables
-weren't compared, and rows pruned before a table's copy reads them would never reach
-history. A heartbeat also counts only for the stream it was written in. After the head
-reconnects to the arm, or its subscription is rebuilt, the arm's prune waits for the
-next heartbeat.
-
-### Turn pruning on
-
-On the arm's worker, set `CANOPY_WINDOW_DAYS` and `CANOPY_PRUNE__ENABLED=true`. The job
-runs nightly at `CANOPY_PRUNE__HOUR` (UTC); a head's worker never schedules it, and the
-job refuses to run anywhere but on an arm (`CANOPY_ROLE=primary`). Until `CANOPY_PRUNE__DRY_RUN=false` it
-only counts what it would remove. Run it dry for a month while the arm's `drift-check`
-stays clean, then turn the dry run off.
-
-Each run removes snapshots older than the window that aren't retained, deleted or
-not, up to `CANOPY_PRUNE__MAX_SNAPSHOTS_PER_RUN`, one per transaction. Each facility
-keeps its newest snapshot however old it is, so a facility history still refers to
-stays in use and can't be deleted. Before every snapshot it checks a gate on the head's
-slot `canopy_history_<CANOPY_INSTANCE>`, and it stops at the first failure, logging each
-failed check by name:
-
-| Check | Fails when |
-|---|---|
-| `window_set` | `CANOPY_WINDOW_DAYS` is unset |
-| `no_delete_publication` | Any publication carrying a snapshot table publishes deletes (`canopy_history` still exists) |
-| `slot_active` | The head's slot is missing or no walsender holds it |
-| `streams_split` | The walsender doesn't stream both `canopy_ref` and `canopy_ts`, they don't carry the snapshot tables whole (inserts and updates, no row filter or column list), or its command can't be read |
-| `no_initial_copy` | A table's initial copy is running (a `pg_<oid>_sync_…` slot exists) |
-| `wal_status_reserved` | The slot's WAL is at risk |
-| `lag` | Flush lag or the head's last reply is older than `CANOPY_PRUNE__MAX_LAG_S` (60 s) |
-| `heartbeat_fresh`, `heartbeat_ok` | No heartbeat within `CANOPY_PRUNE__HEARTBEAT_MAX_AGE_H` (3 h) and since the walsender started, or one reporting a failed check |
-
-A snapshot older than the window can still be restored on its arm: export it from the
-head (`GET /squirrel/v1/snapshots/{id}/export`) and import the bundle on the arm
-(`POST /squirrel/v1/snapshots/import`), which creates a new, recent copy owned by the
-arm. The copy keeps the snapshot's facility, which must be the arm's, so the import
-needs a key that can write there. It takes only values of the arm's own PVs that the
-key could restore and that are still assigned to that facility or one below it, as a
-capture there would; a PV moved to another facility since the snapshot was taken is
-left out and listed in the response's `skipped`. A snapshot with `retain` set is never
-pruned. Prune can't see references held outside Canopy, so a service that refers to
-snapshots, such as an optimization service's runs, sets `retain` on the ones it needs.
 
 ## Writes on a head
 
@@ -357,7 +165,8 @@ A forwarded restore runs as a job on the arm. Clients poll it on the head as usu
 `GET /jobs/v1/{id}` asks that arm about a job the head started there, for a day after
 it started. The arm's 404 is answered as 404 `job_not_found`; any other error from the
 arm is a 502, `service_key_refused` when it refused the head's key and
-`primary_unavailable` naming the arm's answer otherwise.
+`primary_unavailable` naming the arm's answer otherwise. So is a status the head can't
+read, such as one from a newer arm during a rolling deploy.
 
 ### Who wrote it
 
@@ -390,10 +199,11 @@ forwards to it (`-m squirrel`, and `-m magpie` for Magpie configs), every facili
 (`--facility '*'`) or only those the head's users work in. Each caller's own grant
 still limits its requests. A key limited to some facilities must cover every one the
 head's users reach on that arm. Otherwise the arm hides a snapshot outside them from the
-key with a 404, and the head reads that as a prune (`archived_immutable`). Add `-a` only if the head should create, edit or delete the
-arm's facilities: admin on the arm also manages that arm's API keys, and without it
-the arm refuses facility writes with 403 `insufficient_admin_access`. Only the CLI
-mints service keys:
+key with a 404, and the head reads that as a prune (`archived_immutable`). Add `-m core -a` only if the head should create, edit or
+delete the arm's facilities: facility routes are in the `core` module and need admin,
+and admin on the arm also manages that arm's API keys. Without `-m core` the arm
+refuses facility writes with 403 `insufficient_module_access`, and without `-a` with
+403 `insufficient_admin_access`. Only the CLI mints service keys:
 
 ```sh
 python scripts/create_key.py head -r -w -m squirrel --facility '*' --service
@@ -421,16 +231,18 @@ GRANT SELECT ON pg_replication_origin_status TO canopy_app;
 GRANT EXECUTE ON FUNCTION pg_show_replication_origin_status() TO canopy_app;
 ```
 
-Without them every forwarded write is marked stale.
+Without them every forwarded write is marked stale. `status` reads the same view
+for each subscription's applied position: run it as a superuser, or grant the table
+owner the same two rights, or its `applied_lsn` comes back as an error.
 
-### Settings
+### Forwarding settings
 
 On the head, per arm it forwards to: `CANOPY_ARMS__<arm>__FORWARD_URL` (https) and
 `CANOPY_ARMS__<arm>__SERVICE_KEY` from a secret, set together. A head with only one
 of the two doesn't start. Optional, for every arm: `CANOPY_FORWARD__WAIT_S`,
 `CANOPY_FORWARD__TIMEOUT_S` and `CANOPY_FORWARD__CA_BUNDLE`. On each arm:
 `CANOPY_ACCEPT_FORWARDED_WRITES=true`. The full list is in the
-[environment table](index.md). Deploy the head from the same release as its arms, so
+[settings below](#settings). Deploy the head from the same release as its arms, so
 what it forwards has the shapes they expect.
 
 ### Machine access
@@ -562,154 +374,135 @@ minutes (the `canopy-outbox-not-back` alert) means the head's copy of that arm i
 moving. Check the arm's subscription with `python -m canopy.core.replication status`
 on the head and fix replication; the next delivery run removes the outbox row once
 the snapshot is here. If the subscription was rebuilt without a reseed, run
-`reseed --arm <arm>` (see [Slot lost](#slot-lost)). `discard <id>` takes such a row
+`reseed --arm <arm>` (see [Slot lost](runbooks.md#slot-lost)). `discard <id>` takes such a row
 too, but it only drops the head's copy: the arm has the snapshot, and it reaches the
 head once replication from that arm is healthy.
 
 The gauges and alert rules are listed under
-[Snapshot outbox](../observability/metrics.md#snapshot-outbox): a snapshot waiting
+[Snapshot outbox](../../observability/metrics.md#snapshot-outbox): a snapshot waiting
 over 15 minutes, any failed one, one saved but not back after 30 minutes, a queue over
 80% full or full, and a status that can't be read.
 
-## Runbooks
+## Prune
 
-Run SQL on the head as its superuser, from the history cluster's Postgres pod, and on
-an arm as that arm's superuser. The head's subscription to an arm is
-`canopy_history_<arm>`, and its slot on the arm has the same name. Each runbook acts
-on one arm; the other arms keep streaming.
+An arm whose disk can't hold all of its history keeps the last `CANOPY_WINDOW_DAYS`
+days of snapshots and leaves older ones to the head. Turn this on only for an arm whose
+sizing forecast says it's needed; arms may differ, one pruning on the split layout and
+another on `canopy_history`. The head never prunes, its own rows included. Pruning takes
+the three steps below, once per arm, then a worker setting on that arm. Prune deletes
+must never reach the head, so the arm first moves to a second publication layout:
+`canopy_ref` carries the reference tables with every operation, and `canopy_ts` carries
+the time-series tables with inserts and updates only. User deletes still reach the head,
+because deleting a snapshot or a PV only marks it deleted.
 
-### Slot lost
+### Switch to the split layout
 
-**Signs**: an arm's slot shows `wal_status = lost`, and the head's apply worker for
-that arm logs that it can't start streaming. The arm dropped WAL the head still
-needed, so this subscription can't continue.
+1. On the arm: `publish --split`. It creates `canopy_ref` and `canopy_ts` beside
+   `canopy_history`. Deploys keep running plain `publish`, which keeps all three in
+   step and never switches layouts.
+2. On the head: `switch --arm <arm>`, with `CANOPY_ARMS__<arm>__HEARTBEAT_DSN` set to a
+   URI to the arm as `canopy_heartbeat`. It waits (up to `--timeout`, 120 s) until the
+   slot has confirmed a position taken after the pair existed, then moves that arm's
+   subscription to the pair without copying. A subscription moved while its slot is
+   still behind the pair's creation can't find the publications and retries forever.
+   `switch` refuses if the subscription is disabled or the arm has no pair yet. Other
+   arms' subscriptions are untouched.
+3. On the arm: `publish --split` again. It drops `canopy_history` once the head's
+   walsender is seen streaming exactly the pair, and exits 2 with the reason until
+   then. Retry after a few seconds: the walsender restarts after the switch. Reading
+   what a walsender streams needs a superuser or `pg_read_all_stats`.
 
-1. On the head, detach and drop that arm's subscription:
-   ```sql
-   ALTER SUBSCRIPTION canopy_history_<arm> DISABLE;
-   ALTER SUBSCRIPTION canopy_history_<arm> SET (slot_name = NONE);
-   DROP SUBSCRIPTION canopy_history_<arm>;
-   ```
-2. On the arm, drop the invalidated slot:
-   `SELECT pg_drop_replication_slot('canopy_history_<arm>');`
-   If it says the slot is active, the arm's walsender for the head hasn't exited yet:
-   wait a few seconds and run it again.
-3. On the head, find the newest snapshot it holds from that arm:
-   `SELECT max(created_at) FROM squirrel.snapshot WHERE owner_instance = '<arm>';`
-4. Run `reseed --arm <arm> --since <that time>` on the head, with that arm's
-   `CANOPY_ARMS__<arm>__PUBLISHER_DSN` and `CANOPY_ARMS__<arm>__READER_DSN` set. It
-   creates the subscription disabled and without a copy, copies what the head is
-   missing of that arm's rows, and enables it from an exact cut, so nothing is copied
-   and replayed both. Only rows that arm owns are written or deleted. Snapshots the
-   head lacks are found by id, whatever their time; `--since` bounds which snapshots
-   both sides hold get their values re-read. An earlier time is safe, only slower; a
-   later one is refused. For an arm on the split layout the new subscription reads
-   `canopy_ref` and `canopy_ts`.
-5. Run `drift-check --arm <arm>`.
+From then on the head's subscription to that arm reads the pair. `reseed --arm <arm>`
+creates it on the pair whenever the arm has it. To copy everything again instead, run
+`subscribe --split --arm <arm>`.
 
-The cut needs a moment when no transaction on the arm takes a new transaction id.
-`reseed` keeps trying for `--cut-wait` seconds (60 by default), waiting out writes that
-are already open. On an arm that never pauses that long it refuses and changes
-nothing: pause writes on the arm briefly (stop its API and worker), or retry at a
-quieter time.
+### Heartbeat
 
-If `reseed` fails part-way, the subscription stays disabled: run it again. Never enable
-the subscription by hand after a failed run, since replication would resume from where
-the old slot left off, not from the copy. Only one `reseed` of an arm runs at a time; a
-second is refused while the first runs.
+The head reports its checks to each arm that prunes, hourly, last in that arm's Job:
 
-`reseed`'s report lists under `dangling` any row of that arm (or of nobody known) that
-still references a missing parent once it is done: for example, a snapshot the arm
-deleted before deleting its facility, which the head keeps (it never deletes
-time-series rows), as replication would, or rows a rebuilt or out-of-date arm left
-behind. `drift-check` reports them too; fix them by hand.
+```text
+refresh --arm <arm>
+drift-check --arm <arm> --days <the arm's CANOPY_WINDOW_DAYS>
+heartbeat --arm <arm> [--backup-ok] [--wal-archive-ok] [--drift-ok]
+```
 
-### Head PITR
+Pass each flag only when that check passed: `--drift-ok` when that arm's `drift-check`
+exited 0 (1, drift, and 2, couldn't check, both leave it out), and `--backup-ok` and
+`--wal-archive-ok` from the backup system's own status. The backup and WAL archive are
+the head's, so every arm's heartbeat gets the same two; only `--drift-ok` differs by
+arm. A dangling row `drift-check` attributes to one arm fails only that arm's check; one
+it can't attribute fails every arm's. Once an arm prunes, its `drift-check` needs
+`--days`: days the arm has pruned would otherwise count as drift. `heartbeat` writes the
+arm's `core.history_heartbeat` through `CANOPY_ARMS__<arm>__HEARTBEAT_DSN`, in a row named
+after the head's slot there, timed by the arm's clock.
 
-When the head's database must be restored to an earlier point in time (corruption,
-or a mistake made on the head itself):
+While that arm's subscription is disabled or any of its tables is still copying,
+`heartbeat` records the drift check as failed whatever `--drift-ok` says: those tables
+weren't compared, and rows pruned before a table's copy reads them would never reach
+history. A heartbeat also counts only for the stream it was written in. After the head
+reconnects to the arm, or its subscription is rebuilt, the arm's prune waits for the
+next heartbeat.
 
-1. Restore it to time *T*, starting the restored server with
-   `max_logical_replication_workers = 0`. Each restored subscription still points at
-   its arm's slot, which is past *T*, and would otherwise resume from there and skip
-   everything in between.
-2. On the head, detach and drop every arm's subscription (step 1 of "Slot lost"). On
-   each arm, drop the old slot, which is still holding WAL.
-3. Restart the head with its usual `max_logical_replication_workers`.
-4. For each arm in turn, run `reseed --arm <arm> --since <T>` (or the newest snapshot
-   the restored database holds from that arm, if that's earlier), then `drift-check`.
+### Turn pruning on
 
-The head's own rows written after *T* are lost: no arm holds them, only the head's
-backups (see [Backups](#backups)). So is any snapshot queued in the head's outbox after
-*T*, unless its arm already has it. A snapshot queued before *T* and delivered since
-waits again in the restored outbox; sending it again is harmless, since the arm saves
-nothing twice, and its row goes once the reseed brings the snapshot back.
+On the arm's worker, set `CANOPY_WINDOW_DAYS` and `CANOPY_PRUNE__ENABLED=true`. The job
+runs nightly at `CANOPY_PRUNE__HOUR` (UTC); a head's worker never schedules it, and the
+job refuses to run anywhere but on an arm (`CANOPY_ROLE=primary`). Until
+`CANOPY_PRUNE__DRY_RUN=false` it only counts what it would remove. Run it dry for a month while the arm's `drift-check`
+stays clean, then turn the dry run off.
 
-### Arm wipe or rebuild
+Each run removes snapshots older than the window that aren't retained, deleted or
+not, up to `CANOPY_PRUNE__MAX_SNAPSHOTS_PER_RUN`, one per transaction. Each facility
+keeps its newest snapshot however old it is, so a facility history still refers to
+stays in use and can't be deleted. Before every snapshot it checks a gate on the head's
+slot `canopy_history_<CANOPY_INSTANCE>`, and it stops at the first failure, logging each
+failed check by name:
 
-Wiping or rebuilding an arm's database drops its publication and slot, and the head's
-subscription to it starts failing. The head still holds that arm's rows up to the
-wipe.
+| Check | Fails when |
+|---|---|
+| `window_set` | `CANOPY_WINDOW_DAYS` is unset |
+| `no_delete_publication` | Any publication carrying a snapshot table publishes deletes (`canopy_history` still exists) |
+| `slot_active` | The head's slot is missing or no walsender holds it |
+| `streams_split` | The walsender doesn't stream both `canopy_ref` and `canopy_ts`, they don't carry the snapshot tables whole (inserts and updates, no row filter or column list), or its command can't be read |
+| `no_initial_copy` | A table's initial copy is running (a `pg_<oid>_sync_…` slot exists) |
+| `wal_status_reserved` | The slot's WAL is at risk |
+| `lag` | Flush lag or the head's last reply is older than `CANOPY_PRUNE__MAX_LAG_S` (60 s) |
+| `heartbeat_fresh`, `heartbeat_ok` | No heartbeat within `CANOPY_PRUNE__HEARTBEAT_MAX_AGE_H` (3 h) and since the walsender started, or one reporting a failed check |
 
-1. Rebuild the arm's data. The head is normally newer than the arm's last dump, so
-   rebuild from it as in "Arm host lost" below. If you restore a dump instead, also
-   copy the head's rows that arm owns in the reference tables into the arm before
-   step 3: `reseed` makes the head's copy of that arm's reference rows match the arm,
-   and would delete whatever the dump lacks (and, through foreign keys, the snapshot
-   values of a deleted PV).
-2. On the arm: `alembic upgrade head`, then `publish`.
-3. On the head: detach and drop that arm's old subscription (step 1 of "Slot lost"),
-   then run `reseed --arm <arm> --since <time the rebuilt arm's data starts>` and
-   `drift-check --arm <arm>`.
+A snapshot older than the window can still be restored on its arm: export it from the
+head (`GET /squirrel/v1/snapshots/{id}/export`) and import the bundle on the arm
+(`POST /squirrel/v1/snapshots/import`), which creates a new, recent copy owned by the
+arm. The copy keeps the snapshot's facility, which must be the arm's, so the import
+needs a key that can write there. It takes only values of the arm's own PVs that the
+key could restore and that are still assigned to that facility or one below it, as a
+capture there would; a PV moved to another facility since the snapshot was taken is
+left out and listed in the response's `skipped`. A snapshot with `retain` set is never
+pruned. Prune can't see references held outside Canopy, so a service that refers to
+snapshots, such as an optimization service's runs, sets `retain` on the ones it needs.
 
-### Arm host lost
+## Settings
 
-Rebuild the arm from the head, which holds every row that arm owns. API keys are
-local, so they come from the arm's latest dump or are minted again.
+These are the history settings beside `CANOPY_ROLE`, `CANOPY_INSTANCE` and
+`CANOPY_MACHINE_ACCESS`, which every instance sets (see the
+[environment table](../index.md#configuration)). The annotated `.env.example` at the
+repo root lists them all with their defaults.
 
-1. On the new host, create the database and run `alembic upgrade head`.
-2. From the head, copy the rows that arm owns, parents before children: the reference
-   tables, then the time-series rows the arm should hold (all of them, or a recent
-   window). Filter each root table on `owner_instance = '<arm>'` and each child table
-   through its parent, for example
-   `\copy (SELECT v.* FROM squirrel.snapshot_value v JOIN squirrel.snapshot s ON s.id = v.snapshot_id WHERE s.owner_instance = '<arm>') TO ...`
-   on the head and `\copy ... FROM` on the arm. Never copy another owner's rows.
-3. Restore or mint API keys, then run `publish`.
-4. On the head: detach and drop that arm's old subscription, run
-   `reseed --arm <arm> --since <newest snapshot on the head from that arm>`, then
-   `drift-check --arm <arm>`.
-
-### Bad update replicated
-
-A bad write on an arm (a mass edit, a wrong delete) reaches the head within seconds.
-Never repair an arm's rows on the head; repair them on that arm and let replication
-carry the fix.
-
-1. Restore the head's backup into a scratch server at a time before the bad write,
-   starting it with `max_logical_replication_workers = 0`, as in "Head PITR". Its
-   restored subscriptions still point at the arms' live slots: with workers enabled
-   it would connect, apply new writes and move the slots on. Never drop a subscription
-   there without `SET (slot_name = NONE)` first, which would drop the arm's live slot.
-   Discard the scratch server when done.
-2. Extract the good rows that arm owns from it (`\copy (SELECT ...) TO`, filtered on
-   the owner as in "Arm host lost").
-3. Write them back on the arm, in one transaction, parents before children.
-4. Run `drift-check --arm <arm>` on the head once replication has applied the fix.
-
-### An arm's apply stopped on a duplicate key
-
-**Signs**: the `canopy-replication-apply-stopped` alert fires for one arm. The head's
-apply from that arm keeps failing on the same change and retrying, while the other
-arms stream on. Most likely the arm created a facility slug or a Magpie config slug
-that another owner, another arm or the head, already uses: those slugs are unique
-across owners, and each arm only sees its own rows.
-
-1. Find it: the head's Postgres log names the unique constraint and the value. Find
-   the row on the head that holds the value, and its `owner_instance`.
-2. Fix it: rename that row on its owner, on its arm, or on the head itself if the head
-   owns it. The rename reaches the head, the slug is free, and the stuck change
-   applies on the next retry.
-3. Run `drift-check --arm <arm>` once the apply error count stops rising.
-
-Don't skip the failing transaction: the arm's row would be missing on the head, and
-re-seeding that arm would only meet the same clash.
+| Variable | Purpose |
+|----------|---------|
+| `CANOPY_SQUIRREL__OUTBOX__MAX_SNAPSHOTS` | A history head only: most snapshots its outbox holds for one arm it can't reach (default 200). Failed and delivered rows count. At the cap, new captures for that arm get 503 `outbox_full` |
+| `CANOPY_SQUIRREL__OUTBOX__MAX_BYTES` | A history head only: most bundle bytes its outbox holds for one arm (default 4 GiB). A full snapshot is tens of MB; size this from the head's free disk and its number of arms |
+| `CANOPY_SQUIRREL__OUTBOX__RETRY_INITIAL_S` | A history head only: seconds before the first retry of a delivery to an arm (default 30). The wait doubles after each failure |
+| `CANOPY_SQUIRREL__OUTBOX__RETRY_MAX_S` | A history head only: longest wait between delivery retries (default 900). A queued snapshot never gives up |
+| `CANOPY_SQUIRREL__OUTBOX__INTERVAL_S` | A history head only: how often the **worker** looks for deliveries due, 1–60 seconds (default 30) |
+| `CANOPY_SQUIRREL__OUTBOX__RESEND_WAIT_S` | A history head only: how long a resend the arm refused for the user's grant waits for its snapshot to replicate back before it fails, in seconds, at most 900 (default 60). The arm's queue waits behind it. See [When an arm is unreachable](#when-an-arm-is-unreachable) |
+| `CANOPY_HISTORY_URL`, `CANOPY_WINDOW_DAYS` | Optional. Reported by `GET /v1/instance` with the role, the instance name and the Alembic head shipped in the image: the URL of the history head that holds the instance's full history, and how many days of history it keeps (a whole number of at least 1; unset means all). A blank value counts as unset |
+| `CANOPY_ARMS__<arm>__PUBLISHER_DSN` | History head only (`CANOPY_ROLE=mirror`): one per arm, named after that arm's `CANOPY_INSTANCE` (lowercase letters, digits and underscores, at most 48). A `postgresql://` URI the head's subscription `canopy_history_<arm>` uses to reach the arm as its replication role. `subscribe` and `refresh` also open it themselves before an initial copy, to refuse facility or Magpie slugs the head already holds, so the CLI's network must reach the arm at that address too. Supply it from a secret; the CLI never prints it. The arms can also be set as JSON in `CANOPY_ARMS` |
+| `CANOPY_ARMS__<arm>__READER_DSN` | History head only, for `python -m canopy.core.replication drift-check` and `reseed`: a `postgresql://` URI to that arm as its read-only reader role (asyncpg needs the URI form). A secret, like the publisher DSN |
+| `CANOPY_ARMS__<arm>__HEARTBEAT_DSN` | History head only, for an arm that prunes: a `postgresql://` URI to that arm as its heartbeat role. `heartbeat --arm <arm>` records the head's backup, WAL-archive and drift checks for that arm in the arm's `core.history_heartbeat`; `switch --arm <arm>` reads the arm's slot position. Supply it from a secret; the CLI never prints it |
+| `CANOPY_ARMS__<arm>__FORWARD_URL`, `__SERVICE_KEY` | History head only, set together or not at all: where the head sends writes to that arm's rows (the arm's API base URL, https) and a service key minted on that arm (`scripts/create_key.py --service`). Without them the arm's rows are read-only on the head (403 `not_owner`). Supply the key from a secret. See [Writes on a head](#writes-on-a-head) |
+| `CANOPY_FORWARD__WAIT_S`, `__TIMEOUT_S`, `__CA_BUNDLE`, `__ALLOW_INSECURE_HTTP` | History head only, for every arm it forwards to. `WAIT_S` (default 2) bounds the wait for replication to bring a forwarded write back before the answer carries `X-Canopy-Replica-Stale: true`; the wait reads `pg_replication_origin_status`, so a superuser must grant the app role SELECT on it and EXECUTE on `pg_show_replication_origin_status()`. `TIMEOUT_S` (default 30) is per request to an arm; `CA_BUNDLE` verifies the arms' certificates; `ALLOW_INSECURE_HTTP` (default `false`) allows an `http://` forward URL, for development only |
+| `CANOPY_ACCEPT_FORWARDED_WRITES` | Arm (`CANOPY_ROLE=primary`) only, default `false`. When `true`, a service key may send `X-Canopy-On-Behalf-Of`: the write is recorded under that name (`createdBy`), and an answer that committed a write carries `X-Canopy-Commit-LSN`. Otherwise the header is refused with 403 `forwarded_write_refused` |
+| `CANOPY_REPLICATION__REPLICATOR_ROLE`, `__READER_ROLE`, `__APP_ROLE` | Role names for the replication CLI: on a primary, `publish` grants the replication role (default `replicator`) and the reader role (default `canopy_reader`) SELECT on the published tables; on a history head, `grants` lets the app role (default `canopy_app`) read every row and write only the head's own: row-level security on the tables that name a row's owner (facilities, PVs, snapshots, tag groups, Magpie configs) limits its writes to rows whose `owner_instance` is the head's `CANOPY_INSTANCE`, and any other role but the tables' owner sees none of those tables' rows. It also gets read-write on API keys |
+| `CANOPY_REPLICATION__HEARTBEAT_ROLE` | On an arm: the role the head's heartbeat connection logs in as (default `canopy_heartbeat`); `publish` lets it write `core.history_heartbeat` and nothing else |
+| `CANOPY_PRUNE__ENABLED`, `__DRY_RUN` | Arm worker only (`CANOPY_ROLE=primary`; a head never prunes). With `ENABLED=true` a nightly job removes snapshots older than `CANOPY_WINDOW_DAYS` that aren't retained; it only counts them until `DRY_RUN=false`. Before each snapshot it checks that no publication sends their deletes to the head (the split layout), that the head's slot `canopy_history_<CANOPY_INSTANCE>` is streaming and caught up, and that the head's heartbeat for this arm is fresh and OK; it needs a superuser or `pg_read_all_stats` to see what the slot streams. Each run logs what it removed or which check stopped it |
+| `CANOPY_PRUNE__MAX_LAG_S`, `__HEARTBEAT_MAX_AGE_H`, `__HOUR`, `__MAX_SNAPSHOTS_PER_RUN` | Prune limits: the head's largest flush lag and reply age (default 60 s), the oldest acceptable heartbeat (3 h), the UTC hour the job runs (3), and the most snapshots one run removes (500) |
