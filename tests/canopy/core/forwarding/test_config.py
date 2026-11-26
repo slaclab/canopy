@@ -7,11 +7,15 @@ from canopy.core.arms import ArmsConfig
 from canopy.core.forwarding.config import ForwardConfig
 
 
-def test_a_blank_ca_bundle_is_unset(monkeypatch):
+@pytest.mark.parametrize(
+    ("name", "default"),
+    [("CA_BUNDLE", None), ("WAIT_S", 2.0), ("TIMEOUT_S", 30.0), ("ALLOW_INSECURE_HTTP", False)],
+)
+def test_a_blank_setting_keeps_its_default(monkeypatch, name, default):
     # Helm and compose render an unset value as an empty string.
-    monkeypatch.setenv("CANOPY_FORWARD__CA_BUNDLE", "  ")
+    monkeypatch.setenv(f"CANOPY_FORWARD__{name}", "  ")
 
-    assert ForwardConfig().ca_bundle is None
+    assert getattr(ForwardConfig(), name.lower()) == default
 
 
 def test_the_shared_settings(monkeypatch):

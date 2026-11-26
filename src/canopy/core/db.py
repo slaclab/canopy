@@ -12,6 +12,7 @@ Routes and services take their request session through ``SessionDep``;
 
 from __future__ import annotations
 
+import logging
 from uuid import uuid4
 from typing import Annotated
 from datetime import datetime
@@ -20,6 +21,7 @@ from collections.abc import AsyncGenerator
 
 from fastapi import Depends
 from sqlalchemy import DateTime, func, text, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Mapped, DeclarativeBase, mapped_column
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -31,6 +33,8 @@ from sqlalchemy.dialects.postgresql import UUID
 
 from canopy.core.config import get_settings
 from canopy.core.forwarding.context import ForwardedWrite, forwarded_write
+
+logger = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -191,12 +195,22 @@ async def _commit_forwarded(session: AsyncSession, write: ForwardedWrite) -> Non
     A route that always answers with a position (``ForwardedWrite.report_position``,
     the captured import) gets the current WAL position when it wrote nothing: a
     replay of a write already committed, which is at or before it.
+
+    The write is committed before the position is read, so a failure to read it
+    (a lost connection, a failover) leaves the answer without a position rather than
+    turning a saved write into an error. The head then can't wait for it.
     """
     wrote = await session.scalar(text("SELECT pg_current_xact_id_if_assigned() IS NOT NULL"))
     await session.commit()
     if wrote or write.report_position:
         current = "pg_current_wal_insert_lsn()" if wrote else "pg_current_wal_lsn()"
-        row = (await session.execute(text(_POSITION.format(current=current)))).one()
+        try:
+            row = (await session.execute(text(_POSITION.format(current=current)))).one()
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "A forwarded write for %s is committed but its WAL position can't be read: %s", write.on_behalf_of, exc
+            )
+            return
         write.commit_lsn = _lsn_text(_record_end(int(row.position), int(row.page), int(row.segment)))
 
 

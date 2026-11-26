@@ -47,12 +47,18 @@ class Row:
     ``facilities`` is set where the app gates the row by the caller's facility grant.
     The head then forwards only for a caller whose grant reaches the row here, and
     leaves any other caller to the app, which answers as it does on every instance.
+
+    ``retained`` is the error code the owner answers for a row it no longer holds that
+    a head keeps as history, in a table that soft deletes (``deleted_at``): the head
+    refuses a change to a row it holds live with ``archived_immutable`` instead of
+    relaying that 404.
     """
 
     table: str
     param: str
     column: str = "id"
     facilities: FacilityOf | None = None
+    retained: str | None = None
 
 
 @dataclass(frozen=True)
@@ -138,7 +144,13 @@ class WriteRoute:
         return "core" if mount == "v1" else mount
 
 
-_SNAPSHOT = Row("squirrel.snapshot", "snapshot_id", facilities=FacilityOf("squirrel.snapshot", "id"))
+# An arm prunes snapshots past its window; the head keeps them.
+_SNAPSHOT = Row(
+    "squirrel.snapshot",
+    "snapshot_id",
+    facilities=FacilityOf("squirrel.snapshot", "id"),
+    retained="snapshot_not_found",
+)
 _PV = Row("squirrel.pv", "pv_id", facilities=FacilityOf("squirrel.pv_facility", "pv_id"))
 _TAG_GROUP = Row("squirrel.tag_group", "group_id")
 _CONFIG = Row("magpie.config", "slug", column="slug")
@@ -157,6 +169,9 @@ ROUTES: tuple[WriteRoute, ...] = (
     WriteRoute("POST", "/squirrel/v1/snapshots/{snapshot_id}/restore", _SNAPSHOT, machine=True),
     WriteRoute("POST", "/squirrel/v1/pvs", Facilities("facilities"), owner_param=True),
     WriteRoute("POST", "/squirrel/v1/pvs/multi", Facilities("facilities", rows=True), owner_param=True),
+    # One import has one owner, as with /multi: forwarded whole, never split between arms,
+    # since it is one transaction. Rows match only the PVs of the instance that runs it.
+    WriteRoute("POST", "/squirrel/v1/pvs/import", Facilities("facilities", rows=True), owner_param=True),
     WriteRoute("PUT", "/squirrel/v1/pvs/{pv_id}", _PV),
     WriteRoute("DELETE", "/squirrel/v1/pvs/{pv_id}", _PV),
     # A meta-PV marker is keyed by its PV's id. The app doesn't gate markers by facility.

@@ -41,10 +41,10 @@ class ForwardConfig(BaseSettings):
         default=False, description="Allow an http:// arm forward URL. For local development and tests only."
     )
 
-    @field_validator("ca_bundle", mode="before")
+    @field_validator("wait_s", "timeout_s", "ca_bundle", "allow_insecure_http", mode="before")
     @classmethod
     def _blank_is_unset(cls, value: object, info: ValidationInfo) -> object:
-        """Read a blank value, as Helm and compose render an unset one, as unset (like ``Settings``)."""
+        """Read a blank value, as Helm and compose render an unset one, as the field's default (like ``Settings``)."""
         return blank_keeps_default(cls, value, info)
 
 
