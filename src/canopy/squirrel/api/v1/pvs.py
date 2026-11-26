@@ -16,9 +16,11 @@ from canopy.core.ownership import OwnerQuery
 from canopy.core.validation import require_uuid, parse_continuation_token
 from canopy.squirrel.errors import PvNotFound
 from canopy.squirrel.schemas.pv import (
+    OnConflict,
     PVElementDTO,
     NewPVElementDTO,
     PVSearchResponse,
+    PVImportResultDTO,
     UpdatePVElementDTO,
 )
 from canopy.contracts.pagination import PagedResult
@@ -130,6 +132,28 @@ async def create_multiple_pvs(
     """Bulk-create PVs (CSV import). One import has one owner: its facilities', else this instance.
     ``owner`` accepts only this instance's name."""
     return await service.create_many(data, owner)
+
+
+@router.post("/import", dependencies=[Security(require_write_access)])
+async def import_pvs(
+    data: list[NewPVElementDTO],
+    service: PvServiceDep,
+    onConflict: OnConflict = Query(
+        description=(
+            "What to do with a row whose identifying address is already registered: "
+            "'skip' leaves the registered PV alone, 'update' applies the row's provided fields to it"
+        ),
+    ),
+    owner: OwnerQuery = None,
+) -> PVImportResultDTO:
+    """Bulk-import PVs (CSV import), skipping or updating rows already registered.
+
+    The counterpart of ``/multi``, which refuses the whole import if any row is
+    registered. One transaction; see ``PvService.import_many``. Rows match only this
+    instance's PVs; one import has one owner, as with ``/multi``, and ``owner`` accepts
+    only this instance's name.
+    """
+    return await service.import_many(data, onConflict, owner)
 
 
 @router.put("/{pv_id}", dependencies=[Security(require_write_access)])
