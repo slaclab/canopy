@@ -3,7 +3,7 @@
 import asyncio
 
 import pytest
-from prometheus_client import REGISTRY
+from prometheus_client import REGISTRY, generate_latest
 from fastapi.testclient import TestClient
 from prometheus_client.parser import text_string_to_metric_families
 
@@ -154,3 +154,47 @@ def test_metrics_endpoint_is_unauthenticated_and_parseable():
         "canopy_hare_subscriptions",
         "canopy_replication_status_up",
     } <= names
+
+
+def test_metrics_endpoint_carries_the_outbox_gauges_where_arms_are_delivered_to(monkeypatch):
+    from canopy.squirrel.outbox import metrics as outbox_metrics
+
+    monkeypatch.setattr(outbox_metrics.COLLECTOR, "arms", lambda: ["arm2"])
+    with TestClient(app) as client:
+        resp = client.get("/metrics")
+    names = {family.name for family in text_string_to_metric_families(resp.text)}
+    assert "canopy_squirrel_outbox_status_up" in names
+
+
+@pytest.mark.parametrize(("modules", "refreshes"), [(("hare",), 0), (("hare", "squirrel"), 1)])
+def test_only_an_app_serving_squirrel_reads_the_outbox(monkeypatch, modules, refreshes):
+    from canopy.main import build_app
+    from canopy.squirrel.outbox import metrics as outbox_metrics
+
+    reads = []
+
+    async def read() -> None:
+        reads.append(1)
+
+    monkeypatch.setattr(outbox_metrics, "refresh", read)
+    resp = TestClient(build_app(modules, closed_meta=False)).get("/metrics")
+
+    assert resp.status_code == 200
+    assert len(reads) == refreshes
+
+
+def test_building_the_app_again_reports_the_outbox_once(monkeypatch):
+    from canopy.main import build_app
+    from canopy.squirrel.outbox import metrics as outbox_metrics
+
+    # As after a scrape whose read failed: the collector yields only its status_up 0, and a
+    # registry refuses a second collector with that series.
+    monkeypatch.setattr(outbox_metrics.COLLECTOR, "enabled", True)
+    monkeypatch.setattr(outbox_metrics.COLLECTOR, "status", None)
+    build_app(("squirrel",), closed_meta=False)
+    build_app(("squirrel",), closed_meta=False)
+
+    exposition = generate_latest(REGISTRY).decode().splitlines()
+    assert [line for line in exposition if line.startswith("canopy_squirrel_outbox_status_up ")] == [
+        "canopy_squirrel_outbox_status_up 0.0"
+    ]

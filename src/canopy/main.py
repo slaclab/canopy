@@ -349,11 +349,21 @@ def build_app(modules: Iterable[str] | str, *, closed_meta: bool | None = None) 
                 return JSONResponse({"status": "ready"})
             return JSONResponse({"status": "unavailable", "database": "unreachable"}, status_code=503)
 
+    refresh_outbox = None
+    if "squirrel" in selected:
+        # Squirrel registers its outbox gauges once, when its app is imported; like the
+        # replication gauges, they read the database just before each render.
+        from canopy.squirrel.outbox import metrics as outbox_metrics
+
+        refresh_outbox = outbox_metrics.refresh
+
     @app.get("/metrics", tags=["meta"], response_class=PlainTextResponse)
     async def metrics() -> Response:
         """Prometheus exposition for this process."""
         if database_tier:
             await replication_metrics.refresh()
+        if refresh_outbox is not None:
+            await refresh_outbox()
         payload, content_type = render_latest()
         return Response(content=payload, media_type=content_type)
 

@@ -19,6 +19,7 @@ import pytest
 from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 
+from canopy.squirrel.outbox.metrics import OutboxCollector
 from canopy.core.replication.metrics import ReplicationCollector
 
 ALERTING = Path(__file__).resolve().parents[1] / "docker" / "observability" / "grafana" / "provisioning" / "alerting"
@@ -62,11 +63,29 @@ _SUBSCRIPTION = {
     "tables_not_ready": {},
 }
 
+
+def _outbox(status: dict) -> dict[str, set[str]]:
+    collector = OutboxCollector(arms=lambda: list(status["arms"]))
+    collector.enabled, collector.status = True, status
+    return _samples(collector)
+
+
+# Both ages set, so every outbox series is there.
+_QUEUE = {
+    "pending": 1,
+    "delivered": 1,
+    "failed": 1,
+    "bytes": 1,
+    "oldest_pending_age_s": 1.0,
+    "oldest_delivered_age_s": 1.0,
+}
+
 # Every series a rule may use, from a representative status of each collector.
 SAMPLES: dict[str, set[str]] = {}
 for _series in (
     _replication({"side": "publisher", "slots": [_SLOT], "max_slot_wal_keep_bytes": 1}),
     _replication({"side": "subscriber", "subscriptions": [_SUBSCRIPTION], "unexpected": []}),
+    _outbox({"arms": {"arm1": _QUEUE}, "failed": [], "max_snapshots": 1, "max_bytes": 1}),
 ):
     for _name, _labels in _series.items():
         SAMPLES.setdefault(_name, set()).update(_labels)
