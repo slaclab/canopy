@@ -152,6 +152,11 @@ async def import_pvs(
     registered. One transaction; see ``PvService.import_many``. Rows match only this
     instance's PVs; one import has one owner, as with ``/multi``, and ``owner`` accepts
     only this instance's name.
+
+    A deleted PV is never registered, so it is never skipped or updated. In either mode a
+    row with its identifying address brings it back, with its id, under ``created``; if
+    the key couldn't write that PV, the whole import is refused with 409
+    ``pv_already_exists``, naming the rows.
     """
     return await service.import_many(data, onConflict, owner)
 
@@ -168,7 +173,7 @@ async def update_pv(pv_id: str, data: UpdatePVElementDTO, service: PvServiceDep)
 
 @router.delete("/{pv_id}", dependencies=[Security(require_write_access)])
 async def delete_pv(pv_id: str, service: PvServiceDep) -> bool:
-    """Delete a PV."""
+    """Delete a PV: its values in past snapshots are kept, and registering its address again restores it."""
     pv_id = require_uuid(pv_id, PvNotFound, f"PV {pv_id} not found")
     if not await service.delete(pv_id):
         raise PvNotFound(f"PV {pv_id} not found")

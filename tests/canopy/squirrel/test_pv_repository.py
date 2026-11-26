@@ -7,6 +7,7 @@ from httpx import AsyncClient
 from sqlalchemy import text, event, inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from canopy.squirrel.data import repositories
 from canopy.squirrel.data.models import Pv, Tag, TagGroup
 from tests.canopy.squirrel.conftest import WRITE_HEADERS
 from canopy.squirrel.data.repositories import PvRepository
@@ -186,3 +187,39 @@ async def test_multi_create_reports_tags_and_timestamps_in_input_order(client: A
     assert [sorted(t["id"] for t in pv["tags"]) for pv in body] == [sorted(tag_ids), [tag_ids[0]], []]
     assert all(t["name"] in {"first", "second"} for pv in body for t in pv["tags"])
     assert all(pv["createdDate"] and pv["lastModifiedDate"] for pv in body)
+
+
+async def test_lock_by_identity_locks_every_address_with_one_ordered_statement(db_session: AsyncSession, monkeypatch):
+    """One ``text[]`` parameter and one id order, so imports with overlapping PVs can't deadlock.
+
+    A batch per ``PARAM_BATCH_SIZE`` addresses would order each batch on its own; with
+    the limit at 2 that would show here as several statements.
+    """
+    monkeypatch.setattr(repositories, "PARAM_BATCH_SIZE", 2)
+    tags = await _seed_tags(db_session, 3)
+    repo = PvRepository(db_session)
+    pvs = await repo.bulk_create(_new_pvs(11, tags))
+    owner = pvs[0].owner_instance
+    addresses = [pv.setpoint_address for pv in pvs]
+
+    statements: list[tuple[str, object]] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT") and "FOR UPDATE" in statement.upper():
+            statements.append((statement, parameters))
+
+    sync_engine = db_session.bind.sync_engine
+    event.listen(sync_engine, "before_cursor_execute", record)
+    try:
+        few = await repo.lock_by_identity("setpoint", addresses[:2], owner=owner)
+        few_statements = list(statements)
+        statements.clear()
+        many = await repo.lock_by_identity("setpoint", addresses, owner=owner)
+        many_statements = list(statements)
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", record)
+
+    assert set(few) == set(addresses[:2]) and set(many) == set(addresses)
+    assert len(few_statements) == len(many_statements) == 1
+    assert few_statements[0][0] == many_statements[0][0]
+    assert "ORDER BY squirrel.pv.id" in many_statements[0][0]

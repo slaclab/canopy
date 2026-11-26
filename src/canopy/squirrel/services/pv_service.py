@@ -52,9 +52,10 @@ IDENTITY_KINDS: tuple[AddressKind, ...] = ("setpoint", "readback", "config")
 
 # How each identity kind (see `_identity`) is looked up among registered PVs, many
 # addresses at a time: the identifying addresses already registered, and the PVs holding
-# them. Single create and both bulk routes use these, so they agree on what counts as
-# registered. Identities are unique per owner, so each call passes ``owner``: a row is
-# registered only when one of that owner's PVs holds its identity.
+# them. Both bulk routes use these, so they agree on what counts as registered: a live PV
+# only, since a deleted one is never registered (single create finds it with
+# ``find_by_identity`` to bring it back). Identities are unique per owner, so each call
+# passes ``owner``: a row is registered only when one of that owner's PVs holds its identity.
 _REGISTERED_ADDRESSES: dict[AddressKind, Callable[..., Awaitable[set[str]]]] = {
     "setpoint": PvRepository.get_existing_setpoints,
     "readback": PvRepository.get_existing_readbacks_without_setpoint,
@@ -319,6 +320,29 @@ class PvService:
         slugs = sorted((await facilities_gateway.slugs_by_id(row_facility_ids)).values())
         raise InsufficientFacilityAccess(f"API key is not scoped to {what}'s facility(s): {', '.join(slugs)}")
 
+    async def _require_writable(self, pv: Pv) -> set[str]:
+        """Gate a write to ``pv``, and return its facility ids.
+
+        The facility gate comes first, then the owner: a caller who can't reach the row
+        isn't told whose it is. Every write to an existing PV goes through here.
+        """
+        facility_ids = await self.pv_repo.facility_ids_for(pv.id)
+        await self._require_facility_write(facility_ids, "this PV")
+        require_owned(pv.owner_instance, f"PV {pv.id}")
+        return facility_ids
+
+    async def _unrevivable(self, deleted: list[Pv]) -> set[str]:
+        """The ids of the deleted PVs in ``deleted`` that this key may not bring back.
+
+        A deleted PV comes back only for a key that could write it: bringing back
+        another facility's PV would move its past values into this key's facility.
+        ``create`` asks here, and so does every bulk route, through ``_revivals``.
+        """
+        if self.facility_scope is None or not deleted:
+            return set()
+        old_ids = await self.pv_repo.facility_ids_for_many([pv.id for pv in deleted])
+        return {pv.id for pv in deleted if not self._can_write(old_ids.get(pv.id, set()))}
+
     async def _require_facility_for_create(self, facility_ids: set[str], what: str) -> None:
         """Gate the facilities a *new* row is being created with.
 
@@ -368,6 +392,32 @@ class PvService:
         return resolved
 
     @staticmethod
+    def _register(
+        pv: Pv,
+        setpoint_address: str | None,
+        readback_address: str | None,
+        config_address: str | None,
+        data: NewPVElementDTO,
+        tags: list[Tag],
+    ) -> Pv:
+        """Write a registration onto ``pv``: a new row, or a deleted one being brought back.
+
+        A deleted PV comes back with its id and ``created_at``, so its values in past
+        snapshots belong to it again; every other field, tags included, comes from the
+        new registration.
+        """
+        pv.setpoint_address = setpoint_address
+        pv.readback_address = readback_address
+        pv.config_address = config_address
+        pv.device = data.device
+        pv.description = data.description
+        pv.abs_tolerance = data.abs_tolerance
+        pv.rel_tolerance = data.rel_tolerance
+        pv.tags = tags
+        pv.deleted_at = None
+        return pv
+
+    @staticmethod
     def _normalize_address(address: str | None) -> str | None:
         """Trim an optional address from an API payload; empty becomes ``None``."""
         if address is None:
@@ -405,8 +455,36 @@ class PvService:
             return None
         return (await self._to_dtos(pvs))[0]
 
+    async def _find_by_identity(self, kind: str, address: str) -> Pv | None:
+        """Look up and lock this instance's PV already holding an identity, live or deleted.
+
+        Identities are unique per owner, so another instance's PV with the same address
+        (a head holds its arms' rows) is neither found nor brought back. The row stays
+        locked until the transaction ends, so a concurrent registration of the same
+        address waits, then finds the PV live and is refused, instead of both bringing
+        back the same deleted row.
+
+        Parameters
+        ----------
+        kind : str
+            Identity kind as returned by ``_identity``.
+        address : str
+            Address carrying the identity.
+
+        Returns
+        -------
+        Pv | None
+            The PV owning that identity, or ``None`` when no PV ever held it.
+        """
+        return await self.pv_repo.find_by_identity(
+            kind, address, owner=local_instance(), include_deleted=True, for_update=True
+        )
+
     async def create(self, data: NewPVElementDTO, owner: str | None = None) -> PVElementDTO:
         """Register a single PV, owned by its facilities' owner, else by ``owner`` or this instance.
+
+        A deleted PV holding the same identifying address is brought back instead of a
+        new row being created.
 
         Parameters
         ----------
@@ -418,7 +496,7 @@ class PvService:
         Returns
         -------
         PVElementDTO
-            The created PV.
+            The created or restored PV.
 
         Raises
         ------
@@ -446,9 +524,8 @@ class PvService:
             one_owner(facility_owners.values(), "The PV's facilities"), owner, f"PV '{identity_address}'"
         )
 
-        if identity_address in await _REGISTERED_ADDRESSES[kind](
-            self.pv_repo, [identity_address], owner=local_instance()
-        ):
+        existing = await self._find_by_identity(kind, identity_address)
+        if existing is not None and (existing.deleted_at is None or await self._unrevivable([existing])):
             raise PvAlreadyExists(f"PV with {kind} address '{identity_address}' already exists")
 
         tags = []
@@ -458,21 +535,19 @@ class PvService:
                 raise BadRequest("One or more tag IDs are invalid")
             _require_tags_owned_by(local_instance(), tags, "The PV's tags")
 
-        pv = Pv(
-            setpoint_address=setpoint_address,
-            readback_address=readback_address,
-            config_address=config_address,
-            device=data.device,
-            description=data.description,
-            abs_tolerance=data.abs_tolerance,
-            rel_tolerance=data.rel_tolerance,
-            tags=tags,
-        )
         try:
-            pv = await self.pv_repo.create(pv)
+            if existing is not None:
+                pv = await self.pv_repo.update(
+                    self._register(existing, setpoint_address, readback_address, config_address, data, tags)
+                )
+            else:
+                pv = await self.pv_repo.create(
+                    self._register(Pv(), setpoint_address, readback_address, config_address, data, tags)
+                )
         except IntegrityError as e:
             raise PvAlreadyExists(f"PV addresses violate uniqueness constraints: {e}") from e
-        if facility_ids:
+        if facility_ids or existing is not None:
+            # A PV brought back takes the new registration's facilities, like its tags.
             await self.pv_repo.set_facilities(pv.id, facility_ids)
         # The request already named these facilities by slug — skip `_to_dtos`'s
         # id-to-slug round trip and report them straight back.
@@ -491,7 +566,8 @@ class PvService:
         Returns
         -------
         list[PVElementDTO]
-            The created PVs, in input order.
+            The created PVs, in input order. A row whose identifying address belongs to a
+            deleted PV brings that PV back, as ``create`` does.
 
         Raises
         ------
@@ -512,8 +588,9 @@ class PvService:
             if existing:
                 raise PvAlreadyExists(f"{kind.capitalize()} addresses already exist: {sorted(existing)[:10]}")
 
+        revive = await self._revivals(rows)
         tags_by_id = await self._load_import_tags(rows)
-        return await self._create_import_rows(rows, ids_by_slug, tags_by_id)
+        return await self._create_import_rows(rows, ids_by_slug, tags_by_id, revive=revive)
 
     async def import_many(
         self, data_list: list[NewPVElementDTO], on_conflict: OnConflict, owner: str | None = None
@@ -525,6 +602,9 @@ class PvService:
         A row matches a registered PV by the same identity rule as ``create_many`` (see
         ``_identity``). Rows that match nothing are created exactly as ``create_many``
         creates them. Duplicate identities within the import are still a ``BadRequest``.
+        A deleted PV is never registered, so neither mode matches it: a row with its
+        identifying address is created by bringing it back (``_revivals``), or the import
+        is refused if the key couldn't write it.
 
         Every row is facility-gated as a new row before anything is looked up, exactly as
         in ``create_many``, so whether a refused row's address is registered never shows.
@@ -582,7 +662,8 @@ class PvService:
         OwnerMismatch
             If its facilities or tags belong to different owners.
         PvAlreadyExists
-            If a concurrent write registers one of the new rows' addresses first.
+            If a concurrent write registers one of the new rows' addresses first, or a
+            row's identity is a deleted PV the key couldn't write.
         """
         # The route validates this; the guard is for direct callers, since nothing
         # type-checks in CI.
@@ -604,8 +685,9 @@ class PvService:
                 for row in rows
                 if (row.kind, row.identity_address) in registered
             ]
+            revive = await self._revivals(to_create)
             tags_by_id = await self._load_import_tags(to_create)
-            created = await self._create_import_rows(to_create, ids_by_slug, tags_by_id)
+            created = await self._create_import_rows(to_create, ids_by_slug, tags_by_id, revive=revive)
             return PVImportResultDTO(created=created, updated=[], skipped=skipped, address_mismatches=[])
 
         matched: dict[tuple[str, str], Pv] = {}
@@ -637,6 +719,8 @@ class PvService:
         if unknown_tags:
             listed = _list_refused([(row, ", ".join(missing)) for row, missing in unknown_tags])
             raise BadRequest(f"Unknown tag IDs on rows that update an existing PV: {listed}")
+        # Among the checks: the lookup locks, and a locking read flushes what's pending.
+        revive = await self._revivals(to_create)
 
         # Every check has passed; from here on the import only writes.
         mismatches: list[PVAddressMismatchDTO] = []
@@ -653,7 +737,7 @@ class PvService:
                 if kind != row.kind and requested is not None and requested != stored:
                     mismatches.append(PVAddressMismatchDTO(row=row.row, kind=kind, requested=requested, stored=stored))
 
-        created = await self._create_import_rows(to_create, ids_by_slug, tags_by_id)
+        created = await self._create_import_rows(to_create, ids_by_slug, tags_by_id, revive=revive)
         updated_pvs = await self.pv_repo.update_many([pv for _, pv in to_update])
         updated = await self._to_dtos(updated_pvs, {pv.id: stored_ids.get(pv.id, set()) for pv in updated_pvs})
         return PVImportResultDTO(created=created, updated=updated, skipped=[], address_mismatches=mismatches)
@@ -816,12 +900,63 @@ class PvService:
         _require_tags_owned_by(local_instance(), tags, "The imported PVs' tags")
         return {tag.id: tag for tag in tags}
 
+    async def _revivals(self, rows: list[_ImportRow]) -> dict[tuple[str, str], Pv]:
+        """The deleted PVs that ``rows``, about to be created, bring back, locked.
+
+        Every row an import creates goes through here, among its checks and before it
+        writes. A deleted PV is never registered, so neither ``skip`` nor ``update``
+        matches it: a row with its identifying address brings it back, with its id, as
+        ``create`` does, if the key could write it (``_unrevivable``).
+
+        Parameters
+        ----------
+        rows : list[_ImportRow]
+            The rows that match no registered PV.
+
+        Returns
+        -------
+        dict[tuple[str, str], Pv]
+            Each deleted PV to bring back, by ``(kind, identity_address)``, locked until the
+            transaction ends so no other registration brings it back too.
+
+        Raises
+        ------
+        PvAlreadyExists
+            When a row's identity is a deleted PV the key couldn't write, or a PV
+            registered since the import's own lookup. The message names those rows and
+            nothing about the PVs, such as their facilities or owner.
+        """
+        found: dict[tuple[str, str], Pv] = {}
+        for kind in IDENTITY_KINDS:
+            addresses = sorted({row.identity_address for row in rows if row.kind == kind})
+            for address, pv in (await self.pv_repo.lock_by_identity(kind, addresses, owner=local_instance())).items():
+                found[(kind, address)] = pv
+        deleted = {key: pv for key, pv in found.items() if pv.deleted_at is not None}
+        unrevivable = await self._unrevivable(list(deleted.values()))
+        held = [
+            row
+            for row in rows
+            if (pv := found.get((row.kind, row.identity_address))) is not None
+            and (pv.deleted_at is None or pv.id in unrevivable)
+        ]
+        if held:
+            raise PvAlreadyExists(
+                f"Addresses already exist: {_list_refused([(row, 'already exists') for row in held])}"
+            )
+        return deleted
+
     async def _create_import_rows(
-        self, rows: list[_ImportRow], ids_by_slug: dict[str, str], tags_by_id: dict[str, Tag]
+        self,
+        rows: list[_ImportRow],
+        ids_by_slug: dict[str, str],
+        tags_by_id: dict[str, Tag],
+        revive: dict[tuple[str, str], Pv] | None = None,
     ) -> list[PVElementDTO]:
         """Create the PVs for import rows that match no registered PV.
 
-        A tag ID that isn't in ``tags_by_id`` is dropped from the new PV, not refused.
+        A tag ID that isn't in ``tags_by_id`` is dropped from the new PV, not refused. A
+        row whose identity is a deleted PV in ``revive`` brings that PV back instead, with
+        its id, as ``create`` does.
 
         Parameters
         ----------
@@ -831,6 +966,8 @@ class PvService:
             Every facility slug the import names, mapped to its id.
         tags_by_id : dict[str, Tag]
             The tags the rows name, by id.
+        revive : dict[tuple[str, str], Pv] | None
+            Deleted PVs to bring back, keyed by ``(kind, identity_address)``, already locked.
 
         Returns
         -------
@@ -844,23 +981,16 @@ class PvService:
         """
         if not rows:
             return []
+        revive = revive or {}
         pvs = []
         for row in rows:
-            setpoint_address, readback_address, config_address = row.addresses
-            pvs.append(
-                Pv(
-                    setpoint_address=setpoint_address,
-                    readback_address=readback_address,
-                    config_address=config_address,
-                    device=row.data.device,
-                    description=row.data.description,
-                    abs_tolerance=row.data.abs_tolerance,
-                    rel_tolerance=row.data.rel_tolerance,
-                    tags=[tags_by_id[tid] for tid in row.tag_ids if tid in tags_by_id],
-                )
-            )
+            pv = revive.get((row.kind, row.identity_address)) or Pv()
+            tags = [tags_by_id[tid] for tid in row.tag_ids if tid in tags_by_id]
+            pvs.append(self._register(pv, *row.addresses, row.data, tags))
 
         try:
+            # Restored rows are already in the session; adding them again is a no-op, and
+            # the flush writes them with the new ones.
             pvs = await self.pv_repo.bulk_create(pvs)
         except IntegrityError as e:
             raise PvAlreadyExists(f"PV addresses violate uniqueness constraints: {e}") from e
@@ -872,6 +1002,8 @@ class PvService:
             for pv, row in zip(pvs, rows)
             if row.data.facilities
         ]
+        # A PV brought back takes the new registration's facilities, like its tags.
+        await self.pv_repo.clear_facilities_many([pv.id for pv in revive.values()])
         await self.pv_repo.add_facilities_many(assignments)
         # Each row's own payload already named its facilities by slug — skip the
         # id-to-slug round trip `_to_dtos` would otherwise make.
@@ -881,10 +1013,7 @@ class PvService:
         pv = await self.pv_repo.get_by_id(pv_id)
         if not pv:
             return None
-        # The facility gate first: a caller who can't reach the row isn't told its owner.
-        facility_ids = await self.pv_repo.facility_ids_for(pv_id)
-        await self._require_facility_write(facility_ids, "this PV")
-        require_owned(pv.owner_instance, f"PV {pv_id}")
+        facility_ids = await self._require_writable(pv)
         if data.facilities is not None:
             new_ids = set((await self._resolve_slugs(data.facilities)).values())
             refusal = self._facility_change_refusal(facility_ids, new_ids)
@@ -916,21 +1045,34 @@ class PvService:
         return (await self._to_dtos([pv], {pv.id: facility_ids}))[0]
 
     async def delete(self, pv_id: str) -> bool:
-        pv = await self.pv_repo.get_by_id(pv_id)
-        if not pv:
+        """Delete a PV by setting ``deleted_at``.
+
+        The row stays, with its tags, so its values in past snapshots keep their PV, and
+        registering its identifying address again brings it back. Returns ``False`` when
+        no live PV has ``pv_id``.
+
+        Raises
+        ------
+        NotOwner
+            If another instance owns the PV.
+        BadRequest
+            If the PV is still a meta-PV; its marker has to be removed first.
+        """
+        # Judged before it's locked: on a head, row-level security keeps another
+        # instance's row out of SELECT ... FOR UPDATE, so it would look missing.
+        if (pv := await self.pv_repo.get_by_id(pv_id)) is None:
+            return False
+        await self._require_writable(pv)
+        # Now this instance's own row, locked so a meta-PV marker can't be added between
+        # the check below and the delete; re-read, in case it went or moved meanwhile.
+        if await self.pv_repo.get_by_id(pv_id, for_update=True) is None:
             return False
         await self._require_facility_write(await self.pv_repo.facility_ids_for(pv_id), "this PV")
-        require_owned(pv.owner_instance, f"PV {pv_id}")
-        try:
-            await self.pv_repo.delete(pv)
-        except IntegrityError as e:
-            # The meta_pv FK has no cascade by design: a PV that is still a meta-PV can't
-            # be deleted until its marker is removed. Surface a clean 400 instead of
-            # letting the raw IntegrityError become a 500.
+        if await self.meta_pv_repo.get_one(pv_id) is not None:
             raise BadRequest(
                 "Cannot delete a PV that is still registered as a meta-PV; remove the meta-PV marker first"
-            ) from e
-        return True
+            )
+        return await self.pv_repo.soft_delete(pv_id)
 
     async def get_all_for_snapshot(self) -> list[tuple[str, str | None, str | None]]:
         addresses = await self.pv_repo.get_all_addresses()
@@ -994,7 +1136,7 @@ class PvService:
         return MetaPVDTO(pv_id=meta_pv.pv_id, display_name=meta_pv.display_name, is_active=meta_pv.is_active)
 
     async def add_meta_pv(self, pv_name: str, display_name: str, owner: str | None = None) -> MetaPVDTO:
-        """Mark one of this instance's PVs, found by any of its addresses, as a meta-PV.
+        """Mark one of this instance's live PVs, found by any of its addresses, as a meta-PV.
 
         ``owner``, the ``?owner=`` the caller named, accepts only this instance's name.
         On a mirror the address may belong only to arms' PVs; that answers
@@ -1002,7 +1144,8 @@ class PvService:
         """
         if owner is not None:
             require_owned(owner, f"PV {pv_name}")
-        pv = await self.pv_repo.find_by_address(pv_name, owner=local_instance())
+        # Locked, so the PV can't be deleted between this check and the marker's insert.
+        pv = await self.pv_repo.find_by_address(pv_name, owner=local_instance(), for_update=True)
         if pv is None:
             owners = await self.pv_repo.owners_by_address(pv_name)
             if owners:
@@ -1026,7 +1169,8 @@ class PvService:
 
     async def get_meta_pvs(self, active: bool | None = None) -> list[DisplayMetaPVDTO]:
         meta_pv_metadata = await self.meta_pv_repo.get(active=active)
-        pvs = {pv.id: pv for pv in await self.pv_repo.get_by_ids([pv.pv_id for pv in meta_pv_metadata])}
+        pv_ids = [pv.pv_id for pv in meta_pv_metadata]
+        pvs = {pv.id: pv for pv in await self.pv_repo.get_by_ids(pv_ids, include_deleted=True)}
         return [
             DisplayMetaPVDTO(
                 pv_id=meta_pv.pv_id,

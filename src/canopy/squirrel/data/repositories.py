@@ -16,7 +16,10 @@ from collections.abc import Callable, Awaitable
 from sqlalchemy import (
     ARRAY,
     Select,
+    String,
+    ColumnElement,
     or_,
+    and_,
     any_,
     func,
     delete,
@@ -26,7 +29,7 @@ from sqlalchemy import (
     update,
     literal,
 )
-from sqlalchemy.orm import noload, selectinload
+from sqlalchemy.orm import noload, raiseload, selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.dialects.postgresql import UUID
@@ -52,6 +55,11 @@ BULK_INSERT_CHUNK_SIZE = 5000
 PARAM_BATCH_SIZE = 30000
 
 
+def _text_array(values: list[str]):
+    """``values`` as one ``text[]`` bind parameter, like ``_uuid_array`` for addresses."""
+    return literal(values, ARRAY(String))
+
+
 def _uuid_array(ids: list[str]):
     """``ids`` as one ``uuid[]`` bind parameter, for ``col == any_(...)`` — avoids a huge
     ``IN (...)`` expansion."""
@@ -63,6 +71,21 @@ class SnapshotRepository(BaseRepository[Snapshot]):
 
     def __init__(self, session: AsyncSession):
         super().__init__(Snapshot, session)
+
+    async def get_by_id(self, id: str, *, include_deleted: bool = False) -> Snapshot | None:
+        """A snapshot without its values; a deleted one only with ``include_deleted``."""
+        query = select(Snapshot).where(Snapshot.id == id).options(raiseload(Snapshot.values))
+        if not include_deleted:
+            query = query.where(Snapshot.deleted_at.is_(None))
+        result = await self.session.execute(query)
+        return result.scalar_one_or_none()
+
+    async def is_live(self, snapshot_id: str) -> bool:
+        """Whether ``snapshot_id`` exists and hasn't been deleted."""
+        result = await self.session.execute(
+            select(Snapshot.id).where(Snapshot.id == snapshot_id, Snapshot.deleted_at.is_(None))
+        )
+        return result.scalar_one_or_none() is not None
 
     async def get_with_values(
         self, snapshot_id: str, limit: int | None = None, offset: int = 0
@@ -76,7 +99,9 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         relationship's selectin default so a huge snapshot isn't fully loaded just to page it.
         """
         result = await self.session.execute(
-            select(Snapshot).where(Snapshot.id == snapshot_id).options(noload(Snapshot.values))
+            select(Snapshot)
+            .where(Snapshot.id == snapshot_id, Snapshot.deleted_at.is_(None))
+            .options(noload(Snapshot.values))
         )
         snapshot = result.scalar_one_or_none()
         if not snapshot:
@@ -101,9 +126,8 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         title: str | None = None,
         description: str | None = None,
     ) -> Snapshot | None:
-        """Update a snapshot's title and/or description."""
-        result = await self.session.execute(select(Snapshot).where(Snapshot.id == snapshot_id))
-        snapshot = result.scalar_one_or_none()
+        """Update a live snapshot's title and/or description."""
+        snapshot = await self.get_by_id(snapshot_id)
         if not snapshot:
             return None
 
@@ -125,6 +149,8 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         facility_ids: set[str] | None,
     ) -> Select:
         """Apply the snapshot listing filters to ``query``; shared by the page and count queries."""
+        query = query.where(Snapshot.deleted_at.is_(None))
+
         if title:
             query = query.where(Snapshot.title.ilike(f"%{title}%"))
 
@@ -244,15 +270,15 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         )
         return {row[0]: row[1] for row in result.all()}
 
-    async def delete_with_values(self, snapshot_id: str) -> bool:
-        """Delete a snapshot; its values go via the DB ``ON DELETE CASCADE``."""
-        result = await self.session.execute(select(Snapshot.id).where(Snapshot.id == snapshot_id))
-        if not result.scalar_one_or_none():
-            return False
-
-        await self.session.execute(delete(Snapshot).where(Snapshot.id == snapshot_id))
+    async def soft_delete(self, snapshot_id: str) -> bool:
+        """Mark a live snapshot deleted, keeping its values; ``False`` when there is none."""
+        result = await self.session.execute(
+            update(Snapshot)
+            .where(Snapshot.id == snapshot_id, Snapshot.deleted_at.is_(None))
+            .values(deleted_at=func.now())
+        )
         await self.session.flush()
-        return True
+        return result.rowcount > 0
 
 
 class SnapshotValueRepository(BaseRepository[SnapshotValue]):
@@ -322,35 +348,128 @@ class SnapshotValueRepository(BaseRepository[SnapshotValue]):
 
 
 class PvRepository(BaseRepository[Pv]):
-    """Repository for PV operations."""
+    """Repository for PV operations.
+
+    Deleted PVs (``deleted_at`` set) are left out of every lookup except those taking
+    ``include_deleted``: registering an address again finds the deleted row to bring it
+    back, and reading a past snapshot still resolves the PVs its values belong to.
+    """
 
     def __init__(self, session: AsyncSession):
         super().__init__(Pv, session)
 
     @staticmethod
-    def _any_address(address: str):
+    def _identity_filter(kind: str, addresses: list[str]) -> ColumnElement[bool]:
+        """Match PVs whose identifying address of ``kind`` is one of ``addresses``.
+
+        The rule of ``pv_service._identity``: a setpoint address identifies its PV, a
+        readback address only a PV without a setpoint, and a config address only a PV
+        with neither.
+        """
+        if kind == "setpoint":
+            return Pv.setpoint_address == any_(_text_array(addresses))
+        if kind == "readback":
+            return and_(Pv.setpoint_address.is_(None), Pv.readback_address == any_(_text_array(addresses)))
+        return and_(
+            Pv.setpoint_address.is_(None),
+            Pv.readback_address.is_(None),
+            Pv.config_address == any_(_text_array(addresses)),
+        )
+
+    @staticmethod
+    def _locked(query: Select) -> Select:
+        """``query`` with its PV rows locked ``FOR UPDATE`` until the transaction ends.
+
+        A second transaction asking for the same row waits, then reads the row as the
+        first one committed it, so a check made on it can't be overtaken.
+        """
+        return query.with_for_update(of=Pv).execution_options(populate_existing=True)
+
+    async def get_by_id(self, id: str, *, include_deleted: bool = False, for_update: bool = False) -> Pv | None:
+        """A PV by id; a deleted one only with ``include_deleted``; locked with ``for_update``."""
+        query = select(Pv).where(Pv.id == id)
+        if not include_deleted:
+            query = query.where(Pv.deleted_at.is_(None))
+        result = await self.session.execute(self._locked(query) if for_update else query)
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    def _any_address(address: str) -> ColumnElement[bool]:
         return or_(Pv.setpoint_address == address, Pv.readback_address == address, Pv.config_address == address)
 
     async def owner_of(self, pv_id: str) -> str | None:
-        """The PV's ``owner_instance``, or ``None`` when there's no such PV."""
-        return (await self.session.execute(select(Pv.owner_instance).where(Pv.id == pv_id))).scalar_one_or_none()
+        """The PV's ``owner_instance``, or ``None`` when there's no such live PV."""
+        query = select(Pv.owner_instance).where(Pv.id == pv_id, Pv.deleted_at.is_(None))
+        return (await self.session.execute(query)).scalar_one_or_none()
 
     async def owners_by_address(self, address: str) -> set[str]:
-        """The owners of the PVs holding ``address`` as any of their addresses."""
-        result = await self.session.execute(select(Pv.owner_instance).where(self._any_address(address)).distinct())
+        """The owners of the live PVs holding ``address`` as any of their addresses."""
+        result = await self.session.execute(
+            select(Pv.owner_instance).where(self._any_address(address), Pv.deleted_at.is_(None)).distinct()
+        )
         return set(result.scalars().all())
 
-    async def find_by_address(self, address: str, *, owner: str) -> Pv | None:
-        """Find ``owner``'s PV by any of its addresses (setpoint, readback, or config)."""
-        result = await self.session.execute(
+    async def find_by_address(self, address: str, *, owner: str, for_update: bool = False) -> Pv | None:
+        """Find ``owner``'s live PV by any of its addresses (setpoint, readback, or config).
+
+        Locked with ``for_update``.
+        """
+        query = (
             select(Pv)
             .options(selectinload(Pv.tags).selectinload(Tag.group))
-            .where(self._any_address(address), Pv.owner_instance == owner)
+            .where(self._any_address(address), Pv.owner_instance == owner, Pv.deleted_at.is_(None))
         )
+        result = await self.session.execute(self._locked(query) if for_update else query)
         return result.scalar_one_or_none()
 
+    async def find_by_identity(
+        self, kind: str, address: str, *, owner: str, include_deleted: bool = False, for_update: bool = False
+    ) -> Pv | None:
+        """``owner``'s PV holding the identity ``kind`` at ``address``, tags loaded.
+
+        Parameters
+        ----------
+        kind : str
+            Identity kind: ``"setpoint"``, ``"readback"`` or ``"config"``.
+        address : str
+            Address carrying the identity.
+        owner : str
+            The owner whose PVs to search; identities are unique per owner.
+        include_deleted : bool
+            Also match a deleted PV. A live one comes first when both exist.
+        for_update : bool
+            Lock the row until the transaction ends.
+
+        Returns
+        -------
+        Pv | None
+            The PV, or ``None`` when none of ``owner``'s PVs holds that identity.
+        """
+        query = (
+            select(Pv)
+            .options(selectinload(Pv.tags).selectinload(Tag.group))
+            .where(self._identity_filter(kind, [address]), Pv.owner_instance == owner)
+        )
+        if not include_deleted:
+            query = query.where(Pv.deleted_at.is_(None))
+        query = query.order_by(Pv.deleted_at.is_not(None)).limit(1)
+        result = await self.session.execute(self._locked(query) if for_update else query)
+        return result.scalars().first()
+
+    async def _existing_identities(self, kind: str, addresses: list[str], owner: str) -> set[str]:
+        """The subset of ``addresses`` already identifying one of ``owner``'s live PVs as ``kind``."""
+        if not addresses:
+            return set()
+        column = getattr(Pv, f"{kind}_address")
+        result = await self.session.execute(
+            select(column).where(
+                self._identity_filter(kind, addresses), Pv.owner_instance == owner, Pv.deleted_at.is_(None)
+            )
+        )
+        return {row[0] for row in result.all() if row[0]}
+
     async def get_existing_setpoints(self, setpoint_addresses: list[str], *, owner: str) -> set[str]:
-        """Return the subset of ``setpoint_addresses`` that ``owner`` already registered.
+        """Return the subset of ``setpoint_addresses`` held by one of ``owner``'s live PV.
 
         Parameters
         ----------
@@ -364,19 +483,10 @@ class PvRepository(BaseRepository[Pv]):
         set[str]
             The addresses already registered as a PV setpoint.
         """
-        if not setpoint_addresses:
-            return set()
-        existing: set[str] = set()
-        for i in range(0, len(setpoint_addresses), PARAM_BATCH_SIZE):
-            batch = setpoint_addresses[i : i + PARAM_BATCH_SIZE]
-            result = await self.session.execute(
-                select(Pv.setpoint_address).where(Pv.setpoint_address.in_(batch), Pv.owner_instance == owner)
-            )
-            existing.update({row[0] for row in result.all() if row[0]})
-        return existing
+        return await self._existing_identities("setpoint", setpoint_addresses, owner)
 
     async def get_existing_readbacks_without_setpoint(self, readback_addresses: list[str], *, owner: str) -> set[str]:
-        """Return the subset of ``readback_addresses`` already held by one of ``owner``'s setpoint-less PVs.
+        """Return the subset of ``readback_addresses`` already held by one of ``owner``'s live setpoint-less PV.
 
         Parameters
         ----------
@@ -390,21 +500,10 @@ class PvRepository(BaseRepository[Pv]):
         set[str]
             The addresses carried by an existing PV whose ``setpoint_address`` is NULL.
         """
-        if not readback_addresses:
-            return set()
-        existing: set[str] = set()
-        for i in range(0, len(readback_addresses), PARAM_BATCH_SIZE):
-            batch = readback_addresses[i : i + PARAM_BATCH_SIZE]
-            result = await self.session.execute(
-                select(Pv.readback_address).where(
-                    Pv.setpoint_address.is_(None), Pv.readback_address.in_(batch), Pv.owner_instance == owner
-                )
-            )
-            existing.update({row[0] for row in result.all() if row[0]})
-        return existing
+        return await self._existing_identities("readback", readback_addresses, owner)
 
     async def get_existing_config_only(self, config_addresses: list[str], *, owner: str) -> set[str]:
-        """Return the subset of ``config_addresses`` already held by one of ``owner``'s config-only PVs.
+        """Return the subset of ``config_addresses`` already held by one of ``owner``'s live config-only PV.
 
         Parameters
         ----------
@@ -419,21 +518,55 @@ class PvRepository(BaseRepository[Pv]):
             The addresses carried by an existing PV whose ``setpoint_address`` and
             ``readback_address`` are both NULL.
         """
-        if not config_addresses:
-            return set()
-        existing: set[str] = set()
-        for i in range(0, len(config_addresses), PARAM_BATCH_SIZE):
-            batch = config_addresses[i : i + PARAM_BATCH_SIZE]
-            result = await self.session.execute(
-                select(Pv.config_address).where(
-                    Pv.setpoint_address.is_(None),
-                    Pv.readback_address.is_(None),
-                    Pv.config_address.in_(batch),
-                    Pv.owner_instance == owner,
-                )
-            )
-            existing.update({row[0] for row in result.all() if row[0]})
-        return existing
+        return await self._existing_identities("config", config_addresses, owner)
+
+    async def lock_by_identity(self, kind: str, addresses: list[str], *, owner: str) -> dict[str, Pv]:
+        """Lock ``owner``'s PVs, live or deleted, whose identifying address of ``kind`` is one of ``addresses``.
+
+        The rows stay locked ``FOR UPDATE`` until the transaction ends, taken by one query
+        in id order (the addresses go as one ``text[]`` parameter), so two imports naming
+        overlapping PVs lock them in the same order and can't deadlock.
+        Locking the live rows too is what lets a caller see that one it found deleted was
+        brought back meanwhile, rather than miss it and register the address twice.
+
+        Parameters
+        ----------
+        kind : str
+            Identity kind: ``"setpoint"``, ``"readback"`` or ``"config"``.
+        addresses : list[str]
+            Addresses to look up.
+        owner : str
+            The owner whose PVs to lock; identities are unique per owner.
+
+        Returns
+        -------
+        dict[str, Pv]
+            Each PV, with its tags loaded, keyed by the address that identifies it; a live
+            PV over a deleted one where both hold an address.
+        """
+        if not addresses:
+            return {}
+        query = (
+            select(Pv)
+            .options(selectinload(Pv.tags).selectinload(Tag.group))
+            .where(self._identity_filter(kind, addresses), Pv.owner_instance == owner)
+            .order_by(Pv.id)
+        )
+        found: dict[str, Pv] = {}
+        for pv in (await self.session.execute(self._locked(query))).scalars():
+            # Readback and config identities aren't unique in the database: a live PV wins.
+            address = getattr(pv, f"{kind}_address")
+            if address not in found or (found[address].deleted_at is not None and pv.deleted_at is None):
+                found[address] = pv
+        return found
+
+    async def soft_delete(self, pv_id: str) -> bool:
+        """Mark a live PV deleted, keeping its tags and values; ``False`` when there is none."""
+        result = await self.session.execute(
+            update(Pv).where(Pv.id == pv_id, Pv.deleted_at.is_(None)).values(deleted_at=func.now())
+        )
+        await self.session.flush()
+        return result.rowcount > 0
 
     async def search_by_name(
         self,
@@ -448,8 +581,8 @@ class PvRepository(BaseRepository[Pv]):
         ``tag_filters`` is OR within a group, AND across groups. ``facility_ids``
         (already descendant-expanded by the caller) filters via ``pv_facility``.
         """
-        query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group))
-        count_query = select(func.count()).select_from(Pv)
+        query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.deleted_at.is_(None))
+        count_query = select(func.count()).select_from(Pv).where(Pv.deleted_at.is_(None))
 
         if search:
             search_filter = or_(
@@ -495,13 +628,15 @@ class PvRepository(BaseRepository[Pv]):
     async def get_all_addresses(
         self, facility_ids: set[str] | None = None, *, owner: str | None = None
     ) -> list[tuple[str, str | None, str | None, str | None]]:
-        """All ``(id, setpoint, readback, config)`` tuples — the snapshot-capture input.
+        """All live ``(id, setpoint, readback, config)`` tuples — the snapshot-capture input.
 
         ``facility_ids`` limits it to PVs assigned to any of them; unassigned PVs are
-        excluded. ``None`` returns every PV. ``owner`` limits it to that owner's PVs,
+        excluded. ``None`` returns every live PV. ``owner`` limits it to that owner's PVs,
         which a capture needs on a mirror holding several owners' rows.
         """
-        query = select(Pv.id, Pv.setpoint_address, Pv.readback_address, Pv.config_address)
+        query = select(Pv.id, Pv.setpoint_address, Pv.readback_address, Pv.config_address).where(
+            Pv.deleted_at.is_(None)
+        )
         if owner is not None:
             query = query.where(Pv.owner_instance == owner)
         if facility_ids is not None:
@@ -522,7 +657,7 @@ class PvRepository(BaseRepository[Pv]):
         Parameters
         ----------
         pvs : list[Pv]
-            New, not yet persisted PVs.
+            New PVs, and deleted ones being restored (already in the session).
 
         Returns
         -------
@@ -599,7 +734,7 @@ class PvRepository(BaseRepository[Pv]):
             result = await self.session.execute(
                 select(Pv)
                 .options(selectinload(Pv.tags).selectinload(Tag.group))
-                .where(*conditions, address_column.in_(batch), Pv.owner_instance == owner)
+                .where(*conditions, address_column.in_(batch), Pv.owner_instance == owner, Pv.deleted_at.is_(None))
                 .order_by(Pv.id)
             )
             for pv in result.scalars().all():
@@ -701,24 +836,35 @@ class PvRepository(BaseRepository[Pv]):
                 insert(pv_facility), [{"pv_id": pv_id, "facility_id": fid} for fid in sorted(facility_ids)]
             )
 
+    async def clear_facilities_many(self, pv_ids: list[str]) -> None:
+        """Remove every facility assignment of the given PVs, in one statement like ``get_by_ids``."""
+        if pv_ids:
+            await self.session.execute(delete(pv_facility).where(pv_facility.c.pv_id == any_(_uuid_array(pv_ids))))
+
     async def add_facilities_many(self, assignments: list[tuple[str, set[str]]]) -> None:
         """Bulk-insert ``(pv_id, facility_ids)`` assignments for freshly created PVs."""
         rows = [{"pv_id": pv_id, "facility_id": fid} for pv_id, fids in assignments for fid in sorted(fids)]
         if rows:
             await self.session.execute(insert(pv_facility), rows)
 
-    async def get_by_ids(self, ids: list[str], *, populate_existing: bool = False) -> list[Pv]:
+    async def get_by_ids(
+        self, ids: list[str], *, include_deleted: bool = False, populate_existing: bool = False
+    ) -> list[Pv]:
         """Get many PVs by id in one query.
 
         The ids go as a single ``uuid[]`` parameter (``= ANY(...)``), so the SQL is the same
         for any number of ids, which lets asyncpg reuse its prepared statement, and it never
         nears the Postgres parameter limit. Rows come back in database order, not in the
         order of ``ids``. With ``populate_existing``, PVs already in the session are
-        overwritten with the database's values, as ``session.refresh`` would.
+        overwritten with the database's values, as ``session.refresh`` would. Deleted PVs
+        come back only with ``include_deleted``, which a past snapshot's values need to keep
+        their addresses, tags and tolerances.
         """
         if not ids:
             return []
         query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.id == any_(_uuid_array(ids)))
+        if not include_deleted:
+            query = query.where(Pv.deleted_at.is_(None))
         if populate_existing:
             query = query.execution_options(populate_existing=True)
         result = await self.session.execute(query)
@@ -734,8 +880,8 @@ class PvRepository(BaseRepository[Pv]):
         facility_ids: set[str] | None = None,
     ) -> tuple[list[Pv], int]:
         """Offset-paginated, server-side filtered search. Returns ``(results, total_count)``."""
-        query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group))
-        count_query = select(func.count()).select_from(Pv)
+        query = select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.deleted_at.is_(None))
+        count_query = select(func.count()).select_from(Pv).where(Pv.deleted_at.is_(None))
 
         if search_term:
             search_filter = or_(
@@ -774,12 +920,14 @@ class PvRepository(BaseRepository[Pv]):
 
     async def get_all_devices(self) -> list[str]:
         result = await self.session.execute(
-            select(Pv.device).where(Pv.device.isnot(None)).distinct().order_by(Pv.device)
+            select(Pv.device).where(Pv.device.isnot(None), Pv.deleted_at.is_(None)).distinct().order_by(Pv.device)
         )
         return [r[0] for r in result.all() if r[0]]
 
     async def get_all_as_map(self) -> dict[str, Pv]:
-        result = await self.session.execute(select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)))
+        result = await self.session.execute(
+            select(Pv).options(selectinload(Pv.tags).selectinload(Tag.group)).where(Pv.deleted_at.is_(None))
+        )
         pvs = result.scalars().all()
         return {pv.id: pv for pv in pvs}
 
@@ -889,6 +1037,8 @@ class MetaPvRepository(BaseRepository[MetaPv]):
 
 async def facility_in_use(session: AsyncSession, facility_id: str) -> bool:
     """Whether any PV or snapshot still references ``facility_id``.
+
+    Deleted rows count: they keep their facility, and so does a history head's copy.
 
     Registered with ``core.facilities.gateway.register_in_use_checker`` at startup (see
     ``squirrel/app.py``) so core's ``FacilityService.delete`` can enforce its guard
