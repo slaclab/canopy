@@ -1,12 +1,13 @@
 """``POST /v1/pvs/import?onConflict=…``: skipping or updating rows whose PV is already registered.
 
 Facility-restricted keys are injected by rebinding the key registry, as
-``test_facility_enforcement.py`` does, with simulated facility slugs.
+``test_facility_enforcement.py`` does, with simulated facility slugs. A key's grant
+holds facility ids, so the seeded facilities have fixed ones.
 """
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import event
+from sqlalchemy import event, delete
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from canopy.core import security
@@ -29,8 +30,14 @@ class _KeyRegistry:
         return self.by_token.get(token)
 
 
+# The ids the ``facilities`` fixture seeds ``alpha`` and ``beta`` with.
+FACILITY_IDS = {"alpha": "00000000-0000-4000-8000-0000000000a1", "beta": "00000000-0000-4000-8000-0000000000b2"}
+
+
 def _key(token: str, facilities: set[str]) -> APIKey:
-    return APIKey(token=token, read=True, write=True, modules=frozenset({WILDCARD}), facilities=frozenset(facilities))
+    """A key minted granting ``facilities`` (slugs, or ``*``): it holds their ids."""
+    grant = frozenset(slug if slug == WILDCARD else FACILITY_IDS[slug] for slug in facilities)
+    return APIKey(token=token, read=True, write=True, modules=frozenset({WILDCARD}), facility_ids=grant)
 
 
 @pytest.fixture(autouse=True)
@@ -51,7 +58,7 @@ def keys():
 
 @pytest.fixture
 async def facilities(db_session: AsyncSession) -> None:
-    db_session.add_all([Facility(slug=slug, name=slug.title()) for slug in ("alpha", "beta")])
+    db_session.add_all([Facility(id=FACILITY_IDS[slug], slug=slug, name=slug.title()) for slug in ("alpha", "beta")])
     await db_session.commit()
 
 
@@ -574,3 +581,49 @@ async def test_update_moves_updated_at_only_for_rows_that_change_a_pv_column(cli
     assert [after[pv["setpointAddress"]]["lastModifiedDate"] for pv in updated] == [
         pv["lastModifiedDate"] for pv in updated
     ]
+
+
+# --- grants by facility id ---------------------------------------------------- #
+
+
+@pytest.mark.parametrize("mode", ["skip", "update"])
+async def test_a_facility_recreated_under_a_granted_slug_isnt_reached(
+    client: AsyncClient, db_session: AsyncSession, facilities, mode: str
+):
+    """``alpha-key`` was granted ``alpha``. Once ``alpha`` is deleted (as a history head
+    applies its arm's delete, with no check of the head's keys) and a new ``alpha`` is
+    created, the key's grant names a facility that no longer exists: the import refuses
+    a new row in the new ``alpha`` and leaves its registered PV alone."""
+    await db_session.execute(delete(Facility).where(Facility.id == FACILITY_IDS["alpha"]))
+    await db_session.commit()
+    db_session.add(Facility(slug="alpha", name="Alpha again"))
+    await db_session.commit()
+    registered = await _create(client, setpointAddress="SIM:DEV:00001:SET", description="before", facilities=["alpha"])
+
+    rows = [
+        {"setpointAddress": "SIM:DEV:00001:SET", "description": "after", "facilities": ["alpha"]},
+        {"setpointAddress": "SIM:DEV:00002:SET", "facilities": ["alpha"]},
+    ]
+    r = await _import(client, rows, mode, headers=ALPHA)
+
+    assert (r.status_code, r.json()["code"]) == (403, "insufficient_facility_access")
+    pvs = await _all_pvs(client)
+    assert set(pvs) == {"SIM:DEV:00001:SET"}
+    assert pvs["SIM:DEV:00001:SET"]["description"] == registered["description"] == "before"
+
+
+@pytest.mark.parametrize("mode", ["skip", "update"])
+async def test_a_facility_the_key_cant_reach_is_refused_before_its_owner_is_named(
+    client: AsyncClient, db_session: AsyncSession, facilities, as_instance, mode: str
+):
+    """A row in ``remote``, owned by another instance, from a key granted only ``alpha``:
+    the facility refusal comes first, so the caller isn't told who owns ``remote``."""
+    with as_instance("arm2"):
+        db_session.add(Facility(slug="remote", name="Remote"))
+        await db_session.commit()
+
+    r = await _import(client, [{"setpointAddress": "SIM:DEV:00003:SET", "facilities": ["remote"]}], mode, headers=ALPHA)
+
+    assert (r.status_code, r.json()["code"]) == (403, "insufficient_facility_access")
+    assert "arm2" not in r.json()["detail"]
+    assert await _all_pvs(client) == {}
