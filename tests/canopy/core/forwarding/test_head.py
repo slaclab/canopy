@@ -187,12 +187,13 @@ class TestPvImport:
 
         assert resp.status_code == 200, resp.text
 
-    async def test_a_row_without_a_facility_is_the_heads(self, http, copy):
+    @pytest.mark.parametrize("mode", ["skip", "update"])
+    async def test_a_row_without_a_facility_is_the_heads(self, http, copy, mode):
         # Rows match only this instance's PVs, so a row at arm1's address naming no
-        # facility makes the head's own PV there; arm1's is left alone.
+        # facility makes the head's own PV there, in either mode; arm1's is left alone.
         rows = [{"setpointAddress": "ARM1:PV", "description": "mine"}]
 
-        resp = await http.post("/squirrel/v1/pvs/import?onConflict=update", json=rows, headers=HEADERS)
+        resp = await http.post(f"/squirrel/v1/pvs/import?onConflict={mode}", json=rows, headers=HEADERS)
 
         assert resp.status_code == 200, resp.text
         assert await _pvs_at("ARM1:PV") == ["arm1", "head"]
