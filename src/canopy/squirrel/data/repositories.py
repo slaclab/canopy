@@ -15,6 +15,7 @@ from collections.abc import Callable, Awaitable
 
 from sqlalchemy import (
     ARRAY,
+    Row,
     Select,
     String,
     ColumnElement,
@@ -33,6 +34,7 @@ from sqlalchemy.orm import noload, raiseload, selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from canopy.core.db import BaseRepository
 from canopy.squirrel.data.models import (
@@ -80,6 +82,20 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         result = await self.session.execute(query)
         return result.scalar_one_or_none()
 
+    async def insert_unless_taken(self, fields: dict) -> bool:
+        """Insert a snapshot row with ``fields`` (``id`` included) unless that id exists.
+
+        Returns whether it was inserted. A concurrent insert of the same id waits for
+        the other transaction, then finds the id taken if that one committed.
+        """
+        inserted = await self.session.scalar(
+            pg_insert(Snapshot)
+            .values(**fields)
+            .on_conflict_do_nothing(index_elements=[Snapshot.id])
+            .returning(Snapshot.id)
+        )
+        return inserted is not None
+
     async def is_live(self, snapshot_id: str) -> bool:
         """Whether ``snapshot_id`` exists and hasn't been deleted."""
         result = await self.session.execute(
@@ -125,8 +141,9 @@ class SnapshotRepository(BaseRepository[Snapshot]):
         *,
         title: str | None = None,
         description: str | None = None,
+        retain: bool | None = None,
     ) -> Snapshot | None:
-        """Update a live snapshot's title and/or description."""
+        """Update a live snapshot's title, description and/or ``retain`` flag."""
         snapshot = await self.get_by_id(snapshot_id)
         if not snapshot:
             return None
@@ -135,6 +152,8 @@ class SnapshotRepository(BaseRepository[Snapshot]):
             snapshot.title = title
         if description is not None:
             snapshot.description = description
+        if retain is not None:
+            snapshot.retain = retain
 
         await self.session.flush()
         return snapshot
@@ -345,6 +364,33 @@ class SnapshotValueRepository(BaseRepository[SnapshotValue]):
             )
         )
         return list(result.scalars().all())
+
+    async def get_export_rows(self, snapshot_id: str) -> list[Row]:
+        """A snapshot's values with their PV's current addresses, ordered by ``pv_name``.
+
+        Plain columns rather than ORM objects, since a full save has 16k–100k values. The
+        PV is outer-joined and never filtered: a deleted PV still exports its addresses,
+        and a value whose PV row is missing (foreign keys aren't checked when a head
+        applies changes) still exports, without them.
+        """
+        result = await self.session.execute(
+            select(
+                SnapshotValue.pv_id,
+                SnapshotValue.pv_name,
+                Pv.setpoint_address,
+                Pv.readback_address,
+                Pv.config_address,
+                SnapshotValue.setpoint_value,
+                SnapshotValue.readback_value,
+                SnapshotValue.status,
+                SnapshotValue.severity,
+                SnapshotValue.timestamp,
+            )
+            .outerjoin(Pv, Pv.id == SnapshotValue.pv_id)
+            .where(SnapshotValue.snapshot_id == snapshot_id)
+            .order_by(SnapshotValue.pv_name)
+        )
+        return list(result.all())
 
 
 class PvRepository(BaseRepository[Pv]):
@@ -846,6 +892,26 @@ class PvRepository(BaseRepository[Pv]):
         rows = [{"pv_id": pv_id, "facility_id": fid} for pv_id, fids in assignments for fid in sorted(fids)]
         if rows:
             await self.session.execute(insert(pv_facility), rows)
+
+    async def facilities_of_owned(self, ids: list[str], *, owner: str) -> dict[str, set[str]]:
+        """``owner``'s PVs among ``ids``, deleted ones included, each with its facility ids.
+
+        One query, with the ids as one ``uuid[]`` parameter, whatever their number. A PV
+        with no facility maps to an empty set; an id that isn't ``owner``'s PV is absent.
+        """
+        if not ids:
+            return {}
+        rows = await self.session.execute(
+            select(Pv.id, pv_facility.c.facility_id)
+            .outerjoin(pv_facility, pv_facility.c.pv_id == Pv.id)
+            .where(Pv.id == any_(_uuid_array(ids)), Pv.owner_instance == owner)
+        )
+        found: dict[str, set[str]] = {}
+        for pv_id, facility_id in rows.all():
+            facility_ids = found.setdefault(pv_id, set())
+            if facility_id is not None:
+                facility_ids.add(facility_id)
+        return found
 
     async def get_by_ids(
         self, ids: list[str], *, include_deleted: bool = False, populate_existing: bool = False

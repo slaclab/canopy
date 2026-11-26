@@ -1,5 +1,6 @@
 """Repository tests for ``PvRepository.bulk_create``, ``update_many`` and ``get_by_ids`` against the test Postgres."""
 
+import uuid
 import random
 
 import pytest
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from canopy.squirrel.data import repositories
 from canopy.squirrel.data.models import Pv, Tag, TagGroup
+from canopy.core.facilities.models import Facility
 from tests.canopy.squirrel.conftest import WRITE_HEADERS
 from canopy.squirrel.data.repositories import PvRepository
 
@@ -223,3 +225,45 @@ async def test_lock_by_identity_locks_every_address_with_one_ordered_statement(d
     assert len(few_statements) == len(many_statements) == 1
     assert few_statements[0][0] == many_statements[0][0]
     assert "ORDER BY squirrel.pv.id" in many_statements[0][0]
+
+
+async def test_facilities_of_owned_reads_every_id_and_its_facilities_in_one_statement(
+    db_session: AsyncSession, monkeypatch, as_instance
+):
+    """One ``uuid[]`` parameter however many ids: a batch per ``PARAM_BATCH_SIZE`` would show as several."""
+    monkeypatch.setattr(repositories, "PARAM_BATCH_SIZE", 2)
+    repo = PvRepository(db_session)
+    pvs = await repo.bulk_create(_new_pvs(5, await _seed_tags(db_session, 3)))
+    one, two = Facility(slug="one", name="One"), Facility(slug="two", name="Two")
+    db_session.add_all([one, two])
+    await db_session.flush()
+    await repo.add_facilities_many([(pvs[0].id, {one.id, two.id}), (pvs[1].id, {one.id}), (pvs[3].id, {two.id})])
+    assert await repo.soft_delete(pvs[3].id)
+    with as_instance("arm2"):
+        theirs = Pv(setpoint_address="THEIRS:SP")
+        db_session.add(theirs)
+        await db_session.flush()
+    ids = [pv.id for pv in pvs] + [theirs.id, str(uuid.uuid4())]
+
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    sync_engine = db_session.bind.sync_engine
+    event.listen(sync_engine, "before_cursor_execute", record)
+    try:
+        found = await repo.facilities_of_owned(ids, owner=pvs[0].owner_instance)
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", record)
+
+    # Deleted PVs count; another owner's PV and an unknown id don't; no facility is an empty set.
+    assert found == {
+        pvs[0].id: {one.id, two.id},
+        pvs[1].id: {one.id},
+        pvs[2].id: set(),
+        pvs[3].id: {two.id},
+        pvs[4].id: set(),
+    }
+    assert len(statements) == 1
