@@ -98,7 +98,9 @@ An instance writes only rows it owns:
 
 Facility slugs and Magpie slugs are unique everywhere. A PV's setpoint address and
 a tag group's name are unique per owner, so a mirror can hold the same PV or group
-name once for each arm; `ownerInstance` tells them apart.
+name once for each arm; `ownerInstance` tells them apart. For the same reason a PV
+import's `onConflict` (`skip` or `update`) matches only this instance's PVs: a row at
+another owner's address is created as this instance's own.
 
 ## Database migrations
 
