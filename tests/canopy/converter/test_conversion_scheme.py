@@ -3,11 +3,13 @@
 import io
 import json
 import zipfile
+from typing import Protocol, runtime_checkable
 from pathlib import Path
 
 import pytest
 import fakeredis.aioredis
 from fastapi.testclient import TestClient
+from pydmconverter.colors import SchemeLike
 
 import canopy.converter.tasks as tasks_module
 from canopy.core import color_scheme
@@ -221,6 +223,20 @@ def test_facility_import_flattened_by_canopy_reaches_the_converter(tmp_path):
     color = _text_color(result.screen)
     assert color["$role"] == "Ink"
     assert color["fallback"] == "#000000"
+
+
+@runtime_checkable
+class _CheckableSchemeLike(SchemeLike, Protocol):
+    """The converter's ``SchemeLike`` (static only), made checkable with ``isinstance`` here."""
+
+
+def test_canopy_scheme_results_are_the_converters_scheme_like(good_scheme, broken_scheme):
+    """``convert_bytes(scheme=...)`` takes any ``SchemeLike``: ``flat``, ``imports``, ``sources`` and ``meta``."""
+    for path in (None, good_scheme, broken_scheme):
+        result = get_color_scheme(path).result
+        assert isinstance(result, SchemeResult)
+        assert isinstance(result, _CheckableSchemeLike)
+    assert not isinstance(object(), _CheckableSchemeLike)
 
 
 def test_scheme_free_bob_conversion_has_no_roles():
