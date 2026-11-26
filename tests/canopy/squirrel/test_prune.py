@@ -205,3 +205,21 @@ async def test_a_deleted_or_retained_newer_snapshot_still_counts(maker, db_sessi
     await prune(maker, window_days=30, config=PruneConfig(dry_run=False), check_gate=_gate(PASS), now=NOW)
 
     assert (await _left(maker))[0] == {"a_deleted", "b_retained"}
+
+
+@pytest.mark.parametrize(
+    ("name", "default"),
+    [
+        ("enabled", False),
+        ("dry_run", True),
+        ("max_lag_s", 60.0),
+        ("heartbeat_max_age_h", 3.0),
+        ("hour", 3),
+        ("max_snapshots_per_run", 500),
+    ],
+)
+def test_a_blank_prune_setting_keeps_its_default(monkeypatch, name, default):
+    # How Helm and compose render a variable nobody set.
+    monkeypatch.setenv(f"CANOPY_PRUNE__{name.upper()}", "")
+
+    assert getattr(PruneConfig(), name) == default
