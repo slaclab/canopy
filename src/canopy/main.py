@@ -15,6 +15,7 @@ from starlette.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from canopy import __version__
+from canopy.core.asgi import route_path
 from canopy.core.config import (
     MODULES_SCOPE_KEY,
     get_settings,
@@ -116,21 +117,9 @@ class _SelectedModules:
         await self.app(scope, receive, send)
 
 
-def _route_path(scope: Scope) -> str:
-    """The path the router matches: ``scope["path"]`` without the ``root_path`` prefix.
-
-    Behind a path-prefixed ingress (``uvicorn --root-path /canopy``) the server
-    puts the prefix in front of ``path``; the router strips it, and so must the gate.
-    """
-    path, root_path = scope["path"], scope.get("root_path", "")
-    if root_path and path.startswith(root_path) and path[len(root_path) : len(root_path) + 1] in ("", "/"):
-        return path[len(root_path) :] or "/"
-    return path
-
-
 def _is_open(scope: Scope, probes: frozenset[str]) -> bool:
     """A ``GET`` on one of ``probes`` (the health probe paths) passes the closed-meta gate."""
-    return scope["type"] == "http" and scope["method"] == "GET" and _route_path(scope) in probes
+    return scope["type"] == "http" and scope["method"] == "GET" and route_path(scope) in probes
 
 
 class _ClosedMeta:

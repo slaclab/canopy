@@ -51,4 +51,10 @@ async def _forwarded_job_status(job_id: str, caller: APIKey) -> JobStatusDTO | N
         code, detail = arm_error(answer)
         answered = f"{answer.status_code} {code}" if code else str(answer.status_code)
         raise PrimaryUnavailable(f"Arm '{arm.name}' answered {answered} for job {job_id!r}: {detail}")
-    return JobStatusDTO.model_validate(answer.json())
+    try:
+        return JobStatusDTO.model_validate(answer.json())
+    except ValueError as exc:
+        # Malformed JSON, or a job status this version doesn't read (a rolling deploy).
+        raise PrimaryUnavailable(
+            f"Arm '{arm.name}' answered job {job_id!r} with a status this head can't read: {exc}"
+        ) from None

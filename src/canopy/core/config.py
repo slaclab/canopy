@@ -181,10 +181,10 @@ class Settings(BaseSettings):
     history_url: str | None = None
     window_days: int | None = Field(None, ge=1)
 
-    @field_validator("history_url", "window_days", "machine_access", mode="before")
+    @field_validator("history_url", "window_days", "accept_forwarded_writes", "machine_access", mode="before")
     @classmethod
     def _blank_is_unset(cls, value: object, info: ValidationInfo) -> object:
-        """Read a blank value as unset rather than as ``""`` or an unparseable int."""
+        """Read a blank value as unset rather than as ``""``, an unparseable int or bool."""
         return blank_keeps_default(cls, value, info)
 
     # Primary (arm) only: accept writes a history head forwards on a user's behalf.

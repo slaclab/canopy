@@ -308,8 +308,22 @@ write would silently do nothing, which is worse than an error. The rules:
   job result's `skippedPvIds`; if every PV is skipped, the restore is a `403`.
 
 A `403 insufficient_facility_access` names the facilities the key lacks. A refused
-`POST /v1/pvs/multi` names every one the import needs, and lists the refused rows,
-since one bad row refuses the whole batch.
+`POST /v1/pvs/multi` or `POST /v1/pvs/import` names every one the import needs,
+and lists the refused rows, since one bad row refuses the whole batch.
+
+`POST /v1/pvs/import` applies the create rule above to every row before it
+looks up which addresses are already registered, as `POST /v1/pvs/multi` does.
+So a row naming no facility the key holds gets the same `403` whether or not its
+address exists. With `onConflict=skip`, a registered PV is left alone whatever its
+facilities, and the response only repeats the skipped rows' own addresses. That
+tells the key no more than the `409` from `POST /v1/pvs/multi` already does. With
+`onConflict=update`, the key must hold all of the facilities of every registered
+PV the import matches, as `PUT /v1/pvs/{id}` requires. Otherwise the whole import
+is refused. That refusal lists the rows, but it doesn't name the facilities of a
+PV the key can't write, since the key only supplied an address. An import never
+changes a registered PV's facilities: a matched row's `facilities` only has to
+pass the create rule above, and `PUT /v1/pvs/{id}` is how a PV moves between
+facilities.
 
 **Checking access ahead of a write.** `GET /v1/facilities/access` returns the
 calling key's own reach, so a client can check before writing instead of finding
@@ -508,7 +522,8 @@ and each module's docs, OpenAPI and `/v1/health/watchdog`.
 - Refusals are `401 invalid_api_key`, `403 insufficient_module_access` or
   `503 key_store_unavailable`, with CORS headers, so a browser client can read them.
 - A CORS preflight needs no key. The probes stay open behind a path prefix
-  (`uvicorn --root-path`) too.
+  (`uvicorn --root-path /canopy`) too. Give the prefix without a trailing slash:
+  the router, and so the gate, strips it only at a path boundary.
 
 Before turning it on:
 

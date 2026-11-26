@@ -316,7 +316,7 @@ nor named as local.
 | Snapshot restore | Here with machine access `write`; otherwise the snapshot's ([Machine access](#machine-access)) |
 | Snapshot capture | Taken here; saved here or on the facility's arm ([Snapshots taken on the head](#snapshots-taken-on-the-head)) |
 | Snapshot history import | The facility's, from the body |
-| PV create and PV import (`/pvs/multi`) | The facilities' in the body, which must share one owner |
+| PV create and PV imports (`/pvs/multi`, and `/pvs/import` with `onConflict`) | The facilities' in the body, which must share one owner |
 | Meta-PV create | The owner of the PV at that address: the head's own first, else the one arm that holds it |
 | Facility create | The parent's |
 | Tag group create, tag import, Magpie config create, and any create above with no facility or parent | The head's, unless `?owner=` names another instance |
@@ -329,6 +329,13 @@ parent is answered by the head, with `not_owner` or 409 `owner_mismatch`. A faci
 create sent to an arm whose slug the head already holds, under any owner, is refused
 with 409 `facility_slug_conflict` before it is sent: slugs are unique across every
 instance, and the arm's new row would otherwise stop replication from that arm.
+
+A PV import goes whole to the one owner of the facilities its rows name: it is one
+transaction, so it is never split between arms, and rows naming facilities of two
+owners are refused with 409 `owner_mismatch`. An import's rows match only the PVs of
+the instance that runs it, so a row that names no facility is the head's own: to
+update an arm's PVs through the head, name the arm's facility in each row, or send
+`?owner=<arm>`.
 
 A head forwards only the writes of the modules it mounts: with a module left out of
 `CANOPY_MODULES`, its writes are answered 404 on the head, as any route it doesn't
@@ -397,7 +404,9 @@ For a forwarded request that committed a write, the arm returns
 subscription to that arm, `canopy_history_<arm>`, to reach that position
 (`pg_replication_origin_status`). If it doesn't, the answer carries
 `X-Canopy-Replica-Stale: true`: the write succeeded, but a read straight after it may
-not show it yet. A capture commits later, in the arm's worker, so it carries no
+not show it yet. An arm that saved the write but couldn't read its position
+afterwards (a lost connection, a failover) answers without `X-Canopy-Commit-LSN`, and
+the head then can't wait for it. A capture commits later, in the arm's worker, so it carries no
 position. Both headers are exposed through CORS, so a browser client on another
 origin can read them. The wait includes getting a database connection, so a busy pool
 marks the answer stale rather than delaying it.
