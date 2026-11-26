@@ -222,8 +222,8 @@ async def import_snapshot(
     ``X-Canopy-On-Behalf-Of``, who becomes its author. It keeps the bundle's id, time,
     title and description, and is idempotent on the id: a resend that passes the
     facility check a new import gets answers with ``created`` false and saves nothing.
-    The answer always carries ``X-Canopy-Commit-LSN``, so the head can wait for the
-    snapshot to come back.
+    The answer carries ``X-Canopy-Commit-LSN``, so the head can wait for the snapshot
+    to come back, unless the position couldn't be read after the save.
 
     Either way a value is kept only when its PV exists here, the key could restore it,
     and, for a bundle with a facility, the PV is assigned to that facility or one below
