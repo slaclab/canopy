@@ -177,6 +177,7 @@ def test_the_owner_param_creates():
         ("POST", "/squirrel/v1/snapshots"),
         ("POST", "/squirrel/v1/pvs"),
         ("POST", "/squirrel/v1/pvs/multi"),
+        ("POST", "/squirrel/v1/pvs/import"),
         ("POST", "/squirrel/v1/pvs/meta"),
         ("POST", "/squirrel/v1/tags"),
         ("POST", "/squirrel/v1/tags/bulk"),

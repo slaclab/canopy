@@ -314,7 +314,7 @@ nor named as local.
 |---|---|
 | Snapshot edit, retain, delete and restore; PV edit and delete; meta-PV edit and delete; tag group and tag changes; Magpie config edit and delete; facility edit and delete | The row's |
 | Snapshot capture and history import | The facility's, from the body |
-| PV create and PV import (`/pvs/multi`) | The facilities' in the body, which must share one owner |
+| PV create and PV imports (`/pvs/multi`, and `/pvs/import` with `onConflict`) | The facilities' in the body, which must share one owner |
 | Meta-PV create | The owner of the PV at that address: the head's own first, else the one arm that holds it |
 | Facility create | The parent's |
 | Tag group create, tag import, Magpie config create, and any create above with no facility or parent | The head's, unless `?owner=` names another instance |
@@ -327,6 +327,13 @@ parent is answered by the head, with `not_owner` or 409 `owner_mismatch`. A faci
 create sent to an arm whose slug the head already holds, under any owner, is refused
 with 409 `facility_slug_conflict` before it is sent: slugs are unique across every
 instance, and the arm's new row would otherwise stop replication from that arm.
+
+A PV import goes whole to the one owner of the facilities its rows name: it is one
+transaction, so it is never split between arms, and rows naming facilities of two
+owners are refused with 409 `owner_mismatch`. An import's rows match only the PVs of
+the instance that runs it, so a row that names no facility is the head's own: to
+update an arm's PVs through the head, name the arm's facility in each row, or send
+`?owner=<arm>`.
 
 A head forwards only the writes of the modules it mounts: with a module left out of
 `CANOPY_MODULES`, its writes are answered 404 on the head, as any route it doesn't

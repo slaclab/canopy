@@ -166,6 +166,9 @@ ROUTES: tuple[WriteRoute, ...] = (
     WriteRoute("POST", "/squirrel/v1/snapshots/{snapshot_id}/restore", _SNAPSHOT),
     WriteRoute("POST", "/squirrel/v1/pvs", Facilities("facilities"), owner_param=True),
     WriteRoute("POST", "/squirrel/v1/pvs/multi", Facilities("facilities", rows=True), owner_param=True),
+    # One import has one owner, as with /multi: forwarded whole, never split between arms,
+    # since it is one transaction. Rows match only the PVs of the instance that runs it.
+    WriteRoute("POST", "/squirrel/v1/pvs/import", Facilities("facilities", rows=True), owner_param=True),
     WriteRoute("PUT", "/squirrel/v1/pvs/{pv_id}", _PV),
     WriteRoute("DELETE", "/squirrel/v1/pvs/{pv_id}", _PV),
     # A meta-PV marker is keyed by its PV's id. The app doesn't gate markers by facility.
