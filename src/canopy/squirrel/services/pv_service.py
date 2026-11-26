@@ -52,9 +52,10 @@ IDENTITY_KINDS: tuple[AddressKind, ...] = ("setpoint", "readback", "config")
 
 # How each identity kind (see `_identity`) is looked up among registered PVs, many
 # addresses at a time: the identifying addresses already registered, and the PVs holding
-# them. Single create and both bulk routes use these, so they agree on what counts as
-# registered. Identities are unique per owner, so each call passes ``owner``: a row is
-# registered only when one of that owner's PVs holds its identity.
+# them. Both bulk routes use these, so they agree on what counts as registered: a live PV
+# only, since a deleted one is never registered (single create finds it with
+# ``find_by_identity`` to bring it back). Identities are unique per owner, so each call
+# passes ``owner``: a row is registered only when one of that owner's PVs holds its identity.
 _REGISTERED_ADDRESSES: dict[AddressKind, Callable[..., Awaitable[set[str]]]] = {
     "setpoint": PvRepository.get_existing_setpoints,
     "readback": PvRepository.get_existing_readbacks_without_setpoint,
@@ -335,7 +336,7 @@ class PvService:
 
         A deleted PV comes back only for a key that could write it: bringing back
         another facility's PV would move its past values into this key's facility.
-        ``create`` and ``create_many`` both ask here.
+        ``create`` asks here, and so does every bulk route, through ``_revivals``.
         """
         if self.facility_scope is None or not deleted:
             return set()
