@@ -612,6 +612,26 @@ async def test_a_facility_recreated_under_a_granted_slug_isnt_reached(
     assert pvs["SIM:DEV:00001:SET"]["description"] == registered["description"] == "before"
 
 
+async def test_an_update_needs_the_pvs_recreated_facility_too(
+    client: AsyncClient, db_session: AsyncSession, facilities
+):
+    """``alpha-beta-key`` was granted ``alpha`` and ``beta``; ``alpha`` was then deleted and
+    created again. A row naming ``beta`` passes the create gate, but the PV it matches is
+    also in the new ``alpha``, which the key was never granted, so the update is refused."""
+    await db_session.execute(delete(Facility).where(Facility.id == FACILITY_IDS["alpha"]))
+    await db_session.commit()
+    db_session.add(Facility(slug="alpha", name="Alpha again"))
+    await db_session.commit()
+    shared = await _create(client, setpointAddress="SIM:DEV:00001:SET", facilities=["alpha", "beta"])
+
+    rows = [{"setpointAddress": "SIM:DEV:00001:SET", "description": "after", "facilities": ["beta"]}]
+    r = await _import(client, rows, "update", headers=ALPHA_BETA)
+
+    assert (r.status_code, r.json()["code"]) == (403, "insufficient_facility_access")
+    assert "the registered PV is outside the key's facilities" in r.json()["detail"]
+    assert (await _all_pvs(client))["SIM:DEV:00001:SET"] == shared
+
+
 @pytest.mark.parametrize("mode", ["skip", "update"])
 async def test_a_facility_the_key_cant_reach_is_refused_before_its_owner_is_named(
     client: AsyncClient, db_session: AsyncSession, facilities, as_instance, mode: str
