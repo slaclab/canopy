@@ -217,6 +217,20 @@ async def test_a_forwarded_write_returns_its_commit_position(http):
     assert lsn_value(second.headers["x-canopy-commit-lsn"]) > lsn_value(first.headers["x-canopy-commit-lsn"])
 
 
+async def test_a_write_whose_position_cant_be_read_is_still_answered(http, monkeypatch, caplog):
+    # Committed before the position is read: a failed read leaves the answer without
+    # one, instead of a 500 for a write that is saved.
+    monkeypatch.setattr(db, "_POSITION", "SELECT no_such_function() AS position")
+
+    resp = await http.post("/squirrel/v1/tags", json={"name": "Area"}, headers={"X-API-Key": "svc", **ON_BEHALF})
+
+    assert resp.status_code == 200, resp.text
+    assert "x-canopy-commit-lsn" not in resp.headers
+    assert "committed but its WAL position can't be read" in caplog.text
+    async with db.get_session_maker()() as session:
+        assert await session.scalar(text("SELECT count(*) FROM squirrel.tag_group WHERE name = 'Area'")) == 1
+
+
 async def test_reads_and_unforwarded_writes_carry_no_position(http):
     read = await http.get("/squirrel/v1/tags", headers={"X-API-Key": "svc", **ON_BEHALF})
     direct = await http.post("/squirrel/v1/tags", json={"name": "Area"}, headers={"X-API-Key": "cli"})

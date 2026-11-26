@@ -39,3 +39,14 @@ def test_stats():
     assert stats["clients"] == 2
     assert stats["active_pvs"] == 2
     assert stats["subscriptions"] == 3
+
+
+def test_is_subscribed_reports_membership_without_adding_the_client():
+    r = SubscriptionRegistry()
+    r.add_client("c1")
+    r.subscribe("c1", ["PV:A"])
+
+    assert r.is_subscribed("c1", "PV:A")
+    assert not r.is_subscribed("c1", "PV:B")
+    assert not r.is_subscribed("unknown", "PV:A")
+    assert r.stats()["clients"] == 1

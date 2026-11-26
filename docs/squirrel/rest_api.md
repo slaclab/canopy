@@ -26,7 +26,7 @@ snapshot's facility, a tag's group). The creates below also take an optional
 | Endpoint | |
 |----------|---|
 | `POST /squirrel/v1/snapshots` | Capture a snapshot |
-| `POST /squirrel/v1/pvs`, `POST /squirrel/v1/pvs/multi` | Create PVs |
+| `POST /squirrel/v1/pvs`, `POST /squirrel/v1/pvs/multi`, `POST /squirrel/v1/pvs/import` | Create or import PVs |
 | `POST /squirrel/v1/pvs/meta` | Add a meta PV |
 | `POST /squirrel/v1/tags`, `POST /squirrel/v1/tags/bulk` | Create a tag group, import tags |
 
@@ -89,8 +89,8 @@ that, polling it returns `404 job_not_found`.
 On a history head, a restore of an arm's snapshot runs as a job on that arm, and the
 head asks the arm when you poll it. Only the arm's 404 is `404 job_not_found`. The arm
 refusing the head's service key is `502 service_key_refused`, and any other error from
-the arm is `502 primary_unavailable`, naming its answer: the job may still exist, so
-keep polling.
+the arm, or a status the head can't read (during a rolling deploy, say), is
+`502 primary_unavailable`, naming its answer: the job may still exist, so keep polling.
 
 ### Retries and time limits
 
@@ -412,7 +412,8 @@ Requires `write`. Nothing is read from or written to EPICS.
   `created: false` and saves nothing, once it passes the facility check a new
   import gets. One whose grant doesn't reach the facility is refused with 403
   `insufficient_facility_access` whether or not the snapshot is here, so the
-  answer doesn't say it exists. The answer always carries `X-Canopy-Commit-LSN`.
+  answer doesn't say it exists. The answer carries `X-Canopy-Commit-LSN`, unless the
+arm couldn't read its position after the save.
 
 Either way, a value is kept only when its PV exists here, the key could restore
 it, and, for a bundle with a facility, the PV is assigned to that facility or one
@@ -623,7 +624,7 @@ with its id and created date; everything else comes from the request.
 | Status | Code | Condition |
 |--------|------|-----------|
 | 400 | `bad_request` | A tag id does not exist |
-| 409 | `pv_already_exists` | A PV that isn't deleted has the same identifying address |
+| 409 | `pv_already_exists` | A PV that isn't deleted has the same identifying address, or a deleted one the key can't write does |
 | 422 | — | No address given |
 
 ### Create PVs in bulk
@@ -637,14 +638,91 @@ created PVs in the same order. Requires `write`. The import is all-or-nothing:
 if any row is rejected, no PV is created.
 
 Unlike [Create a PV](#create-a-pv), a tag id that doesn't exist isn't an
-error here: it is ignored, and the PV is created without that tag. As there,
-a row with a deleted PV's identifying address brings that PV back.
+error here: it is ignored, and the PV is created without that tag. Tag ids
+match in any case, and a tag id listed twice on a row adds the tag once. As in
+[Create a PV](#create-a-pv), a row with a deleted PV's identifying address
+brings that PV back.
+
+To import rows whose PV may already be registered, use
+[Import PVs](#import-pvs) instead.
 
 | Status | Code | Condition |
 |--------|------|-----------|
 | 400 | `bad_request` | Two rows share an identifying address |
-| 409 | `pv_already_exists` | A row's identifying address belongs to a PV that isn't deleted |
+| 403 | `insufficient_facility_access` | See [API keys](../deployment/api-keys.md) |
+| 409 | `pv_already_exists` | A row's identifying address belongs to a PV that isn't deleted, or to a deleted PV the key can't write |
 | 422 | — | A row has no address |
+
+### Import PVs
+
+```
+POST /squirrel/v1/pvs/import?onConflict=skip|update
+```
+
+Takes the same list as [Create PVs in bulk](#create-pvs-in-bulk), but a row
+whose identifying address is already registered doesn't refuse the import.
+`onConflict` is required and decides what happens to such a row:
+
+- `skip`: the registered PV is left as it is, and the other rows are created.
+- `update`: the registered PV is changed the way
+  [Update a PV](#update-a-pv) changes one, and the other rows are created.
+  Only the fields the row includes are applied, so a column missing from the
+  row keeps its stored value even where creating a PV would use a default
+  (tolerances, `tags`); a `null` `device` or `description` also leaves it
+  alone. `tags` replaces the tag list, and an unknown tag id on such a row is
+  a `400`. Addresses are never changed: a non-identifying address that differs
+  from the stored one is kept as stored and reported in `addressMismatches`.
+  An address the row leaves out isn't a mismatch. Facilities aren't changed
+  either: the row's `facilities` only has to pass the same check as a created
+  row's (see [API keys](../deployment/api-keys.md)), and the PV keeps its
+  assignments. Change them with [Update a PV](#update-a-pv).
+
+Rows that match no registered PV are created exactly as
+[Create PVs in bulk](#create-pvs-in-bulk) creates them, unknown tag ids
+included. A deleted PV is never registered, so neither mode skips or updates
+it. A row with its identifying address brings it back, with its id and created
+date, and lists it under `created`, as [Create PVs in bulk](#create-pvs-in-bulk)
+does. If the key couldn't write that PV, the import is refused.
+
+An import has one owner, as in [Create PVs in bulk](#create-pvs-in-bulk), and
+its rows match only that owner's PVs: a row with the address of another
+owner's PV creates a new PV (see [Owners](#owners)). On a history head the
+whole import goes to the one owner of its rows' facilities and is never split;
+a row that names no facility is the head's own, so to update an arm's PVs
+through the head, name the arm's facility in each row or send `?owner=<arm>`
+(see [Writes on a head](../deployment/history/operations.md#writes-on-a-head)).
+
+Requires `write`. The import is all-or-nothing: if any row is
+rejected, no PV is created or changed.
+
+The response lists what happened to each row. Each list is in request order,
+and `row` is the row's 1-based position in the request:
+
+??? example "Response (`onConflict=update`)"
+    ```json
+    {
+      "created": [{"id": "…", "setpointAddress": "SIM:DEV:00002:SET", "…": "…"}],
+      "updated": [{"id": "…", "setpointAddress": "SIM:DEV:00001:SET", "…": "…"}],
+      "skipped": [],
+      "addressMismatches": [
+        {"row": 1, "kind": "readback", "requested": "SIM:DEV:00001:RBV2", "stored": "SIM:DEV:00001:RBV"}
+      ]
+    }
+    ```
+
+`skipped` lists `{"row", "kind", "address"}` for each skipped row, where
+`kind` is the identifying address's kind (`setpoint`, `readback` or
+`config`). `updated` and `addressMismatches` are always empty for `skip`, and
+`skipped` is always empty for `update`.
+
+| Status | Code | Condition |
+|--------|------|-----------|
+| 400 | `bad_request` | Two rows share an identifying address, or an `update` row names an unknown tag id |
+| 403 | `insufficient_facility_access` | See [API keys](../deployment/api-keys.md) |
+| 403 | `not_owner` | The import's facilities, or `owner`, are an instance this one can't save for |
+| 409 | `owner_mismatch` | The rows' facilities or tags belong to different owners |
+| 409 | `pv_already_exists` | A row's identifying address belongs to a deleted PV the key can't write, or another write registered it while the import ran |
+| 422 | — | A row has no address, or `onConflict` is missing or isn't `skip` or `update` |
 
 ### Update a PV
 
@@ -1013,6 +1091,6 @@ FastAPI's validation body, which lists each problem under `detail`.
 | `snapshot_pending` | 409 | On a history head: the snapshot is still waiting for its arm, so it can't be edited, deleted, or restored with machine access `read` |
 | `outbox_full` | 503 | On a history head: the arm's snapshot outbox is at its cap |
 | `archived_immutable` | 409 | On a history head: the arm no longer holds this snapshot (it was pruned there) |
-| `primary_unavailable` | 502, 504 | On a history head: the arm couldn't be reached (502, nothing sent), didn't answer in time (504, the write may have landed), or answered a job poll with an error other than 404 (502, naming its answer) |
+| `primary_unavailable` | 502, 504 | On a history head: the arm couldn't be reached (502, nothing sent), didn't answer in time (504, the write may have landed), or answered a job poll with an error other than 404 or a status the head can't read (502, naming its answer) |
 | `service_key_refused` | 502 | On a history head: the arm refused the head's service key for it, not the caller's key. See [When an arm is unreachable](../deployment/history/operations.md#when-an-arm-is-unreachable) |
 | `invalid_settings` | 500 | On a history head: `CANOPY_ARMS` doesn't parse, so a request that needs an arm can't be routed. The detail names each wrong setting, never its value |

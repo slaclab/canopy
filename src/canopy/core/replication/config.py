@@ -10,8 +10,10 @@ arm keeps is ``CANOPY_WINDOW_DAYS``, the setting ``GET /v1/instance`` already re
 
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from canopy.core.config import blank_keeps_default
 
 
 class ReplicationConfig(BaseSettings):
@@ -87,6 +89,14 @@ class PruneConfig(BaseSettings):
     max_snapshots_per_run: int = Field(
         default=500, gt=0, description="Most snapshots one run removes; the next run continues."
     )
+
+    @field_validator(
+        "enabled", "dry_run", "max_lag_s", "heartbeat_max_age_h", "hour", "max_snapshots_per_run", mode="before"
+    )
+    @classmethod
+    def _blank_keeps_default(cls, value: object, info: ValidationInfo) -> object:
+        """Read a blank value, as Helm and compose render an unset variable, as the default."""
+        return blank_keeps_default(cls, value, info)
 
 
 def get_replication_config() -> ReplicationConfig:

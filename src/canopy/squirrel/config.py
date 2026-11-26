@@ -9,8 +9,10 @@ from __future__ import annotations
 
 from typing import Self
 
-from pydantic import Field, BaseModel, model_validator
+from pydantic import Field, BaseModel, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from canopy.core.config import blank_keeps_default
 
 
 class PVCacheConfig(BaseModel):
@@ -73,6 +75,14 @@ class OutboxConfig(BaseModel):
             "here before it fails; the arm's queue waits behind it."
         ),
     )
+
+    @field_validator(
+        "max_snapshots", "max_bytes", "retry_initial_s", "retry_max_s", "interval_s", "resend_wait_s", mode="before"
+    )
+    @classmethod
+    def _blank_keeps_default(cls, value: object, info: ValidationInfo) -> object:
+        """Read a blank value, as Helm and compose render an unset variable, as the default."""
+        return blank_keeps_default(cls, value, info)
 
     @model_validator(mode="after")
     def _initial_within_max(self) -> Self:

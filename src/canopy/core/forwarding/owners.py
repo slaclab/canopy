@@ -198,20 +198,24 @@ async def _address_owners(address: str) -> set[str]:
         return {row.owner for row in rows}
 
 
-async def snapshot_is_live(snapshot_id: str) -> bool:
-    """Whether this instance holds ``snapshot_id`` and it isn't deleted.
+async def row_is_live(rule: Row, value: str) -> bool:
+    """Whether this instance holds ``rule``'s row ``value`` and it isn't deleted (``deleted_at``).
 
-    An arm that answers 404 for a snapshot the head still holds has pruned it: the
-    head keeps history the arm no longer has.
+    An owner that answers 404 for a row the head still holds live has pruned it: the
+    head keeps history the owner no longer has (``Row.retained``).
     """
-    try:
-        snapshot_id = str(UUID(snapshot_id))
-    except ValueError:
-        return False
+    if rule.column == "id":
+        try:
+            value = str(UUID(value))
+        except ValueError:
+            return False
+        condition = f"{quote_ident(rule.column)} = CAST(:value AS uuid)"
+    else:
+        condition = f"{quote_ident(rule.column)} = :value"
     async with session_scope() as session:
         return bool(
             await session.scalar(
-                text("SELECT 1 FROM squirrel.snapshot WHERE id = CAST(:id AS uuid) AND deleted_at IS NULL"),
-                {"id": snapshot_id},
+                text(f"SELECT 1 FROM {qualified(rule.table)} WHERE {condition} AND deleted_at IS NULL"),
+                {"value": value},
             )
         )
