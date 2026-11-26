@@ -6,7 +6,9 @@ absolute path, so each file is read, flattened and (when broken) logged once per
 decided in one place, ``resolve_scheme_path``: an explicit path wins, else the ``CANOPY_THEME_FILE`` setting
 (:class:`ColorSchemeSettings`), else ``canopy-default`` alone.
 
-Any error is served as ``canopy-default`` with the errors in ``meta`` and ``degraded == ["color-scheme"]``. The
+Any error is served as ``canopy-default`` with the errors in ``meta`` and ``degraded == ["color-scheme"]``; a
+non-empty ``meta["errors"]``, not ``served``, is what marks that fallback, since a facility file may itself carry the
+id ``canopy-default`` (it loads, with a warning logged). The
 flattener needs only the standard library and ``jsonschema``, so an install without the ``convert`` extra flattens
 and serves schemes too.
 
@@ -145,6 +147,13 @@ def _load(requested: Path | None) -> ColorScheme:
             result.meta.get("served"),
             first.get("path") or "<root>",
             first.get("message"),
+        )
+    elif requested is not None and result.meta.get("id") == DEFAULT_ID:
+        # Not an error (the format allows any id), but meta then reads like the fallback: only errors tell them apart.
+        logger.warning(
+            "color scheme %s loaded with id %r, the built-in scheme's; give a facility scheme its own id",
+            label,
+            DEFAULT_ID,
         )
     flat_json = result.flat_json()
     return ColorScheme(

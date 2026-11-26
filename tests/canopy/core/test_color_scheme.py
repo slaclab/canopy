@@ -134,6 +134,40 @@ def test_default_is_cached_too(monkeypatch):
     assert get_color_scheme(None) is first
 
 
+# -- a facility file that keeps the id canopy-default -------------------------------------------------------------------
+
+
+def _warnings(caplog):
+    return [r for r in caplog.records if r.name == color_scheme.__name__ and r.levelno == logging.WARNING]
+
+
+def test_a_facility_file_with_the_default_id_loads_with_one_warning(tmp_path, caplog):
+    path = tmp_path / "copy.json"
+    path.write_text(json.dumps({"id": "canopy-default", "roles": {"OK": "#00ff00"}}))
+    with caplog.at_level(logging.WARNING, logger=color_scheme.__name__):
+        scheme = get_color_scheme(path)
+        get_color_scheme(path)
+    # Served like any facility file: only the empty errors tell it from the fallback.
+    assert scheme.meta["served"] == "canopy-default"
+    assert scheme.meta["errors"] == []
+    assert scheme.degraded == []
+    assert "#00ff00" in scheme.flat_json["light"]
+    assert len(_warnings(caplog)) == 1
+    assert "give a facility scheme its own id" in _warnings(caplog)[0].getMessage()
+    assert _errors(caplog) == []
+
+
+def test_no_warning_for_the_built_in_default_or_a_facility_id(tmp_path, caplog):
+    with caplog.at_level(logging.WARNING, logger=color_scheme.__name__):
+        get_color_scheme()
+        get_color_scheme(_facility(tmp_path, "facility-x"))
+        broken = tmp_path / "broken.json"
+        broken.write_text(json.dumps({"id": "canopy-default", "roles": {"A": "@Nope"}}))
+        get_color_scheme(broken)
+    assert _warnings(caplog) == []
+    assert len(_errors(caplog)) == 1
+
+
 # -- CANOPY_THEME_FILE through settings -------------------------------------------------------------------------------
 
 

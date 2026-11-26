@@ -65,7 +65,7 @@ canopy-spec's `screen-ir/color-scheme.schema.json` (canopy carries a copy as
 
 | Key | Required | Meaning |
 |-----|----------|---------|
-| `id` | yes | Non-empty scheme name, reported in `meta.id` |
+| `id` | yes | Non-empty scheme name, reported in `meta.id`. Give your facility its own name: `canopy-default` is the built-in scheme's, and a file that keeps it reads like the fallback (it is served, with a `WARNING` line logged) |
 | `format` | no | `canopy-color-scheme/1`, the only value allowed. A file without it is read as that format |
 | `$schema` | no | For editors; ignored |
 | `extends` | no | Only `canopy-default` is allowed, and it is the default when omitted. There are no deeper chains |
@@ -155,8 +155,10 @@ asks for a read key:
 Responses of `POST /converter/v1/conversions` and
 `POST /converter/v1/conversions/validate` carry `scheme`:
 `{ "id", "served", "sha256", "errors" }`, describing the scheme that conversion
-used. `served` is `canopy-default` when the file was rejected, and `errors` lists
-why, each as `{ "path", "message" }`. Batch rows carry only the warning.
+used. A non-empty `errors` is what shows the file was rejected: it lists why,
+each as `{ "path", "message" }`, and `served` is then `canopy-default`. A file
+that loaded has `errors: []` and `served` equal to its own `id`. Batch rows
+carry only the warning.
 
 The flattened form, which a server hands to viewers, is what
 `canopy.core.color_scheme.get_color_scheme().flat_json` returns:
