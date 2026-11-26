@@ -25,7 +25,7 @@ from pydmconverter.ir.schema import validate_screen_json
 from pydmconverter.ir.registry import VendoredRegistry
 
 from canopy.converter.errors import ConversionFailed, UnsupportedInput
-from canopy.core.color_scheme import ColorScheme
+from canopy.core.color_scheme import DEGRADED_KEY, ColorScheme
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +145,15 @@ class ConversionService:
     def scheme_meta(self) -> dict[str, Any] | None:
         """The injected scheme's meta (with ``flatHash``), or ``None`` when scheme-free."""
         return self._scheme.meta if self._scheme is not None else None
+
+    @property
+    def degraded(self) -> list[str]:
+        """``["color-scheme"]`` while conversions use ``canopy-default`` because the injected file was rejected.
+
+        Read from the same errors as each conversion's scheme warning, so the health summary and the
+        conversions agree; empty for a scheme-free service, which falls back to nothing.
+        """
+        return [DEGRADED_KEY] if self._scheme_warning is not None else []
 
     def _convert_kwargs(self, kind: ScreenKind, filename: str | None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {

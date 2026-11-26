@@ -143,8 +143,9 @@ Point that server ([canopy-mcp](https://github.com/slaclab/canopy-mcp)) at the
 
 ## Checking what is used
 
-The converter's summary reports the scheme it converts with, and asks for a read
-key:
+The converter's summary reports the scheme canopy-api loaded at startup, the one
+its conversions use (an edited environment changes neither until a restart). It
+asks for a read key:
 
 | Route | Healthy | Scheme rejected |
 |-------|---------|-----------------|

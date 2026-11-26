@@ -19,6 +19,7 @@ from canopy.converter.app import app as converter_app
 from canopy.converter.config import ConverterConfig
 from canopy.core.color_scheme import (
     DEFAULT_ID,
+    DEGRADED_KEY,
     get_color_scheme,
     resolve_scheme_path,
     clear_color_scheme_cache,
@@ -150,6 +151,12 @@ def test_injected_scheme_result_is_passed_through(spy, good_scheme):
     assert result.scheme == loaded.meta
     assert result.scheme["id"] == "facility"
     assert _scheme_warnings(result.warnings) == []
+
+
+def test_degraded_follows_the_injected_scheme(good_scheme, broken_scheme):
+    assert ConversionService().degraded == []
+    assert ConversionService(scheme=get_color_scheme(good_scheme)).degraded == []
+    assert ConversionService(scheme=get_color_scheme(broken_scheme)).degraded == [DEGRADED_KEY]
 
 
 def test_color_def_path_passed_only_when_set(spy, tmp_path):
