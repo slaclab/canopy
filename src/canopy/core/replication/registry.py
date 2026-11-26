@@ -11,8 +11,8 @@ table can't ship before someone decides whether the head gets it:
     applied on its head too.
 ``time_series``
     Rows that only accumulate (snapshots and their values). Replicated with every
-    operation for now; a later phase moves them to a publication without
-    deletes, so pruning the primary never removes history.
+    operation in the single layout; in the split layout their publication carries
+    no deletes, so pruning an arm never removes the head's history.
 ``local``
     Rows that belong to one database and never replicate. API keys are local: a
     head mints and checks its own.
@@ -22,6 +22,11 @@ table names its row's owner in a column, and a child table follows its parent. O
 a head, that is how a command tells one arm's rows from another's and from the
 head's own. ``shared_keys`` lists the columns unique across every owner, where two
 owners' rows can clash.
+
+Two publication layouts carry the same tables. ``publications`` is the single
+``canopy_history`` every arm starts with; ``split_publications`` is the pair an
+arm that prunes old rows switches to (``publish --split``): ``canopy_ref`` with
+every operation and ``canopy_ts`` with inserts and updates only.
 
 Keys are ``"schema.table"`` strings rather than model classes, so ``canopy.core``
 imports no module's models.
@@ -103,6 +108,7 @@ class ReplicationRegistry:
 
     tables: Mapping[str, TableClass]
     publications: tuple[Publication, ...]
+    split_publications: tuple[Publication, ...] = ()
     owner_paths: Mapping[str, OwnerPath] = field(default_factory=dict)
     # Registered tables a migration has dropped (``RETIRED`` for ``REGISTRY``): still
     # classified wherever a database holds one, never missing where it doesn't.
@@ -110,6 +116,15 @@ class ReplicationRegistry:
     # Columns unique across every owner, by table: two owners' rows can't share a
     # value, so a clash stops replication from the arm whose row arrives second.
     shared_keys: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+
+    def layout(self, split: bool) -> tuple[Publication, ...]:
+        """The publications of one layout: the split pair when ``split``, else the single one."""
+        return self.split_publications if split else self.publications
+
+    @property
+    def all_publications(self) -> tuple[Publication, ...]:
+        """Every publication either layout uses."""
+        return self.publications + self.split_publications
 
     def owner_chain(self, table: str) -> list[tuple[str, str]]:
         """The ``(parent, key)`` hops from ``table`` to the root that names its owner.
@@ -186,6 +201,7 @@ EXCLUDED = frozenset({"public.alembic_version"})
 RETIRED: frozenset[str] = frozenset()
 
 _ALL_OPERATIONS = ("insert", "update", "delete")
+_NO_DELETES = ("insert", "update")
 
 REGISTRY = ReplicationRegistry(
     tables=MappingProxyType(
@@ -201,6 +217,7 @@ REGISTRY = ReplicationRegistry(
             "squirrel.snapshot": TableClass.TIME_SERIES,
             "squirrel.snapshot_value": TableClass.TIME_SERIES,
             "core.api_key": TableClass.LOCAL,
+            "core.history_heartbeat": TableClass.LOCAL,
         }
     ),
     retired=RETIRED,
@@ -228,5 +245,13 @@ REGISTRY = ReplicationRegistry(
             classes=frozenset({TableClass.REFERENCE, TableClass.TIME_SERIES}),
             operations=_ALL_OPERATIONS,
         ),
+    ),
+    # Reference tables keep their deletes: replacing a PV's tags deletes and re-inserts
+    # link rows, and without the delete the re-insert would collide on the head and
+    # stop replication. Time-series deletes come only from pruning (user deletes are
+    # soft), and those must never reach history.
+    split_publications=(
+        Publication(name="canopy_ref", classes=frozenset({TableClass.REFERENCE}), operations=_ALL_OPERATIONS),
+        Publication(name="canopy_ts", classes=frozenset({TableClass.TIME_SERIES}), operations=_NO_DELETES),
     ),
 )

@@ -6,6 +6,7 @@ setting, keyed by arm name::
 
     CANOPY_ARMS__ARM1__PUBLISHER_DSN="postgresql://replicator:<secret>@<arm1-host>/canopy"
     CANOPY_ARMS__ARM1__READER_DSN="postgresql://canopy_reader:<secret>@<arm1-host>/canopy"
+    CANOPY_ARMS__ARM1__HEARTBEAT_DSN="postgresql://canopy_heartbeat:<secret>@<arm1-host>/canopy"
     CANOPY_ARMS__ARM2__PUBLISHER_DSN="..."
 
 or as JSON, ``CANOPY_ARMS='{"arm1": {"publisher_dsn": "..."}}'``. An arm's name
@@ -51,7 +52,17 @@ class Arm(BaseModel):
         ),
     )
 
-    @field_validator("publisher_dsn", "reader_dsn")
+    heartbeat_dsn: SecretStr | None = Field(
+        default=None,
+        description=(
+            "postgresql:// URI to this arm as its heartbeat role, which may write only "
+            "core.history_heartbeat. `heartbeat` records the head's checks for this arm through it, and "
+            "`switch` reads the arm's slot position. Needed only for an arm that prunes. Supply it from a "
+            "secret, like the publisher DSN."
+        ),
+    )
+
+    @field_validator("publisher_dsn", "reader_dsn", "heartbeat_dsn")
     @classmethod
     def _is_a_uri(cls, dsn: SecretStr | None) -> SecretStr | None:
         # The message never quotes the value, which holds a password.

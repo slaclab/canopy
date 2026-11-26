@@ -78,7 +78,11 @@ async def _grants(o: Octopus) -> dict:
 async def test_copy_then_stream_changes(octopus: Octopus):
     o, arm = octopus, octopus.arm
     published = await publish(arm.admin, role="primary", config=o.config)
-    assert published["roles"] == {o.config.replicator_role: "granted", o.config.reader_role: "granted"}
+    assert published["roles"] == {
+        o.config.replicator_role: "granted",
+        o.config.reader_role: "granted",
+        o.config.heartbeat_role: "absent",
+    }
     ids = await seed_rows(arm.admin, arm.name)
     await arm.admin.execute(
         "INSERT INTO core.api_key (id, app_name, token_hash, is_active, read_access, write_access, admin_access) "
