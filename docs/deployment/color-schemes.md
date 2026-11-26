@@ -180,20 +180,30 @@ their order, then the facility's new roles sorted by name.
 
 ## Checking a scheme file
 
-Canopy checks a file with the same flattener it serves with:
+Canopy's `canopy-scheme` command checks a file with the same flattener canopy
+serves with. It needs no optional extra (`python -m canopy.core.color_scheme_cli`
+runs the same command):
 
 ```bash
 # Prints every error and every role without a dark value, and exits 1 if
 # there is any; otherwise prints "<file>: ok (N roles)".
-python -m canopy.core.color_scheme_cli check my-facility-colors.json
+canopy-scheme check my-facility-colors.json
 ```
 
-The tools that read Phoebus files come with the converter package (PyDMConverter),
-not with canopy: `survey` counts the named colors a `.bob` corpus uses and says
-what each becomes under a scheme, and `from-colordef` writes the light value of
-every name in a color table (the built-in Phoebus table, or a `color.def`) into a
-scheme file, keeping each role's dark value. See the PyDMConverter documentation
-for how to run them.
+The tools that read Phoebus files come with the converter package (PyDMConverter)
+as its `pydmconverter-scheme` command:
+
+```bash
+# Count the named colors a .bob corpus uses, per (name, slot, saved RGB),
+# and with --scheme say what each becomes.
+pydmconverter-scheme survey panels/ --scheme my-facility-colors.json [--corpus-root panels/]
+
+# Write the light value of every name in a color table into a scheme file,
+# keeping each role's dark value. Without --color-def the built-in Phoebus
+# table is used. --id is required when the target file does not exist yet.
+pydmconverter-scheme from-colordef --color-def color.def --extends canopy-default \
+    --into my-facility-colors.json --id my-facility
+```
 
 ## Matching a facility color.def
 
@@ -202,8 +212,8 @@ which keeps the light look of converted screens as it is today.
 `CANOPY_CONVERTER__COLOR_DEF_PATH` is an **opt-in** switch for a facility that
 wants its own `color.def` instead. To switch:
 
-1. Regenerate the scheme's light values from the same `color.def` with the
-   converter's `from-colordef`.
+1. Regenerate the scheme's light values from the same file:
+   `pydmconverter-scheme from-colordef --color-def <color.def> --extends canopy-default --into <scheme file>`.
 2. Set `CANOPY_CONVERTER__COLOR_DEF_PATH=<color.def>` for canopy-api and the
    worker.
 3. Check the scheme, restart and reload viewers, as

@@ -1,8 +1,11 @@
-"""``python -m canopy.core.color_scheme_cli check``: canopy's own scheme check (carried over from the converter's)."""
+"""``canopy-scheme check``: canopy's own scheme check (carried over from the converter's)."""
 
 import sys
 import json
+import tomllib
 import subprocess
+from pathlib import Path
+from importlib.metadata import entry_points
 
 import pytest
 
@@ -69,3 +72,12 @@ def test_runs_as_a_module(tmp_path):
     )
     assert proc.returncode == 1
     assert "alias cycle in light: OK -> OK" in proc.stdout
+
+
+def test_canopy_scheme_is_a_console_script_of_canopy_only():
+    """pyproject declares it, and no other installed distribution (the converter's old name) claims it."""
+    pyproject = tomllib.loads((Path(__file__).resolve().parents[3] / "pyproject.toml").read_text(encoding="utf-8"))
+    assert pyproject["project"]["scripts"]["canopy-scheme"] == "canopy.core.color_scheme_cli:main"
+    (installed,) = entry_points(group="console_scripts", name="canopy-scheme")
+    assert installed.dist is not None and installed.dist.name == "canopy"
+    assert installed.load() is color_scheme_cli.main

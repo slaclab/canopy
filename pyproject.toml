@@ -34,6 +34,10 @@ dependencies = [
     "nh3>=0.2.18",
 ]
 
+[project.scripts]
+# Validates a color scheme file with canopy's flattener; needs no extra.
+canopy-scheme = "canopy.core.color_scheme_cli:main"
+
 [project.optional-dependencies]
 # Postgres and the Redis job queue: needed by squirrel, magpie, jobs and the
 # canopy-worker. A deployment that selects none of them (CANOPY_MODULES) runs
