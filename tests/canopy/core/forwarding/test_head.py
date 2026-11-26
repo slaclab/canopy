@@ -131,6 +131,74 @@ async def test_facilities_of_two_owners_are_refused_here(http, copy):
     assert resp.json()["code"] == "owner_mismatch"
 
 
+async def _pvs_at(address: str) -> list[str]:
+    async with db.get_session_maker()() as session:
+        rows = await session.scalars(
+            text("SELECT owner_instance FROM squirrel.pv WHERE setpoint_address = :a ORDER BY owner_instance"),
+            {"a": address},
+        )
+        return list(rows)
+
+
+class TestPvImport:
+    """``POST /squirrel/v1/pvs/import``: one owner per import, decided before the head's import runs."""
+
+    @pytest.mark.parametrize("mode", ["skip", "update"])
+    async def test_rows_in_an_arm1_facility_go_to_arm1_and_nothing_is_written_here(
+        self, http, copy, httpx_mock: HTTPXMock, mode
+    ):
+        rows = [
+            {"setpointAddress": "ARM1:PV", "description": "changed", "facilities": ["arm1-site"]},
+            {"setpointAddress": "ARM1:NEW", "facilities": ["arm1-site"]},
+        ]
+        httpx_mock.add_response(
+            method="POST", url=f"{ARM1}/squirrel/v1/pvs/import?onConflict={mode}", json={"created": []}
+        )
+
+        resp = await http.post(f"/squirrel/v1/pvs/import?onConflict={mode}", json=rows, headers=HEADERS)
+
+        assert resp.status_code == 200, resp.text
+        assert json.loads(httpx_mock.get_request().content) == rows
+        # Replication brings arm1's changes back; the head's copy isn't written here.
+        assert await _pvs_at("ARM1:PV") == ["arm1"]
+        assert await _pvs_at("ARM1:NEW") == []
+
+    async def test_facilities_of_two_arms_are_refused_here(self, http, copy):
+        rows = [
+            {"setpointAddress": "ARM1:NEW", "facilities": ["arm1-site"]},
+            {"setpointAddress": "ARM2:NEW", "facilities": ["arm2-site"]},
+        ]
+
+        resp = await http.post("/squirrel/v1/pvs/import?onConflict=skip", json=rows, headers=HEADERS)
+
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["code"] == "owner_mismatch"
+        assert "(arm1, arm2)" in resp.json()["detail"]
+        assert await _pvs_at("ARM1:NEW") == await _pvs_at("ARM2:NEW") == []
+
+    async def test_the_owner_param_sends_a_facility_less_import_to_that_arm(self, http, copy, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            method="POST", url=f"{ARM1}/squirrel/v1/pvs/import?onConflict=update&owner=arm1", json={"created": []}
+        )
+
+        resp = await http.post(
+            "/squirrel/v1/pvs/import?onConflict=update&owner=arm1", json=[{"setpointAddress": "N:1"}], headers=HEADERS
+        )
+
+        assert resp.status_code == 200, resp.text
+
+    @pytest.mark.parametrize("mode", ["skip", "update"])
+    async def test_a_row_without_a_facility_is_the_heads(self, http, copy, mode):
+        # Rows match only this instance's PVs, so a row at arm1's address naming no
+        # facility makes the head's own PV there, in either mode; arm1's is left alone.
+        rows = [{"setpointAddress": "ARM1:PV", "description": "mine"}]
+
+        resp = await http.post(f"/squirrel/v1/pvs/import?onConflict={mode}", json=rows, headers=HEADERS)
+
+        assert resp.status_code == 200, resp.text
+        assert await _pvs_at("ARM1:PV") == ["arm1", "head"]
+
+
 class TestTheOwnerParam:
     async def test_absent_or_this_instance_is_here(self, http, copy):
         assert (await http.post("/squirrel/v1/tags", json={"name": "Mine"}, headers=HEADERS)).status_code == 200

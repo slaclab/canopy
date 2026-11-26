@@ -17,6 +17,7 @@ import json
 import types
 import asyncio
 import datetime
+import contextlib
 from dataclasses import field, dataclass
 
 import pytest
@@ -108,8 +109,20 @@ def _beats(socket: FakeWebSocket) -> list[dict]:
     return [m for m in socket.sent if m.get("type") == "heartbeat"]
 
 
-def _app(broker: PVBroker) -> FastAPI:
-    app = FastAPI()
+def _app(broker: PVBroker, *, running: bool = False) -> FastAPI:
+    """The WebSocket route on ``broker``; with ``running``, the broker's loops run for the app's lifetime."""
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_: FastAPI):
+        if running:
+            await broker.start()
+        try:
+            yield
+        finally:
+            if running:
+                await broker.stop()
+
+    app = FastAPI(lifespan=lifespan)
     app.include_router(ws_module.router)
     app.dependency_overrides[get_pv_broker] = lambda: broker
     app.dependency_overrides[ws_require_read_access] = lambda: None
@@ -412,7 +425,9 @@ def test_ws_first_frame_is_the_heartbeat():
 
 def test_ws_first_frame_precedes_subscribe_output():
     broker = PVBroker(FakeConnector(), _config())
-    with TestClient(_app(broker)) as client:
+    # LIVE:1 isn't cached, so the subscribe answers nothing at once: its
+    # initial frame comes with the next flush, which needs the broker running.
+    with TestClient(_app(broker, running=True)) as client:
         with client.websocket_connect("/ws/pvs") as ws:
             first = ws.receive_json()
             assert first["type"] == "heartbeat"

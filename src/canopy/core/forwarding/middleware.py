@@ -23,6 +23,7 @@ from prometheus_client import Counter
 from starlette.responses import Response, JSONResponse
 from starlette.datastructures import Headers, QueryParams
 
+from canopy.core.asgi import route_path
 from canopy.core.config import get_settings, module_selected
 from canopy.core.errors import CanopyError, ArchivedImmutable
 from canopy.core.security import APIKey, get_registry
@@ -63,18 +64,6 @@ RememberJob = Callable[[str, str], Awaitable[None]]
 """Records that job ``job_id`` (first) runs on arm ``arm`` (second), for ``GET /jobs/v1/{id}``."""
 
 
-def _route_path(scope: Scope) -> str:
-    """The path the app routes on: ``scope["path"]`` without the ``root_path`` prefix.
-
-    Behind a path-prefixed ingress (``uvicorn --root-path``) the server includes the
-    prefix in ``path``; the arm has its own, so it is never sent on.
-    """
-    path, root_path = scope["path"], scope.get("root_path", "")
-    if root_path and path.startswith(root_path + "/"):
-        return path[len(root_path) :]
-    return path
-
-
 def _error(exc: CanopyError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"code": exc.error_code.value, "detail": exc.detail})
 
@@ -97,7 +86,7 @@ class ForwardingMiddleware:
         settings = get_settings()
         if settings.role == "mirror" and scope["method"] in _WRITE_METHODS:
             # A module this deployment doesn't mount isn't forwarded either: the app answers 404.
-            found = routes.match(scope["method"], _route_path(scope))
+            found = routes.match(scope["method"], route_path(scope))
             if found and (found[0].module == "core" or module_selected(scope, found[0].module)):
                 await self._route(scope, receive, send, *found)
                 return
@@ -177,7 +166,7 @@ class ForwardingMiddleware:
             answer = await send_to_arm(
                 arm,
                 scope["method"],
-                _route_path(scope),
+                route_path(scope),
                 caller=Caller.of(caller),
                 query=scope.get("query_string", b"").decode("latin-1"),
                 body=body,
@@ -197,8 +186,9 @@ class ForwardingMiddleware:
                 raise refusal
             if answer.status_code == 404 and await _pruned_on_arm(route, params, answer):
                 outcome = "refused"
+                what = route.owner.table.rsplit(".", 1)[-1].replace("_", " ").capitalize()
                 raise ArchivedImmutable(
-                    f"Snapshot {params[route.owner.param]} is no longer on arm '{arm.name}'; it is kept here as "
+                    f"{what} {params[route.owner.param]} is no longer on arm '{arm.name}'; it is kept here as "
                     "history and can't be changed"
                 )
         except CanopyError as exc:
@@ -286,13 +276,13 @@ async def _pruned_on_arm(route: routes.WriteRoute, params: dict[str, str], answe
     404 is the right answer and is relayed as it is.
     """
     rule = route.owner
-    if not isinstance(rule, routes.Row) or rule.table != "squirrel.snapshot":
+    if not isinstance(rule, routes.Row) or rule.retained is None:
         return False
     try:
         code = answer.json().get("code")
     except (ValueError, AttributeError):
         return False
-    return code == "snapshot_not_found" and await owners.snapshot_is_live(params[rule.param])
+    return code == rule.retained and await owners.row_is_live(rule, params[rule.param])
 
 
 def _job_id(answer) -> str | None:

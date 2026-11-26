@@ -20,9 +20,9 @@ from canopy.squirrel.data.models import Pv, Snapshot, TagGroup, pv_facility
 from canopy.core.facilities.models import Facility
 from canopy.core.forwarding.owners import (
     owner_of,
+    row_is_live,
     caller_reaches,
     require_unused,
-    snapshot_is_live,
 )
 from canopy.core.forwarding.routes import ROUTES, match
 
@@ -163,7 +163,7 @@ async def test_a_facility_slug_held_here_under_any_owner_is_taken(rows):
     await require_unused(route, {"slug": "fresh"})
 
 
-async def test_a_snapshot_is_live_here(rows, as_instance):
+async def test_a_retained_row_is_live_here(rows, as_instance):
     live = rows["arm1"]["snapshot"]
     async with db.get_session_maker()() as session:
         with as_instance("arm1"):
@@ -175,10 +175,13 @@ async def test_a_snapshot_is_live_here(rows, as_instance):
             )
             await session.commit()
 
-    assert await snapshot_is_live(live)
-    assert not await snapshot_is_live(gone.id)
-    assert not await snapshot_is_live(str(uuid4()))
-    assert not await snapshot_is_live("latest")
+    snapshot = match("DELETE", f"/squirrel/v1/snapshots/{live}")[0].owner
+
+    assert snapshot.retained == "snapshot_not_found"
+    assert await row_is_live(snapshot, live)
+    assert not await row_is_live(snapshot, gone.id)
+    assert not await row_is_live(snapshot, str(uuid4()))
+    assert not await row_is_live(snapshot, "latest")
 
 
 def _key(*facilities: str) -> APIKey:

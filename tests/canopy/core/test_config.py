@@ -88,3 +88,10 @@ def test_instance_names_that_are_refused(monkeypatch, name):
 
     with pytest.raises(ValidationError, match="instance"):
         Settings(_env_file=None)
+
+
+def test_a_blank_accept_forwarded_writes_is_off(monkeypatch):
+    # How Helm and compose render a value nobody set: off, as when unset.
+    monkeypatch.setenv("CANOPY_ACCEPT_FORWARDED_WRITES", "")
+
+    assert Settings().accept_forwarded_writes is False
