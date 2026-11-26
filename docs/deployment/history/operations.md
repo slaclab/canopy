@@ -165,7 +165,8 @@ A forwarded restore runs as a job on the arm. Clients poll it on the head as usu
 `GET /jobs/v1/{id}` asks that arm about a job the head started there, for a day after
 it started. The arm's 404 is answered as 404 `job_not_found`; any other error from the
 arm is a 502, `service_key_refused` when it refused the head's key and
-`primary_unavailable` naming the arm's answer otherwise.
+`primary_unavailable` naming the arm's answer otherwise. So is a status the head can't
+read, such as one from a newer arm during a rolling deploy.
 
 ### Who wrote it
 

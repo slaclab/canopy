@@ -89,8 +89,8 @@ that, polling it returns `404 job_not_found`.
 On a history head, a restore of an arm's snapshot runs as a job on that arm, and the
 head asks the arm when you poll it. Only the arm's 404 is `404 job_not_found`. The arm
 refusing the head's service key is `502 service_key_refused`, and any other error from
-the arm is `502 primary_unavailable`, naming its answer: the job may still exist, so
-keep polling.
+the arm, or a status the head can't read (during a rolling deploy, say), is
+`502 primary_unavailable`, naming its answer: the job may still exist, so keep polling.
 
 ### Retries and time limits
 
@@ -412,7 +412,8 @@ Requires `write`. Nothing is read from or written to EPICS.
   `created: false` and saves nothing, once it passes the facility check a new
   import gets. One whose grant doesn't reach the facility is refused with 403
   `insufficient_facility_access` whether or not the snapshot is here, so the
-  answer doesn't say it exists. The answer always carries `X-Canopy-Commit-LSN`.
+  answer doesn't say it exists. The answer carries `X-Canopy-Commit-LSN`, unless the
+arm couldn't read its position after the save.
 
 Either way, a value is kept only when its PV exists here, the key could restore
 it, and, for a bundle with a facility, the PV is assigned to that facility or one
@@ -1090,6 +1091,6 @@ FastAPI's validation body, which lists each problem under `detail`.
 | `snapshot_pending` | 409 | On a history head: the snapshot is still waiting for its arm, so it can't be edited, deleted, or restored with machine access `read` |
 | `outbox_full` | 503 | On a history head: the arm's snapshot outbox is at its cap |
 | `archived_immutable` | 409 | On a history head: the arm no longer holds this snapshot (it was pruned there) |
-| `primary_unavailable` | 502, 504 | On a history head: the arm couldn't be reached (502, nothing sent), didn't answer in time (504, the write may have landed), or answered a job poll with an error other than 404 (502, naming its answer) |
+| `primary_unavailable` | 502, 504 | On a history head: the arm couldn't be reached (502, nothing sent), didn't answer in time (504, the write may have landed), or answered a job poll with an error other than 404 or a status the head can't read (502, naming its answer) |
 | `service_key_refused` | 502 | On a history head: the arm refused the head's service key for it, not the caller's key. See [When an arm is unreachable](../deployment/history/operations.md#when-an-arm-is-unreachable) |
 | `invalid_settings` | 500 | On a history head: `CANOPY_ARMS` doesn't parse, so a request that needs an arm can't be routed. The detail names each wrong setting, never its value |
