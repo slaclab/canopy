@@ -9,7 +9,67 @@ import math
 
 import numpy as np
 
+
+def _float(value: object) -> float | np.ndarray:
+    """Convert a scalar or array value to floating point."""
+    if isinstance(value, np.ndarray):
+        if np.ma.isMaskedArray(value):
+            return value.astype(np.float64).filled(np.nan)
+        return np.asarray(value, dtype=np.float64)
+    return float(value)
+
+
+def _int(value: object) -> int | np.ndarray:
+    """Convert a scalar or array to a signed 64-bit integer.
+
+    Array NaN and infinity values remain NaN; finite values are truncated
+    toward zero and returned as float64 so missing samples stay missing.
+    """
+    if not isinstance(value, np.ndarray):
+        return int(value)
+
+    if np.issubdtype(value.dtype, np.integer) or np.issubdtype(value.dtype, np.bool_):
+        data = np.ma.getdata(value)
+        integers = data[~np.ma.getmaskarray(value)].astype(object)
+        if np.any(integers < -(2**63)) or np.any(integers >= 2**63):
+            raise OverflowError("int() array values must fit in signed 64-bit integers")
+        return value.astype(np.int64)
+
+    if np.ma.isMaskedArray(value):
+        value = value.astype(np.float64).filled(np.nan)
+
+    values = np.asarray(value, dtype=np.float64)
+    finite = np.isfinite(values)
+    finite_values = np.trunc(values[finite])
+    if np.any(finite_values < -(2**63)) or np.any(finite_values >= 2**63):
+        raise OverflowError("int() array values must fit in signed 64-bit integers")
+    result = np.full(values.shape, np.nan, dtype=np.float64)
+    result[finite] = finite_values
+    return result
+
+
+def _str(value: object) -> str:
+    """Convert a scalar value to text; array conversion is unsupported."""
+    if isinstance(value, np.ndarray):
+        raise TypeError("str() is only supported for scalar values")
+    return str(value)
+
+
+def _isnan(value: object) -> bool | np.ndarray:
+    """Test scalar or array values for NaN."""
+    if isinstance(value, np.ndarray):
+        if np.ma.isMaskedArray(value):
+            return np.ma.filled(np.isnan(value), True)
+        return np.isnan(value)
+    return bool(np.isnan(value))
+
+
 SAFE_FUNCS: dict[str, object] = {
+    # Conversion and classification
+    "float": _float,
+    "int": _int,
+    "str": _str,
+    "isnan": _isnan,
     # Trigonometric
     "sin": np.sin,
     "cos": np.cos,

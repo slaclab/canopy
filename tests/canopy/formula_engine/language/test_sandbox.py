@@ -77,6 +77,17 @@ def test_safe_functions_allowed(parser):
         ("{a} ** 2", {"a": "PV:A"}),
         ("exp({a})", {"a": "PV:A"}),
         ("log({a})", {"a": "PV:A"}),
+        ("float({a})", {"a": "PV:A"}),
+        ("int({a})", {"a": "PV:A"}),
+        ("str({a})", {"a": "PV:A"}),
+        ("isnan({a})", {"a": "PV:A"}),
+        ("np.isnan({a})", {"a": "PV:A"}),
+        ("{a} & 4", {"a": "PV:A"}),
+        ("{a} | 4", {"a": "PV:A"}),
+        ("{a} ^ 4", {"a": "PV:A"}),
+        ("~{a}", {"a": "PV:A"}),
+        ("{a} << 2", {"a": "PV:A"}),
+        ("{a} >> 2", {"a": "PV:A"}),
     ]
     for expr, bindings in safe_exprs:
         result = parser.parse(expr, bindings)
