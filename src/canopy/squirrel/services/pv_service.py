@@ -587,26 +587,9 @@ class PvService:
             if existing:
                 raise PvAlreadyExists(f"{kind.capitalize()} addresses already exist: {sorted(existing)[:10]}")
 
-        # Lock every PV holding one of the import's identities. One found deleted above may
-        # have been brought back since by another registration; locked, it can't be again.
-        deleted: dict[tuple[str, str], Pv] = {}
-        revived: list[str] = []
-        for kind in IDENTITY_KINDS:
-            for address, pv in (
-                await self.pv_repo.lock_by_identity(kind, sorted(identities[kind]), owner=local_instance())
-            ).items():
-                if pv.deleted_at is None:
-                    revived.append(address)
-                else:
-                    deleted[(kind, address)] = pv
-        if revived:
-            raise PvAlreadyExists(f"Addresses already exist: {sorted(revived)[:10]}")
-        unrevivable = await self._unrevivable(list(deleted.values()))
-        if held := sorted(address for (_, address), pv in deleted.items() if pv.id in unrevivable):
-            raise PvAlreadyExists(f"Addresses already exist: {held[:10]}")
-
+        revive = await self._revivals(rows)
         tags_by_id = await self._load_import_tags(rows)
-        return await self._create_import_rows(rows, ids_by_slug, tags_by_id, revive=deleted)
+        return await self._create_import_rows(rows, ids_by_slug, tags_by_id, revive=revive)
 
     async def import_many(
         self, data_list: list[NewPVElementDTO], on_conflict: OnConflict, owner: str | None = None
@@ -618,6 +601,9 @@ class PvService:
         A row matches a registered PV by the same identity rule as ``create_many`` (see
         ``_identity``). Rows that match nothing are created exactly as ``create_many``
         creates them. Duplicate identities within the import are still a ``BadRequest``.
+        A deleted PV is never registered, so neither mode matches it: a row with its
+        identifying address is created by bringing it back (``_revivals``), or the import
+        is refused if the key couldn't write it.
 
         Every row is facility-gated as a new row before anything is looked up, exactly as
         in ``create_many``, so whether a refused row's address is registered never shows.
@@ -675,7 +661,8 @@ class PvService:
         OwnerMismatch
             If its facilities or tags belong to different owners.
         PvAlreadyExists
-            If a concurrent write registers one of the new rows' addresses first.
+            If a concurrent write registers one of the new rows' addresses first, or a
+            row's identity is a deleted PV the key couldn't write.
         """
         # The route validates this; the guard is for direct callers, since nothing
         # type-checks in CI.
@@ -697,8 +684,9 @@ class PvService:
                 for row in rows
                 if (row.kind, row.identity_address) in registered
             ]
+            revive = await self._revivals(to_create)
             tags_by_id = await self._load_import_tags(to_create)
-            created = await self._create_import_rows(to_create, ids_by_slug, tags_by_id)
+            created = await self._create_import_rows(to_create, ids_by_slug, tags_by_id, revive=revive)
             return PVImportResultDTO(created=created, updated=[], skipped=skipped, address_mismatches=[])
 
         matched: dict[tuple[str, str], Pv] = {}
@@ -730,6 +718,8 @@ class PvService:
         if unknown_tags:
             listed = _list_refused([(row, ", ".join(missing)) for row, missing in unknown_tags])
             raise BadRequest(f"Unknown tag IDs on rows that update an existing PV: {listed}")
+        # Among the checks: the lookup locks, and a locking read flushes what's pending.
+        revive = await self._revivals(to_create)
 
         # Every check has passed; from here on the import only writes.
         mismatches: list[PVAddressMismatchDTO] = []
@@ -746,7 +736,7 @@ class PvService:
                 if kind != row.kind and requested is not None and requested != stored:
                     mismatches.append(PVAddressMismatchDTO(row=row.row, kind=kind, requested=requested, stored=stored))
 
-        created = await self._create_import_rows(to_create, ids_by_slug, tags_by_id)
+        created = await self._create_import_rows(to_create, ids_by_slug, tags_by_id, revive=revive)
         updated_pvs = await self.pv_repo.update_many([pv for _, pv in to_update])
         updated = await self._to_dtos(updated_pvs, {pv.id: stored_ids.get(pv.id, set()) for pv in updated_pvs})
         return PVImportResultDTO(created=created, updated=updated, skipped=[], address_mismatches=mismatches)
@@ -908,6 +898,51 @@ class PvService:
         tags = await self.tag_repo.get_by_ids(list(tag_ids))
         _require_tags_owned_by(local_instance(), tags, "The imported PVs' tags")
         return {tag.id: tag for tag in tags}
+
+    async def _revivals(self, rows: list[_ImportRow]) -> dict[tuple[str, str], Pv]:
+        """The deleted PVs that ``rows``, about to be created, bring back, locked.
+
+        Every row an import creates goes through here, among its checks and before it
+        writes. A deleted PV is never registered, so neither ``skip`` nor ``update``
+        matches it: a row with its identifying address brings it back, with its id, as
+        ``create`` does, if the key could write it (``_unrevivable``).
+
+        Parameters
+        ----------
+        rows : list[_ImportRow]
+            The rows that match no registered PV.
+
+        Returns
+        -------
+        dict[tuple[str, str], Pv]
+            Each deleted PV to bring back, by ``(kind, identity_address)``, locked until the
+            transaction ends so no other registration brings it back too.
+
+        Raises
+        ------
+        PvAlreadyExists
+            When a row's identity is a deleted PV the key couldn't write, or a PV
+            registered since the import's own lookup. The message names those rows and
+            nothing about the PVs, such as their facilities or owner.
+        """
+        found: dict[tuple[str, str], Pv] = {}
+        for kind in IDENTITY_KINDS:
+            addresses = sorted({row.identity_address for row in rows if row.kind == kind})
+            for address, pv in (await self.pv_repo.lock_by_identity(kind, addresses, owner=local_instance())).items():
+                found[(kind, address)] = pv
+        deleted = {key: pv for key, pv in found.items() if pv.deleted_at is not None}
+        unrevivable = await self._unrevivable(list(deleted.values()))
+        held = [
+            row
+            for row in rows
+            if (pv := found.get((row.kind, row.identity_address))) is not None
+            and (pv.deleted_at is None or pv.id in unrevivable)
+        ]
+        if held:
+            raise PvAlreadyExists(
+                f"Addresses already exist: {_list_refused([(row, 'already exists') for row in held])}"
+            )
+        return deleted
 
     async def _create_import_rows(
         self,

@@ -152,6 +152,11 @@ async def import_pvs(
     registered. One transaction; see ``PvService.import_many``. Rows match only this
     instance's PVs; one import has one owner, as with ``/multi``, and ``owner`` accepts
     only this instance's name.
+
+    A deleted PV is never registered, so it is never skipped or updated. In either mode a
+    row with its identifying address brings it back, with its id, under ``created``; if
+    the key couldn't write that PV, the whole import is refused with 409
+    ``pv_already_exists``, naming the rows.
     """
     return await service.import_many(data, onConflict, owner)
 

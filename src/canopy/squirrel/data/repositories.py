@@ -541,7 +541,8 @@ class PvRepository(BaseRepository[Pv]):
         Returns
         -------
         dict[str, Pv]
-            Each PV, with its tags loaded, keyed by the address that identifies it.
+            Each PV, with its tags loaded, keyed by the address that identifies it; a live
+            PV over a deleted one where both hold an address.
         """
         if not addresses:
             return {}
@@ -551,9 +552,13 @@ class PvRepository(BaseRepository[Pv]):
             .where(self._identity_filter(kind, addresses), Pv.owner_instance == owner)
             .order_by(Pv.id)
         )
-        return {
-            getattr(pv, f"{kind}_address"): pv for pv in (await self.session.execute(self._locked(query))).scalars()
-        }
+        found: dict[str, Pv] = {}
+        for pv in (await self.session.execute(self._locked(query))).scalars():
+            # Readback and config identities aren't unique in the database: a live PV wins.
+            address = getattr(pv, f"{kind}_address")
+            if address not in found or (found[address].deleted_at is not None and pv.deleted_at is None):
+                found[address] = pv
+        return found
 
     async def soft_delete(self, pv_id: str) -> bool:
         """Mark a live PV deleted, keeping its tags and values; ``False`` when there is none."""
@@ -729,7 +734,7 @@ class PvRepository(BaseRepository[Pv]):
             result = await self.session.execute(
                 select(Pv)
                 .options(selectinload(Pv.tags).selectinload(Tag.group))
-                .where(*conditions, address_column.in_(batch), Pv.owner_instance == owner)
+                .where(*conditions, address_column.in_(batch), Pv.owner_instance == owner, Pv.deleted_at.is_(None))
                 .order_by(Pv.id)
             )
             for pv in result.scalars().all():
