@@ -111,9 +111,15 @@ def test_summary_stays_ok_and_quiet_when_the_env_later_names_a_broken_file(monke
     assert conversion.json()["scheme"]["id"] == "facility"
 
 
+def _scheme_free_service() -> ConversionService:
+    return ConversionService()
+
+
 def test_summary_of_a_scheme_free_service_is_ok():
     with TestClient(app) as client:
-        converter_app.dependency_overrides[get_conversion_service] = ConversionService
+        # A zero-argument provider: overriding with the class itself would make FastAPI read
+        # ConversionService.__init__ as a dependency (query params, a TypeAdapter for its annotations).
+        converter_app.dependency_overrides[get_conversion_service] = _scheme_free_service
         try:
             resp = client.get(SUMMARY, headers=READ_HEADERS)
         finally:
