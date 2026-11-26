@@ -5,6 +5,7 @@ keeps one subscription per arm and holds every arm's rows. The arms are one
 setting, keyed by arm name::
 
     CANOPY_ARMS__ARM1__PUBLISHER_DSN="postgresql://replicator:<secret>@<arm1-host>/canopy"
+    CANOPY_ARMS__ARM1__READER_DSN="postgresql://canopy_reader:<secret>@<arm1-host>/canopy"
     CANOPY_ARMS__ARM2__PUBLISHER_DSN="..."
 
 or as JSON, ``CANOPY_ARMS='{"arm1": {"publisher_dsn": "..."}}'``. An arm's name
@@ -42,7 +43,15 @@ class Arm(BaseModel):
         ),
     )
 
-    @field_validator("publisher_dsn")
+    reader_dsn: SecretStr | None = Field(
+        default=None,
+        description=(
+            "postgresql:// URI the head's `drift-check` uses to read this arm, as its read-only reader "
+            "role. Supply it from a secret, like the publisher DSN."
+        ),
+    )
+
+    @field_validator("publisher_dsn", "reader_dsn")
     @classmethod
     def _is_a_uri(cls, dsn: SecretStr | None) -> SecretStr | None:
         # The message never quotes the value, which holds a password.
