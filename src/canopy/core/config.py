@@ -119,9 +119,10 @@ class Settings(BaseSettings):
     # app that answers with the wrong registry. Empty counts as unset.
     api_keys_file: str | None = None
 
-    # Require a registry key on every route of the composed app except
-    # GET /health -- the routes that carry no key dependency of their own
-    # (/, the docs and OpenAPI pages, the per-module watchdogs) included.
+    # Require a registry key on every route of the composed app except the probes,
+    # GET /health and (on the database tier) GET /health/ready -- the routes that
+    # carry no key dependency of their own (/, the docs and OpenAPI pages, the
+    # per-module watchdogs) included.
     closed_meta: bool = False
 
     # Comma-separated names of the modules to mount (see ALL_MODULES); empty

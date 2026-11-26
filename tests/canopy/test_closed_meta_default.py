@@ -13,7 +13,7 @@ from tests.conftest import READ_HEADERS
 from canopy.core.config import ALL_MODULES
 from tests.canopy.test_closed_meta import _walk
 
-OPEN = ("GET", "/health")
+OPEN = {("GET", "/health"), ("GET", "/health/ready")}
 
 
 @pytest.fixture(scope="module")
@@ -36,7 +36,7 @@ def test_every_http_route_and_method_of_all_eleven_is_refused_without_a_key(clos
     client = TestClient(closed_app)
     answered = {}
     for kind, method, path in routes:
-        if kind == "http" and (method, path) != OPEN:
+        if kind == "http" and (method, path) not in OPEN:
             status = client.request(method, path).status_code
             if status != 401:
                 answered[f"{method} {path}"] = status
