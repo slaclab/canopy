@@ -2,7 +2,14 @@ from typing import Any, Literal
 from functools import lru_cache
 from collections.abc import Mapping, Iterable
 
-from pydantic import Field, BaseModel, ValidationInfo, ValidationError, field_validator
+from pydantic import (
+    Field,
+    BaseModel,
+    ValidationInfo,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsError, SettingsConfigDict
 
 INSTANCE_NAME_PATTERN = r"^[a-z0-9_]{1,48}$"
@@ -106,6 +113,13 @@ class Settings(BaseSettings):
         On a primary (an arm), trust ``X-Canopy-On-Behalf-Of`` from service keys, so
         writes a history head forwards are recorded under the user it sent them for.
         Off by default: the header is then refused from every key.
+    machine_access : {"read", "write"}
+        Whether this instance changes the machine: ``"write"`` lets it run Hare PV
+        writes and snapshot restores, through its own EPICS gateway; with ``"read"``
+        both are refused with ``machine_read_only``, and it only reads EPICS (a
+        capture). Unset (or blank) means ``"write"`` on a primary and ``"read"`` on a
+        mirror, so an arm keeps restoring and a history head never writes to the
+        machine unless told to.
     """
 
     model_config = SettingsConfigDict(
@@ -167,7 +181,7 @@ class Settings(BaseSettings):
     history_url: str | None = None
     window_days: int | None = Field(None, ge=1)
 
-    @field_validator("history_url", "window_days", "accept_forwarded_writes", mode="before")
+    @field_validator("history_url", "window_days", "accept_forwarded_writes", "machine_access", mode="before")
     @classmethod
     def _blank_is_unset(cls, value: object, info: ValidationInfo) -> object:
         """Read a blank value as unset rather than as ``""``, an unparseable int or bool."""
@@ -175,11 +189,19 @@ class Settings(BaseSettings):
 
     # Primary (arm) only: accept writes a history head forwards on a user's behalf.
     accept_forwarded_writes: bool = False
+    # Whether this instance writes to the machine (Hare PUT, restores); by role when unset.
+    machine_access: Literal["read", "write"] | None = None
+
+    @model_validator(mode="after")
+    def _machine_access_by_role(self) -> "Settings":
+        if self.machine_access is None:
+            self.machine_access = "write" if self.role == "primary" else "read"
+        return self
 
     @property
     def machine_writes(self) -> bool:
-        """Whether this instance may change the machine (a Hare PV write, a restore): a primary only."""
-        return self.role == "primary"
+        """Whether this instance may change the machine (``CANOPY_MACHINE_ACCESS=write``)."""
+        return self.machine_access == "write"
 
 
 def blank_keeps_default(model: type[BaseModel], value: object, info: ValidationInfo) -> object:

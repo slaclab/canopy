@@ -534,7 +534,8 @@ def require_write_access(key: APIKeyDep) -> APIKey:
 
 
 MACHINE_READ_ONLY_DETAIL = (
-    "This Canopy instance doesn't write to the machine (CANOPY_ROLE=mirror); make machine changes where it is allowed"
+    "This Canopy instance doesn't write to the machine (CANOPY_MACHINE_ACCESS=read); "
+    "make machine changes where it is allowed"
 )
 
 
@@ -544,7 +545,7 @@ def require_machine_access() -> None:
     Raises
     ------
     MachineReadOnly
-        With ``CANOPY_ROLE=mirror``.
+        With ``CANOPY_MACHINE_ACCESS=read``.
     """
     if not get_settings().machine_writes:
         raise MachineReadOnly(MACHINE_READ_ONLY_DETAIL)
@@ -553,9 +554,9 @@ def require_machine_access() -> None:
 def require_machine_write_access(key: APIKeyDep) -> APIKey:
     """Gate for a write to the machine made by this process (a Hare PV write).
 
-    Refused with ``machine_read_only`` on a mirror. That comes after the key resolves
-    (a bad token is still a 401) but before its scope, so a caller learns that no key
-    would succeed here.
+    Refused with ``machine_read_only`` without ``CANOPY_MACHINE_ACCESS=write``, in any
+    role. That comes after the key resolves (a bad token is still a 401) but before
+    its scope, so a caller learns that no key would succeed here.
     """
     require_machine_access()
     if not key.write:

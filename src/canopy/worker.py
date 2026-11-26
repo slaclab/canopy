@@ -84,7 +84,7 @@ async def on_shutdown(ctx: dict) -> None:
 
 # Task functions registered with Arq. Each module appends its tasks here.
 FUNCTIONS = [ping, convert_batch, create_snapshot_task, restore_snapshot_task]
-# Tasks that write to the machine, registered only on a primary.
+# Tasks that write to the machine, registered only with CANOPY_MACHINE_ACCESS=write.
 MACHINE_FUNCTIONS = [restore_snapshot_task]
 
 
@@ -93,8 +93,8 @@ def worker_functions(settings: Settings) -> list:
 
     A capture only reads EPICS, so every worker registers it. A restore that reaches a
     queue whose worker has no machine access fails as an unknown task rather than run;
-    the API refuses it before it is queued. That is also why each instance needs its
-    own Redis (or database number).
+    the API refuses or forwards it before it is queued. That is also why each instance
+    needs its own Redis (or database number).
     """
     if settings.machine_writes:
         return FUNCTIONS

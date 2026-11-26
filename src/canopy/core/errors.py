@@ -344,7 +344,7 @@ class MachineReadOnly(CanopyError):
     """A machine write (a PV write, a restore) refused by an instance without machine access.
 
     The instance takes other writes, just not ones that change the machine
-    (``CANOPY_ROLE=mirror``).
+    (``CANOPY_MACHINE_ACCESS=read``).
     """
 
     status_code = 403

@@ -51,7 +51,7 @@ async def put_pv(
     or timeout raises `PVWriteFailed` (-> 502). ``binding``, ``origin`` and
     ``confirmed`` are passed on to the connector, which may use or ignore them.
 
-    Runs only on a primary; a mirror answers ``machine_read_only``.
+    Runs only with ``CANOPY_MACHINE_ACCESS=write``, the default on a primary.
     """
     origin = body.origin.model_dump() if body.origin is not None else None
     await broker.put(

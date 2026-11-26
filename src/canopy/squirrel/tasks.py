@@ -14,12 +14,16 @@ Task results are opaque refs the Jobs module returns verbatim to pollers.
 from __future__ import annotations
 
 import logging
+from uuid import uuid4
 
 from arq import Retry
 
 from canopy.core.db import session_scope
+from canopy.core.errors import PrimaryUnavailable
 from canopy.jobs.gateway import report_progress
 from canopy.squirrel.config import get_squirrel_config
+from canopy.squirrel.capture import deliver_capture
+from canopy.core.forwarding.client import Caller, ArmRefused
 from canopy.squirrel.pv_cache.reader import PVCacheReader
 from canopy.squirrel.schemas.snapshot import NewSnapshotDTO, RestoreRequestDTO
 from canopy.squirrel.adapters.epics_io import EpicsIO
@@ -65,24 +69,35 @@ async def create_snapshot_task(
     created_by: str | None = None,
     facility_id: str | None = None,
     use_cache: bool = False,
+    arm: str | None = None,
+    caller: dict | None = None,
 ) -> dict:
-    """Read the facility's PVs (or every PV) from EPICS and persist a snapshot. Returns
-    ``{"type":"snapshot","id":...}``.
+    """Read the facility's PVs (or every PV of the snapshot's owner) from EPICS and save a
+    snapshot. Returns ``{"type":"snapshot","id":...}``.
 
     The facility arrives as a resolved **id**, not a slug: the route had to resolve it to
     check the caller's facility grant before enqueueing, and re-resolving here would
     re-read a slug that may have changed in the interim.
 
+    With ``arm`` (a history head's capture for that arm's facility), the arm's PVs are
+    read here and the snapshot is saved on the arm, as ``caller`` (a ``Caller`` as a
+    dict), under the id and time it got here (``canopy.squirrel.capture``). The result
+    then names the arm too.
+
     With ``use_cache``, values the PV cache can vouch for come from it and the rest
     are read live from EPICS.
     """
-    logger.info("create_snapshot_task: job_id=%s title=%r use_cache=%s", ctx.get("job_id"), title, use_cache)
+    logger.info(
+        "create_snapshot_task: job_id=%s title=%r use_cache=%s arm=%s", ctx.get("job_id"), title, use_cache, arm
+    )
     try:
         epics_io = _build_epics_io(ctx)
         pv_cache = None
         if use_cache:
             cache_cfg = get_squirrel_config().pv_cache
             pv_cache = PVCacheReader(ctx["redis"], heartbeat_max_age_s=cache_cfg.heartbeat_max_age_s)
+        if arm is not None:
+            return await _capture_for_arm(ctx, epics_io, pv_cache, arm, caller or {}, title, description, facility_id)
         async with session_scope() as session:
             service = SnapshotService(session, epics_io)
             summary = await service.create_snapshot(
@@ -94,10 +109,42 @@ async def create_snapshot_task(
             )
             await session.commit()
         return {"type": "snapshot", "id": summary.id}
+    except (PrimaryUnavailable, ArmRefused):
+        # Not retried here: the arm refused the bundle, or nothing reached it. The job
+        # fails with the reason, and the head's worker never saves the arm's snapshot.
+        logger.exception("create_snapshot_task failed: job_id=%s", ctx.get("job_id"))
+        raise
     except Exception as exc:
         logger.exception("create_snapshot_task failed: job_id=%s", ctx.get("job_id"))
         _maybe_retry(exc)
         raise
+
+
+async def _capture_for_arm(
+    ctx: dict,
+    epics_io: EpicsIO,
+    pv_cache: PVCacheReader | None,
+    arm: str,
+    caller: dict,
+    title: str,
+    description: str | None,
+    facility_id: str | None,
+) -> dict:
+    """Capture the arm's PVs here, then save the snapshot on the arm (``deliver_capture``)."""
+    progress = _progress_sink(ctx)
+    async with session_scope() as session:  # read-only: the snapshot is the arm's to save
+        service = SnapshotService(session, epics_io)
+        captured = await service.capture_values(facility_id, owner=arm, progress_callback=progress, pv_cache=pv_cache)
+        bundle = await service.bundle_captured(
+            captured,
+            snapshot_id=str(uuid4()),
+            title=title,
+            description=description,
+            created_by=caller.get("on_behalf_of"),
+            facility_id=facility_id,
+        )
+    await progress(captured.total_pvs, captured.total_pvs, f"Saving {len(bundle.values):,} PV values on {arm}...")
+    return await deliver_capture(arm, bundle, Caller(**caller))
 
 
 async def restore_snapshot_task(
