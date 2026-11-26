@@ -101,8 +101,9 @@ a role that exists after the merge.
 If the file cannot be read, is not valid JSON, fails the format, has a dangling or
 cyclic alias, imports onto a role that does not exist, or leaves a role without a
 light or dark value, the **whole file is rejected** and `canopy-default` is served
-instead. Every problem found is listed in `meta.errors`, each process logs one
-`ERROR` line, the converter's `GET /converter/v1/health/summary` reports
+instead. Every problem found is listed in `meta.errors`, each process (canopy-api
+and canopy-worker alike) logs one `ERROR` line when it starts, the converter's
+`GET /converter/v1/health/summary` reports
 `color-scheme` in `degraded`, and every conversion carries one warning naming the
 first error. [Check the file](#checking-a-scheme-file) before deploying it.
 
@@ -130,8 +131,9 @@ Point that server ([canopy-mcp](https://github.com/slaclab/canopy-mcp)) at the
 ## Changing a scheme: restart
 
 !!! warning "There is no live reload"
-    Each process reads and flattens the scheme file **once, at startup**, and
-    keeps it for the life of the process. After you edit the file:
+    Each process (canopy-api, and canopy-worker for batch conversions) reads and
+    flattens the scheme file **once, at startup**, and keeps it for the life of
+    the process. After you edit the file:
 
     1. [Check it](#checking-a-scheme-file).
     2. Restart **canopy-api** and the **canopy-worker** (batch conversions run

@@ -8,7 +8,9 @@ Arq job result) so a thousand-screen folder never lands as one giant blob.
 
 The worker process does not run ``converter_lifespan`` (that binds the gateway
 service in the API process), so this module builds and memoizes its own
-``ConversionService`` from config.
+``ConversionService`` from config; the worker's ``on_startup`` builds it
+(:func:`warm_service`), so the color scheme is flattened, and a rejected file
+logged, when ``canopy-worker`` starts.
 """
 
 from __future__ import annotations
@@ -65,6 +67,20 @@ def _get_service() -> ConversionService:
             search_paths=config.search_paths,
         )
     return _service
+
+
+def warm_service() -> None:
+    """Build the worker's batch service now rather than at the first batch job.
+
+    Called from the worker's ``on_startup``, so a rejected color scheme file is
+    logged when ``canopy-worker`` starts, as in canopy-api. A service that cannot
+    be built is logged and left unbuilt: the worker still runs its other tasks,
+    and each batch job tries again and fails with the error.
+    """
+    try:
+        _get_service()
+    except Exception:  # noqa: BLE001 - any config/registry failure; batch jobs raise it again
+        logger.exception("converter batch service could not be built at startup; batch conversions will fail")
 
 
 def input_key(token: str) -> str:

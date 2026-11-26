@@ -20,7 +20,7 @@ from canopy.core.logging import configure_logging
 from canopy.epics.config import get_epics_config
 from canopy.epics.gateway import build_connector
 from canopy.squirrel.tasks import create_snapshot_task, restore_snapshot_task
-from canopy.converter.tasks import convert_batch
+from canopy.converter.tasks import warm_service, convert_batch
 from canopy.squirrel.config import get_squirrel_config
 from canopy.squirrel.pv_cache import PVCacheMonitor
 from canopy.squirrel.restore_hooks import get_restore_hooks, publish_worker_status
@@ -40,7 +40,8 @@ async def on_startup(ctx: dict) -> None:
     Also builds the restore hooks, so configuration warnings are logged at startup
     rather than at the first restore, and publishes which ones this process resolved,
     since restores run here and not in the API; ``GET /squirrel/v1/health/restore-hooks``
-    reads it back.
+    reads it back. Builds the converter's batch service for the same reason: its
+    color scheme is flattened, and a rejected file logged, at startup.
 
     Parameters
     ----------
@@ -56,6 +57,7 @@ async def on_startup(ctx: dict) -> None:
     ctx["epics"] = connector
     get_restore_hooks()
     await publish_worker_status(ctx["redis"])
+    warm_service()
     cache_cfg = get_squirrel_config().pv_cache
     if cache_cfg.enabled:
         # Every worker competes for the cache's leader lease; one monitors, the rest stand by.
