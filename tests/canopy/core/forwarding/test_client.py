@@ -38,9 +38,10 @@ def test_on_behalf_of_names_the_key_and_instance(head):
 
 
 def test_a_caller_is_plain_data(head):
-    key = APIKey(read=True, write=True, modules=frozenset(), facilities=frozenset({"b", "a"}), name="console")
+    a, b = "00000000-0000-4000-8000-00000000000a", "00000000-0000-4000-8000-00000000000b"
+    key = APIKey(read=True, write=True, modules=frozenset(), facility_ids=frozenset({b, a}), name="console")
 
-    assert Caller.of(key) == Caller(on_behalf_of="console@head", facilities=["a", "b"])
+    assert Caller.of(key) == Caller(on_behalf_of="console@head", facility_ids=[a, b])
 
 
 def test_only_an_arm_with_both_forward_settings_is_a_target(head):

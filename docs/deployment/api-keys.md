@@ -192,11 +192,12 @@ A `?facility=` naming a facility that doesn't exist is a `404 facility_not_found
 with the key's own grant, so an unrestricted key gets the same 404 a restricted
 one does.
 
-The grant itself is defined and validated here; nothing yet *consults* it. A
-data-serving module (Squirrel) reading and enforcing this scope on its own
-reads and writes is separate, not-yet-merged work — until it lands, a
-facility-scoped key authenticates and passes module/read/write checks
-normally, but every module ignores its facility grant.
+Squirrel enforces the grant on its PV and snapshot reads and writes, as the
+rest of this section describes. Key management applies it too: an `admin` key
+can mint or deactivate only keys whose grant falls within its own, and only an
+`admin` key granted every facility may change the facility hierarchy. No other
+module consults it, so a facility-scoped key reaches the other modules it's
+scoped to as any key does.
 
 Unlike module scope, an **empty** facility list is valid and meaningful — it's
 the default for a newly minted key, and means "provisioned but not yet
@@ -237,6 +238,15 @@ authenticate normally and then see and write nothing, with no error to point at 
 mistake. Define the facility first (see
 [Defining facilities](docker.md#defining-facilities)). `*` names no slug, so it
 needs nothing defined.
+
+A grant is bound when the key is minted: the key records the ids of the facilities
+its slugs name then, and every check resolves those ids. `GET /v1/api-keys` still
+shows the slugs it was minted with. Descendants come from the hierarchy at request
+time, so a grant on a parent covers a child created later. A facility created later
+under the slug of one that was deleted is a different facility, and the key doesn't
+reach it. On a single instance that can't happen to an active key (see below); on a
+history head it can, since an arm deletes its facilities without seeing the head's
+keys (see [Instance roles](history/index.md#instance-roles)).
 
 For the same reason, a facility that any *active* key grants cannot be deleted:
 `DELETE /v1/facilities/{slug}` is refused with `facility_in_use` until the grants

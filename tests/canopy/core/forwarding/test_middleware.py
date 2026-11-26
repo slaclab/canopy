@@ -23,8 +23,14 @@ from canopy.core.forwarding import owners, middleware
 
 from .conftest import ARM1, ARM1_SERVICE_KEY
 
+FACILITY_A = "00000000-0000-4000-8000-00000000000a"
 WRITER = APIKey(
-    token="writer", read=True, write=True, modules=frozenset({WILDCARD}), facilities=frozenset({"a"}), name="console"
+    token="writer",
+    read=True,
+    write=True,
+    modules=frozenset({WILDCARD}),
+    facility_ids=frozenset({FACILITY_A}),
+    name="console",
 )
 READER = APIKey(token="reader", read=True, write=False, modules=frozenset({WILDCARD}), name="viewer")
 MAGPIE_ONLY = APIKey(token="magpie", read=True, write=True, modules=frozenset({"magpie"}), name="configs")
@@ -36,7 +42,7 @@ HIERARCHY = APIKey(
     write=True,
     admin=True,
     modules=frozenset({WILDCARD}),
-    facilities=frozenset({WILDCARD}),
+    facility_ids=frozenset({WILDCARD}),
     name="ops-all",
 )
 SNAPSHOT_ID = "6f1c2c1e-0d4b-4c43-9a55-2f0d7a3c9b10"
@@ -120,7 +126,7 @@ def test_an_arms_write_goes_there_as_the_heads_service_key(client, owner, httpx_
     sent = httpx_mock.get_request()
     assert sent.headers["X-API-Key"] == ARM1_SERVICE_KEY
     assert sent.headers["X-Canopy-On-Behalf-Of"] == "console@head"
-    assert json.loads(sent.headers["X-Canopy-On-Behalf-Of-Facilities"]) == ["a"]
+    assert json.loads(sent.headers["X-Canopy-On-Behalf-Of-Facilities"]) == [FACILITY_A]
 
 
 def test_the_lookup_gets_the_path_parameters_body_and_owner_param(client, owner, httpx_mock: HTTPXMock):

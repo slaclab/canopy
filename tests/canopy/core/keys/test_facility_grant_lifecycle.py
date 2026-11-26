@@ -1,15 +1,22 @@
-"""A facility a key still grants cannot be deleted out from under it.
+"""A key's grant stays bound to the facilities it was minted with.
 
-The regression being pinned is the silent one: a grant stores a *slug*, so deleting
-the facility leaves the key authenticating normally while its scope resolves to
-``set()`` — a deny-all credential that looks healthy, diagnosed as an outage rather
-than as a mis-provisioning. These tests live under ``keys`` rather than
-``facilities`` because they need both tables, and this conftest builds the whole
-``core`` schema.
+A facility a key still grants cannot be deleted out from under it. The regression
+being pinned is the silent one: deleting the facility would leave the key
+authenticating normally while its scope resolves to ``set()`` — a deny-all credential
+that looks healthy, diagnosed as an outage rather than as a mis-provisioning.
+
+A history head holds its arms' facilities but not their keys, so an arm's delete
+reaches the head with no such check, as a plain ``DELETE`` that replication applies.
+The tests here do the same. The key then loses that facility, and a facility created
+later under the same slug, by any owner, doesn't fall under it: a grant holds ids.
+
+These tests live under ``keys`` rather than ``facilities`` because they need both
+tables, and this conftest builds the whole ``core`` schema.
 """
 
 import pytest
 from fastapi import FastAPI
+from sqlalchemy import delete, select
 from fastapi.testclient import TestClient
 
 from canopy.core import security
@@ -21,6 +28,7 @@ from canopy.core.security import APIKey
 from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.facilities import service as facilities_service
 from canopy.core.keys.service import ApiKeyService
+from canopy.core.keys.registry import DbKeyRegistry
 from canopy.core.facilities.models import Facility
 from canopy.core.facilities.routes import router as facilities_router
 
@@ -65,7 +73,7 @@ def admin_client(session_maker) -> TestClient:
                     write=True,
                     admin=True,
                     modules=frozenset({WILDCARD}),
-                    facilities=frozenset({WILDCARD}),
+                    facility_ids=frozenset({WILDCARD}),
                     name="admin",
                 )
             return None
@@ -92,7 +100,7 @@ async def test_granted_facility_cannot_be_deleted_and_the_key_keeps_its_scope(
 
     # The consequence that matters: the grant still resolves to a real facility, so
     # the key can still reach its data.
-    scope = await facilities_gateway.resolve_key_facility_scope(frozenset(key.facilities))
+    scope = await facilities_gateway.resolve_key_facility_scope((await DbKeyRegistry().get(key.token)).facility_ids)
     assert len(scope) == 1
 
 
@@ -121,3 +129,54 @@ async def test_facility_no_key_grants_deletes_cleanly(
     await session.commit()
 
     assert admin_client.delete("/v1/facilities/facet", headers=ADMIN_HEADERS).status_code == 200
+
+
+async def _scope_of(token: str) -> set[str] | None:
+    """What every facility gate resolves the key with ``token`` to, as a request would."""
+    key = await DbKeyRegistry().get(token)
+    return await facilities_gateway.resolve_key_facility_scope(key.facility_ids)
+
+
+async def _delete_as_replicated(session, slug: str) -> str:
+    """Delete ``slug``'s facility the way a head applies its arm's delete: no in-use check."""
+    facility_id = await session.scalar(select(Facility.id).where(Facility.slug == slug))
+    await session.execute(delete(Facility).where(Facility.id == facility_id))
+    await session.commit()
+    return facility_id
+
+
+async def test_a_key_whose_facility_is_deleted_loses_it(session, session_maker, seeded_facilities):
+    key = await ApiKeyService(session).create_key("trace", read=True, modules=["*"], facilities=["lcls-sc", "lcls"])
+    await session.commit()
+    lcls = await session.scalar(select(Facility.id).where(Facility.slug == "lcls"))
+
+    await _delete_as_replicated(session, "lcls-sc")
+
+    assert await _scope_of(key.token) == {lcls}
+
+
+async def test_a_facility_recreated_under_a_granted_slug_isnt_granted(session, session_maker, seeded_facilities):
+    key = await ApiKeyService(session).create_key("trace", read=True, modules=["*"], facilities=["lcls-sc"])
+    await session.commit()
+    old = await _delete_as_replicated(session, "lcls-sc")
+
+    recreated = Facility(slug="lcls-sc", name="Another SC")
+    session.add(recreated)
+    await session.commit()
+
+    assert recreated.id != old
+    assert await _scope_of(key.token) == set()
+    # The key still shows the slug it was minted with.
+    assert (await ApiKeyService(session).get_by_id(key.id)).facilities == ["lcls-sc"]
+
+
+async def test_a_parent_grant_covers_a_child_created_later(session, session_maker, seeded_facilities):
+    key = await ApiKeyService(session).create_key("trace", read=True, modules=["*"], facilities=["lcls"])
+    await session.commit()
+    lcls = await session.scalar(select(Facility.id).where(Facility.slug == "lcls"))
+
+    child = Facility(slug="lcls-nc", name="LCLS NC", parent_id=lcls)
+    session.add(child)
+    await session.commit()
+
+    assert child.id in await _scope_of(key.token)

@@ -145,7 +145,7 @@ async def test_delete_blocked_by_in_use_checker(session, session_maker):
     facility = await _seed_facility(session, "in-use")
     await session.commit()
 
-    async def always_in_use(facility_id: str, slug: str) -> bool:
+    async def always_in_use(facility_id: str) -> bool:
         return facility_id == facility.id
 
     # The conftest's autouse `_reset_in_use_checkers` restores the registry after.

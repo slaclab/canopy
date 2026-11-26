@@ -110,7 +110,7 @@ async def caller_reaches(route: WriteRoute, params: dict[str, str], key: APIKey)
         row_id = str(UUID(params[rule.param]))
     except ValueError:
         return True
-    scope = await facilities_gateway.resolve_key_facility_scope(key.facilities)
+    scope = await facilities_gateway.resolve_key_facility_scope(key.facility_ids)
     if scope is None:
         return True
     where = rule.facilities

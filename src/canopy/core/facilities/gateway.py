@@ -30,15 +30,15 @@ async def descendant_ids(facility_id: str) -> set[str]:
         return await FacilityService(session).descendant_ids(facility_id)
 
 
-async def resolve_key_facility_scope(slugs: frozenset[str]) -> set[str] | None:
-    """A credential's granted slugs -> union of their descendant id sets, or ``None``
-    if unrestricted. See ``FacilityService.resolve_key_facility_scope``.
+async def resolve_key_facility_scope(facility_ids: frozenset[str]) -> set[str] | None:
+    """A credential's granted facility ids -> union of their descendant id sets, or
+    ``None`` if unrestricted. See ``FacilityService.resolve_key_facility_scope``.
 
     Resolve this **once per request** (a service-factory dependency is the natural
     place) rather than per service call — every call here opens its own session.
     """
     async with session_scope() as session:
-        return await FacilityService(session).resolve_key_facility_scope(slugs)
+        return await FacilityService(session).resolve_key_facility_scope(facility_ids)
 
 
 async def resolve_effective_scope(slug: str | None, key_scope: set[str] | None) -> set[str] | None:
@@ -70,17 +70,11 @@ async def id_by_slug(slug: str) -> str | None:
         return await FacilityService(session).id_by_slug(slug)
 
 
-async def known_slugs(slugs: list[str]) -> set[str]:
-    """The subset of ``slugs`` that exist. Used to reject unknown facilities at the
-    point a reference to one is *written* (e.g. minting an API key's grant)."""
-    async with session_scope() as session:
-        return await FacilityService(session).known_slugs(slugs)
-
-
 async def ids_by_slug(slugs: list[str] | set[str]) -> dict[str, str]:
     """``{slug: id}`` for the subset of ``slugs`` that exist, in one round trip. For a
-    caller resolving many slugs at once (a bulk PV import naming several facilities)
-    instead of one ``get_by_slug`` call per slug."""
+    caller resolving many slugs at once (a bulk PV import naming several facilities, or
+    an API key's grant at mint) instead of one ``get_by_slug`` call per slug. An unknown
+    slug is absent, so the caller can reject every one at once."""
     async with session_scope() as session:
         return await FacilityService(session).ids_by_slug(slugs)
 
@@ -99,12 +93,11 @@ async def slugs_by_id(ids: list[str] | set[str]) -> dict[str, str]:
         return await FacilityService(session).slugs_by_id(ids)
 
 
-def register_in_use_checker(checker: Callable[[str, str], Awaitable[bool]], what: str) -> None:
+def register_in_use_checker(checker: Callable[[str], Awaitable[bool]], what: str) -> None:
     """Register an "is this facility still referenced by my data?" check, consulted by
     ``FacilityService.delete``.
 
-    The checker receives ``(facility_id, slug)`` — module data references a facility by
-    id, a key grant by slug. ``what`` names what to go unassign, e.g. ``"PVs or
-    snapshots"``.
+    The checker receives the facility's id: module data and key grants both reference a
+    facility by id. ``what`` names what to go unassign, e.g. ``"PVs or snapshots"``.
     """
     _register_in_use_checker(checker, what)

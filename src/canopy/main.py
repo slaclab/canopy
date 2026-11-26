@@ -206,19 +206,19 @@ class _ClosedMeta:
             await websocket.close(code=close_code, reason=f"{code}: {detail}")
 
 
-async def _facility_granted_to_key(facility_id: str, slug: str) -> bool:
-    """Is any active API key's facility grant still naming this facility?
+async def _facility_granted_to_key(facility_id: str) -> bool:
+    """Does any active API key still grant this facility?
 
     Registered from here, not from ``core.keys``, to keep ``core.facilities`` free of
     imports out of ``core.keys`` — the reverse edge already exists, since
-    ``keys.service`` validates grants through the facilities gateway. Grants store
-    slugs, so ``facility_id`` is unused. Imported here: it needs the database tier.
+    ``keys.service`` validates grants through the facilities gateway. Imported here:
+    it needs the database tier.
     """
     from canopy.core.db import session_scope
     from canopy.core.keys.repositories import ApiKeyRepository
 
     async with session_scope() as session:
-        return await ApiKeyRepository(session).count_granting(slug) > 0
+        return await ApiKeyRepository(session).count_granting(facility_id) > 0
 
 
 def build_app(modules: Iterable[str] | str, *, closed_meta: bool | None = None) -> FastAPI:

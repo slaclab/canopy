@@ -97,13 +97,16 @@ its users read keys only. `GET /v1/instance` reports the role, the instance's na
 the Alembic head shipped in the image (which the deploy check compares), and on a head
 each arm with its subscription's state and whether the head forwards to it.
 
-**API keys and facilities.** Each instance's API keys are its own, and a key's
-facility grants are slugs. An arm refuses to delete a facility its own rows or keys
+**API keys and facilities.** Each instance's API keys are its own. A key is granted
+facilities by slug when it's minted, and holds those facilities' ids, which are the
+same on the head and its arms. An arm refuses to delete a facility its own rows or keys
 still use, and no other instance's rows can use it (a facility's rows share its
 owner). What it can't see is the head's keys. A facility deleted on its arm is deleted
 on the head too, and a head key that granted it silently stops reaching that
-facility's data (a slug that no longer exists grants nothing). Check the head's keys
-before deleting a facility on an arm, and re-grant them afterwards.
+facility's data. A facility created later under the same slug, by that arm or another,
+is a different facility, and the old key doesn't reach it. Check the head's keys
+before deleting a facility on an arm, and mint new keys afterwards for any that should
+reach what replaces it.
 
 ### Database roles
 

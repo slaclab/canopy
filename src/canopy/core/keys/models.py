@@ -10,6 +10,7 @@ from datetime import datetime
 
 from sqlalchemy import ARRAY, String, Boolean, DateTime, text
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.dialects.postgresql import UUID
 
 from canopy.core.db import Base, UUIDMixin, TimestampMixin
 from canopy.core.modules import WILDCARD
@@ -56,12 +57,27 @@ class ApiKey(UUIDMixin, TimestampMixin, Base):
         default=lambda: [WILDCARD],
         server_default=text(f"'{{{WILDCARD}}}'::text[]"),
     )
-    # Which facilities this key's data access is scoped to. Unlike `modules`, empty is
-    # a valid, meaningful state — "provisioned but not yet assigned to a facility" —
-    # so the default is empty, not {WILDCARD}. "*" is an explicit "every facility".
+    # Which facilities this key's data access is scoped to, as the slugs it was minted
+    # with: what `/v1/api-keys` shows. Unlike `modules`, empty is a valid, meaningful
+    # state — "provisioned but not yet assigned to a facility" — so the default is
+    # empty, not {WILDCARD}. "*" is an explicit "every facility".
     facilities: Mapped[list[str]] = mapped_column(
         ARRAY(String),
         nullable=False,
         default=list,
         server_default=text("'{}'::text[]"),
     )
+    # The ids of the facilities `facilities` named at mint, which every check resolves.
+    # A facility deleted later matches nothing, and one created later under the same
+    # slug has a new id, so no key reaches it. Empty for the wildcard.
+    facility_ids: Mapped[list[str]] = mapped_column(
+        ARRAY(UUID(as_uuid=False)),
+        nullable=False,
+        default=list,
+        server_default=text("'{}'::uuid[]"),
+    )
+
+    @property
+    def facility_grant(self) -> frozenset[str]:
+        """The grant every check resolves: the facility ids, or ``{"*"}`` for every facility."""
+        return frozenset({WILDCARD}) if WILDCARD in self.facilities else frozenset(self.facility_ids)

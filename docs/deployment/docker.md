@@ -80,9 +80,10 @@ trailing, or doubled; `LCLS` is rejected rather than silently lowercased. A
 handful of slugs (`snapshots`, `tags`, `pv-browser`, `api-keys`, `meta-pvs`,
 `comparison`, `snapshot-details`) are reserved, since they collide with
 react-squirrel's own page routes. A slug is **immutable** once created — it's
-what `?facility=` filters and API key grants reference — so correcting one
-means deleting and recreating, which is refused while the facility has
-children or while any PV, snapshot, or active key grant still references it.
+what `?facility=` filters reference, and what an API key is granted by at mint
+— so correcting one means deleting and recreating, which is refused while the
+facility has children or while any PV, snapshot, or active key grant still
+references it.
 
 An `admin` key can also manage facilities over HTTP: `POST /v1/facilities`,
 `PUT /v1/facilities/{slug}`, `DELETE /v1/facilities/{slug}`. These routes

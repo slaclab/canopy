@@ -12,6 +12,7 @@ from sqlalchemy.exc import OperationalError
 
 from canopy.core.errors import ApiKeyNotFound
 from canopy.core.modules import WILDCARD
+from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.keys.models import ApiKey
 from canopy.core.keys.tokens import hash_token
 from canopy.core.keys.service import ApiKeyService
@@ -65,13 +66,24 @@ class TestMintAndResolve:
         assert resolved is not None
         assert resolved.modules == frozenset({"*"})
 
-    async def test_scoped_key_resolves_with_its_facilities(self, session, session_maker, seeded_facilities):
+    async def test_scoped_key_resolves_with_its_facilities_ids(self, session, session_maker, seeded_facilities):
         created = await mint(session, "trace", read=True, facilities=["lcls", "lcls-sc"])
 
         resolved = await DbKeyRegistry().get(created.token)
 
+        ids = await facilities_gateway.ids_by_slug(["lcls", "lcls-sc"])
         assert resolved is not None
-        assert resolved.facilities == frozenset({"lcls", "lcls-sc"})
+        assert resolved.facility_ids == frozenset(ids.values())
+        assert created.facilities == ["lcls", "lcls-sc"]  # shown as minted
+
+    async def test_wildcard_facility_key_resolves_with_the_wildcard(self, session, session_maker):
+        created = await mint(session, "trace", read=True, facilities=[WILDCARD])
+
+        resolved = await DbKeyRegistry().get(created.token)
+
+        assert resolved is not None
+        assert resolved.facility_ids == frozenset({WILDCARD})
+        assert resolved.unrestricted_facilities
 
     async def test_unscoped_key_resolves_with_no_facilities(self, session, session_maker):
         created = await mint(session, "trace", read=True)
@@ -79,7 +91,7 @@ class TestMintAndResolve:
         resolved = await DbKeyRegistry().get(created.token)
 
         assert resolved is not None
-        assert resolved.facilities == frozenset()
+        assert resolved.facility_ids == frozenset()
 
     async def test_unknown_token_resolves_to_none(self, session, session_maker):
         await mint(session)

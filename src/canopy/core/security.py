@@ -1,6 +1,7 @@
 import json
 import logging
 import importlib.util
+from uuid import UUID
 from typing import Protocol, Annotated
 from pathlib import Path
 from dataclasses import field, dataclass
@@ -52,6 +53,11 @@ class APIKey:
     `is_service` marks a key held by another Canopy instance (a history head's
     key on one of its arms): only such a key may name the caller it acts for in
     ``X-Canopy-On-Behalf-Of``. Only database keys can be service keys.
+
+    `facility_ids` is the facility grant: the ids of the facilities the key was
+    minted with, or ``{"*"}`` for every facility. Ids, not slugs, so the grant
+    stays bound to those facilities: one created later under a granted slug, here
+    or on any arm a head holds, has a new id.
     """
 
     read: bool
@@ -62,7 +68,7 @@ class APIKey:
     name: str = "unknown"
     id: str | None = None
     token: str = field(default="", repr=False)
-    facilities: frozenset[str] = frozenset()
+    facility_ids: frozenset[str] = frozenset()
 
     def allows_module(self, module: str) -> bool:
         return module == JOBS or WILDCARD in self.modules or module in self.modules
@@ -71,13 +77,12 @@ class APIKey:
     def unrestricted_facilities(self) -> bool:
         """Whether this key may reach every facility's data.
 
-        There is no ``allows_facility(id)`` counterpart to ``allows_module``:
-        ``facilities`` holds slugs, rows carry ids, and a grant on a parent covers its
-        descendants, so the check needs hierarchy expansion against the database.
-        That resolution lives in ``core.facilities.gateway``; the per-row check lives
-        in the module owning the row.
+        There is no ``allows_facility(id)`` counterpart to ``allows_module``: a grant
+        on a parent covers its descendants, so the check needs hierarchy expansion
+        against the database. That resolution lives in ``core.facilities.gateway``;
+        the per-row check lives in the module owning the row.
         """
-        return WILDCARD in self.facilities
+        return WILDCARD in self.facility_ids
 
 
 class KeyRegistry(Protocol):
@@ -199,7 +204,7 @@ class EnvKeyRegistry(_DictRegistry):
                 name=f"env:{position}",
                 modules=known_modules,
                 # Every facility, unconditionally — see the class docstring.
-                facilities=frozenset({WILDCARD}),
+                facility_ids=frozenset({WILDCARD}),
             )
         if self._keys:
             logger.info(
@@ -311,7 +316,7 @@ def load_keys_file(path: str | Path) -> FileKeyRegistry:
             name=f"file:{number}",
             token=token,
             # Every facility, as for an env key: the static tier has no facility syntax.
-            facilities=frozenset({WILDCARD}),
+            facility_ids=frozenset({WILDCARD}),
         )
     logger.info(
         "Registered %d API key(s) from CANOPY_API_KEYS_FILE (%d write, %d admin, %d module-scoped)",
@@ -423,9 +428,11 @@ def _accept_on_behalf_of(value: str, facilities: str | None, key: APIKey) -> Non
     needn't be; the decoded value is recorded for this request (see ``request_actor``).
 
     ``X-Canopy-On-Behalf-Of-Facilities`` must come with it: the caller's facility grant,
-    a JSON list of slugs. The request then reaches only the facilities both the service
-    key and the caller reach (see ``forwarded_facilities``). Without it a head would
-    widen every caller to the service key's grant, so it is required.
+    a JSON list of facility ids, or ``["*"]`` for every facility. The ids are the same
+    here as on the head, since replication copies rows unchanged. The request then
+    reaches only the facilities both the service key and the caller reach (see
+    ``forwarded_facilities``). Without it a head would widen every caller to the
+    service key's grant, so it is required.
     """
     settings = get_settings()
     if settings.role != "primary" or not settings.accept_forwarded_writes:
@@ -443,20 +450,25 @@ def _accept_on_behalf_of(value: str, facilities: str | None, key: APIKey) -> Non
         write = ForwardedWrite()
         forwarded_write.set(write)
     write.on_behalf_of = value
-    write.facilities = grant
+    write.facility_ids = grant
 
 
 def _parse_facilities(value: str | None) -> frozenset[str]:
-    """The caller's facility grant from ``X-Canopy-On-Behalf-Of-Facilities``."""
+    """The caller's facility grant from ``X-Canopy-On-Behalf-Of-Facilities``: ids, or ``{"*"}``.
+
+    Each id comes back in canonical form, so only a well-formed one reaches a query.
+    """
     if value is None:
         raise BadRequest(f"{ON_BEHALF_OF_FACILITIES_HEADER} is required with {ON_BEHALF_OF_HEADER}")
     try:
-        slugs = json.loads(value)
-    except ValueError:
-        slugs = None
-    if not isinstance(slugs, list) or not all(isinstance(slug, str) for slug in slugs):
-        raise BadRequest(f"{ON_BEHALF_OF_FACILITIES_HEADER} must be a JSON list of facility slugs")
-    return frozenset(slugs)
+        items = json.loads(value)
+        if not isinstance(items, list):
+            raise ValueError
+        return frozenset(item if item == WILDCARD else str(UUID(item)) for item in items)
+    except (ValueError, TypeError, AttributeError):
+        raise BadRequest(
+            f'{ON_BEHALF_OF_FACILITIES_HEADER} must be a JSON list of facility ids, or ["{WILDCARD}"]'
+        ) from None
 
 
 def forwarded_for() -> str | None:
@@ -471,11 +483,12 @@ def forwarded_for() -> str | None:
 def forwarded_facilities() -> frozenset[str] | None:
     """The facility grant of the caller a trusted history head named, or ``None``.
 
-    Set by ``get_api_key`` alongside ``forwarded_for``. Facility gates intersect it
-    with the service key's own grant.
+    Facility ids, or ``{"*"}``, as ``APIKey.facility_ids`` holds them. Set by
+    ``get_api_key`` alongside ``forwarded_for``. Facility gates intersect it with the
+    service key's own grant.
     """
     write = forwarded_write.get()
-    return write.facilities if write is not None else None
+    return write.facility_ids if write is not None else None
 
 
 def request_actor(key: APIKeyDep) -> str:

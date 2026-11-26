@@ -14,6 +14,7 @@ from canopy.core import db
 from canopy.core.errors import FacilitySlugConflict
 from canopy.core.modules import WILDCARD
 from canopy.core.security import APIKey
+from canopy.core.facilities import gateway as facilities_gateway
 from canopy.core.forwarding import owners
 from canopy.magpie.data.models import Config
 from canopy.squirrel.data.models import Pv, Snapshot, TagGroup, pv_facility
@@ -184,8 +185,11 @@ async def test_a_retained_row_is_live_here(rows, as_instance):
     assert not await row_is_live(snapshot, "latest")
 
 
-def _key(*facilities: str) -> APIKey:
-    return APIKey(token="t", read=True, write=True, modules=frozenset({WILDCARD}), facilities=frozenset(facilities))
+async def _key(*slugs: str) -> APIKey:
+    """A key minted now granting ``slugs``: it holds the ids they name here."""
+    ids = {WILDCARD} if WILDCARD in slugs else set((await facilities_gateway.ids_by_slug(set(slugs))).values())
+    assert len(ids) == len(slugs)
+    return APIKey(token="t", read=True, write=True, modules=frozenset({WILDCARD}), facility_ids=frozenset(ids))
 
 
 async def _reaches(key: APIKey, method: str, path: str) -> bool:
@@ -201,9 +205,9 @@ class TestCallerReaches:
             ("POST", f"/squirrel/v1/snapshots/{arm1['snapshot']}/restore"),
             ("DELETE", f"/squirrel/v1/pvs/{arm1['pv']}"),
         ]:
-            assert await _reaches(_key("arm1-site"), method, path)
-            assert not await _reaches(_key("head-site"), method, path)
-            assert not await _reaches(_key(), method, path)
+            assert await _reaches(await _key("arm1-site"), method, path)
+            assert not await _reaches(await _key("head-site"), method, path)
+            assert not await _reaches(await _key(), method, path)
 
     async def test_a_grant_on_a_parent_reaches_its_children(self, rows, as_instance):
         with as_instance("arm1"):
@@ -216,7 +220,7 @@ class TestCallerReaches:
                 session.add(snapshot)
                 await session.commit()
 
-        assert await _reaches(_key("arm1-site"), "DELETE", f"/squirrel/v1/snapshots/{snapshot.id}")
+        assert await _reaches(await _key("arm1-site"), "DELETE", f"/squirrel/v1/snapshots/{snapshot.id}")
 
     async def test_a_row_with_no_facility_is_outside_every_restricted_grant(self, rows, as_instance):
         with as_instance("arm1"):
@@ -225,14 +229,14 @@ class TestCallerReaches:
                 session.add(snapshot)
                 await session.commit()
 
-        assert not await _reaches(_key("arm1-site"), "DELETE", f"/squirrel/v1/snapshots/{snapshot.id}")
-        assert await _reaches(_key(WILDCARD), "DELETE", f"/squirrel/v1/snapshots/{snapshot.id}")
+        assert not await _reaches(await _key("arm1-site"), "DELETE", f"/squirrel/v1/snapshots/{snapshot.id}")
+        assert await _reaches(await _key(WILDCARD), "DELETE", f"/squirrel/v1/snapshots/{snapshot.id}")
 
     async def test_rows_the_app_doesnt_gate_by_facility(self, rows):
         arm1 = rows["arm1"]
-        assert await _reaches(_key(), "PATCH", f"/squirrel/v1/pvs/meta/{arm1['pv']}")
-        assert await _reaches(_key(), "DELETE", f"/squirrel/v1/tags/{arm1['group']}")
-        assert await _reaches(_key(), "PUT", f"/magpie/v1/configs/trace/{arm1['config']}")
+        assert await _reaches(await _key(), "PATCH", f"/squirrel/v1/pvs/meta/{arm1['pv']}")
+        assert await _reaches(await _key(), "DELETE", f"/squirrel/v1/tags/{arm1['group']}")
+        assert await _reaches(await _key(), "PUT", f"/magpie/v1/configs/trace/{arm1['config']}")
 
 
 async def test_an_unrestricted_key_reaches_every_row_without_a_read(monkeypatch):
@@ -242,5 +246,6 @@ async def test_an_unrestricted_key_reaches_every_row_without_a_read(monkeypatch)
     monkeypatch.setattr(owners, "session_scope", no_read)
     monkeypatch.setattr(owners.facilities_gateway, "resolve_key_facility_scope", no_read)
 
-    assert await _reaches(_key(WILDCARD), "DELETE", f"/squirrel/v1/snapshots/{uuid4()}")
-    assert await _reaches(_key("a"), "DELETE", "/squirrel/v1/snapshots/not-a-uuid")
+    assert await _reaches(await _key(WILDCARD), "DELETE", f"/squirrel/v1/snapshots/{uuid4()}")
+    restricted = APIKey(read=True, write=True, modules=frozenset({WILDCARD}), facility_ids=frozenset({str(uuid4())}))
+    assert await _reaches(restricted, "DELETE", "/squirrel/v1/snapshots/not-a-uuid")

@@ -23,7 +23,9 @@ class Facility(UUIDMixin, TimestampMixin, OwnedMixin, Base):
     Self-referential rather than two separate tables — "in facility X" means "X or
     any descendant of X," which falls out of walking ``parent_id`` without a
     facility/sub-facility special case. ``slug`` is immutable once created: it goes
-    into URLs and API key facility grants, and it is unique across every instance.
+    into URLs and ``?facility=`` filters, and it is unique across every instance. An API
+    key's grant names slugs at mint but records the facilities' ids, so a facility
+    created later under a deleted one's slug isn't covered by it.
     A facility's parent has the same ``owner_instance`` (``canopy.core.ownership``).
     """
 

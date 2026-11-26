@@ -8,13 +8,17 @@ so both halves can be shown against the same router.
 
 from canopy.core.facilities.models import Facility
 
+from .conftest import FACILITY_IDS
+
 READ_HEADERS = {"X-API-Key": "test-read"}
 ADMIN_HEADERS = {"X-API-Key": "test-admin"}
 SCOPED_ADMIN_HEADERS = {"X-API-Key": "test-scoped-admin"}
 
 
 async def _seed_facility(session, slug: str, parent_id: str | None = None) -> Facility:
-    facility = Facility(slug=slug, name=slug.upper(), parent_id=parent_id)
+    """Seed ``slug``, with its id from ``FACILITY_IDS`` if it has one there."""
+    fixed = {"id": FACILITY_IDS[slug]} if slug in FACILITY_IDS else {}
+    facility = Facility(**fixed, slug=slug, name=slug.upper(), parent_id=parent_id)
     session.add(facility)
     await session.commit()
     return facility
