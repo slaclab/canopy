@@ -394,6 +394,16 @@ def test_settings_from_the_environment(monkeypatch):
         OutboxConfig(retry_initial_s=1000, retry_max_s=10)
 
 
+@pytest.mark.parametrize("field", sorted(OutboxConfig.model_fields))
+def test_a_blank_outbox_setting_keeps_its_default(monkeypatch, field):
+    from canopy.squirrel.config import get_squirrel_config
+
+    # As Helm and compose render a variable that is declared but not set.
+    monkeypatch.setenv(f"CANOPY_SQUIRREL__OUTBOX__{field.upper()}", "")
+
+    assert getattr(get_squirrel_config().outbox, field) == getattr(OutboxConfig(), field)
+
+
 async def test_a_capture_time_without_an_offset_is_read_as_utc(db_session, seeded: Seeded):
     bundle = make_bundle(seeded, created=CAPTURED.replace(tzinfo=None))
     await enqueue(
